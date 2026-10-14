@@ -107,6 +107,7 @@ struct VuCompiled {
     const VuBlock* blocks;
     std::uint32_t block_count;
     const VuBlock* fast_blocks = nullptr;   // the same without MAC and STATUS (--vu-fast), or none
+    const VuBlock* native_blocks = nullptr; // the same, the pipeline worked out ahead (--vu-native), or none
 };
 /* Adds one to those Vu::Run looks for (the generated file does, as it starts). */
 void RegisterVuProgram(const VuCompiled* program);
@@ -717,6 +718,195 @@ struct VuCore {
         v.regs.vc[0] = 0;
         ++cycle;
     }
+
+#if PS2RT_VU_SSE
+    // ------------------------------------------------------------ native blocks (vunative.py)
+    /* The Vu's state as a native block loads it into locals and stores it
+       back as it leaves. */
+    static PS2HOST_VU_INLINE __m128i LoadVf(const Vu& v, int r) {
+        return _mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[r]));
+    }
+    static PS2HOST_VU_INLINE void StoreVf(Vu& v, int r, __m128i x) {
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(v.regs.vf[r]), x);
+    }
+    static PS2HOST_VU_INLINE __m128i LoadAcc(const Vu& v) {
+        return _mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vacc));
+    }
+    static PS2HOST_VU_INLINE void StoreAcc(Vu& v, __m128i x) {
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(v.regs.vacc), x);
+    }
+    static PS2HOST_VU_INLINE u32& ViRef(Vu& v, u32 r) { return v.regs.vc[r]; }
+    static PS2HOST_VU_INLINE u64* Ready(Vu& v, int r) { return v.vf_ready_[r]; }
+    static PS2HOST_VU_INLINE void Ready4(Vu& v, int r, u64 ready) {
+        for (int lane = 0; lane < 4; ++lane) v.vf_ready_[r][lane] = ready;
+    }
+    static PS2HOST_VU_INLINE u32& Unclean(Vu& v) { return v.unclean_; }
+    static PS2HOST_VU_INLINE bool& AccUnclean(Vu& v) { return v.acc_unclean_; }
+    static PS2HOST_VU_INLINE void GetQ(const Vu& v, u32& next, u64& ready, bool& busy) {
+        next = v.q_next_;
+        ready = v.q_ready_;
+        busy = v.q_busy_;
+    }
+    static PS2HOST_VU_INLINE void SetQ(Vu& v, u32 next, u64 ready, bool busy) {
+        v.q_next_ = next;
+        v.q_ready_ = ready;
+        v.q_busy_ = busy;
+    }
+    static PS2HOST_VU_INLINE void GetP(const Vu& v, u32& p, u32& next, u64& ready, bool& busy) {
+        p = v.p;
+        next = v.p_next_;
+        ready = v.p_ready_;
+        busy = v.p_busy_;
+    }
+    static PS2HOST_VU_INLINE void SetP(Vu& v, u32 p, u32 next, u64 ready, bool busy) {
+        v.p = p;
+        v.p_next_ = next;
+        v.p_ready_ = ready;
+        v.p_busy_ = busy;
+    }
+    static PS2HOST_VU_INLINE void QpDue(Vu& v) {
+        v.qp_due_ = std::min(v.q_busy_ ? v.q_ready_ : ~u64(0), v.p_busy_ ? v.p_ready_ : ~u64(0));
+    }
+    static PS2HOST_VU_INLINE u32& MacLanded(Vu& v) { return v.mac; }
+    static PS2HOST_VU_INLINE u32& StatusLanded(Vu& v) { return v.status; }
+    static PS2HOST_VU_INLINE u32& ClipLanded(Vu& v) { return v.clip; }
+    static PS2HOST_VU_INLINE u32& MacLatest(Vu& v) { return v.mac_latest_; }
+    /* A result's flags into the queue as FinishUpper puts them, `issue` the
+       cycle its pair issued (a full queue lands what has arrived by then). */
+    static PS2HOST_VU_INLINE void PushFlags(Vu& v, u64 issue, u64 ready, u32 mac, u32 status, u32 clip,
+                                            bool sets_mac, bool sets_clip) {
+        if (v.flag_count_ == 8) LandFlags(v, issue);
+        if (v.flag_count_ < 8) {
+            Vu::FlagWrite& f = v.flag_queue_[(v.flag_head_ + v.flag_count_++) & 7];
+            f.ready = ready;
+            f.mac = mac;
+            f.status = status;
+            f.clip = clip;
+            f.sets_mac = sets_mac;
+            f.sets_clip = sets_clip;
+        }
+    }
+    // Data memory, through a base and a mask (quadwords) the block keeps.
+    static PS2HOST_VU_INLINE std::uint8_t* Mem(Vu& v) { return v.data.data(); }
+    static PS2HOST_VU_INLINE u32 MemMask(const Vu& v) { return v.data_mask_; }
+    static PS2HOST_VU_INLINE __m128i LoadQuad(const std::uint8_t* mem, u32 mask, u32 address) {
+        return _mm_loadu_si128(reinterpret_cast<const __m128i*>(mem + std::size_t(address & mask) * 16));
+    }
+    template <u32 Dest>
+    static PS2HOST_VU_INLINE void StoreQuad(std::uint8_t* mem, u32 mask, u32 address, __m128i x) {
+        __m128i* q = reinterpret_cast<__m128i*>(mem + std::size_t(address & mask) * 16);
+        if constexpr (Dest == 15) _mm_storeu_si128(q, x);
+        else if constexpr (Dest != 0) _mm_storeu_si128(q, Blend(LaneMask(Dest), x, _mm_loadu_si128(q)));
+    }
+    static PS2HOST_VU_INLINE u32 WordOf(const std::uint8_t* mem, u32 mask, u32 address, int lane) {
+        u32 word;
+        std::memcpy(&word, mem + std::size_t(address & mask) * 16 + 4 * lane, 4);
+        return word;
+    }
+    template <u32 Dest>
+    static PS2HOST_VU_INLINE void StoreWord(std::uint8_t* mem, u32 mask, u32 address, u32 vi) {
+        u32* q = reinterpret_cast<u32*>(mem + std::size_t(address & mask) * 16);
+        const u32 value = vi & 0xFFFF;
+        if constexpr ((Dest & 8) != 0) q[0] = value;
+        if constexpr ((Dest & 4) != 0) q[1] = value;
+        if constexpr ((Dest & 2) != 0) q[2] = value;
+        if constexpr ((Dest & 1) != 0) q[3] = value;
+    }
+    // Values.
+    template <int Lane>
+    static PS2HOST_VU_INLINE u32 Lane(__m128i x) {
+        return u32(_mm_cvtsi128_si32(_mm_shuffle_epi32(x, _MM_SHUFFLE(Lane, Lane, Lane, Lane))));
+    }
+    template <int Lane>
+    static PS2HOST_VU_INLINE __m128i Bc(__m128i x) { return _mm_shuffle_epi32(x, _MM_SHUFFLE(Lane, Lane, Lane, Lane)); }
+    static PS2HOST_VU_INLINE __m128i CleanOf(__m128i x) { return lifted::CleanLanes(x); }
+    static PS2HOST_VU_INLINE bool Changed(__m128i after, __m128i before) {
+        return _mm_movemask_epi8(_mm_cmpeq_epi32(after, before)) != 0xFFFF;
+    }
+    /* The FMAC on operands already as Clean leaves them (MAX and MINI take
+       theirs as they are). */
+    template <int Op>
+    static PS2HOST_VU_INLINE __m128i Lanes(__m128i a, __m128i b, __m128i acc) {
+        return lifted::LanesSse<Op, 7>(a, b, acc);
+    }
+    static PS2HOST_VU_INLINE __m128i OpmulaOf(__m128i fs, __m128i ft) {
+        return lifted::LanesSse<lifted::kMul>(_mm_shuffle_epi32(fs, _MM_SHUFFLE(3, 0, 2, 1)),
+                                              _mm_shuffle_epi32(ft, _MM_SHUFFLE(3, 1, 0, 2)), _mm_setzero_si128());
+    }
+    static PS2HOST_VU_INLINE __m128i OpmsubOf(__m128i fs, __m128i ft, __m128i acc) {
+        return lifted::LanesSse<lifted::kMsub>(_mm_shuffle_epi32(fs, _MM_SHUFFLE(3, 0, 2, 1)),
+                                               _mm_shuffle_epi32(ft, _MM_SHUFFLE(3, 1, 0, 2)), acc);
+    }
+    template <int Shift>
+    static PS2HOST_VU_INLINE __m128i ItofOf(__m128i a) {
+        static constexpr double kScale[4] = {1.0, 16.0, 4096.0, 32768.0};
+        alignas(16) u32 in[4], out[4];
+        _mm_store_si128(reinterpret_cast<__m128i*>(in), a);
+        for (int lane = 0; lane < 4; ++lane) out[lane] = lifted::Result(double(std::int32_t(in[lane])) / kScale[Shift]);
+        return _mm_load_si128(reinterpret_cast<const __m128i*>(out));
+    }
+    template <int Shift>
+    static PS2HOST_VU_INLINE __m128i FtoiOf(__m128i a) {       // as Ftoi
+        static constexpr float kScaleF[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
+        const __m128 x = _mm_mul_ps(_mm_castsi128_ps(lifted::CleanLanes(a)), _mm_set1_ps(kScaleF[Shift]));
+        const __m128i over = _mm_castps_si128(_mm_cmpge_ps(x, _mm_set1_ps(2147483648.0f)));
+        return _mm_xor_si128(_mm_cvttps_epi32(x), over);
+    }
+    static PS2HOST_VU_INLINE __m128i AbsOf(__m128i a) {
+        return _mm_and_si128(lifted::CleanLanes(a), _mm_set1_epi32(0x7FFFFFFF));
+    }
+    static PS2HOST_VU_INLINE __m128i Mfir(u32 vi) {
+        u32 x = vi & 0xFFFF;
+        if (x & 0x8000) x |= 0xFFFF0000u;
+        return _mm_set1_epi32(int(x));
+    }
+    static PS2HOST_VU_INLINE u32 DivOf(u32 num, u32 den) {
+        return lifted::Value(den) == 0.0 ? ((num ^ den) & lifted::kSign) | lifted::kMax
+                                         : lifted::Result(lifted::Value(num) / lifted::Value(den));
+    }
+    static PS2HOST_VU_INLINE u32 SqrtOf(u32 x) { return lifted::Result(std::sqrt(std::fabs(lifted::Value(x)))); }
+    static PS2HOST_VU_INLINE u32 RsqrtOf(u32 num, u32 x) {
+        const double root = std::sqrt(std::fabs(lifted::Value(x)));
+        return root == 0.0 ? (num & lifted::kSign) | lifted::kMax : lifted::Result(lifted::Value(num) / root);
+    }
+    static PS2HOST_VU_INLINE u32 ClipOf(__m128i fs, __m128i ft) {      // as ClipJudge
+        alignas(16) u32 f[4], t[4];
+        _mm_store_si128(reinterpret_cast<__m128i*>(f), fs);
+        _mm_store_si128(reinterpret_cast<__m128i*>(t), ft);
+        const u32 w = CleanMagnitude(t[3]);
+        u32 judgement = 0;
+        for (int lane = 0; lane < 3; ++lane)
+            if (CleanMagnitude(f[lane]) > w) judgement |= (f[lane] >> 31 ? 2u : 1u) << (2 * lane);
+        return judgement;
+    }
+    // Flags, as FlagsOf sets them.
+    template <u32 Dest>
+    static PS2HOST_VU_INLINE u32 MacOf(__m128i bits) {
+        bits = _mm_shuffle_epi32(bits, _MM_SHUFFLE(0, 1, 2, 3));
+        const __m128i magnitude = _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF));
+        const u32 zero = u32(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(magnitude, _mm_setzero_si128()))));
+        const u32 sign = u32(_mm_movemask_ps(_mm_castsi128_ps(bits)));
+        return (zero & Dest) | (sign & Dest) << 4;
+    }
+    template <u32 Dest>
+    static PS2HOST_VU_INLINE u32 LowOf(__m128i bits) {
+        const u32 m = MacOf<Dest>(bits);
+        return ((m & 0xF) ? 1u : 0u) | ((m & 0xF0) ? 2u : 0u);
+    }
+    /* STATUS's sticky zero and sign: the lanes of Dest that are zero (all
+       ones) and the sign bits of Dest's lanes, gathered with OR; StickyOf
+       turns them into bits 6 and 7. */
+    template <u32 Dest>
+    static PS2HOST_VU_INLINE __m128i ZeroLanes(__m128i bits) {
+        const __m128i magnitude = _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF));
+        return _mm_and_si128(_mm_cmpeq_epi32(magnitude, _mm_setzero_si128()), LaneMask(Dest));
+    }
+    template <u32 Dest>
+    static PS2HOST_VU_INLINE __m128i SignLanes(__m128i bits) { return _mm_and_si128(bits, LaneMask(Dest)); }
+    static PS2HOST_VU_INLINE u32 StickyOf(__m128i zero, __m128i sign) {
+        return (_mm_movemask_ps(_mm_castsi128_ps(zero)) ? 0x40u : 0u) | (_mm_movemask_ps(_mm_castsi128_ps(sign)) ? 0x80u : 0u);
+    }
+#endif
 };
 
 }  // namespace ps2host

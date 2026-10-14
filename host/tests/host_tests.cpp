@@ -925,6 +925,64 @@ void VuCompiledIsTheInterpreter() {
     Check(entered == runs, what);
 }
 
+// --vu-native: the corpus's programs run their native blocks (vunative.py)
+// and end as the exact blocks do in everything - registers, memory, flags,
+// Q and P, every pipeline and cycle - and in the pairs counted.
+void VuNativeIsTheExact() {
+    std::size_t count = 0;
+    const ps2host::VuCompiled* programs = VuGeneratedPrograms(&count);
+    u32 seed = 4242;
+    u32 wrong = 0, runs = 0, native = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        const ps2host::VuCompiled& program = programs[i];
+        if (!program.block_count || !program.native_blocks) continue;
+        bool any = false;
+        for (u32 b = 0; b < program.block_count; ++b) any = any || program.native_blocks[b] != program.blocks[b];
+        for (int trial = 0; trial < 8; ++trial) {
+            auto exact = std::make_unique<ps2host::Vu>(program.unit);
+            auto fast = std::make_unique<ps2host::Vu>(program.unit);
+            const u32 start = seed;
+            for (ps2host::Vu* vu : {exact.get(), fast.get()}) {
+                seed = start;
+                PrepareVuRun(*vu, program, seed);
+            }
+            exact->native = false;
+            fast->native = true;
+            const u64 limit = 3000;
+            const u64 a = exact->Run(program.entry, limit), b = fast->Run(program.entry, limit);
+            ++runs;
+            if (any) ++native;
+            if (a != b || !exact->SameState(*fast)) {
+                if (++wrong <= 6) {
+                    std::fprintf(stderr, "[native] program %zu entry %X trial %d: pairs %llu %llu\n", i, program.entry,
+                                 trial, (unsigned long long)a, (unsigned long long)b);
+                    for (int r = 0; r < 32; ++r)
+                        for (int l = 0; l < 4; ++l)
+                            if (exact->regs.vf[r][l] != fast->regs.vf[r][l]) std::fprintf(stderr, "  vf%d.%d\n", r, l);
+                    for (int r = 0; r < 32; ++r)
+                        if (exact->regs.vc[r] != fast->regs.vc[r])
+                            std::fprintf(stderr, "  vc%d %X %X\n", r, exact->regs.vc[r], fast->regs.vc[r]);
+                    if (exact->regs.vacc[0] != fast->regs.vacc[0] || exact->regs.vacc[1] != fast->regs.vacc[1] ||
+                        exact->regs.vacc[2] != fast->regs.vacc[2] || exact->regs.vacc[3] != fast->regs.vacc[3])
+                        std::fprintf(stderr, "  acc\n");
+                    if (exact->mac != fast->mac || exact->status != fast->status || exact->clip != fast->clip)
+                        std::fprintf(stderr, "  flags %X %X %X / %X %X %X\n", exact->mac, exact->status, exact->clip,
+                                     fast->mac, fast->status, fast->clip);
+                    if (exact->p != fast->p) std::fprintf(stderr, "  p\n");
+                    if (std::memcmp(exact->data.data(), fast->data.data(), exact->data.size()))
+                        std::fprintf(stderr, "  data\n");
+                    if (exact->SameState(*fast, false) && (a == b)) std::fprintf(stderr, "  (MAC/STATUS or their pipeline)\n");
+                }
+            }
+        }
+    }
+    char what[160];
+    std::snprintf(what, sizeof what, "VU native blocks run as the exact ones (%u of %u runs differ)", wrong, runs);
+    Check(wrong == 0 && runs >= 100, what);
+    std::snprintf(what, sizeof what, "VU native blocks taken (%u of %u runs)", native, runs);
+    Check(native > runs / 2, what);
+}
+
 // --vu-fast: the corpus's VU1 programs that never read MAC or STATUS
 // (vurecomp's fast_eligible) run their flag-free blocks, and end as the
 // exact blocks do in everything else - registers, memory, CLIP, Q and P,
@@ -945,6 +1003,7 @@ void VuFastIsTheExactButFlags() {
                 seed = start;
                 PrepareVuRun(*vu, program, seed);
             }
+            exact->native = fast->native = false;      // the exact blocks and their fast ones
             fast->fast = true;
             const u64 limit = 3000;
             const u64 a = exact->Run(program.entry, limit), b = fast->Run(program.entry, limit);
@@ -1298,6 +1357,7 @@ int main() {
     VuLanesAreTheModel();
     VuCompiledIsTheInterpreter();
     VuFastIsTheExactButFlags();
+    VuNativeIsTheExact();
     VuTimingIsVisible();
     VuFlagsOfAResultIntoVf0();
     VuMaxKeepsADenormal();

@@ -74,6 +74,7 @@ Options for finding out why boot stops, passed after `run --`:
 | `--setting KEY=VALUE` | a PC setting for this run, not saved (`--setting aspect=16:9`: a scripted run in a wider picture); any number of them |
 | `--vu-record FILE`, `--vu-interpret` | record the VU microprograms a run starts, for compiling ahead of time; run them interpreted (see below) |
 | `--vu-fast` | compiled VU1 programs leave out the MAC and STATUS flags no instruction of theirs can read ("Fast mode" below): exact but for those flags, ~15% less VU1 time; exact is the default |
+| `--vu-exact` | compiled VU programs run their exact blocks, not the native ones ("Native blocks" below; native is the default and ends in the same state) |
 | `--audio-wav FILE` | the same output recorded to a WAV file, for checking sound without listening |
 | `PS2HOST_AUDIO_LOG=1`, `PS2HOST_AUDIO_MUTE=1`, `PS2HOST_SPU_LOG=1`, `PS2HOST_SPU_NO_REVERB=1` | sound, looked into: every two seconds how the SPU2's samples came (the longest wait between batches) and what the device made of them (ran out, dropped, fewest buffers queued); the device played unheard; once a second the voices sounding, their volumes fixed or sweeping, the main volumes; the reverb left out |
 | `--watch-write ADDR` | every store to a guest address, with the function making it and four of its callers |
@@ -305,6 +306,23 @@ Burnout 3, the car select and the race recorded: 67 programs, 11,364 pairs;
 every pair of either run compiled (428 million and 2.46 billion). The car
 select 32 s to 24 s on the same build (`--vu-interpret` for the
 comparison); the race script about 2 minutes.
+
+### Native blocks (the default; `--vu-exact` turns them off)
+
+`engine/tools/vunative.py` compiles each block a second time, with the
+pipeline worked out as the code is generated: issue times are a base and an
+offset, compared ahead wherever their bases allow it (only what was in flight
+before the block, Q and P from before it, and moves that change nothing are
+compared as it runs); VF, ACC, VI, I, Q and P are locals; MAC and CLIP are
+computed only where read or leaving the block, STATUS's sticky bits gathered
+in vector registers; only the flags still in flight as the block leaves go
+into the queue. A block with an operation it does not do (FSxx, FCSET,
+COP2-only lowers and uppers, VI16+), or entered with a branch or an E bit
+pending, is the exact block. The end state is the exact block's in
+everything (VuNativeIsTheExact; `--vu-bench` hashes the same). Burnout 3:
+16,798 of 16,830 pairs native, ~9.5 -> ~5.9 ns a pair on its race's VU1
+runs, 35.8 -> 39.8 pictures a second in the race (the GS thread the limit
+after), 97/97 race pictures unchanged.
 
 ### Fast mode (`--vu-fast`)
 
