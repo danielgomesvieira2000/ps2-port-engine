@@ -137,7 +137,7 @@ int GsReplay(const std::string& file, const std::string& out, bool sample) {
                      bench, unsigned(g.primitives() / u64(bench)), sorted.front(), sorted[sorted.size() / 2],
                      sum / bench, sorted.back());
         std::fprintf(stderr, "gs-replay bench: %.2f ms a pass in all, to the last drawn\n", total / bench);
-        if (sample) std::printf("%s", SampleReport().c_str());
+        if (sample) std::printf("%s", SampleReport(std::getenv("PS2HOST_SAMPLE_TOP") ? std::atoi(std::getenv("PS2HOST_SAMPLE_TOP")) : 30).c_str());
         return 0;
     }
     std::FILE* trace = std::fopen((out + "/trace.txt").c_str(), "w");
@@ -842,7 +842,7 @@ int Main(int argc, char** argv) {
             SampleFrame(0);
         }
         const int status = Vu::Bench(options.vu_bench, options.sample ? 100 : 5, options.vu_fast, options.vu_native);
-        if (options.sample) std::printf("%s", SampleReport().c_str());
+        if (options.sample) std::printf("%s", SampleReport(std::getenv("PS2HOST_SAMPLE_TOP") ? std::atoi(std::getenv("PS2HOST_SAMPLE_TOP")) : 30).c_str());
         return status;
     }
     if (options.elf_path.empty() && options.disc_path.empty()) {
