@@ -773,6 +773,34 @@ struct VuCore {
     static PS2HOST_VU_INLINE u32& MacLatest(Vu& v) { return v.mac_latest_; }
     /* A result's flags into the queue as FinishUpper puts them, `issue` the
        cycle its pair issued (a full queue lands what has arrived by then). */
+    /* Native blocks leaving four cycles or more after they began: whatever
+       was queued before them has landed by now (an FMAC's flags land four
+       cycles after its issue), in order, without a time compared. */
+    static PS2HOST_VU_INLINE void LandAllFlags(Vu& v) {
+        for (int n = v.flag_count_, at = v.flag_head_; n; --n, at = (at + 1) & 7) {
+            const Vu::FlagWrite& f = v.flag_queue_[at];
+            if (f.sets_mac) {
+                v.mac = f.mac;
+                v.status = (v.status & ~0x3u) | (f.status & 0x3u) | (f.status & 0xC0u);
+            }
+            if (f.sets_clip) v.clip = f.clip;
+        }
+        v.flag_head_ = 0;
+        v.flag_count_ = 0;
+    }
+    /* After LandAllFlags: the block's flags still on their way, the queue's
+       slot `slot` (from 0, in order), Count of them in all. */
+    static PS2HOST_VU_INLINE void QueueFlags(Vu& v, int slot, u64 ready, u32 mac, u32 status, u32 clip,
+                                             bool sets_mac, bool sets_clip) {
+        Vu::FlagWrite& f = v.flag_queue_[slot];
+        f.ready = ready;
+        f.mac = mac;
+        f.status = status;
+        f.clip = clip;
+        f.sets_mac = sets_mac;
+        f.sets_clip = sets_clip;
+    }
+    static PS2HOST_VU_INLINE void QueuedFlags(Vu& v, int count) { v.flag_count_ = count; }
     static PS2HOST_VU_INLINE void PushFlags(Vu& v, u64 issue, u64 ready, u32 mac, u32 status, u32 clip,
                                             bool sets_mac, bool sets_clip) {
         if (v.flag_count_ == 8) LandFlags(v, issue);

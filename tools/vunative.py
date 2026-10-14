@@ -671,8 +671,17 @@ class Block:
         for i, e in enumerate(self.events):
             if self.le(e["ready"], exit_t):
                 landed = i
+        in_flight = len(self.events) - ((landed + 1) if landed is not None else 0)
+        # Four cycles or more after c0, what was queued before the block has
+        # landed (an FMAC's flags land four cycles after its issue, and every
+        # issue before the block was before c0): all of it lands at once, and
+        # the block's own flags on their way fill the queue from its start.
+        settled = self.low(exit_t) >= 4 and in_flight <= 8
+        if settled:
+            tail.append("C::LandAllFlags(v);")
         if landed is not None:
-            tail.append("C::LandFlags(v, %s);" % self.texpr(exit_t))
+            if not settled:
+                tail.append("C::LandFlags(v, %s);" % self.texpr(exit_t))
             mac = next((e for e in reversed(self.events[:landed + 1]) if e["kind"] == "mac"), None)
             clip = next((e for e in reversed(self.events[:landed + 1]) if e["kind"] == "clip"), None)
             if mac:
@@ -680,12 +689,18 @@ class Block:
                 tail.append("C::StatusLanded(v) = (C::StatusLanded(v) & ~3u) | (%s & 0xC3u);" % self.status_of(mac))
             if clip:
                 tail.append("C::ClipLanded(v) = %s;" % clip["cl"])
-        for i in range((landed + 1) if landed is not None else 0, len(self.events)):
+        for slot, i in enumerate(range((landed + 1) if landed is not None else 0, len(self.events))):
             e = self.events[i]
             mac, status, clip = self.snapshot(i)
-            tail.append("C::PushFlags(v, %s, %s, %s, %s, %s, %s, %s);" %
-                        (self.texpr(e["t"]), self.texpr(e["ready"]), mac, status, clip,
-                         "true" if e["kind"] == "mac" else "false", "true" if e["kind"] == "clip" else "false"))
+            sets = ("true" if e["kind"] == "mac" else "false", "true" if e["kind"] == "clip" else "false")
+            if settled:
+                tail.append("C::QueueFlags(v, %d, %s, %s, %s, %s, %s, %s);" %
+                            ((slot, self.texpr(e["ready"]), mac, status, clip) + sets))
+            else:
+                tail.append("C::PushFlags(v, %s, %s, %s, %s, %s, %s, %s);" %
+                            ((self.texpr(e["t"]), self.texpr(e["ready"]), mac, status, clip) + sets))
+        if settled and in_flight:
+            tail.append("C::QueuedFlags(v, %d);" % in_flight)
         last_mac = next((e for e in reversed(self.events) if e["kind"] == "mac"), None)
         if last_mac:
             tail.append("C::MacLatest(v) = %s;" % self.mac_of(last_mac))
