@@ -112,6 +112,9 @@ public:
     /* --gs-trace: log image transfers and primitives (stderr). */
     bool trace = false;
     std::FILE* trace_out = stderr;      // where the trace goes (a capture's trace.txt)
+    /* A skipped picture's packets (the frame skip, GsSkipDraws): registers and
+       image transfers taken, primitives not drawn. */
+    bool skip_draws = false;
 
     /* A GS register write by address (A+D, REGLIST, or the GIF's own). */
     void WriteRegister(u32 address, u64 value);

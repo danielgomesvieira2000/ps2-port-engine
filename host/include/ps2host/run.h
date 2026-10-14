@@ -196,6 +196,9 @@ void GsQword(int path, u64 low, u64 high);
 void GsWord(int path, u32 word);
 void GsWords(int path, const u32* words, u32 count, u32 from = ~0u);
 void GsPrivileged(u32 address, u64 value);
+/* The frame skip: from here in the GS's stream, primitives are drawn (false) or
+   not (true) - in order with the packets around (gs_thread.cpp). */
+void GsSkipDraws(bool on);
 /* The end of frame N, in the GS's stream: the handler (the GPU bridge's, when
    the GPU draws: hand the frame to the GPU, show its picture) runs on the GS
    thread once the frame's packets are taken, so the EE need not wait for

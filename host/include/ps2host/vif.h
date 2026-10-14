@@ -30,6 +30,9 @@ public:
     /* The VU behind this VIF (VU1 for VIF1); none drops VU traffic. */
     Vu* vu = nullptr;
     bool double_buffered = false;   /* VIF1's BASE/OFFSET/TOPS */
+    /* A skipped picture's (devices.cpp, the frame skip): MSCAL, MSCALF and
+       MSCNT keep their double buffer's bookkeeping but start no program. */
+    bool skip_programs = false;
     /* Called when MSKPATH3 masks (true) or unmasks (false) PATH3. */
     std::function<void(bool masked)> on_mask_path3;
     /* Each word of DIRECT/DIRECTHL data: GIF data on PATH2. */

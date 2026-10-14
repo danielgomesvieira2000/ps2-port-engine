@@ -246,6 +246,26 @@ std::shared_ptr<ChainCopy> NewChainCopy() {
     });
 }
 
+/* The frame skip (real time, with VIF1's worker; PC setting frame_skip, on
+   unless "off"). A game whose logic goes at its pictures' pace (Burnout 3:
+   a race in slow motion below 60 pictures a second) keeps its pace when the
+   worker cannot keep up: a picture's display list - a VIF1 chain - started
+   while the one before is still on the worker is skipped. Its words are all
+   taken (VU1's memory, its programs, the GS's registers, PATH2's and PATH3's
+   images) but its VU1 programs do not run, so nothing of it is drawn; and the
+   display is not flipped to it (DISPFB1/2 left as they were) until the next
+   picture drawn. Never two in a row. */
+constexpr u64 kPictureQuadwords = 1024;    // a chain this long is a picture's
+std::atomic<int> g_pictures_on_worker{0};
+std::atomic<bool> g_hold_flips{false};
+std::atomic<u64> g_pictures_skipped{0};
+bool g_skipped_last = false;
+
+bool FrameSkipOn() {
+    static const bool on = Setting("frame_skip", "on") != "off";
+    return on;
+}
+
 // Walks a started transfer and leaves the registers as it would; returns a
 // note (when `describe`: a transfer is noted only the first time).
 std::string Walk(const Channel& ch, u32 chcr, bool describe) {
@@ -301,13 +321,27 @@ std::string Walk(const Channel& ch, u32 chcr, bool describe) {
             }
         }
         if (queued) {
-            Vif1Run([copy, gif, fifo, learn] {
+            const bool picture = vif1 && quadwords >= kPictureQuadwords && FrameSkipOn();
+            bool skip = false;
+            if (picture) {
+                skip = g_pictures_on_worker.load() > 0 && !g_skipped_last;
+                g_skipped_last = skip;
+                g_hold_flips = skip;
+                if (skip) ++g_pictures_skipped;
+                ++g_pictures_on_worker;
+            }
+            Vif1Run([copy, gif, fifo, learn, picture, skip] {
+                Vif1().skip_programs = skip;
+                if (skip) GsSkipDraws(true);
                 const u32* at = copy->words.data();
                 for (const auto& [count, from] : copy->runs) {
                     if (gif) Path3(at, count, from);
                     else Vif1().Words(at, count, from);
                     at += count;
                 }
+                Vif1().skip_programs = false;
+                if (skip) GsSkipDraws(false);
+                if (picture) --g_pictures_on_worker;
                 fifo();
                 learn();
             });
@@ -434,6 +468,14 @@ void FrameTimes(u64 frame) {
                       (unsigned long long)(guesses - last_guesses), (unsigned long long)wrong);
     }
     last_guesses = guesses;
+    static u64 last_skipped = 0;
+    const u64 skipped = g_pictures_skipped.load();
+    if (skipped != last_skipped) {
+        const std::size_t used = std::strlen(job_text);
+        std::snprintf(job_text + used, sizeof job_text - used, ", %llu pictures skipped",
+                      (unsigned long long)(skipped - last_skipped));
+    }
+    last_skipped = skipped;
     // Frames here are vertical blanks; a game that cannot keep up draws a
     // picture every other one (or less), which the VIF1 transfers show.
     std::fprintf(stderr, "[frames] %llu-%llu: %.2f s, %.1f frames a second, %.1f VIF1 transfers a second%s\n",
@@ -723,6 +765,9 @@ void InstallDevices() {
     for (u32 reg : {0x12000000u, 0x12000020u, 0x12000070u, 0x12000080u, 0x12000090u, 0x120000A0u, 0x120000E0u}) {
         for (u32 half : {0u, 4u}) {
             GuestMemory().OnWrite(reg + half, [reg](u32, u64) {
+                // A skipped picture is not shown (the frame skip): the display
+                // stays on the last one drawn.
+                if (g_hold_flips && (reg == 0x12000070u || reg == 0x12000090u)) return;
                 GsPrivileged(reg, GuestMemory().Read(reg, 8));
             });
         }
