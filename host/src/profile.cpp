@@ -192,6 +192,31 @@ void SampleFrame(unsigned long long frame) {
 
 #ifdef _WIN32
 
+/* The suspended thread's call stack from its context, into a fixed array
+   (nothing here may allocate or lock). A walk that faults - a sample caught
+   where the unwind tables do not describe the stack, as clang-cl's code was
+   - keeps the frames found so far. */
+void WalkStack(CONTEXT ctx, std::uint64_t* frames) {
+    frames[0] = ctx.Rip;
+    __try {
+        for (int n = 1; n < kFrames; ++n) {
+            DWORD64 base = 0;
+            PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
+            if (entry) {
+                void* handler = nullptr;
+                DWORD64 frame = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, entry, &ctx, &handler, &frame, nullptr);
+            } else {                // a leaf: its return address is on top of the stack
+                ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
+                ctx.Rsp += 8;
+            }
+            if (!ctx.Rip) break;
+            frames[n] = ctx.Rip;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
 void StartSampler() {
     Sampler& s = TheSampler();
     HANDLE target = nullptr;
@@ -218,23 +243,7 @@ void StartSampler() {
             CONTEXT ctx{};
             ctx.ContextFlags = CONTEXT_FULL;
             if (SuspendThread(target) == DWORD(-1)) break;
-            if (GetThreadContext(target, &ctx)) {
-                frames[0] = ctx.Rip;
-                for (int n = 1; n < kFrames; ++n) {
-                    DWORD64 base = 0;
-                    PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
-                    if (entry) {
-                        void* handler = nullptr;
-                        DWORD64 frame = 0;
-                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, entry, &ctx, &handler, &frame, nullptr);
-                    } else {                // a leaf: its return address is on top of the stack
-                        ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
-                        ctx.Rsp += 8;
-                    }
-                    if (!ctx.Rip) break;
-                    frames[n] = ctx.Rip;
-                }
-            }
+            if (GetThreadContext(target, &ctx)) WalkStack(ctx, frames);
             if (sample_guest) GuestCallsNow(guest, kGuest);
             ResumeThread(target);
             local.insert(local.end(), frames, frames + kFrames);
