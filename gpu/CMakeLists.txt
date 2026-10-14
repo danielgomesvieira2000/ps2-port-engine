@@ -105,13 +105,14 @@ add_custom_target(ps2gpu_shaders DEPENDS ${PS2GPU_SHADER_HEADERS})
 add_library(ps2gpu STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/vulkan_display.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gpu.cpp
-    ${CMAKE_CURRENT_LIST_DIR}/src/gs_renderer.cpp)
+    ${CMAKE_CURRENT_LIST_DIR}/src/gs_renderer.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/threaded_renderer.cpp)
 add_dependencies(ps2gpu ps2gpu_shaders)
 target_include_directories(ps2gpu PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include PRIVATE ${PS2GPU_SHADER_DIR})
 target_compile_features(ps2gpu PUBLIC cxx_std_17)
 target_link_libraries(ps2gpu PUBLIC SDL3::SDL3-static PRIVATE volk::volk Vulkan::Headers)
 if(MSVC)
-    target_compile_options(ps2gpu PRIVATE /W3)
+    target_compile_options(ps2gpu PRIVATE /W3 /Z7)     # symbols for --sample, as the host's
 endif()
 
 add_executable(ps2gpu_smoke ${CMAKE_CURRENT_LIST_DIR}/tests/display_smoke.cpp)

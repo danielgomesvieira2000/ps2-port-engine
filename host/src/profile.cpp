@@ -347,6 +347,19 @@ std::string SampleReport(int top) {
         }
         if (f[1]) ++callers[leaf][name(f[1])];
     }
+    // PS2HOST_SAMPLE_STACKS=text: the whole stacks (function and line) of the
+    // samples whose innermost function's name holds the text, most taken first.
+    std::map<std::string, std::uint64_t> wanted_stacks;
+    static const char* const wanted = std::getenv("PS2HOST_SAMPLE_STACKS");
+    if (wanted)
+        for (std::size_t i = 0; i < samples; ++i) {
+            const std::uint64_t* f = &s.stacks[i * kFrames];
+            if (!f[0] || !counted[i] || name(f[0]).find(wanted) == std::string::npos) continue;
+            std::string stack;
+            for (int n = 0; n < kFrames && f[n]; ++n)
+                stack += (n ? "\n        <- " : "") + name(f[n]).substr(0, 80) + " (" + line_of(f[n]) + ")";
+            ++wanted_stacks[stack];
+        }
     SymCleanup(process);
     std::map<std::string, std::uint64_t> guest_total, guest_self, guest_stacks;
     std::size_t guest_samples = 0;
@@ -441,6 +454,14 @@ std::string SampleReport(int top) {
                       100.0 * double(by_total[i].first) / double(samples ? samples : 1),
                       by_total[i].second.substr(0, 120).c_str());
         out += line;
+    }
+    if (wanted) {
+        out += std::string("  stacks of ") + wanted + ":\n";
+        const auto by_stack = ranked(wanted_stacks);
+        for (int i = 0; i < 8 && i < int(by_stack.size()); ++i) {
+            std::snprintf(line, sizeof line, "  %5.1f%%  ", 100.0 * double(by_stack[i].first) / double(samples ? samples : 1));
+            out += line + by_stack[i].second + "\n";
+        }
     }
     return out;
 }

@@ -64,6 +64,9 @@ Options for finding out why boot stops, passed after `run --`:
 | `--audio` | the SPU2's mixed output on the sound device, reverb included |
 | `--sample-gs` | `--sample` on the GS thread instead (the GS model, the GPU bridge, their submissions) |
 | `--sample-vif1` | `--sample` on VIF1's worker (real time: VIF1, VU1 and what they feed the GS) |
+| `PS2HOST_SAMPLE_STACKS=text` | with a `--sample*`: the whole stacks (function and line) of the samples whose innermost function's name holds the text - who calls what is hot |
+| `PS2HOST_GPU_THREAD=0` | the GPU renderer's Vulkan recording on the GS thread, as before; by default it has a thread of its own (`threaded_renderer.cpp`: draws and uploads queued in order, what answers or reads waits for the queue) - `PS2HOST_GPU_THREAD_LOG=1` says every 60 frames what waited for the queue |
+| `PS2HOST_REPLAY_BENCH=n` | with `--gs-replay` and `PS2HOST_REPLAY_GPU=1`: a capture's GS stream played n times over, without trace or pictures, and the time a pass took (and in all, to the last drawn) - the GS thread's work on a fixed sample; `--sample` before `--gs-replay` profiles it. Mind that the bridge starts from nothing there: images the game had made before the capture are missing (Burnout 3's race: a texture in the depth buffer's top byte, then decoded rather than sampled) |
 | `--vif1-sync` | in real time, VIF1 and VU1 on the EE's thread as under `--virtual-time` (vif1_worker.cpp) |
 | `--press BUTTON@FRAME` | hold a pad button for 6 frames from that frame (cross, circle, start, up, ...); `BUTTON@FROM-TO` holds it from one frame to another (`cross@17650-19400`: accelerate through a race); repeatable |
 | `--real-time-from N` | a `--virtual-time` run goes on in real time from frame N - the clock carrying on, the blanks' timer and VIF1's worker started - so a scripted run gets exactly to what is to be measured, then is measured as played (with the player's settings beside the executable) |
