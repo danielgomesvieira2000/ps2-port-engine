@@ -142,6 +142,8 @@ public:
     bool Picture(std::vector<u32>* pixels, u32* width, u32* height) const;
     /* How many lines of the frame buffer the display shows. */
     u32 ShownLines() const;
+    /* SMODE2's interlaced field mode (INT and FFMD): a field shown at a time. */
+    bool FieldMode() const;
     bool WriteBmp(const std::string& path) const;
 
     /* Every primitive as it is drawn, for a second renderer (the GPU's, which

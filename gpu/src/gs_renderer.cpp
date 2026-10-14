@@ -147,7 +147,7 @@ struct SwizzleParams {
 constexpr std::uint32_t kDepthRows = 512;   // a depth buffer's rows (DrawTriangles; the bridge's)
 constexpr VkDeviceSize kLocalMemory = 4u << 20;
 constexpr VkDeviceSize kLinear = VkDeviceSize(2048) * 1024 * 4;    // the largest image, a value a pixel (at scale 1)
-constexpr std::uint32_t kMaxScale = 4;
+constexpr std::uint32_t kMaxScale = 8;      // 4 the resolution's, twice that supersampled
 
 /* FBMSK as the bits of the target's RGBA bytes it keeps. FBMSK is in RGBA32
    bit positions whatever the format (the GS masks the colour before it is

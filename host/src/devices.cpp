@@ -29,11 +29,13 @@
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
+#include <functional>
 #include <cstring>
 #include <deque>
 #include <mutex>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "ps2host/dma.h"
 #include "ps2host/timeline.h"
@@ -343,7 +345,10 @@ void SetFrameDumps(const std::string& dir, int every, int limit, u64 from) {
 
 namespace {
 long long g_trace_frame = -1;
+std::function<void(u32*, u32, u32)> g_path2_filter;    // SetPath2Filter
 }  // namespace
+
+void SetPath2Filter(std::function<void(u32* words, u32 count, u32 from)> filter) { g_path2_filter = std::move(filter); }
 
 void SetGsTraceFrame(long long frame) { g_trace_frame = frame; }
 
@@ -695,7 +700,13 @@ void InstallDevices() {
         if (!masked) ReleasePath3(false);
     };
     Vif1().on_direct = [](u32 word) { GsWord(2, word); };
-    Vif1().on_direct_block = [](const u32* words, u32 count, u32 from) { GsWords(2, words, count, from); };
+    Vif1().on_direct_block = [](const u32* words, u32 count, u32 from) {
+        if (!g_path2_filter || from == gs::Gs::kNoSource) return GsWords(2, words, count, from);
+        static std::vector<u32> copy;
+        copy.assign(words, words + count);
+        g_path2_filter(copy.data(), count, from);
+        GsWords(2, copy.data(), count, from);
+    };
     Vif1().on_trace = [](const char* what) {
         if (gs::TheGs().trace) std::fprintf(gs::TheGs().trace_out, "[vif1] %s, %zu PATH3 words held\n", what, g_path3_held.size());
         // FLUSHA waits for PATH3 to finish: unmasked, all it holds goes.

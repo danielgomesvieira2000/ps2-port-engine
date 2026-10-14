@@ -16,6 +16,8 @@
 #include <volk.h>
 
 #include "gpu_internal.h"
+#include "downsample_comp.h"
+#include "fxaa_comp.h"
 
 #include <algorithm>
 #ifdef _WIN32
@@ -64,6 +66,7 @@ public:
     }
     bool texture_pack_ = false;
     void SetAspect(float aspect) override { aspect_.store(aspect); }
+    void SetAntiAliasing(AntiAliasing mode) override { anti_aliasing_.store(int(mode)); }
     void SetOverlay(std::vector<std::uint32_t> pixels, std::uint32_t width, std::uint32_t height) override {
         std::lock_guard<std::mutex> hold(overlay_lock_);
         overlay_ = std::move(pixels);
@@ -131,6 +134,16 @@ public:
     void SetRumble(std::uint16_t large, std::uint16_t small) override {
         rumble_.store(std::uint32_t(large) << 16 | small);
     }
+    void SetTriggerEffects(TriggerEffect left, TriggerEffect right) override {
+        std::lock_guard<std::mutex> hold(triggers_lock_);
+        triggers_[0] = left;
+        triggers_[1] = right;
+    }
+    void ReleaseController() override;
+    std::mutex triggers_lock_;
+    TriggerEffect triggers_[2], triggers_sent_[2];      // left, right: wanted, and last sent
+    bool triggers_unsent_ = true;                       // (a controller plugged in since)
+    void SendTriggers(const TriggerEffect& left, const TriggerEffect& right);
     bool TakeMouse(MouseState* state) override {
         std::lock_guard<std::mutex> hold(mouse_lock_);
         *state = mouse_;
@@ -225,6 +238,29 @@ private:
     /* Ends the command buffer, submits it and presents the image. */
     bool Submit(std::uint32_t index);
     bool dual_source_ = false;
+    // ANTI-ALIASING (SetAntiAliasing): the picture copied into post_in_, and
+    // smoothed by fxaa.comp into post_out_ (its size), or brought down to the
+    // shown size by downsample.comp (supersampling's) - which goes to the
+    // window instead.
+    std::atomic<int> anti_aliasing_{int(AntiAliasing::kOff)};
+    VkImage post_in_ = VK_NULL_HANDLE, post_out_ = VK_NULL_HANDLE;
+    VkDeviceMemory post_in_memory_ = VK_NULL_HANDLE, post_out_memory_ = VK_NULL_HANDLE;
+    VkImageView post_in_view_ = VK_NULL_HANDLE, post_out_view_ = VK_NULL_HANDLE;
+    VkSampler post_sampler_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout post_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool post_descriptors_ = VK_NULL_HANDLE;
+    VkDescriptorSet post_set_ = VK_NULL_HANDLE;
+    VkPipelineLayout post_layout_ = VK_NULL_HANDLE;
+    VkPipeline fxaa_pipeline_ = VK_NULL_HANDLE, downsample_pipeline_ = VK_NULL_HANDLE;
+    std::uint32_t post_in_width_ = 0, post_in_height_ = 0, post_out_width_ = 0, post_out_height_ = 0;
+    bool post_failed_ = false;              // the passes could not be made: pictures shown as drawn
+    /* The pipelines (once) and the images at these sizes; false when there are none. */
+    bool EnsurePost(std::uint32_t in_width, std::uint32_t in_height, std::uint32_t out_width,
+                    std::uint32_t out_height);
+    void DestroyPostImages();
+    /* `source` (TRANSFER_SRC, width x height) through `pipeline` into post_out_ (left
+       TRANSFER_SRC), in cmd_. */
+    void RecordPost(VkImage source, std::uint32_t width, std::uint32_t height, VkPipeline pipeline);
     std::string describe_, error_;
     // PresentImageAt's pictures: copies of the frames' targets, three, each
     // its copy's command buffer and fence (the GS thread's own pool).
@@ -637,6 +673,177 @@ void VulkanDisplay::DrawOverlay(VkImage target) {
     vkCmdCopyBufferToImage(cmd_, overlay_buffer_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 }
 
+void VulkanDisplay::DestroyPostImages() {
+    if (!device_) return;
+    if (post_in_view_) vkDestroyImageView(device_, post_in_view_, nullptr);
+    if (post_out_view_) vkDestroyImageView(device_, post_out_view_, nullptr);
+    if (post_in_) vkDestroyImage(device_, post_in_, nullptr);
+    if (post_out_) vkDestroyImage(device_, post_out_, nullptr);
+    if (post_in_memory_) vkFreeMemory(device_, post_in_memory_, nullptr);
+    if (post_out_memory_) vkFreeMemory(device_, post_out_memory_, nullptr);
+    post_in_view_ = post_out_view_ = VK_NULL_HANDLE;
+    post_in_ = post_out_ = VK_NULL_HANDLE;
+    post_in_memory_ = post_out_memory_ = VK_NULL_HANDLE;
+    post_in_width_ = post_in_height_ = post_out_width_ = post_out_height_ = 0;
+}
+
+bool VulkanDisplay::EnsurePost(std::uint32_t width, std::uint32_t height, std::uint32_t out_width,
+                               std::uint32_t out_height) {
+    if (post_failed_) return false;
+    if (width == post_in_width_ && height == post_in_height_ && out_width == post_out_width_ &&
+        out_height == post_out_height_ && post_out_)
+        return true;
+    post_failed_ = true;                    // until it is all made
+    if (!fxaa_pipeline_) {
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (!Check(vkCreateSampler(device_, &sci, nullptr, &post_sampler_), "vkCreateSampler (FXAA)")) return false;
+        VkDescriptorSetLayoutBinding bindings[2] = {};
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[1].binding = 1;
+        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[1].descriptorCount = 1;
+        bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        lci.bindingCount = 2;
+        lci.pBindings = bindings;
+        if (!Check(vkCreateDescriptorSetLayout(device_, &lci, nullptr, &post_set_layout_), "FXAA set layout"))
+            return false;
+        const VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                                               {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1}};
+        VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpi.maxSets = 1;
+        dpi.poolSizeCount = 2;
+        dpi.pPoolSizes = sizes;
+        if (!Check(vkCreateDescriptorPool(device_, &dpi, nullptr, &post_descriptors_), "FXAA descriptor pool"))
+            return false;
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorPool = post_descriptors_;
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &post_set_layout_;
+        if (!Check(vkAllocateDescriptorSets(device_, &dai, &post_set_), "FXAA descriptor set")) return false;
+        const VkPushConstantRange size{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &post_set_layout_;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &size;
+        if (!Check(vkCreatePipelineLayout(device_, &pli, nullptr, &post_layout_), "FXAA pipeline layout"))
+            return false;
+        const struct { const std::uint32_t* code; std::size_t bytes; VkPipeline* pipeline; } shaders[2] = {
+            {spirv_fxaa_comp, sizeof spirv_fxaa_comp, &fxaa_pipeline_},
+            {spirv_downsample_comp, sizeof spirv_downsample_comp, &downsample_pipeline_},
+        };
+        for (const auto& shader : shaders) {
+            VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            smi.codeSize = shader.bytes;
+            smi.pCode = shader.code;
+            VkShaderModule module = VK_NULL_HANDLE;
+            if (!Check(vkCreateShaderModule(device_, &smi, nullptr, &module), "anti-aliasing shader")) return false;
+            VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            cpi.stage.module = module;
+            cpi.stage.pName = "main";
+            cpi.layout = post_layout_;
+            const VkResult made = vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpi, nullptr, shader.pipeline);
+            vkDestroyShaderModule(device_, module, nullptr);
+            if (!Check(made, "anti-aliasing pipeline")) return false;
+        }
+    }
+    // Earlier presents may still read the old images.
+    {
+        std::lock_guard<std::mutex> hold(g_queue_lock);
+        vkDeviceWaitIdle(device_);
+    }
+    DestroyPostImages();
+    struct Made { VkImage* image; VkDeviceMemory* memory; VkImageView* view; VkImageUsageFlags usage;
+                  std::uint32_t width, height; };
+    const Made made[2] = {
+        {&post_in_, &post_in_memory_, &post_in_view_, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+         width, height},
+        {&post_out_, &post_out_memory_, &post_out_view_, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+         out_width, out_height},
+    };
+    for (const Made& m : made) {
+        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ici.extent = {m.width, m.height, 1};
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = m.usage;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (!Check(vkCreateImage(device_, &ici, nullptr, m.image), "vkCreateImage (FXAA)")) return false;
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(device_, *m.image, &req);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (!Check(vkAllocateMemory(device_, &mai, nullptr, m.memory), "vkAllocateMemory (FXAA)")) return false;
+        vkBindImageMemory(device_, *m.image, *m.memory, 0);
+        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vci.image = *m.image;
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (!Check(vkCreateImageView(device_, &vci, nullptr, m.view), "vkCreateImageView (FXAA)")) return false;
+    }
+    const VkDescriptorImageInfo in{post_sampler_, post_in_view_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    const VkDescriptorImageInfo out{VK_NULL_HANDLE, post_out_view_, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+    writes[0].dstSet = writes[1].dstSet = post_set_;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo = &in;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[1].pImageInfo = &out;
+    vkUpdateDescriptorSets(device_, 2, writes, 0, nullptr);
+    post_in_width_ = width;
+    post_in_height_ = height;
+    post_out_width_ = out_width;
+    post_out_height_ = out_height;
+    post_failed_ = false;
+    return true;
+}
+
+void VulkanDisplay::RecordPost(VkImage source, std::uint32_t width, std::uint32_t height, VkPipeline pipeline) {
+    // The picture as RGBA (a blit converts the display's BGRA), to be sampled;
+    // the last present's reads of both images done before they are written.
+    Barrier(cmd_, post_in_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkImageBlit region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstSubresource = region.srcSubresource;
+    region.srcOffsets[1] = {std::int32_t(width), std::int32_t(height), 1};
+    region.dstOffsets[1] = region.srcOffsets[1];
+    vkCmdBlitImage(cmd_, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, post_in_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   1, &region, VK_FILTER_NEAREST);
+    Barrier(cmd_, post_in_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    Barrier(cmd_, post_out_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, post_layout_, 0, 1, &post_set_, 0, nullptr);
+    struct { float texel[2]; std::int32_t size[2]; } size{{1.0f / float(width), 1.0f / float(height)},
+                                                         {std::int32_t(post_out_width_), std::int32_t(post_out_height_)}};
+    vkCmdPushConstants(cmd_, post_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof size, &size);
+    vkCmdDispatch(cmd_, (post_out_width_ + 7) / 8, (post_out_height_ + 7) / 8, 1);
+    Barrier(cmd_, post_out_, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+}
+
 bool VulkanDisplay::FinishPresent(std::uint32_t index, VkImage source, std::uint32_t width, std::uint32_t height) {
     const VkImage target = images_[index];
     Barrier(cmd_, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
@@ -658,6 +865,20 @@ bool VulkanDisplay::FinishPresent(std::uint32_t index, VkImage source, std::uint
     shown_y0_.store(y0);
     shown_w_.store(std::max(dw, 1));
     shown_h_.store(std::max(dh, 1));
+    // Anti-aliasing: FXAA at the picture's size; supersampling's picture,
+    // larger than shown, averaged down to the shown size (then copied 1:1).
+    const AntiAliasing mode = AntiAliasing(anti_aliasing_.load());
+    const bool larger = width > std::uint32_t(dw) || height > std::uint32_t(dh);
+    if (mode == AntiAliasing::kFxaa && EnsurePost(width, height, width, height)) {
+        RecordPost(source, width, height, fxaa_pipeline_);
+        source = post_out_;
+    } else if (mode == AntiAliasing::kDownsample && larger && dw > 0 && dh > 0 &&
+               EnsurePost(width, height, std::uint32_t(dw), std::uint32_t(dh))) {
+        RecordPost(source, width, height, downsample_pipeline_);
+        source = post_out_;
+        width = std::uint32_t(dw);
+        height = std::uint32_t(dh);
+    }
     VkImageBlit blit{};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.srcOffsets[1] = {std::int32_t(width), std::int32_t(height), 1};
@@ -1060,6 +1281,21 @@ bool VulkanDisplay::Pump() {
         if (title_changed_ && window_) SDL_SetWindowTitle(window_, title_.c_str());
         title_changed_ = false;
     }
+    // The triggers' effects as last set, when they change.
+    if (gamepad_) {
+        TriggerEffect wanted[2];
+        {
+            std::lock_guard<std::mutex> hold(triggers_lock_);
+            wanted[0] = triggers_[0];
+            wanted[1] = triggers_[1];
+        }
+        if (triggers_unsent_ || !(wanted[0] == triggers_sent_[0]) || !(wanted[1] == triggers_sent_[1])) {
+            SendTriggers(wanted[0], wanted[1]);
+            triggers_sent_[0] = wanted[0];
+            triggers_sent_[1] = wanted[1];
+            triggers_unsent_ = false;
+        }
+    }
     // The motors as the game last set them: renewed before SDL's duration
     // runs out, stopped when set to zero.
     if (gamepad_) {
@@ -1113,6 +1349,7 @@ bool VulkanDisplay::Pump() {
         }
         if (e.type == SDL_EVENT_GAMEPAD_ADDED && !gamepad_) {
             gamepad_ = SDL_OpenGamepad(e.gdevice.which);
+            triggers_unsent_ = true;
             if (gamepad_) std::fprintf(stderr, "[window] controller: %s\n", SDL_GetGamepadName(gamepad_));
         }
         if (e.type == SDL_EVENT_GAMEPAD_REMOVED && gamepad_ && SDL_GetGamepadID(gamepad_) == e.gdevice.which) {
@@ -1243,6 +1480,40 @@ bool VulkanDisplay::Pad(PadState* state) const {
     return true;
 }
 
+/* A DualSense's effects packet (SDL's HIDAPI PS5 driver takes it as the
+   controller's output report's effects part: SDL_SendGamepadEffect), the
+   triggers' alone: their effects at 10 (right) and 21 (left), 11 bytes each,
+   enabled by bits 2 and 3 of the first byte. An effect: its mode, then its
+   parameters - 0x05 off; 0x01 resistance (start, force); 0x06 vibration
+   (frequency, amplitude, start). */
+void VulkanDisplay::SendTriggers(const TriggerEffect& left, const TriggerEffect& right) {
+    if (!gamepad_ || SDL_GetGamepadType(gamepad_) != SDL_GAMEPAD_TYPE_PS5) return;
+    std::uint8_t packet[47] = {};
+    packet[0] = 0x04 | 0x08;
+    auto put = [](std::uint8_t* at, const TriggerEffect& t) {
+        switch (t.kind) {
+            case TriggerEffect::kResistance:
+                at[0] = 0x01, at[1] = t.start, at[2] = t.force;
+                break;
+            case TriggerEffect::kVibration:
+                at[0] = 0x06, at[1] = t.frequency, at[2] = t.force, at[3] = t.start;
+                break;
+            default:
+                at[0] = 0x05;
+        }
+    };
+    put(packet + 10, right);
+    put(packet + 21, left);
+    if (!SDL_SendGamepadEffect(gamepad_, packet, sizeof packet))
+        std::fprintf(stderr, "[window] trigger effects: %s\n", SDL_GetError());
+}
+
+void VulkanDisplay::ReleaseController() {
+    if (!gamepad_) return;
+    SendTriggers(TriggerEffect{}, TriggerEffect{});
+    SDL_RumbleGamepad(gamepad_, 0, 0, 0);
+}
+
 bool VulkanDisplay::Focused() const {
     return window_ && (SDL_GetWindowFlags(window_) & SDL_WINDOW_INPUT_FOCUS) != 0;
 }
@@ -1265,6 +1536,13 @@ VulkanDisplay::~VulkanDisplay() {
     DestroyPaced();
     if (copy_pool_) vkDestroyCommandPool(device_, copy_pool_, nullptr);
     DestroyPicture();
+    DestroyPostImages();
+    if (fxaa_pipeline_) vkDestroyPipeline(device_, fxaa_pipeline_, nullptr);
+    if (downsample_pipeline_) vkDestroyPipeline(device_, downsample_pipeline_, nullptr);
+    if (post_layout_) vkDestroyPipelineLayout(device_, post_layout_, nullptr);
+    if (post_descriptors_) vkDestroyDescriptorPool(device_, post_descriptors_, nullptr);
+    if (post_set_layout_) vkDestroyDescriptorSetLayout(device_, post_set_layout_, nullptr);
+    if (post_sampler_) vkDestroySampler(device_, post_sampler_, nullptr);
     if (overlay_buffer_) vkDestroyBuffer(device_, overlay_buffer_, nullptr);
     if (overlay_memory_) vkFreeMemory(device_, overlay_memory_, nullptr);
     DestroySwapchain();

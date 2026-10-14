@@ -1,0 +1,25 @@
+#version 450
+// Supersampling's last step (ANTI-ALIASING, SSAA): a picture drawn larger
+// than the window shows it, brought down to the shown size by averaging all
+// of it - each shown pixel the mean of an even grid of samples over the
+// source pixels it covers (exact boxes at a whole ratio), where a single
+// bilinear sample (a blit) would leave most of them out and alias again.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D picture;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D shown;
+layout(push_constant) uniform Size { vec2 texel; ivec2 size; } size;     // texel: the source's
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= size.size.x || p.y >= size.size.y) return;
+    const vec2 ratio = vec2(textureSize(picture, 0)) / vec2(size.size);    // source pixels per shown one
+    const ivec2 n = clamp(ivec2(ceil(ratio - 0.001)), ivec2(1), ivec2(8));
+    vec3 sum = vec3(0.0);
+    for (int j = 0; j < n.y; ++j)
+        for (int i = 0; i < n.x; ++i) {
+            const vec2 at = (vec2(p) + (vec2(i, j) + 0.5) / vec2(n)) / vec2(size.size);
+            sum += textureLod(picture, at, 0.0).rgb;
+        }
+    imageStore(shown, p, vec4(sum / float(n.x * n.y), 1.0));
+}

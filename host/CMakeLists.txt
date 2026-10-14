@@ -41,6 +41,7 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/audio.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/vu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/timers.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/pc_menu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/window.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/settings.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/timeline.cpp

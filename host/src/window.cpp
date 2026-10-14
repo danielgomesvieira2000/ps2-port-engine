@@ -46,6 +46,7 @@ int Scancode(int key) {
     switch (key) {
         case VK_BACK: return SDL_SCANCODE_BACKSPACE;
         case VK_RETURN: return SDL_SCANCODE_RETURN;
+        case VK_ESCAPE: return SDL_SCANCODE_ESCAPE;      // the PC settings panel's
         case VK_UP: return SDL_SCANCODE_UP;
         case VK_DOWN: return SDL_SCANCODE_DOWN;
         case VK_LEFT: return SDL_SCANCODE_LEFT;
@@ -126,6 +127,15 @@ void PresentGdi() {
     ReleaseDC(g_window, dc);
 }
 
+#ifdef PS2HOST_VULKAN
+/* The "antialiasing" setting as the display takes it: supersampling's
+   pictures (drawn larger, SupersamplingFactor) averaged down. */
+ps2gpu::Display::AntiAliasing DisplayAntiAliasing(const std::string& mode) {
+    using AA = ps2gpu::Display::AntiAliasing;
+    return mode == "fxaa" ? AA::kFxaa : mode == "ssaa2" || mode == "ssaa4" ? AA::kDownsample : AA::kOff;
+}
+#endif
+
 /* The "aspect" setting as the display takes it: "4:3" (the default), "16:9",
    or "auto" (0, the window's own shape). */
 float SettingAspect() {
@@ -173,6 +183,7 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
         });
         if (SettingOn("vsync")) g_display->SetVsync(true);
         g_display->SetAspect(SettingAspect());
+        g_display->SetAntiAliasing(DisplayAntiAliasing(Setting("antialiasing", "off")));
         return true;
     }
     Note("window", "window: no Vulkan display (" + error + "); drawing with GDI");
@@ -196,11 +207,38 @@ bool WindowFocused() {
 
 bool WindowClosed() { return g_closed; }
 
+// A game's own EXIT GAME: as if the window had been closed.
+void QuitGame() { g_closed = true; }
+
 bool HostKeyDown(int key) {
 #ifdef PS2HOST_VULKAN
     if (g_display) return g_display->KeyDown(Scancode(key));
 #endif
     return (GetAsyncKeyState(key) & 0x8000) != 0;
+}
+
+void HostTriggerEffects(const HostTriggerEffect& left, const HostTriggerEffect& right) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) {
+        auto effect = [](const HostTriggerEffect& e) {
+            ps2gpu::Display::TriggerEffect t;
+            t.kind = ps2gpu::Display::TriggerEffect::Kind(e.kind);
+            t.start = e.start;
+            t.force = e.force;
+            t.frequency = e.frequency;
+            return t;
+        };
+        g_display->SetTriggerEffects(effect(left), effect(right));
+    }
+#else
+    (void)left, (void)right;
+#endif
+}
+
+void ReleaseController() {
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->ReleaseController();
+#endif
 }
 
 void HostRumble(u8 large, u8 small) {
@@ -306,6 +344,7 @@ bool PumpWindow() {
         if (!g_display->Pump()) g_closed = true;
         KeepFullscreenSetting();
         if (g_display->TakeCapture()) RequestCapture();
+        UpdatePcMenu();                     // F1: the PC settings panel (pc_menu.cpp)
         // Tab: the texture pack on or off, said on the screen for two seconds.
         static std::chrono::steady_clock::time_point notice_until{};
         static bool notice = false;
@@ -319,13 +358,13 @@ bool PumpWindow() {
         }
         if (notice && std::chrono::steady_clock::now() >= notice_until) {
             notice = false;
-            SetWindowOverlay({});
+            if (!PcMenuOpen()) SetWindowOverlay({});
         }
         return !g_closed;
     }
 #endif
     if (g_window) PresentGdi();
-    return true;
+    return !g_closed;                  // a game's EXIT GAME (QuitGame) with no window too
 }
 
 void SetWindowFullscreen(bool on) {
@@ -409,6 +448,18 @@ void SetWindowAspect(const std::string& aspect) {
 #ifdef PS2HOST_VULKAN
     if (g_display) g_display->SetAspect(SettingAspect());
 #endif
+}
+
+void SetWindowAntiAliasing(const std::string& mode) {
+    SetSetting("antialiasing", mode);
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetAntiAliasing(DisplayAntiAliasing(mode));
+#endif
+}
+
+u32 SupersamplingFactor() {
+    const std::string mode = Setting("antialiasing", "off");
+    return mode == "ssaa2" ? 2 : mode == "ssaa4" ? 4 : 1;
 }
 
 float PictureAspect() {

@@ -307,12 +307,40 @@ bool WindowVsync();
    so - auto's the window's now. */
 void SetWindowAspect(const std::string& aspect);
 float PictureAspect();
+/* Anti-aliasing (the "antialiasing" setting): "off", the default; "fxaa",
+   the picture's edges smoothed before it is scaled to the window; "ssaa2" or
+   "ssaa4", supersampling - drawn at 2 or 4 times the internal resolution
+   (SupersamplingFactor) and averaged down to the window's size. */
+void SetWindowAntiAliasing(const std::string& mode);
+u32 SupersamplingFactor();
 /* A line after the window's title (a game's tool says what it is doing);
    empty for the title alone. */
 void SetWindowStatus(const std::string& status);
 /* A panel of text over the picture (a game's tool, its menu): the lines,
    the first a heading, one starting with '>' picked out; none when empty. */
 void SetWindowOverlay(const std::vector<std::string>& lines);
+/* The PC settings panel (pc_menu.cpp): F1, or L3 + R3 on a controller, over
+   any game - resolution, aspect, fullscreen, v-sync, frame pacing, the
+   texture pack. UpdatePcMenu reads its keys (PumpWindow calls it); while it
+   is open the game gets no input (PcMenuOpen). */
+void UpdatePcMenu();
+bool PcMenuOpen();
+/* The PC settings for a game's own menu (a port's PC SETTINGS screen): each
+   one's short name and value in capitals (RESOLUTION, 2X) and a line of help;
+   a texture pack's only when one is loaded. StepPcSetting changes the n-th to
+   its next value (step 1) or the one before (-1), applied and saved. */
+struct PcSetting { std::string label, value, help; };
+std::vector<PcSetting> PcSettings();
+void StepPcSetting(int index, int step);
+/* The panel opened from a game's own menu (a port's PC SETTINGS entry). */
+void OpenPcMenu();
+/* A port's EXIT GAME: the run ends as when the window is closed. */
+void QuitGame();
+/* A port's look at the 2D on its way to the GS (VIF1 DIRECT, PATH2): each
+   block of words, `from` the guest address of the first, before the GS takes
+   it. A copy - the guest's packets stay as the game wrote them - on the EE
+   thread, in order. Widescreen: a port places its HUD in a wider picture. */
+void SetPath2Filter(std::function<void(u32* words, u32 count, u32 from)> filter);
 /* The window's display, null when there is none (or no Vulkan one). */
 ps2gpu::Display* WindowDisplay();
 /* What the window shows instead of the software GS's picture (BGRA, as
@@ -329,6 +357,7 @@ struct HostPadState {
     u16 buttons = 0;
     u8 sticks[4] = {0x80, 0x80, 0x80, 0x80};
     u8 l2 = 0, r2 = 0;
+    u8 pressure[16] = {};       // each input's pressure (a controller filter's to change; 0xFF pressed)
 };
 bool HostPad(HostPadState* state);
 /* The mouse over the window (window.cpp), in the picture's terms: x and y
@@ -352,18 +381,39 @@ void ShowHostCursor(bool on);
 /* The window's controller's motors, as a DualShock 2's: the large one 0-255,
    the small one 0-255 (a DualShock 2's is on or off: 0 or 255). */
 void HostRumble(u8 large, u8 small);
+/* A controller's adaptive triggers (a DualSense's), left and right: off, a
+   resistance from `start` (0-255 of the travel) of `force` (0-255), or a
+   vibration from `start` of `force` at `frequency` Hz - until set again. */
+struct HostTriggerEffect {
+    enum Kind : u8 { kOff, kResistance, kVibration } kind = kOff;
+    u8 start = 0, force = 0, frequency = 0;
+};
+void HostTriggerEffects(const HostTriggerEffect& left, const HostTriggerEffect& right);
+/* The controller left as it was found (the game ending): motors stopped,
+   trigger effects off. */
+void ReleaseController();
 /* Controllers (dbc.cpp): each frame, the devices write their state. */
 void DbcFrame();
 /* The DualShock 2's buttons as the game last read them (bit n: input n held,
    libpad's order - 3 is Start): the keyboard, the game controller and
    --press together. For hooks that act on a button as the game would. */
 u16 PadButtonsHeld();
+/* The device the player last pressed something on - a key, or a
+   controller's button or stick (scripted presses are neither) - and the pad
+   read (frame) it was, a press later than the last: kNone before any. */
+enum class InputDevice { kNone, kController, kKeyboard };
+InputDevice LastInputDevice(u64* frame = nullptr);
 /* A game's own input, as DualShock 2 buttons held (bit n: input n), asked for
    each time the pad is read (once a frame, on the EE's thread, at the
    vertical blank): what the mouse means, say. */
 void SetPadHook(u16 (*hook)());
 /* --press: hold `button` (cross, start, up, ...) for 6 frames from `frame`. */
-bool ScriptPress(const std::string& button, u64 from, u64 to);
+bool ScriptPress(const std::string& button, u64 from, u64 to, u8 pressure = 0xFF);
+/* A game's own controls: the controller's state each pad read, before the
+   game sees it - its buttons (DualShock 2 inputs, libpad's order) and their
+   pressures to change as the filter likes; the keyboard and scripted presses
+   are not given to it. LastInputDevice sees what the player pressed. */
+void SetControllerFilter(void (*filter)(HostPadState* pad));
 /* --mouse FRAME:X,Y[,L|R|U|D]: the mouse at (X, Y) of the picture (0 to 1)
    from that frame - and its left or right button clicked, or the wheel
    turned up or down, then. With any, the window's own mouse is not read. */

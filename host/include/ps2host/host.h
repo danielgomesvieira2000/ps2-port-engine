@@ -124,8 +124,10 @@ struct Options {
     bool audio = false;            /* play the SPU2's output on the sound device */
     std::string audio_wav;         /* record the SPU2's output to this WAV file */
     std::string memcard;           /* --memcard DIR: a memory card in slot 1, kept as this directory (mc2.h) */
-    struct Press { std::string button; u64 from, to; };
-    std::vector<Press> presses;    /* --press BUTTON@FRAME (six frames) or BUTTON@FROM-TO (held) */
+    std::vector<std::string> settings;   /* --setting KEY=VALUE: a PC setting for this run, not saved */
+    struct Press { std::string button; u64 from, to; u8 pressure = 0xFF; };
+    std::vector<Press> presses;    /* --press BUTTON@FRAME (six frames) or BUTTON@FROM-TO (held), and
+                                      :PRESSURE (0-255) after either: pressed that far */
 };
 
 /* Load the executable, run it from its entry point, and report how far it got.

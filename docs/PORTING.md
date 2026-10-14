@@ -71,6 +71,7 @@ Options for finding out why boot stops, passed after `run --`:
 | `PS2HOST_PROFILE=FILE`, `PS2HOST_PROFILE_FROM=N` | the frame-pacing profiler (`ps2host/timeline.h`): every thread's work and every picture's way to the screen, as a timeline (Chrome's trace format: ui.perfetto.dev), from frame N; at the end a summary - the present intervals' percentiles, the frames dropped or late, and what was busy before each |
 | `--mouse FRAME:X,Y[,L\|R\|U\|D]` | the mouse at (X, Y) of the picture (0 to 1 across it) from that frame, its left or right button clicked or the wheel turned up or down then; repeatable. With any, the window's mouse is not read - a scripted run's menus driven by the mouse |
 | `--memcard DIR` | a memory card in slot 1, kept as a directory: the game's saves are files there (`ps2host/mc2.h` answers libmc2's handlers; the port binds them). Without it the slot is empty |
+| `--setting KEY=VALUE` | a PC setting for this run, not saved (`--setting aspect=16:9`: a scripted run in a wider picture); any number of them |
 | `--vu-record FILE`, `--vu-interpret` | record the VU microprograms a run starts, for compiling ahead of time; run them interpreted (see below) |
 | `--vu-fast` | compiled VU1 programs leave out the MAC and STATUS flags no instruction of theirs can read ("Fast mode" below): exact but for those flags, ~15% less VU1 time; exact is the default |
 | `--audio-wav FILE` | the same output recorded to a WAV file, for checking sound without listening |
@@ -92,6 +93,12 @@ It is a windowed program, so no console opens beside it: started from a
 terminal it writes to that one, and started with no arguments to a log named
 after it (`burnout3.log`), which an error message points to.
 
+F1 (or L3 + R3 on a controller) opens the engine's PC settings panel over
+any game (`host/src/pc_menu.cpp`): resolution, aspect ratio, fullscreen,
+v-sync, frame pacing and the texture pack, applied at once and saved in
+`pc_settings.ini`; the game gets no input while it is open. A port can also
+put its settings in the game's own menus (Burnout 3's PC SETTINGS).
+
 The window's title is game.json's `title`. The executable's icon (the
 window's and the taskbar's too) is the port's own, `port/icon.ico` - original
 art, safe to publish with the port (Burnout 3's from
@@ -101,7 +108,7 @@ disc (the port run to the title screen, the logo's texture taken from GS
 memory with `gsmem.py texture`), which `ps2_add_port` takes over the port's
 own. Made from the disc, that one is never committed or shared. A `--virtual-time` run
 without `--memcard` leaves the player's settings alone and uses the defaults,
-so its pictures stay as recorded.
+so its pictures stay as recorded; `--setting` gives it one of its own.
 
 `port.py` generates `build/port/generated/dispatch.cpp` (every translated
 function by address, with names from `config/names.csv`), builds `port/` with
@@ -357,7 +364,11 @@ address with a host implementation. It is the mechanism for:
 * **hardware redirection** - library routines that drive the GS, VU1 or the IOP
   are replaced by host code that does the same job with the PC's facilities;
 * **enhancements** - resolution, frame rate, input, widescreen: hook the
-  function that decides it.
+  function that decides it. A game's 2D that is built in packets the game
+  keeps from frame to frame can be changed on its way to the GS instead:
+  `SetPath2Filter` (run.h) hands the port each VIF1 DIRECT block as a copy,
+  with the guest address it came from (Mister Mosquito's HUD in a wider
+  picture: its vertices tagged where they are made, placed there).
 
 Prefer overriding a whole library routine (`sceGsSyncV`, `sceSifCallRpc`) to
 emulating the hardware it touches: the routine's contract is smaller than the

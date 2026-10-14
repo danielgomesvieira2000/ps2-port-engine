@@ -549,8 +549,88 @@ Name NameOf(const gs::Memory& memory, u64 tex0, u64 clamp, u64 texa, const u32* 
     return name;
 }
 
+namespace {
+
+// ------------------------------------------------------------------ overrides
+
+struct Overrides {
+    std::mutex lock;
+    std::unordered_map<Name, std::shared_ptr<const Image>, NameHash> images;
+    std::unordered_map<const void*, std::shared_ptr<const Image>> decoded;     // by the PNG's address
+    u64 next_id = 1ull << 40;           // past any pack file's id
+};
+Overrides& TheOverrides() {
+    static Overrides overrides;
+    return overrides;
+}
+// Wanted's test: a bit per PSM | TW << 6 | TH << 10 an override has.
+std::atomic<u64> g_override_bits[(1u << 14) / 64];
+std::atomic<bool> g_any_override{false};
+
+void IndexOverrides(Overrides& o) {
+    for (auto& word : g_override_bits) word = 0;
+    for (const auto& [name, image] : o.images) {
+        const u32 bits = name.bits & 0x3FFFu;
+        g_override_bits[bits / 64] |= 1ull << (bits % 64);
+    }
+    g_any_override = !o.images.empty();
+    ++g_generation;
+}
+
+}  // namespace
+
+bool SetOverride(const std::string& text, const std::uint8_t* png, std::size_t bytes) {
+    Name name;
+    if (!ParseName(text, &name)) return false;
+    Overrides& o = TheOverrides();
+    std::lock_guard<std::mutex> hold(o.lock);
+    if (!png) {
+        if (o.images.erase(name)) IndexOverrides(o);
+        return true;
+    }
+    std::shared_ptr<const Image>& image = o.decoded[png];
+    if (!image) {
+        std::shared_ptr<Image> loaded = LoadPng(std::vector<u8>(png, png + bytes));
+        if (!loaded) {
+            o.decoded.erase(png);
+            return false;
+        }
+        loaded->id = o.next_id++;
+        image = loaded;
+    }
+    auto found = o.images.find(name);
+    if (found != o.images.end() && found->second == image) return true;
+    o.images[name] = image;
+    IndexOverrides(o);
+    return true;
+}
+
+void ClearOverrides() {
+    Overrides& o = TheOverrides();
+    std::lock_guard<std::mutex> hold(o.lock);
+    if (o.images.empty()) return;
+    o.images.clear();
+    IndexOverrides(o);
+}
+
+bool Active() { return g_any_override || (g_count != 0 && g_enabled); }
+
+bool Wanted(u32 bits) {
+    if (g_count != 0 && g_enabled) return true;
+    if (!g_any_override) return false;
+    bits &= 0x3FFFu;
+    return (g_override_bits[bits / 64] >> (bits % 64)) & 1;
+}
+
 std::shared_ptr<const Image> Find(const Name& name, bool* pending) {
     *pending = false;
+    if (g_any_override) {
+        Overrides& o = TheOverrides();
+        std::lock_guard<std::mutex> hold(o.lock);
+        auto found = o.images.find(name);
+        if (found != o.images.end()) return found->second;
+    }
+    if (g_count == 0 || !g_enabled) return nullptr;
     Pack& pack = ThePack();
     std::lock_guard<std::mutex> hold(pack.lock);
     auto kept = pack.kept.find(name);

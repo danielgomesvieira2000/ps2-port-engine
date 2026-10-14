@@ -74,4 +74,9 @@ void SetSetting(const std::string& key, const std::string& value) {
 
 void SetSettingOn(const std::string& key, bool on) { SetSetting(key, on ? "on" : "off"); }
 
+void RunSetting(const std::string& key, const std::string& value) {
+    std::lock_guard<std::mutex> hold(g_lock);
+    g_values[key] = value;
+}
+
 }  // namespace ps2host

@@ -160,13 +160,20 @@ the disc picker on first start, a memory card folder, rumble, the mouse
 PCSX2 texture packs (`ps2host/texture_pack.h`: the "texture pack" folder
 beside the settings, PCSX2's XXH3 names, DDS kept block-compressed on the GPU,
 Tab toggles; scripted runs never load one - test with `PS2HOST_TEXTURE_PACK`
-and `--real-time-from`).
+and `--real-time-from`; `PS2HOST_TEXTURE_DUMP=<folder>` writes each texture
+once, named as a pack file for it would be), the game's own replacements at
+run time (`texture_pack::SetOverride`: a PNG by a texture's pack name, drawn
+with or without a pack), the device the player last used
+(`LastInputDevice`: keyboard or controller).
 Per game: a settings menu inside the game's own menus where one can be hooked,
 widescreen (the game's camera and its 2D, with per-element anchors - Burnout
 3's `port/widescreen.cpp`: RenderWare's RwCameraSetViewWindow), the mouse's
 targets (the game's menu objects), the window title and version
-(`game.json`), an original icon (`port/icon.ico`). Art the port ships is
-original (a script draws it: `port/tools/make_cursor.py`, `make_icon_art.py`),
+(`game.json`), an original icon (`port/icon.ico`), button prompts for the
+keyboard and mouse (Burnout 3's `port/prompts.cpp`: its button textures
+overridden while those are used). Art the port ships is
+original (a script draws it: `port/tools/make_cursor.py`, `make_icon_art.py`,
+`make_prompts.py`),
 never the game's.
 
 ## Working autonomously

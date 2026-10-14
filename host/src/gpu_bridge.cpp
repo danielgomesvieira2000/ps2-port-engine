@@ -839,7 +839,7 @@ bool GpuHolds(const Bridge& b, u32 begin, u32 end) {
    the texture's blocks newer (the race reads its own targets' alpha as
    PSMT8H textures, its depth buffer as PSMZ16) - by the GPU from its own,
    rather than wait for them to come back. */
-void WriteBmp(const std::string& path, const std::vector<u32>& rgba, u32 stride, u32 w, u32 h);
+void WriteBmp(const std::string& path, const std::vector<u32>& rgba, u32 stride, u32 w, u32 h, bool alpha = false);
 
 // A texture pack's replacement for the texture, uploaded in its place if its
 // file has been read (texture_pack::Find); false if not (yet).
@@ -907,7 +907,7 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
     // A texture pack (texture_pack.h), for textures from memory - not ones the
     // GPU drew, as PCSX2 replaces none of those. Turned on or off (Tab):
     // every texture comes back once, replaced or as the game has it.
-    const bool pack = texture_pack::Count() != 0 && texture_pack::Enabled();
+    const bool pack = texture_pack::Active() && texture_pack::Wanted(Bits(c.tex0, 20, 14));
     if (t.pack_generation != texture_pack::Generation()) {
         t.pack_generation = texture_pack::Generation();
         if (pack || t.replaced) t.valid = t.decoded = false;
@@ -1004,10 +1004,20 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
         // thread), the hash kept to compare the next time.
         if (!t.decoded || content != t.content) {
             t.replaced = t.pack_pending = false;
-            if (pack)
+            // PS2HOST_TEXTURE_DUMP=<folder>: each texture the first time it
+            // is decoded, named as a pack's replacement for it would be
+            // (<name>.bmp; a pack wants it as .png or .dds) - to make one.
+            static const char* dump_dir = std::getenv("PS2HOST_TEXTURE_DUMP");
+            if (pack || dump_dir)
                 t.pack_name = texture_pack::NameOf(gs::TheGs().memory, c.tex0, c.clamp, texa,
                                                    gs::TheGs().Clut().data());
             if (!pack || !Replace(b, t)) gpu_decode();
+            static std::set<std::string> dumped;
+            std::vector<u32> pixels;
+            u32 w = 0, h = 0;
+            if (dump_dir && !t.replaced && dumped.insert(t.pack_name.Text()).second &&
+                b.renderer->ReadTexture(t.renderer_key, &pixels, &w, &h))
+                WriteBmp(std::string(dump_dir) + "/" + t.pack_name.Text() + ".bmp", pixels, w, w, h, true);
             t.content = content;
             ++b.decodes;
         } else {
@@ -1109,7 +1119,7 @@ std::size_t Triangles(const gs::Gs::DrawCall& call, bool fst, u32 tw, u32 th, ps
     return 0;
 }
 
-void WriteBmp(const std::string& path, const std::vector<u32>& rgba, u32 stride, u32 w, u32 h);
+void WriteBmp(const std::string& path, const std::vector<u32>& rgba, u32 stride, u32 w, u32 h, bool alpha);
 
 /* PS2HOST_GPU_DUMP_FRAME: the target drawing just left, as it stands. */
 void DumpPass(Bridge& s, const std::tuple<u32, u32, u32>& target) {
@@ -1469,7 +1479,8 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     blocks = std::max(blocks, std::max(1u, state.fbw * 64 * e.y1 * PixelBits(state.psm) / 8 / 256));
 }
 
-void WriteBmp(const std::string& path, const std::vector<u32>& rgba, u32 stride, u32 w, u32 h) {
+/* `alpha`: the pixels' own (else opaque). */
+void WriteBmp(const std::string& path, const std::vector<u32>& rgba, u32 stride, u32 w, u32 h, bool alpha) {
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) return;
     const u32 data = w * h * 4, file = 54 + data;
@@ -1487,7 +1498,8 @@ void WriteBmp(const std::string& path, const std::vector<u32>& rgba, u32 stride,
     for (u32 y = 0; y < h; ++y)
         for (u32 x = 0; x < w; ++x) {
             const u32 c = rgba[std::size_t(y) * stride + x];
-            const unsigned char px[4] = {(unsigned char)(c >> 16), (unsigned char)(c >> 8), (unsigned char)c, 0xFF};
+            const unsigned char px[4] = {(unsigned char)(c >> 16), (unsigned char)(c >> 8), (unsigned char)c,
+                                         alpha ? (unsigned char)(c >> 24) : (unsigned char)0xFF};
             std::fwrite(px, 1, 4, f);
         }
     std::fclose(f);
@@ -1499,8 +1511,9 @@ void WriteBmp(const std::string& path, const std::vector<u32>& rgba, u32 stride,
    picture where the GPU has none), on the thread the GS runs on. */
 /* The internal resolution the "resolution" setting asks for (PC SETTINGS):
    original 1, 2x 2, display as many times the PS2's 448 lines as the window
-   has (at most 4). */
-u32 WantedScale(const ps2gpu::Display* display) {
+   has (at most 4) - times supersampling's factor (ANTI-ALIASING), at most 8
+   in all. */
+u32 ResolutionScale(const ps2gpu::Display* display) {
     const std::string wanted = Setting("resolution", "original");
     // "2x" (the menu's), or 3x and 4x written into the file by hand.
     if (wanted.size() == 2 && wanted[1] == 'x' && wanted[0] >= '2' && wanted[0] <= '4') return u32(wanted[0] - '0');
@@ -1509,6 +1522,9 @@ u32 WantedScale(const ps2gpu::Display* display) {
         return std::min(4u, std::max(1u, lines / 448u));
     }
     return 1;
+}
+u32 WantedScale(const ps2gpu::Display* display) {
+    return std::min(8u, ResolutionScale(display) * SupersamplingFactor());
 }
 
 /* A new internal resolution: what the GPU drew goes to its local memory

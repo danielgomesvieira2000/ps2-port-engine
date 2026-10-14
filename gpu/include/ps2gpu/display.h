@@ -76,6 +76,12 @@ public:
        television showed it (the default), 16:9, or 0 - the window's own
        shape, filled. Letterboxed or pillarboxed in the window otherwise. */
     virtual void SetAspect(float aspect) { (void)aspect; }
+    /* Anti-aliasing: the picture shown as drawn (the default); its edges
+       smoothed (FXAA) before it is scaled to the window; or, drawn larger
+       than shown (supersampling), averaged down to the shown size rather
+       than scaled. */
+    enum class AntiAliasing { kOff, kFxaa, kDownsample };
+    virtual void SetAntiAliasing(AntiAliasing mode) { (void)mode; }
     /* The window's shape in the screen's pixels, width over height (0 when
        not known). */
     virtual float WindowAspect() const { return 0.0f; }
@@ -110,6 +116,22 @@ public:
        the high-frequency, small one), until set again - 0, 0 stops them.
        Taken up by the window's own thread (Pump). */
     virtual void SetRumble(std::uint16_t large, std::uint16_t small) { (void)large, (void)small; }
+    /* A controller's adaptive triggers (a DualSense's; others have none):
+       off, a resistance from `start` (0-255 of the travel) of `force`
+       (0-255), or a vibration from `start` of `force` at `frequency` (Hz),
+       until set again. Taken up by the window's own thread (Pump), and
+       again when a controller is plugged in. */
+    struct TriggerEffect {
+        enum Kind : std::uint8_t { kOff, kResistance, kVibration } kind = kOff;
+        std::uint8_t start = 0, force = 0, frequency = 0;
+        bool operator==(const TriggerEffect& o) const {
+            return kind == o.kind && start == o.start && force == o.force && frequency == o.frequency;
+        }
+    };
+    virtual void SetTriggerEffects(TriggerEffect left, TriggerEffect right) { (void)left, (void)right; }
+    /* The controller left as it was found, at once (the game is ending):
+       its motors stopped, its triggers' effects off. */
+    virtual void ReleaseController() {}
 
     /* The mouse over the window, in the picture's terms: x and y from 0 to 1
        across the game's picture as it is shown (inside its letterbox; outside

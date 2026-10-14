@@ -97,8 +97,8 @@ const std::pair<int, int> kKeys[] = {
 
 bool Pressed(int key) { return WindowFocused() && HostKeyDown(key); }
 
-// Scripted presses (--press): (input, first frame, last frame).
-struct Press { int input; u64 from, to; };
+// Scripted presses (--press): (input, first frame, last frame, pressure).
+struct Press { int input; u64 from, to; u8 pressure; };
 std::vector<Press>& Script() {
     static std::vector<Press> presses;
     return presses;
@@ -106,17 +106,76 @@ std::vector<Press>& Script() {
 u64 g_frame = 0;
 u16 g_held = 0;                     // PadButtonsHeld
 u16 (*g_pad_hook)() = nullptr;      // SetPadHook
+void (*g_controller_filter)(HostPadState*) = nullptr;     // SetControllerFilter
+// LastInputDevice: the device of the last press, and when; what each held.
+InputDevice g_last_device = InputDevice::kNone;
+u64 g_last_input_frame = 0;
+u16 g_keys_before = 0, g_controller_before = 0;
+bool g_sticks_before = false;
 
 void PadData(u8* data) {
     u16 buttons = 0xFFFF;                                   // active low: nothing pressed
+    u8 pressure[16] = {};                                   // each input's, the most any source gives
+    u16 keys = 0;
     for (const auto& [input, key] : kKeys)
-        if (Pressed(key)) buttons &= u16(~(1u << input));
+        if (Pressed(key)) keys |= u16(1u << input), pressure[input] = 0xFF;
+    buttons &= u16(~keys);
+    // PS2HOST_SCRIPT_CONTROLLER=1: scripted presses as a controller's (a
+    // game's controller filter sees them; L2's and R2's pressure the
+    // triggers' travel) - to test a game's own controls in a scripted run.
+    static const bool script_controller = std::getenv("PS2HOST_SCRIPT_CONTROLLER") != nullptr;
+    HostPadState scripted;
     for (const Press& p : Script())
-        if (g_frame >= p.from && g_frame <= p.to) buttons &= u16(~(1u << p.input));
+        if (g_frame >= p.from && g_frame <= p.to) {
+            if (script_controller) {
+                scripted.buttons |= u16(1u << p.input);
+                if (p.input == 8) scripted.l2 = p.pressure;
+                if (p.input == 9) scripted.r2 = p.pressure;
+                continue;
+            }
+            buttons &= u16(~(1u << p.input));
+            pressure[p.input] = std::max(pressure[p.input], p.pressure);
+        }
     HostPadState pad;
-    const bool controller = HostPad(&pad);
-    buttons &= u16(~pad.buttons);
-    if (g_pad_hook) buttons &= u16(~g_pad_hook());
+    bool controller = HostPad(&pad);
+    if (script_controller && !controller) {
+        pad = scripted;
+        controller = true;
+    }
+    const u16 controller_held = controller ? pad.buttons : 0;   // as the player pressed them
+    if (controller) {
+        for (int i = 0; i < 16; ++i)
+            if (pad.buttons & (1u << i)) pad.pressure[i] = 0xFF;
+        if (pad.buttons & (1u << 8)) pad.pressure[8] = std::max<u8>(pad.l2, 1);
+        if (pad.buttons & (1u << 9)) pad.pressure[9] = std::max<u8>(pad.r2, 1);
+        // A game's own controls (SetControllerFilter): the controller's alone.
+        if (g_controller_filter) g_controller_filter(&pad);
+        for (int i = 0; i < 16; ++i)
+            if (pad.buttons & (1u << i)) pressure[i] = std::max(pressure[i], pad.pressure[i]);
+        buttons &= u16(~pad.buttons);
+    }
+    // A key or a controller's button newly down, or a stick pushed well off
+    // its centre: that device the player's now.
+    bool sticks = false;
+    if (controller)
+        for (int i = 0; i < 4; ++i) sticks = sticks || std::abs(int(pad.sticks[i]) - 0x80) > 0x50;
+    if (keys & ~g_keys_before) g_last_device = InputDevice::kKeyboard, g_last_input_frame = g_frame;
+    if (controller && ((controller_held & ~g_controller_before) || (sticks && !g_sticks_before)))
+        g_last_device = InputDevice::kController, g_last_input_frame = g_frame;
+    g_keys_before = keys;
+    g_controller_before = controller_held;
+    g_sticks_before = sticks;
+    if (g_pad_hook) {
+        const u16 hooked = g_pad_hook();
+        buttons &= u16(~hooked);
+        for (int i = 0; i < 16; ++i)
+            if (hooked & (1u << i)) pressure[i] = 0xFF;
+    }
+    if (PcMenuOpen()) {                     // the PC settings panel has the keys
+        buttons = 0xFFFF;
+        pad = HostPadState{};
+        std::fill(std::begin(pressure), std::end(pressure), u8(0));
+    }
     g_held = u16(~buttons);
     data[0] = u8(buttons);
     data[1] = u8(buttons >> 8);
@@ -124,13 +183,12 @@ void PadData(u8* data) {
     // left X, Y), centred without a controller, and the pressure of the
     // pressure-sensitive buttons - right, left, up, down, triangle, circle,
     // cross, square, L1, R1, L2, R2 - full when pressed, the triggers' own
-    // travel for L2 and R2. (Sticks read as 0 are pushed fully up and left:
-    // with them there, the frontend saw input held and never a press.)
+    // travel for L2 and R2 (or wherever a controller filter puts it), a
+    // scripted press's its own. (Sticks read as 0 are pushed fully up and
+    // left: with them there, the frontend saw input held and never a press.)
     for (u32 i = 2; i < 6; ++i) data[i] = controller ? pad.sticks[i - 2] : 0x80;
     static const int kPressure[12] = {5, 7, 4, 6, 12, 13, 14, 15, 10, 11, 8, 9};
-    for (u32 i = 0; i < 12; ++i) data[6 + i] = (buttons >> kPressure[i]) & 1 ? 0 : 0xFF;
-    if (controller && pad.l2 && !(buttons & (1u << 8))) data[6 + 10] = std::max<u8>(pad.l2, 1);
-    if (controller && pad.r2 && !(buttons & (1u << 9))) data[6 + 11] = std::max<u8>(pad.r2, 1);
+    for (u32 i = 0; i < 12; ++i) data[6 + i] = (buttons >> kPressure[i]) & 1 ? 0 : pressure[kPressure[i]];
 }
 
 std::vector<u8> Server(u32 procedure, const std::vector<u8>& request) {
@@ -319,12 +377,12 @@ void PadmanFrame() {
 
 }  // namespace
 
-bool ScriptPress(const std::string& button, u64 from, u64 to) {
+bool ScriptPress(const std::string& button, u64 from, u64 to, u8 pressure) {
     static const char* const kNames[16] = {"select", "l3", "r3", "start", "up", "right", "down", "left",
                                            "l2", "r2", "l1", "r1", "triangle", "circle", "cross", "square"};
     for (int i = 0; i < 16; ++i)
         if (button == kNames[i]) {
-            Script().push_back({i, from, to});
+            Script().push_back({i, from, to, pressure});
             return true;
         }
     return false;
@@ -373,7 +431,14 @@ void InstallDbc() {
 
 u16 PadButtonsHeld() { return g_held; }
 
+InputDevice LastInputDevice(u64* frame) {
+    if (frame) *frame = g_last_input_frame;
+    return g_last_device;
+}
+
 void SetPadHook(u16 (*hook)()) { g_pad_hook = hook; }
+
+void SetControllerFilter(void (*filter)(HostPadState* pad)) { g_controller_filter = filter; }
 
 namespace {
 struct MouseStep {

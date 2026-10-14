@@ -75,10 +75,25 @@ std::uint64_t Generation();
 Name NameOf(const gs::Memory& memory, std::uint64_t tex0, std::uint64_t clamp, std::uint64_t texa,
             const std::uint32_t* clut);
 
-/* The replacement for `name`: null if the pack has none - or while its file
-   is still being read (asked for here: `*pending` says so; a later call has
-   it). */
+/* The replacement for `name`: an override's, or the pack's (when it is on);
+   null if there is none - or while its file is still being read (asked for
+   here: `*pending` says so; a later call has it). */
 std::shared_ptr<const Image> Find(const Name& name, bool* pending);
+
+/* A game's own replacements (overrides), beside any pack and drawn whether
+   the pack is on or not: the PNG `png` (alpha as the GS's, 0x80 opaque) for
+   the texture `name` names - spelt as a pack file's name, without its
+   extension; null clears that one. A PNG passed again (the same pointer) is
+   not decoded again. False for a name or PNG that cannot be read. Each
+   change bumps Generation. */
+bool SetOverride(const std::string& name, const std::uint8_t* png, std::size_t bytes);
+void ClearOverrides();
+
+/* Whether anything could be replaced: overrides, or a pack that is on. */
+bool Active();
+/* Whether a texture of these bits (PSM | TW << 6 | TH << 10) could be: the
+   cheap test before NameOf's hashing. */
+bool Wanted(std::uint32_t bits);
 
 }  // namespace texture_pack
 }  // namespace ps2host

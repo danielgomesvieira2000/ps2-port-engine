@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace ps2host {
@@ -249,7 +250,14 @@ void Gs::WriteRegister(u32 address, u64 value) {
             Vertex v;
             const bool f = address == 0x04 || address == 0x0C;
             v.x = (float(Bits(value, 0, 16)) - float(Bits(c.xyoffset, 0, 16))) / 16.0f;
-            v.y = (float(Bits(value, 16, 16)) - float(Bits(c.xyoffset, 32, 16))) / 16.0f;
+            // Field mode: a game draws one field half a pixel lower than the
+            // other (sceGsSetHalfOffset), for a television to scan between
+            // the lines. Shown a field at a time on a progressive screen that
+            // shook the picture up and down; drawn on the whole pixel, both
+            // fields stand still (PS2HOST_HALF_OFFSET=1 keeps the console's).
+            static const bool half_offset = std::getenv("PS2HOST_HALF_OFFSET") != nullptr;
+            const u32 ofy = FieldMode() && !half_offset ? Bits(c.xyoffset, 32, 16) & ~15u : Bits(c.xyoffset, 32, 16);
+            v.y = (float(Bits(value, 16, 16)) - float(ofy)) / 16.0f;
             v.z = f ? Bits(value, 32, 24) : u32(value >> 32);
             v.fog = f ? u8(value >> 56) : fog_;
             v.r = u8(rgbaq_); v.g = u8(rgbaq_ >> 8); v.b = u8(rgbaq_ >> 16); v.a = u8(rgbaq_ >> 24);
@@ -583,6 +591,8 @@ u32 Gs::ShownLines() const {
     const bool field = Bits(smode2_, 0, 1) && Bits(smode2_, 1, 1);    // interlaced, FFMD
     return field ? h / 2 : h;
 }
+
+bool Gs::FieldMode() const { return Bits(smode2_, 0, 1) && Bits(smode2_, 1, 1); }
 
 bool Gs::WriteBmp(const std::string& path) const {
     std::vector<u32> pixels;

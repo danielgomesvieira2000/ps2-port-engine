@@ -24,6 +24,8 @@ bool SettingOn(const std::string& key, bool fallback = false);
 /* Sets one and writes the file. */
 void SetSetting(const std::string& key, const std::string& value);
 void SetSettingOn(const std::string& key, bool on);
+/* Sets one for this run only (--setting): the file is not written. */
+void RunSetting(const std::string& key, const std::string& value);
 
 }  // namespace ps2host
 

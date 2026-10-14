@@ -194,6 +194,7 @@ int main(int argc, char** argv) {
     // (vkDestroyDevice with the driver's threads and the renderer's images
     // still about), leaving a window that never closed.
     ps2host::CloseAudio();
+    ps2host::ReleaseController();
     std::fflush(nullptr);
     TerminateProcess(GetCurrentProcess(), UINT(code));
     return code;

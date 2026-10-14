@@ -1,0 +1,105 @@
+#version 450
+// FXAA (after Timothy Lottes' FXAA 3.11, its PC quality preset trimmed):
+// the finished picture's edges smoothed before it is scaled to the window
+// (ANTI-ALIASING). A pixel whose neighbours differ enough in brightness is
+// on an edge: the edge's direction and its ends are found along it, and the
+// pixel takes a sample from across the edge, as far as it lies from its
+// nearer end.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D picture;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D smoothed;
+layout(push_constant) uniform Size { vec2 texel; ivec2 size; } size;
+
+const float kEdgeMin = 0.0312;      // darker than this: never an edge
+const float kEdgeRatio = 0.125;     // the local contrast that makes one
+const float kSubpixel = 0.75;       // how much single-pixel detail is softened
+const int kSteps = 10;
+const float kStep[kSteps] = float[](1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 4.0, 8.0);
+
+float Luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+vec3 At(vec2 uv) { return textureLod(picture, uv, 0.0).rgb; }
+float LumaAt(vec2 uv) { return Luma(At(uv)); }
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= size.size.x || p.y >= size.size.y) return;
+    const vec2 t = size.texel;
+    const vec2 uv = (vec2(p) + 0.5) * t;
+    const vec3 centre = At(uv);
+    const float m = Luma(centre);
+    const float n = LumaAt(uv + vec2(0, -t.y)), s = LumaAt(uv + vec2(0, t.y));
+    const float w = LumaAt(uv + vec2(-t.x, 0)), e = LumaAt(uv + vec2(t.x, 0));
+    const float lo = min(m, min(min(n, s), min(w, e)));
+    const float hi = max(m, max(max(n, s), max(w, e)));
+    const float range = hi - lo;
+    if (range < max(kEdgeMin, hi * kEdgeRatio)) {
+        imageStore(smoothed, p, vec4(centre, 1.0));
+        return;
+    }
+    const float nw = LumaAt(uv + vec2(-t.x, -t.y)), ne = LumaAt(uv + vec2(t.x, -t.y));
+    const float sw = LumaAt(uv + vec2(-t.x, t.y)), se = LumaAt(uv + vec2(t.x, t.y));
+
+    // Horizontal or vertical: where brightness changes more.
+    const float horizontal = abs(nw + sw - 2.0 * w) + 2.0 * abs(n + s - 2.0 * m) + abs(ne + se - 2.0 * e);
+    const float vertical = abs(nw + ne - 2.0 * n) + 2.0 * abs(w + e - 2.0 * m) + abs(sw + se - 2.0 * s);
+    const bool across_y = horizontal >= vertical;        // the edge runs along x; its other side is up or down
+    float before = across_y ? n : w, after = across_y ? s : e;
+    float step_across = across_y ? t.y : t.x;
+    const float gradient_before = abs(before - m), gradient_after = abs(after - m);
+    const bool towards_before = gradient_before >= gradient_after;
+    const float gradient = 0.25 * max(gradient_before, gradient_after);
+    float edge_luma;
+    if (towards_before) {
+        step_across = -step_across;
+        edge_luma = 0.5 * (before + m);
+    } else {
+        edge_luma = 0.5 * (after + m);
+    }
+
+    // Along the edge (half a pixel across it), both ways, to its ends.
+    vec2 edge = uv;
+    vec2 along;
+    if (across_y) {
+        edge.y += 0.5 * step_across;
+        along = vec2(t.x, 0);
+    } else {
+        edge.x += 0.5 * step_across;
+        along = vec2(0, t.y);
+    }
+    vec2 uv_neg = edge - along, uv_pos = edge + along;
+    float end_neg = LumaAt(uv_neg) - edge_luma, end_pos = LumaAt(uv_pos) - edge_luma;
+    bool done_neg = abs(end_neg) >= gradient, done_pos = abs(end_pos) >= gradient;
+    for (int i = 1; i < kSteps && !(done_neg && done_pos); ++i) {
+        if (!done_neg) {
+            uv_neg -= along * kStep[i];
+            end_neg = LumaAt(uv_neg) - edge_luma;
+            done_neg = abs(end_neg) >= gradient;
+        }
+        if (!done_pos) {
+            uv_pos += along * kStep[i];
+            end_pos = LumaAt(uv_pos) - edge_luma;
+            done_pos = abs(end_pos) >= gradient;
+        }
+    }
+    const float dist_neg = across_y ? uv.x - uv_neg.x : uv.y - uv_neg.y;
+    const float dist_pos = across_y ? uv_pos.x - uv.x : uv_pos.y - uv.y;
+    const bool nearer_neg = dist_neg < dist_pos;
+    const float length_ = dist_neg + dist_pos;
+    // Only where the edge's end changes the other way from the pixel: there
+    // the step it makes lies on this side.
+    const bool darker = m - edge_luma < 0.0;
+    const bool right_side = ((nearer_neg ? end_neg : end_pos) < 0.0) != darker;
+    float offset = right_side ? 0.5 - min(dist_neg, dist_pos) / length_ : 0.0;
+
+    // A single pixel standing out (no long edge): softened by its neighbours.
+    const float average = (2.0 * (n + s + w + e) + nw + ne + sw + se) / 12.0;
+    const float sub = clamp(abs(average - m) / range, 0.0, 1.0);
+    const float sub_smooth = (-2.0 * sub + 3.0) * sub * sub;
+    offset = max(offset, sub_smooth * sub_smooth * kSubpixel);
+
+    vec2 at = uv;
+    if (across_y) at.y += offset * step_across;
+    else at.x += offset * step_across;
+    imageStore(smoothed, p, vec4(At(at), 1.0));
+}
