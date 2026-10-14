@@ -83,8 +83,8 @@ const Service kServices[] = {
     {0x70, "GsGetIMR"}, {0x71, "GsPutIMR"}, {0x73, "SetVSyncFlag"},
     {0x74, "SetSyscall"}, {0x76, "SifDmaStat"}, {0x77, "SifSetDma"},
     {0x78, "SifSetDChain"}, {0x79, "SifSetReg"}, {0x7A, "SifGetReg"},
-    {0x7C, "Deci2Call"}, {0xFC, "SetAlarm"}, {0xFD, "iSetAlarm"},
-    {0xFE, "ReleaseAlarm"}, {0xFF, "iReleaseAlarm"},
+    {0x7C, "Deci2Call"}, {0xFC, "SetAlarm"}, {0xFD, "ReleaseAlarm"},
+    {0xFE, "iSetAlarm"}, {0xFF, "iReleaseAlarm"},
 };
 
 }  // namespace

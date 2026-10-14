@@ -19,8 +19,10 @@
  * A function the host lacks stops the run with its name (iop_vm.cpp).
  */
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <cctype>
@@ -42,11 +44,11 @@ namespace {
 
 constexpr s32 KE_OK = 0, KE_ILLEGAL_CONTEXT = -100, KE_UNKNOWN_THID = -407;
 constexpr s32 KE_NOT_DORMANT = -414, KE_NOT_WAIT = -416, KE_CAN_NOT_WAIT = -417;
-constexpr s32 KE_SEMA_ZERO = -419, KE_EVF_COND = -421, KE_UNKNOWN_SEMID = -408;
+constexpr s32 KE_RELEASE_WAIT = -418, KE_SEMA_ZERO = -419, KE_EVF_COND = -421, KE_UNKNOWN_SEMID = -408;
 constexpr u32 WEF_OR = 1, WEF_CLEAR = 0x10;
 constexpr u64 kClockHz = 36864000;              // the IOP's system clock
 
-using Map = std::map<std::pair<std::string, u32>, Library>;
+using Map = LibraryTable;
 
 u32 A(Vm& vm, Context& c, int i) { return Arg(vm, c, i); }
 
@@ -171,6 +173,22 @@ Outcome WakeupThread(Vm& vm, Context& c) {
     } else {
         ++t.wakeups;
     }
+    Return(c, KE_OK);
+    return vm.reschedule && !vm.in_interrupt ? Outcome::Yield : Outcome::Return;
+}
+
+// (i)ReleaseWaitThread(id): a waiting thread's wait ends in KE_RELEASE_WAIT.
+Outcome ReleaseWaitThread(Vm& vm, Context& c) {
+    auto found = vm.threads.find(A(vm, c, 0));
+    if (found == vm.threads.end()) return Ret(c, u32(KE_UNKNOWN_THID));
+    Thread& t = found->second;
+    if (t.ready || t.wait == Wait::Dormant || t.wait == Wait::None) return Ret(c, u32(KE_NOT_WAIT));
+    if (t.wait == Wait::Sema) {
+        auto& waiting = vm.semaphores[t.object].waiting;
+        waiting.erase(std::remove(waiting.begin(), waiting.end(), t.id), waiting.end());
+    }
+    t.c.r[2] = u32(KE_RELEASE_WAIT);
+    vm.MakeReady(t);
     Return(c, KE_OK);
     return vm.reschedule && !vm.in_interrupt ? Outcome::Yield : Outcome::Return;
 }
@@ -494,6 +512,22 @@ Outcome Strtol(Vm& vm, Context& c) {
     return Ret(c, u32(value));
 }
 
+Outcome Strtoul(Vm& vm, Context& c) {
+    const u32 s = A(vm, c, 0), end = A(vm, c, 1);
+    const std::string text = vm.String(s, 256);
+    char* stop = nullptr;
+    const unsigned long value = std::strtoul(text.c_str(), &stop, int(A(vm, c, 2)));
+    if (end) vm.Write(end, s + u32(stop - text.c_str()), 4);
+    return Ret(c, u32(value));
+}
+
+Outcome Strstr(Vm& vm, Context& c) {
+    const u32 s = A(vm, c, 0);
+    const std::string text = vm.String(s, 1u << 20);
+    const std::size_t at = text.find(vm.String(A(vm, c, 1), 1u << 20));
+    return Ret(c, at == std::string::npos ? 0 : s + u32(at));
+}
+
 // Arguments of a variadic call: from argument `first` on.
 std::function<u32()> Varargs(Vm& vm, Context& c, int first) {
     auto index = std::make_shared<int>(first);
@@ -594,6 +628,10 @@ Outcome SetDma(Vm& vm, Context& c) {
     for (u32 k = 0; k < count; ++k) {
         const u32 src = vm.Read(list + 16 * k, 4), dest = vm.Read(list + 16 * k + 4, 4);
         const u32 size = vm.Read(list + 16 * k + 8, 4);
+        if (std::getenv("PS2HOST_SIF_LOG"))
+            std::fprintf(stderr, "[sif] IOP 0x%08X -> EE 0x%08X, %u bytes: %08X %08X %08X %08X\n",
+                         unsigned(src), unsigned(dest), unsigned(size), unsigned(vm.Read(src, 4)),
+                         unsigned(vm.Read(src + 4, 4)), unsigned(vm.Read(src + 8, 4)), unsigned(vm.Read(src + 12, 4)));
         for (u32 i = 0; i < size; ++i) ee.Write(dest + i, vm.Read(src + i, 1), 1);
     }
     return Ret(c, 1);
@@ -883,7 +921,8 @@ const Map& Table() {
         {{"sysclib", 17}, Bzero}, {{"sysclib", 19}, Sprintf}, {{"sysclib", 20}, Strcat},
         {{"sysclib", 21}, Strchr}, {{"sysclib", 22}, Strcmp}, {{"sysclib", 23}, Strcpy},
         {{"sysclib", 27}, Strlen}, {{"sysclib", 29}, Strncmp}, {{"sysclib", 30}, Strncpy},
-        {{"sysclib", 32}, Strrchr}, {{"sysclib", 36}, Strtol}, {{"sysclib", 42}, Vsprintf},
+        {{"sysclib", 32}, Strrchr}, {{"sysclib", 34}, Strstr}, {{"sysclib", 36}, Strtol},
+        {{"sysclib", 38}, Strtoul}, {{"sysclib", 42}, Vsprintf},
         {{"intrman", 4}, Succeed}, {{"intrman", 5}, Succeed}, {{"intrman", 6}, Succeed},
         {{"intrman", 7}, Succeed}, {{"intrman", 8}, Succeed}, {{"intrman", 9}, Succeed},
         {{"intrman", 17}, CpuSuspendIntr}, {{"intrman", 18}, Succeed},
@@ -893,6 +932,7 @@ const Map& Table() {
         {{"thbase", 8}, ExitThread}, {{"thbase", 10}, TerminateThread},
         {{"thbase", 11}, TerminateThread}, {{"thbase", 14}, ChangeThreadPriority},
         {{"thbase", 15}, ChangeThreadPriority}, {{"thbase", 16}, RotateThreadReadyQueue},
+        {{"thbase", 18}, ReleaseWaitThread}, {{"thbase", 19}, ReleaseWaitThread},
         {{"thbase", 20}, GetThreadId}, {{"thbase", 24}, SleepThread},
         {{"thbase", 25}, WakeupThread}, {{"thbase", 26}, WakeupThread},
         {{"thbase", 27}, CancelWakeupThread}, {{"thbase", 28}, CancelWakeupThread},
@@ -964,7 +1004,9 @@ std::map<std::pair<std::string, u32>, std::string> LoadNames() {
 
 Library FindLibrary(const std::string& library, u32 index) {
     const auto found = Table().find({library, index});
-    return found == Table().end() ? Library() : found->second;
+    if (found != Table().end()) return found->second;
+    const auto network = NetworkLibraries().find({library, index});
+    return network == NetworkLibraries().end() ? Library() : network->second;
 }
 
 std::string ExportName(const std::string& library, u32 index) {

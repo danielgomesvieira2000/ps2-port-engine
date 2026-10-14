@@ -74,11 +74,19 @@ struct Alarm {
     u32 handler = 0, arg = 0;
 };
 
-// What a library function did to the calling thread.
-enum class Outcome { Return, Block, Yield };
+// What a library function did to the calling thread. Retry: it has blocked
+// (Vm::Block) and makes the same call again, same arguments, when the thread
+// wakes - a host call that waits on something outside the IOP (a socket)
+// without holding the EE up.
+enum class Outcome { Return, Block, Yield, Retry };
 
 struct Vm;
 using Library = std::function<Outcome(Vm& vm, Context& c)>;
+using LibraryTable = std::map<std::pair<std::string, u32>, Library>;
+
+/* The IOP network libraries (inet, netcnf, inetctl) on the host's sockets,
+   iop_inet.cpp; FindLibrary looks there after its own table. */
+const LibraryTable& NetworkLibraries();
 
 struct Vm {
     u8* ram = nullptr;                          // the 2 MB, shared with the EE's view

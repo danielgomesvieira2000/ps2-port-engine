@@ -35,6 +35,7 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/mcserv.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/iop_vm.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/iop_libs.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/iop_inet.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/iopheap.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/spu2.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/audio.cpp
@@ -103,6 +104,9 @@ if(MSVC)
     target_compile_options(ps2host PRIVATE /Z7)     # symbols for --sample, as the ports'
     target_compile_options(ps2rt PRIVATE /Z7)
     target_link_libraries(ps2host PRIVATE dbghelp winmm)  # ...which resolves them; 1 ms sleeps
+endif()
+if(WIN32)
+    target_link_libraries(ps2host PRIVATE ws2_32)         # the IOP's inet (iop_inet.cpp)
 endif()
 
 # The host's own tests, which need no game.
