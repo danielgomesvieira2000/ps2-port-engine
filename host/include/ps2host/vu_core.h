@@ -695,7 +695,7 @@ struct VuCore {
         const u64 ready = cycle + kFmacLatency;
 #if defined(__AVX2__)
         if (written > 0 && lanes == 15)         // all four in a store
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(v.vf_ready_[written]), _mm256_set1_epi64x(long long(ready)));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(v.vf_ready_[written]), _mm256_set1_epi64x(static_cast<long long>(ready)));
         else
 #endif
         if (written > 0)
