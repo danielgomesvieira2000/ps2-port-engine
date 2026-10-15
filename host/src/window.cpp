@@ -328,6 +328,10 @@ void SetPictureSource(std::function<bool(std::vector<u32>*, u32*, u32*)> source)
     g_picture_source = std::move(source);
 }
 
+namespace {
+void RefreshOverlay();      // the overlay's lines and the FPS counter's, drawn
+}  // namespace
+
 // Alt+Enter changes fullscreen in the display's Pump: saved as the setting.
 void KeepFullscreenSetting() {
 #ifdef PS2HOST_VULKAN
@@ -344,7 +348,18 @@ bool PumpWindow() {
         if (!g_display->Pump()) g_closed = true;
         KeepFullscreenSetting();
         if (g_display->TakeCapture()) RequestCapture();
-        UpdatePcMenu();                     // F1: the PC settings panel (pc_menu.cpp)
+        UpdatePcMenu();                     // F9: the PC settings panel (pc_menu.cpp)
+        // F1: the FPS counter on or off; its figure redrawn twice a second.
+        static std::chrono::steady_clock::time_point fps_drawn{};
+        const auto now = std::chrono::steady_clock::now();
+        if (g_display->TakeFpsToggle()) {
+            SetSettingOn("fps_counter", !SettingOn("fps_counter", false));
+            RefreshOverlay();
+            fps_drawn = now;
+        } else if (now - fps_drawn >= std::chrono::milliseconds(500)) {
+            RefreshOverlay();
+            fps_drawn = now;
+        }
         // Tab: the texture pack on or off, said on the screen for two seconds.
         static std::chrono::steady_clock::time_point notice_until{};
         static bool notice = false;
@@ -374,7 +389,12 @@ void SetWindowFullscreen(bool on) {
 #endif
 }
 
-void SetWindowOverlay(const std::vector<std::string>& lines) {
+namespace {
+
+std::vector<std::string> g_overlay_lines;      // SetWindowOverlay's: the panel's, a notice's
+
+// Draws the lines as the window's overlay (none when empty).
+void DrawOverlay(const std::vector<std::string>& lines) {
 #ifdef PS2HOST_VULKAN
     if (!g_display) return;
     if (lines.empty()) {
@@ -433,6 +453,32 @@ void SetWindowOverlay(const std::vector<std::string>& lines) {
 #else
     (void)lines;
 #endif
+}
+
+// The FPS counter (F1, setting "fps_counter", off unless turned on): the
+// pictures shown a second, a line under whatever else the overlay says.
+void RefreshOverlay() {
+    std::vector<std::string> lines = g_overlay_lines;
+#ifdef PS2HOST_VULKAN
+    if (g_display && SettingOn("fps_counter", false)) {
+        const double fps = g_display->PresentsPerSecond();
+        char text[32];
+        if (fps > 0) std::snprintf(text, sizeof text, "FPS %.1f", fps);
+        else std::snprintf(text, sizeof text, "FPS --");
+        lines.push_back(text);
+    }
+#endif
+    static std::vector<std::string> shown;
+    if (lines == shown) return;                 // drawn again only when it changes
+    shown = lines;
+    DrawOverlay(lines);
+}
+
+}  // namespace
+
+void SetWindowOverlay(const std::vector<std::string>& lines) {
+    g_overlay_lines = lines;
+    RefreshOverlay();
 }
 
 void SetWindowStatus(const std::string& status) {

@@ -80,6 +80,9 @@ def programs():
         out[name] = (at, words)
         at += 4 * len(words)
 
+    for name, destination in (("pmulth", T0), ("pmulth_alias", T4), ("pmulth_zero", ZERO)):
+        add(name, [i_type(0x1E, A0, T4, 0), i_type(0x1E, A0, T5, 16),
+                   mmi_word("pmulth", destination, T4, T5), JR_RA, NOP])
     add("arithmetic", [
         addiu(V0, A0, 5), r_type(0x21, A0, A1, V1), r_type(0x00, 0, A0, T0, 3),
         r_type(0x03, 0, A1, T1, 2), r_type(0x2A, A0, A1, T2), i_type(0x0B, A0, T3, 100),
@@ -265,7 +268,7 @@ class TestLift(unittest.TestCase):
             args = [rng.choice([rng.getrandbits(64), rng.getrandbits(8), 0,
                                 (1 << 64) - rng.getrandbits(4) - 1])
                     for _ in range(8)]
-            if name == "memory":
+            if name == "memory" or name.startswith("pmulth"):
                 args[0] = scratch + 16 * rng.randrange(64)
             if name == "unaligned":
                 args[0] = scratch + rng.randrange(1024)
@@ -319,6 +322,10 @@ class TestLift(unittest.TestCase):
 
     def test_fpu_control_registers(self):
         self.check("fpu_control")
+
+    def test_pmulth_and_aliases(self):
+        for name in ("pmulth", "pmulth_alias", "pmulth_zero"):
+            self.check(name)
 
     def test_more_lane_operations(self):
         self.check("mmi_pack")
@@ -382,6 +389,33 @@ class TestStructured(TestLift):
 
 
 class TestLiftRefusals(unittest.TestCase):
+    def test_constant_audio_shift_amount(self):
+        from ps2decomp import emu
+        from ps2decomp.r5900 import DISASM
+        m = Machine(BASE, b"", 0x02000000 - BASE)
+        ins = DISASM.decode(i_type(1, ZERO, 0x19, 2), BASE)
+        emu._HANDLERS["mtsah"](m, ins)
+        self.assertEqual(m.sa, 32)
+        self.assertIn("^ 0x2ull", lift.statement(ins))
+
+    def test_pmulth_signed_products_and_accumulator_layout(self):
+        from ps2decomp import emu
+        from ps2decomp.r5900 import DISASM
+        m = Machine(BASE, b"", 0x02000000 - BASE)
+        a = [-32768, 32767, -1, 0, -16384, 123, -256, 7]
+        b = [-32768, -1, 32767, -32768, 2, -321, -257, -8]
+        expected = [0x40000000, 0xFFFF8001, 0xFFFF8001, 0, 0xFFFF8000, 0xFFFF65C5, 65792, 0xFFFFFFC8]
+        for register, values in ((A1, a), (A2, b)):
+            bits = sum((v & 0xFFFF) << (16*i) for i, v in enumerate(values))
+            m.regs[register] = bits & ((1 << 64)-1)
+            m.regs_hi[register] = bits >> 64
+        ins = DISASM.decode(mmi_word("pmulth", T0, A1, A2), BASE)
+        emu._HANDLERS["pmulth"](m, ins)
+        self.assertEqual((m.lo, m.hi, m.lo1, m.hi1),
+                         tuple(expected[i] | expected[i+1] << 32 for i in (0, 2, 4, 6)))
+        self.assertEqual((m.regs[T0], m.regs_hi[T0]),
+                         (expected[0] | expected[2] << 32, expected[4] | expected[6] << 32))
+
     def test_unsupported_instruction_is_refused(self):
         image = struct.pack("<3I", 0x42000002, JR_RA, NOP)      # tlbwi: no TLB on the host
         with self.assertRaises(lift.Refused):

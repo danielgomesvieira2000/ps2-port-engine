@@ -68,6 +68,9 @@ void SetTrace(bool on);
 
 /* Send the SPU2's mixed output to the host's sound device (--audio). */
 void EnableSound();
+/* A host volume for a core's planar PCM input (0-200%, 100 is original).
+   Burnout 3's processed player engine is core 1's PCM input. */
+void SetPcmInputVolume(std::uint32_t core, std::uint32_t percent);
 
 /* For the report: one line per IOP thread. */
 std::string Report();

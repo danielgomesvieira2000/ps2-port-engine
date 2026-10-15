@@ -114,6 +114,32 @@ vec4 Texel(int u, int v, int n) {
     return Fetch(at);
 }
 
+// Texel's addresses for the four texels around (u0, v0) in level n, worked
+// out together (x0, x1, y0, y1): a bilinear sample otherwise repeats the
+// size, wrap and mip work four times. The same texels as Texel's.
+ivec4 Neighbours(ivec2 i0, int n) {
+    const int k = n == 0 && Fine() ? int(p.scale) : 1;
+    const ivec2 size = n == 0 ? TextureSize() * k : max(TextureSize() >> n, ivec2(1));
+    ivec2 a = ivec2(Wrap(i0.x, size.x, p.wms, p.minu >> n, p.maxu >> n, k),
+                    Wrap(i0.y, size.y, p.wmt, p.minv >> n, p.maxv >> n, k));
+    ivec2 b = ivec2(Wrap(i0.x + 1, size.x, p.wms, p.minu >> n, p.maxu >> n, k),
+                    Wrap(i0.y + 1, size.y, p.wmt, p.minv >> n, p.maxv >> n, k));
+    if (n == 0) {
+        if (k == 1) { a &= 2047; b &= 2047; }
+        if (k == 1 && p.scale > 1u) { a = a * int(p.scale) + int(p.scale / 2u); b = b * int(p.scale) + int(p.scale / 2u); }
+        a = min(a, textureSize(texture_image, 0) - 1);
+        b = min(b, textureSize(texture_image, 0) - 1);
+    } else {
+        a = clamp(a, ivec2(0), size - 1);
+        b = clamp(b, ivec2(0), size - 1);
+        int offset = 0;
+        for (int i = 0; i < n; ++i) offset += max(TextureSize().y >> i, 1);
+        a.y += offset;
+        b.y += offset;
+    }
+    return ivec4(a.x, b.x, a.y, b.y);
+}
+
 // The texel at (u, v) in level 0's texels, in level n: the nearest, or the
 // four around (u - 0.5, v - 0.5) mixed per channel as the GS mixes them: in
 // sixteenths (its coordinates' 4 fractional bits), each step truncated - a
@@ -126,8 +152,8 @@ vec4 Sample(vec2 uv, int n, bool linear) {
     const ivec2 xy = ivec2(floor((uv - 0.5) * 16.0));
     const ivec2 i0 = xy >> 4;
     const vec4 f = vec4(xy & 15, 0, 0);
-    const vec4 c00 = Texel(i0.x, i0.y, n), c10 = Texel(i0.x + 1, i0.y, n);
-    const vec4 c01 = Texel(i0.x, i0.y + 1, n), c11 = Texel(i0.x + 1, i0.y + 1, n);
+    const ivec4 at = Neighbours(i0, n);
+    const vec4 c00 = Fetch(at.xz), c10 = Fetch(at.yz), c01 = Fetch(at.xw), c11 = Fetch(at.yw);
     const vec4 top = c00 + floor((c10 - c00) * f.x / 16.0), bottom = c01 + floor((c11 - c01) * f.x / 16.0);
     return top + floor((bottom - top) * f.y / 16.0);
 }

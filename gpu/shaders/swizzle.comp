@@ -36,6 +36,9 @@ layout(push_constant) uniform Params {
 } p;
 
 #include "gs_address.glsl"
+layout(constant_id = 1) const uint specialized_direction = 0xFFFFFFFFu;
+layout(constant_id = 2) const uint specialized_scale = 0u;
+layout(constant_id = 3) const uint specialized_depth = 0xFFFFFFFFu;
 
 uint To16(uint c) {
     return ((c >> 3) & 31u) | (((c >> 11) & 31u) << 5) | (((c >> 19) & 31u) << 10) | ((c >> 31) << 15);
@@ -47,8 +50,17 @@ uint From16(uint c) {
 }
 
 void main() {
+    const uint direction = specialized_direction == 0xFFFFFFFFu ? p.to_memory : specialized_direction;
+    const uint depth = specialized_depth == 0xFFFFFFFFu ? p.depth : specialized_depth;
     const uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
     if (x >= p.cols || y >= p.rows) return;
+    // In each GS 16-pixel column, x and x+8 occupy the low/high half
+    // of one word. Complete columns can be packed by one invocation,
+    // without four contending atomic operations per word. Partial columns
+    // retain the masked atomic path so pixels outside the rectangle survive.
+    const bool paired=direction==1u && Is16() && p.bw<=32u && p.cols<=max(p.bw,1u)*64u &&
+                      p.row0+p.rows<=1024u && (x&~15u)+16u<=p.cols;
+    if(paired && (x&8u)!=0u) return;
     const uint a = Address(x, y + p.row0);
     const uint word = a >> 2;
     // The image's pixels for GS pixel (x, y): a square of scale x scale,
@@ -56,14 +68,14 @@ void main() {
     // memory - the one a primitive covers when the GS pixel's centre is
     // covered (a sprite's edge at a half pixel - Burnout 3's channel shuffle
     // - left the square's first one out, and its column stale).
-    const uint k = max(p.scale, 1u);
+    const uint k = specialized_scale == 0u ? max(p.scale, 1u) : specialized_scale;
     const uint li = (y * k) * p.stride + x * k;
     const uint mid = li + (k / 2u) * p.stride + k / 2u;
 #if defined(IMAGE) || defined(DEPTH_IMAGE)
     const ivec2 at = ivec2(x * k, (y + p.row0) * k);
 #endif
-    const bool z24 = p.psm == PSMCT24 || p.psm == PSMZ24;
-    if (p.to_memory == 1u) {
+    const bool z24 = Format() == PSMCT24 || Format() == PSMZ24;
+    if (direction == 1u) {
 #ifdef IMAGE
         uint v = packUnorm4x8(imageLoad(target, at + ivec2(k / 2u)));
 #elif defined(DEPTH_IMAGE)
@@ -71,10 +83,24 @@ void main() {
 #else
         uint v = lin[mid];
 #endif
-        if (p.depth == 1u) v = uint(clamp(uintBitsToFloat(v) * 4294967296.0, 0.0, 4294967040.0));
+        if (depth == 1u) v = uint(clamp(uintBitsToFloat(v) * 4294967296.0, 0.0, 4294967040.0));
         if (Is16()) {
+            if(paired) {
+#ifdef IMAGE
+                uint other=packUnorm4x8(imageLoad(target,at+ivec2(8u*k+k/2u,k/2u)));
+#elif defined(DEPTH_IMAGE)
+                uint other=floatBitsToUint(texelFetch(depth_image,at+ivec2(8u*k+k/2u,k/2u),0).r);
+#else
+                uint other=lin[mid+8u*k];
+#endif
+                if(depth==1u) other=uint(clamp(uintBitsToFloat(other)*4294967296.0,0.0,4294967040.0));
+                const uint low=depth==1u?(v&0xFFFFu):To16(v);
+                const uint high=depth==1u?(other&0xFFFFu):To16(other);
+                mem[word]=low|(high<<16);
+                return;
+            }
             const uint shift = (a & 2u) * 8u;
-            const uint h = p.depth == 1u ? (v & 0xFFFFu) : To16(v);
+            const uint h = depth == 1u ? (v & 0xFFFFu) : To16(v);
             // Two pixels share the word: each changes only its own half.
             atomicAnd(mem[word], ~(0xFFFFu << shift));
             atomicOr(mem[word], h << shift);
@@ -88,11 +114,11 @@ void main() {
         uint v;
         if (Is16()) {
             const uint h = (w >> ((a & 2u) * 8u)) & 0xFFFFu;
-            v = p.depth == 1u ? h : From16(h);
+            v = depth == 1u ? h : From16(h);
         } else {
             v = z24 ? (w & 0xFFFFFFu) : w;
         }
-        const uint value = p.depth == 1u ? floatBitsToUint(float(v) * (1.0 / 4294967296.0)) : v;
+        const uint value = depth == 1u ? floatBitsToUint(float(v) * (1.0 / 4294967296.0)) : v;
 #ifdef IMAGE
         // Memory differing from the square's middle (what went to memory) in
         // alpha alone: each pixel keeps its colour, takes memory's alpha.

@@ -19,9 +19,14 @@
  * output joins the core's at EVOL. The algorithm is the PS1 SPU's, which the
  * SPU2 kept (no-cash psx-spx, "SPU Reverb Formula").
  *
- * Not modelled yet: volume sweeps (a sweeping volume plays at its maximum),
- * noise, pitch modulation, and the cores' external and sound-data inputs
- * (core 0's output into core 1's reverb included).
+ * Capture RAM holds raw voice 1/3, dry/wet mixes and core 0 output in
+ * 512-sample rings. Their writes raise IRQA, so drivers can DMA-read the
+ * captured audio to process and play it through their normal sound path.
+ *
+ * Sound-data inputs read planar signed PCM from byte addresses 0x4000/0x4400
+ * (core 0) and 0x4800/0x4C00 (core 1), with MMIX gates and BVOL. Core 0's
+ * output reaches core 1 through AVOL and its external-input MMIX gates.
+ * Not modelled yet: noise, pitch modulation and AutoDMA block-input refill.
  *
  * libsd's entries (ps2sdk libsd-common.h): a voice parameter or address is
  * (param << 8) | core | voice << 1; a switch or core address (n << 8) | core.
@@ -46,8 +51,11 @@ public:
     using s32 = std::int32_t;
     using u64 = std::uint64_t;
 
-    Spu2() : ram_(2u << 20) {}
+    Spu2() : ram_(2u << 20) { cores_[1].mmix = 0xFFC; }
 
+    // Host gain for a core's PCM input, applied after the game's own volume.
+    // A 5 ms ramp makes live menu changes click-free; capture RAM is unchanged.
+    void SetInputVolume(u32 core, u32 percent);
     void SetParam(u32 entry, u32 value);
     u32 GetParam(u32 entry) const;
     void SetSwitch(u32 entry, u32 value);
@@ -115,6 +123,11 @@ private:
         Voice voices[24];
         u32 endx = 0, irqa = 0, attr = 0, esa = 0, eea = 0, tsa = 0;
         u32 switches[16] = {};          // by switch number - 0x13
+        u32 mmix = 0xFF0;
+        u32 avoll = 0x7FFF, avolr = 0x7FFF;  // signed 16-bit external-input volumes
+        s32 input_gain = 65536, input_gain_target = 65536;
+        u32 input_gain_remaining = 0;
+        u32 bvoll = 0x7FFF, bvolr = 0x7FFF;  // signed 16-bit PCM-input volumes
         u32 mvoll = 0x3FFF, mvolr = 0x3FFF;
         Level main_left{0x3FFF}, main_right{0x3FFF};     // MVOLL, MVOLR as they are now
         bool irq_enabled = false;

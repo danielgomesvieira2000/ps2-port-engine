@@ -533,7 +533,7 @@ class Disassembler:
             return self._invalid(word, addr)
         rs = _rs(word)
         if mnem in ("mtsab", "mtsah"):
-            return Instruction(addr, word, mnem, (GPR[rs], _hex(_imm(word))), rs=rs)
+            return Instruction(addr, word, mnem, (GPR[rs], _hex(_imm(word))), rs=rs, imm=_imm(word))
         if mnem.startswith("t"):  # trap immediate
             return Instruction(
                 addr, word, mnem, (GPR[rs], _hex(_simm(word))), Flags.TRAP, rs=rs

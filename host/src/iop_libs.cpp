@@ -1026,6 +1026,8 @@ std::string ExportName(const std::string& library, u32 index) {
     return found == names.end() ? "?" : found->second;
 }
 
+void SetPcmInputVolume(u32 core, u32 percent) { S().spu.SetInputVolume(core, percent); }
+
 void EnableSound() {
     S().spu.SetOutput([](const Spu2::s16* frames, u32 count) { AudioFrames(frames, count); });
 }

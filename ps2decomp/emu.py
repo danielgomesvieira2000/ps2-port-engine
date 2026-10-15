@@ -1235,7 +1235,19 @@ def _op_rsqrt_s(m: Machine, ins) -> None:
         m.fpr[_fd(ins)] = _fp_bits(_f32(_fp_from_bits(numerator) / root))
 
 
+def _op_pmulth(m: Machine, ins) -> None:
+    a, b = _q_get(m, ins.rs), _q_get(m, ins.rt)
+    signed = _signed(16)
+    products = [(signed((a >> (16*i)) & 0xFFFF) * signed((b >> (16*i)) & 0xFFFF)) & MASK32 for i in range(8)]
+    m.lo = products[0] | products[1] << 32
+    m.hi = products[2] | products[3] << 32
+    m.lo1 = products[4] | products[5] << 32
+    m.hi1 = products[6] | products[7] << 32
+    _q_set(m, ins.rd, sum(products[2*i] << (32*i) for i in range(4)))
+
+
 _HANDLERS = {
+    "pmulth": _op_pmulth,
     # MMI (128-bit integer SIMD) subset
     "pand": _q_bitwise(lambda a, b: a & b),
     "por": _q_bitwise(lambda a, b: a | b),

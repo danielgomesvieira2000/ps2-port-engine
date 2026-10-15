@@ -1171,14 +1171,20 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     const std::size_t n = Triangles(call, fst, tw, th, v, &gouraud);
     state.gouraud = gouraud;
     if (!n) return;
-    u32 x0 = state.width, x1 = 0, y1 = 0, y0 = state.height;
+    // The vertices' extremes, then rounded once (floor, ceil and the clamp
+    // keep order: the same bounds as rounding each vertex).
+    float low_x = float(state.width), high_x = 0, low_y = float(state.height), high_y = 0;
     for (std::size_t i = 0; i < n; ++i) {
-        x0 = std::min(x0, u32(std::clamp(std::floor(v[i].x), 0.0f, float(state.width))));
-        // Exclusive: the GS draws the pixels whose centres lie before the far edge.
-        x1 = std::max(x1, u32(std::clamp(std::ceil(v[i].x), 0.0f, float(state.width))));
-        y1 = std::max(y1, u32(std::clamp(std::ceil(v[i].y), 0.0f, float(state.height))));
-        y0 = std::min(y0, u32(std::clamp(std::floor(v[i].y), 0.0f, float(state.height))));
+        low_x = std::min(low_x, v[i].x);
+        high_x = std::max(high_x, v[i].x);
+        low_y = std::min(low_y, v[i].y);
+        high_y = std::max(high_y, v[i].y);
     }
+    u32 x0 = u32(std::clamp(std::floor(low_x), 0.0f, float(state.width)));
+    // Exclusive: the GS draws the pixels whose centres lie before the far edge.
+    u32 x1 = u32(std::clamp(std::ceil(high_x), 0.0f, float(state.width)));
+    u32 y0 = u32(std::clamp(std::floor(low_y), 0.0f, float(state.height)));
+    u32 y1 = u32(std::clamp(std::ceil(high_y), 0.0f, float(state.height)));
     y0 = std::max(y0, u32(std::max(state.scissor_y0, 0)));
     x0 = std::max(x0, u32(std::max(state.scissor_x0, 0)));
     x1 = std::min(x1, u32(state.scissor_x1 + 1));

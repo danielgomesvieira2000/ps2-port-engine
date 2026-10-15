@@ -97,7 +97,9 @@ It is a windowed program, so no console opens beside it: started from a
 terminal it writes to that one, and started with no arguments to a log named
 after it (`burnout3.log`), which an error message points to.
 
-F1 (or L3 + R3 on a controller) opens the engine's PC settings panel over
+F1 shows or hides an FPS counter (the pictures shown a second; setting
+`fps_counter`, off by default). F9 (or L3 + R3 on a controller) opens the
+engine's PC settings panel over
 any game (`host/src/pc_menu.cpp`): resolution, aspect ratio, fullscreen,
 v-sync, frame pacing and the texture pack, applied at once and saved in
 `pc_settings.ini`; the game gets no input while it is open. A port can also

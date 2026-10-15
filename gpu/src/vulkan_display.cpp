@@ -65,6 +65,16 @@ public:
         return asked;
     }
     bool texture_pack_ = false;
+    bool TakeFpsToggle() override {
+        const bool asked = fps_toggle_;
+        fps_toggle_ = false;
+        return asked;
+    }
+    bool fps_toggle_ = false;
+    double PresentsPerSecond() const override { return fps_.load(); }
+    std::atomic<double> fps_{0.0};
+    std::chrono::steady_clock::time_point fps_since_{};
+    std::uint64_t fps_presents_ = 0;
     void SetAspect(float aspect) override { aspect_.store(aspect); }
     void SetAntiAliasing(AntiAliasing mode) override { anti_aliasing_.store(int(mode)); }
     void SetOverlay(std::vector<std::uint32_t> pixels, std::uint32_t width, std::uint32_t height) override {
@@ -72,14 +82,14 @@ public:
         overlay_ = std::move(pixels);
         overlay_width_ = width;
         overlay_height_ = height;
-        overlay_dirty_ = true;
+        ++overlay_generation_;
     }
     /* The overlay into the swapchain image (TRANSFER_DST) being made. */
     void DrawOverlay(VkImage target);
     std::mutex overlay_lock_;
     std::vector<std::uint32_t> overlay_;
     std::uint32_t overlay_width_ = 0, overlay_height_ = 0;
-    bool overlay_dirty_ = false;
+    std::uint64_t overlay_generation_ = 1;      // a SetOverlay's
     static constexpr VkDeviceSize kOverlayBytes = VkDeviceSize(1280) * 720 * 4;
     VkBuffer overlay_buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory overlay_memory_ = VK_NULL_HANDLE;
@@ -211,6 +221,11 @@ private:
        present's wait for a refresh (at 144 Hz the GS thread waited on its
        fences most of a loading screen, kept to 144 frames a second). */
     VkFence acquire_fences_[kInFlight] = {};
+    /* The overlay's copy each slot's present reads (DrawOverlay): which of
+       SetOverlay's panels it holds. One copy for all would be overwritten
+       while an earlier present still read it - a panel changing twice a
+       second (the FPS counter) would tear. */
+    std::uint64_t overlay_slot_generation_[kInFlight] = {};
     int slot_ = 0;
     // The current present's (slot_'s).
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
@@ -644,7 +659,7 @@ void VulkanDisplay::DrawOverlay(VkImage target) {
     if (overlay_.empty() || !overlay_width_ || !overlay_height_) return;
     if (!overlay_buffer_) {
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bci.size = kOverlayBytes;
+        bci.size = kOverlayBytes * kInFlight;
         bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         if (vkCreateBuffer(device_, &bci, nullptr, &overlay_buffer_) != VK_SUCCESS) return;
         VkMemoryRequirements req;
@@ -655,17 +670,20 @@ void VulkanDisplay::DrawOverlay(VkImage target) {
                                                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         if (vkAllocateMemory(device_, &mai, nullptr, &overlay_memory_) != VK_SUCCESS) return;
         vkBindBufferMemory(device_, overlay_buffer_, overlay_memory_, 0);
-        vkMapMemory(device_, overlay_memory_, 0, kOverlayBytes, 0, &overlay_mapped_);
-        overlay_dirty_ = true;
+        vkMapMemory(device_, overlay_memory_, 0, kOverlayBytes * kInFlight, 0, &overlay_mapped_);
     }
     const std::uint32_t w = std::min(overlay_width_, extent_.width > 16 ? extent_.width - 16 : 0u);
     const std::uint32_t h = std::min(overlay_height_, extent_.height > 16 ? extent_.height - 16 : 0u);
     if (!w || !h || VkDeviceSize(overlay_width_) * overlay_height_ * 4 > kOverlayBytes) return;
-    if (overlay_dirty_) {
-        std::memcpy(overlay_mapped_, overlay_.data(), std::size_t(overlay_width_) * overlay_height_ * 4);
-        overlay_dirty_ = false;
+    // This slot's copy (BeginPresent waited for its fence: no present reads it).
+    const VkDeviceSize offset = kOverlayBytes * VkDeviceSize(slot_);
+    if (overlay_slot_generation_[slot_] != overlay_generation_) {
+        std::memcpy(static_cast<char*>(overlay_mapped_) + offset, overlay_.data(),
+                    std::size_t(overlay_width_) * overlay_height_ * 4);
+        overlay_slot_generation_[slot_] = overlay_generation_;
     }
     VkBufferImageCopy copy{};
+    copy.bufferOffset = offset;
     copy.bufferRowLength = overlay_width_;
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageOffset = {16, 16, 0};
@@ -1199,6 +1217,14 @@ bool VulkanDisplay::Submit(std::uint32_t index) {
                 std::fprintf(stderr, "[hitch] present: %.1f ms since the last\n", ms);
         }
         last_present_ = now;
+        // The FPS counter's: presents counted over half a second at a time.
+        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) ++fps_presents_;
+        const double counted = std::chrono::duration<double>(now - fps_since_).count();
+        if (counted >= 0.5) {
+            fps_.store(fps_since_.time_since_epoch().count() ? fps_presents_ / counted : 0.0);
+            fps_presents_ = 0;
+            fps_since_ = now;
+        }
     }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) stale_ = true;
     else if (!Check(r, "vkQueuePresentKHR")) return false;
@@ -1316,6 +1342,7 @@ bool VulkanDisplay::Pump() {
             SetFullscreen(!Fullscreen());
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F12) capture_ = true;
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_TAB) texture_pack_ = true;
+        if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F1) fps_toggle_ = true;
         if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && gamepad_ &&
             (e.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_STICK || e.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_STICK) &&
             SDL_GetGamepadButton(gamepad_, SDL_GAMEPAD_BUTTON_LEFT_STICK) &&

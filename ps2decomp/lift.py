@@ -263,6 +263,18 @@ def statement(ins) -> str:
                 "hi = (c.rh[%d] & 0xFFFF) * 0x0001000100010001ull; "
                 "c.r[%d] = lo; c.rh[%d] = hi; }" % (b, rt, rd, rd))
 
+    if m == "pmulth":
+        # All eight signed halfword products update the two HI/LO pipelines;
+        # the destination receives the even products as four signed words.
+        result = ("{ const u64 a[2] = {%s, c.rh[%d]}, b[2] = {%s, c.rh[%d]}; u32 p[8]; "
+                  "for (int i = 0; i < 8; ++i) p[i] = (u32)((s32)(s16)(a[i/4] >> ((i%%4)*16)) * "
+                  "(s32)(s16)(b[i/4] >> ((i%%4)*16))); "
+                  "c.lo = (u64)p[0] | (u64)p[1] << 32; c.hi = (u64)p[2] | (u64)p[3] << 32; "
+                  "c.lo1 = (u64)p[4] | (u64)p[5] << 32; c.hi1 = (u64)p[6] | (u64)p[7] << 32; "
+                  % (a, rs, b, rt))
+        if rd:
+            result += "c.r[%d] = (u64)p[0] | (u64)p[2] << 32; c.rh[%d] = (u64)p[4] | (u64)p[6] << 32; " % (rd, rd)
+        return result + "}"
     if m in _LANES:
         if rd == 0:
             return ""

@@ -35,22 +35,33 @@ const uint kMask = (4u << 20) - 1u;
 
 uint Page(uint px, uint py) { return p.bp + 32u * (py * max(p.bw, 1u) + px); }
 
-bool Is16() { return p.psm == PSMCT16 || p.psm == PSMCT16S || p.psm == PSMZ16 || p.psm == PSMZ16S; }
+// Generic callers retain the push-constant format. Common image transfers
+// specialize it at pipeline creation, allowing the driver to remove branches.
+layout(constant_id = 0) const uint specialized_format = 0xFFFFFFFFu;
+uint Format() { return specialized_format == 0xFFFFFFFFu ? p.psm : specialized_format; }
+bool Is16() { return Format() == PSMCT16 || Format() == PSMCT16S || Format() == PSMZ16 || Format() == PSMZ16S; }
 
 // The byte address of pixel (x, y).
 uint Address(uint x, uint y) {
     if (Is16()) {
-        const uint i = ((y % 64u) / 8u) * 4u + (x % 64u) / 16u;
-        uint b;
-        if (p.psm == PSMCT16) b = kBlock16[i];
-        else if (p.psm == PSMCT16S) b = kBlock16S[i];
-        else if (p.psm == PSMZ16) b = kBlockZ16[i];
-        else b = kBlockZ16S[i];
+        // These tables are bit permutations. Express them directly rather
+        // than dynamically indexing shader-local constant arrays per pixel.
+        const uint bx = (x >> 4u) & 3u, by = (y >> 3u) & 7u;
+        const bool s = Format() == PSMCT16S || Format() == PSMZ16S;
+        uint b = ((bx & 1u) << 1u) | (by & 1u);
+        b |= s ? ((bx & 2u) << 3u) | ((by & 2u) << 2u) | (by & 4u)
+               : ((bx & 2u) << 2u) | ((by & 2u) << 1u) | ((by & 4u) << 2u);
+        if (Format() == PSMZ16 || Format() == PSMZ16S) b ^= 24u;
         const uint block = Page(x / 64u, y / 64u) + b;
-        return (block * 256u + kColumn16[(y % 8u) * 16u + x % 16u] * 2u) & kMask;
+        const uint column = ((x & 1u) << 1u) | ((x & 6u) << 2u) | ((x & 8u) >> 3u) |
+                            ((y & 1u) << 2u) | ((y & 6u) << 4u);
+        return (block * 256u + column * 2u) & kMask;
     }
-    const uint i = ((y % 32u) / 8u) * 8u + (x % 64u) / 8u;
-    const uint b = (p.psm == PSMZ32 || p.psm == PSMZ24) ? kBlockZ32[i] : kBlock32[i];
+    const uint bx = (x >> 3u) & 7u, by = (y >> 3u) & 3u;
+    uint b = (bx & 1u) | ((bx & 2u) << 1u) | ((bx & 4u) << 2u) | ((by & 1u) << 1u) |
+             ((by & 2u) << 2u);
+    if (Format() == PSMZ32 || Format() == PSMZ24) b ^= 24u;
     const uint block = Page(x / 64u, y / 32u) + b;
-    return (block * 256u + kColumn32[(y % 8u) * 8u + x % 8u] * 4u) & kMask;
+    const uint column = (x & 1u) | ((x & 6u) << 1u) | ((y & 1u) << 1u) | ((y & 6u) << 3u);
+    return (block * 256u + column * 4u) & kMask;
 }

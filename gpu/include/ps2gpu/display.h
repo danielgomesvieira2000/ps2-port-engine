@@ -59,6 +59,9 @@ public:
        longest, in milliseconds. */
     struct Pacing { std::uint64_t presents = 0; double mean_ms = 0, jitter_ms = 0, longest_ms = 0; };
     virtual Pacing TakePacing() { return {}; }
+    /* Pictures shown a second, over the last half second or so: the FPS
+       counter's (F1), apart from TakePacing so it takes nothing from it. */
+    virtual double PresentsPerSecond() const { return 0.0; }
 
     /* Vertical sync: each picture waits for the screen's refresh (no
        tearing, FIFO), or goes at once (IMMEDIATE, or MAILBOX where that is
@@ -96,6 +99,8 @@ public:
     virtual bool TakeCapture() { return false; }
     /* Tab since the last call: the texture pack turned on or off. */
     virtual bool TakeTexturePackToggle() { return false; }
+    /* F1 since the last call: the FPS counter turned on or off. */
+    virtual bool TakeFpsToggle() { return false; }
 
     /* Whether the window has the keyboard, and whether a key is down - by SDL
        scancode (SDL_SCANCODE_*), which names keys by position. */

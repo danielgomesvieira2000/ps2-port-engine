@@ -155,6 +155,16 @@ void Gs::Words(int path, const u32* words, u32 count, u32 from) {
             i += 4 * qwords;
             continue;
         }
+        // DMA already supplies complete quadwords. Avoid assembling those
+        // through four Word calls; retain that path for fragmented packets.
+        // Word's fourth write supplies the diagnostic source address.
+        if (p.pending_count == 0 && count - i >= 4) {
+            if (from != kNoSource) dma_source_ = from + 4 * (i + 3);
+            Qword(path, u64(words[i]) | u64(words[i + 1]) << 32,
+                  u64(words[i + 2]) | u64(words[i + 3]) << 32);
+            i += 4;
+            continue;
+        }
         if (from != kNoSource) dma_source_ = from + 4 * i;
         Word(path, words[i++]);
     }

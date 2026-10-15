@@ -27,6 +27,12 @@ def enc_j(op, target):
 
 
 class TestCoreMips(unittest.TestCase):
+    def test_mtsab_mtsah_keep_the_encoded_immediate(self):
+        for opcode in (0x18, 0x19):
+            for immediate in (0, 2, 4, 0xFFFF):
+                ins = decode(enc_i(1, 0, opcode, immediate), 0x100000)
+                self.assertEqual(ins.imm, immediate)
+
     def test_nop(self):
         ins = decode(0x00000000, 0x100000)
         self.assertEqual(ins.mnemonic, "nop")
