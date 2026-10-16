@@ -118,6 +118,7 @@ public:
     bool Focused() const override;
     bool KeyDown(int scancode) const override;
     bool Pad(PadState* state) const override;
+    int PadLabels() const override;
     std::string Describe() const override { return describe_; }
     Gpu* SharedGpu() override;
     const std::string& error() const { return error_; }
@@ -1505,6 +1506,15 @@ bool VulkanDisplay::Pad(PadState* state) const {
     }
     *state = s;
     return true;
+}
+
+int VulkanDisplay::PadLabels() const {
+    if (!gamepad_) return 0;
+    switch (SDL_GetGamepadButtonLabel(gamepad_, SDL_GAMEPAD_BUTTON_SOUTH)) {
+        case SDL_GAMEPAD_BUTTON_LABEL_A: return 1;
+        case SDL_GAMEPAD_BUTTON_LABEL_B: return 2;
+        default: return 0;
+    }
 }
 
 /* A DualSense's effects packet (SDL's HIDAPI PS5 driver takes it as the

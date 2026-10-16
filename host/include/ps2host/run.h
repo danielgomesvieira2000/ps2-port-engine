@@ -363,6 +363,10 @@ struct HostPadState {
     u8 pressure[16] = {};       // each input's pressure (a controller filter's to change; 0xFF pressed)
 };
 bool HostPad(HostPadState* state);
+/* What the controller's face buttons say (window.cpp): 0 the DualShock's
+   shapes (or no controller, or not known), 1 A at the bottom (Xbox and most
+   others), 2 B at the bottom (Nintendo's). For the prompts drawn for it. */
+int HostPadLabels();
 /* The mouse over the window (window.cpp), in the picture's terms: x and y
    from 0 to 1 across the game's picture as shown (past them outside it);
    `held` the buttons down (bit 0 left, 1 middle, 2 right), and since the last
