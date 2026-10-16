@@ -39,6 +39,11 @@ class TestStubs(unittest.TestCase):
         m = machine([0x2403007A, 0x0000000C, JR_RA, 0])
         self.assertEqual(m.call(BASE, ()), -1)
 
+    def test_deci2_calls_fail_with_no_debugger_attached(self):
+        # addiu $v1, $zero, 0x7C (Deci2Call) ; syscall ; jr $ra ; nop
+        m = machine([0x2403007C, 0x0000000C, JR_RA, 0])
+        self.assertEqual(m.call(BASE, ()), -1)
+
     def test_mfc0_reads_zero(self):
         # addiu $v0, $zero, 7 ; mfc0 $v0, Count ; jr $ra ; nop
         m = machine([0x24020007, 0x40024800, JR_RA, 0])

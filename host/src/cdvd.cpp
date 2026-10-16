@@ -8,7 +8,9 @@
  * a game is seen to reach them.
  */
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <cstring>
 #include <string>
@@ -132,10 +134,20 @@ std::vector<u8> CdInit(u32 /*procedure*/, const std::vector<u8>& /*data*/) { ret
 // How long a read takes the drive: a 24x CD's 3.6 MB/s, after a seek. Games
 // time things by it - Mister Mosquito's stage loader moves a sound bank a
 // jingle still plays from, which the seconds its reads take let end first.
+// Fast (FastDisc): an SSD's - the image is read in the time the RPC takes.
+// PS2HOST_DISC_SPEED=n: the drive n times as fast, for measuring what the
+// drive's time costs a loading screen.
 u64 ReadTimeNs(std::size_t bytes) {
     constexpr u64 kSeekNs = 2000000, kBytesPerSecond = 3686400;
-    return kSeekNs + u64(bytes) * 1000000000ull / kBytesPerSecond;
+    static const double speed = [] {
+        const char* text = std::getenv("PS2HOST_DISC_SPEED");
+        return text ? std::max(1.0, std::atof(text)) : 1.0;
+    }();
+    if (FastDisc()) return 50000 + u64(bytes) * 1000000000ull / (400ull << 20);
+    return u64(double(kSeekNs + u64(bytes) * 1000000000ull / kBytesPerSecond) / speed);
 }
+
+
 
 std::vector<u8> NCommand(u32 procedure, const std::vector<u8>& data) {
     Memory& m = GuestMemory();
@@ -152,7 +164,7 @@ std::vector<u8> NCommand(u32 procedure, const std::vector<u8>& data) {
                           sectors, lsn, buffer, pattern, ends, ok ? "" : " - past the disc's end");
             Note("cd read " + std::to_string(lsn) + " " + std::to_string(buffer), text);
             if (!ok) return Word(0);
-            for (std::size_t i = 0; i < bytes.size(); ++i) m.Write(buffer + u32(i), bytes[i], 1);
+            m.WriteBytes(buffer, bytes.data(), bytes.size());
             if (ends)
                 for (u32 k = 0; k < 16; ++k) m.Write(ends + k, 0, 1);
             DelayRpcReply(ReadTimeNs(bytes.size()));
@@ -173,7 +185,7 @@ std::vector<u8> NCommand(u32 procedure, const std::vector<u8>& data) {
                           sectors, lsn, buffer, ok ? "" : " - failed");
             Note("cd read iop " + std::to_string(lsn), text);
             if (!ok) return Word(0);
-            for (u32 i = 0; i < size; ++i) m.Write(kIopRamBase + buffer + i, bytes[i], 1);
+            m.WriteBytes(kIopRamBase + buffer, bytes.data(), size);
             DelayRpcReply(ReadTimeNs(size));
             return Word(1);
         }

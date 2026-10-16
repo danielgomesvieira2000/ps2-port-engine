@@ -28,6 +28,8 @@
 
 extern const ps2host::FunctionEntry kGuestFunctions[];
 extern const std::size_t kGuestFunctionCount;
+extern const ps2host::OverlayEntry kGuestOverlays[];
+extern const std::size_t kGuestOverlayCount;
 
 /* The game's host implementations of guest functions (its port's overrides.cpp). */
 void RegisterGameOverrides();
@@ -178,6 +180,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "[port] %s, version %s\n", PS2HOST_GAME_TITLE, PS2HOST_GAME_VERSION);
 #endif
     ps2host::RegisterFunctions(kGuestFunctions, kGuestFunctionCount);
+    ps2host::RegisterOverlays(kGuestOverlays, kGuestOverlayCount);
     RegisterGameOverrides();
     const int code = ps2host::Main(argc, argv);
     if (!play.empty() && code != 0) {         // closing the window ends a run with 0

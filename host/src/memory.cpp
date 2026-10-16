@@ -33,7 +33,17 @@ Memory::Memory()
     : rdram_(kRdramSize), scratchpad_(kScratchpadSize), ee_registers_(kEeRegisterSize),
       vu_memory_(kVuMemorySize), gs_registers_(kGsRegisterSize), iop_ram_(kIopRamSize),
       bios_(kBiosSize),
-      read_hooks_(kEeWords + kGsWords), write_hooks_(kEeWords + kGsWords) {}
+      read_hooks_(kEeWords + kGsWords), write_hooks_(kEeWords + kGsWords),
+      read_counts_(kEeWords + kGsWords), write_counts_(kEeWords + kGsWords) {}
+
+std::map<u32, u64> Memory::RegisterCounts(bool written) const {
+    const std::vector<u64>& counts = written ? write_counts_ : read_counts_;
+    std::map<u32, u64> seen;
+    for (u32 i = 0; i < counts.size(); ++i)
+        if (counts[i])
+            seen[i < kEeWords ? kEeRegisterBase + 4 * i : kGsRegisterBase + 4 * (i - kEeWords)] = counts[i];
+    return seen;
+}
 
 u8* Memory::Translate(u32 address, u32 size) {
     // kseg0 (0x80000000) and kseg1 (0xA0000000) see the whole low 512 MB of the
@@ -98,7 +108,7 @@ u64 Memory::Read(u32 address, u32 size) {
     std::memcpy(&value, bytes, size);        // the EE and the host are both little-endian
     const int index = HookIndex(address & ~3u);
     if (index >= 0) {
-        if (!OnVif1Worker()) RunStats().register_reads[address & ~3u]++;
+        if (!OnVif1Worker()) ++read_counts_[index];
         if (read_hooks_[index]) value = read_hooks_[index](address, value);
     }
     if (status) Vif1Settled(address, u32(value));     // read with the queue run
@@ -143,9 +153,39 @@ void Memory::Write(u32 address, u64 value, u32 size) {
         const u32 word = (address & ~3u) + offset;
         const int index = HookIndex(word);
         if (index < 0) continue;
-        if (!OnVif1Worker()) RunStats().register_writes[word]++;
+        if (!OnVif1Worker()) ++write_counts_[index];
         if (write_hooks_[index]) write_hooks_[index](word, offset ? value >> (8 * offset) : value);
     }
+}
+
+namespace {
+/* Main RAM, the IOP's and the scratchpad: no hooks, no programs in them. */
+bool Plain(u32 physical) {
+    return physical < kRdramSize || (physical >= kIopRamBase && physical - kIopRamBase < kIopRamSize) ||
+           (physical >= kScratchpadBase && physical - kScratchpadBase < kScratchpadSize);
+}
+}  // namespace
+
+void Memory::ReadBytes(u32 address, u8* bytes, std::size_t count) {
+    if (!count) return;
+    if (Plain(Physical(address)) && count <= 0xFFFFFFFFu)
+        if (const u8* from = Translate(address, u32(count))) {
+            std::memcpy(bytes, from, count);
+            return;
+        }
+    for (std::size_t i = 0; i < count; ++i) bytes[i] = u8(Read(address + u32(i), 1));
+}
+
+void Memory::WriteBytes(u32 address, const u8* bytes, std::size_t count) {
+    if (!count) return;
+    // Not the device registers (their hooks), VU memory (its programs) or ROM.
+    const bool plain = Plain(Physical(address));
+    if (plain && watched_.empty() && count <= 0xFFFFFFFFu)
+        if (u8* to = Translate(address, u32(count))) {
+            std::memcpy(to, bytes, count);
+            return;
+        }
+    for (std::size_t i = 0; i < count; ++i) Write(address + u32(i), bytes[i], 1);
 }
 
 void Memory::OnRead(u32 address, ReadHook hook) {

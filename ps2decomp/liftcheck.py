@@ -42,6 +42,7 @@ class Context(ctypes.Structure):
         ("vc", ctypes.c_uint32 * 32),
         ("vacc", ctypes.c_uint32 * 4),
         ("sa", ctypes.c_uint32),
+        ("attention", ctypes.c_uint32),     # another thread's request (the port's); 0 here
     ]
 
 

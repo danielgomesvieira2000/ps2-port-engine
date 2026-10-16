@@ -33,6 +33,14 @@ constexpr u32 kTooDeep = 0x81019004;      // a directory under a directory under
 constexpr u32 kCardKb = 8000;             // an 8 MB card's clusters, less its file system
 constexpr u16 kDirectoryMode = 0x8427, kFileMode = 0x8417, kWritten = 0x80;
 
+// What a handler returns in $v0: a 32-bit value, sign-extended as the R5900
+// keeps every word. Zero-extended, the codes with bit 31 set (all of them)
+// were not the values the game compares with: Resident Evil Outbreak's card
+// thread turns EEXIST into 0 with a `bne` against 0xFFFFFFFF81010011, saw
+// 0x0000000081010011 instead, kept the code, and took a card holding its save
+// for one that "cannot be found".
+u64 Result(u32 value) { return u64(s64(s32(value))); }
+
 std::string& Directory() {
     static std::string directory;
     return directory;
@@ -202,54 +210,54 @@ void Format(lifted::Context& c) { c.r[2] = 0; }
 
 void ReadFile(lifted::Context& c) {
     std::vector<std::string> parts;
-    if (const u32 refused = Resolve(c, &parts)) { c.r[2] = refused; return; }
+    if (const u32 refused = Resolve(c, &parts)) { c.r[2] = Result(refused); return; }
     const u32 buffer = u32(c.r[6]), offset = u32(c.r[7]);
     u32 size = u32(c.r[8]);
     const fs::path path = HostPath(parts);
     std::error_code error;
-    if (parts.empty() || !fs::exists(path, error) || fs::is_directory(path, error)) { c.r[2] = kNoEntry; return; }
+    if (parts.empty() || !fs::exists(path, error) || fs::is_directory(path, error)) { c.r[2] = Result(kNoEntry); return; }
     const u32 length = u32(fs::file_size(path, error));
-    if (offset > length) { c.r[2] = kInvalid; return; }
+    if (offset > length) { c.r[2] = Result(kInvalid); return; }
     if (size == 0 || offset + size > length) size = length - offset;
     std::vector<u8> bytes(size);
     std::ifstream file(path, std::ios::binary);
     file.seekg(offset);
     file.read(reinterpret_cast<char*>(bytes.data()), size);
     CopyToGuest(buffer, bytes.data(), bytes.size());
-    c.r[2] = size;
+    c.r[2] = Result(size);
 }
 
 void WriteFile(lifted::Context& c) {
     std::vector<std::string> parts;
-    if (const u32 refused = Resolve(c, &parts)) { c.r[2] = refused; return; }
+    if (const u32 refused = Resolve(c, &parts)) { c.r[2] = Result(refused); return; }
     const u32 buffer = u32(c.r[6]), offset = u32(c.r[7]), size = u32(c.r[8]);
     const fs::path path = HostPath(parts);
     std::error_code error;
-    if (parts.empty() || !fs::exists(path, error) || fs::is_directory(path, error)) { c.r[2] = kNoEntry; return; }
+    if (parts.empty() || !fs::exists(path, error) || fs::is_directory(path, error)) { c.r[2] = Result(kNoEntry); return; }
     const u32 length = u32(fs::file_size(path, error));
-    if (offset > length) { c.r[2] = kInvalid; return; }
+    if (offset > length) { c.r[2] = Result(kInvalid); return; }
     const u32 grows = offset + size > length ? (offset + size + 1023) / 1024 - (length + 1023) / 1024 : 0;
-    if (grows > FreeKb()) { c.r[2] = kNoSpace; return; }
+    if (grows > FreeKb()) { c.r[2] = Result(kNoSpace); return; }
     std::vector<u8> bytes(size);
     CopyFromGuest(buffer, bytes.data(), bytes.size());
     std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
     file.seekp(offset);
     file.write(reinterpret_cast<const char*>(bytes.data()), size);
-    c.r[2] = size;
+    c.r[2] = Result(size);
 }
 
 void Create(lifted::Context& c) {
     std::vector<std::string> parts;
-    if (const u32 refused = Resolve(c, &parts)) { c.r[2] = refused; return; }
+    if (const u32 refused = Resolve(c, &parts)) { c.r[2] = Result(refused); return; }
     const u32 mode = u32(c.r[6]) ? u32(c.r[6]) : kFileMode;
     const bool directory = (mode & 0x20) != 0;
-    if (parts.empty() || parts.back().size() > 31) { c.r[2] = kBadName; return; }
-    if (directory && parts.size() > 1) { c.r[2] = kTooDeep; return; }
+    if (parts.empty() || parts.back().size() > 31) { c.r[2] = Result(kBadName); return; }
+    if (directory && parts.size() > 1) { c.r[2] = Result(kTooDeep); return; }
     const fs::path path = HostPath(parts);
     std::error_code error;
-    if (fs::exists(path, error)) { c.r[2] = kFound; return; }
-    if (!fs::is_directory(path.parent_path(), error)) { c.r[2] = kNoEntry; return; }
-    if (FreeKb() < (directory ? 2u : 1u)) { c.r[2] = kNoSpace; return; }
+    if (fs::exists(path, error)) { c.r[2] = Result(kFound); return; }
+    if (!fs::is_directory(path.parent_path(), error)) { c.r[2] = Result(kNoEntry); return; }
+    if (FreeKb() < (directory ? 2u : 1u)) { c.r[2] = Result(kNoSpace); return; }
     if (directory) fs::create_directory(path, error);
     else std::ofstream(path, std::ios::binary);
     c.r[2] = 0;
@@ -264,12 +272,12 @@ void GetDir(lifted::Context& c) {
     const std::string directory = slash == std::string::npos ? "" : name.substr(0, slash);
     const std::string pattern = slash == std::string::npos ? name : name.substr(slash + 1);
     std::vector<std::string> parts;
-    if (pattern.empty() || !Components(directory, &parts)) { c.r[2] = kInvalid; return; }
+    if (pattern.empty() || !Components(directory, &parts)) { c.r[2] = Result(kInvalid); return; }
     const fs::path path = HostPath(parts);
     std::error_code error;
     fs::create_directories(fs::u8path(Directory()), error);
-    if (!fs::exists(path, error)) { c.r[2] = kNoEntry; return; }
-    if (!fs::is_directory(path, error)) { c.r[2] = kNotDirectory; return; }
+    if (!fs::exists(path, error)) { c.r[2] = Result(kNoEntry); return; }
+    if (!fs::is_directory(path, error)) { c.r[2] = Result(kNotDirectory); return; }
     const std::vector<Entry> listed = List(path);
     u32 matched = 0;
     for (std::size_t i = offset; i < listed.size(); ++i) {
@@ -286,11 +294,11 @@ void GetDir(lifted::Context& c) {
 
 void Lookup(lifted::Context& c) {
     std::vector<std::string> parts;
-    if (const u32 refused = Resolve(c, &parts)) { c.r[2] = refused; return; }
+    if (const u32 refused = Resolve(c, &parts)) { c.r[2] = Result(refused); return; }
     const u32 entry = u32(c.r[6]);
     const fs::path path = HostPath(parts);
     std::error_code error;
-    if (parts.empty() || !fs::exists(path, error)) { c.r[2] = kNoEntry; return; }
+    if (parts.empty() || !fs::exists(path, error)) { c.r[2] = Result(kNoEntry); return; }
     const Entry e = Describe(path);
     if (entry) {
         u8 bytes[0x60] = {};
@@ -302,7 +310,7 @@ void Lookup(lifted::Context& c) {
         std::memcpy(bytes + 0x40, e.name.c_str(), std::min<std::size_t>(e.name.size(), 31));
         CopyToGuest(entry, bytes, sizeof bytes);
     }
-    c.r[2] = kFound;
+    c.r[2] = Result(kFound);
 }
 
 }  // namespace mc2

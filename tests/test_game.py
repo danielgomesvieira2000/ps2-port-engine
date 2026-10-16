@@ -83,5 +83,39 @@ class TestConfiguration(unittest.TestCase):
             layout.configure(not_a_field=1)
 
 
+class TestCallersKnown(unittest.TestCase):
+    """A loads with B resident; C loads with B too. B's callers include C,
+    which B's own list leaves out; A's are all in A's list."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+
+        def overlay(name, image, resident):
+            directory = os.path.join(self.root, "overlays", name)
+            os.makedirs(directory)
+            with open(os.path.join(directory, "game.json"), "w") as handle:
+                json.dump({"overlay": {"of": "../..", "image": "../../%s.bin" % image,
+                                       "resident": [{"image": "../../%s.bin" % r}
+                                                    for r in resident]}}, handle)
+            return directory
+
+        self.base = game.Game(self.root, "base", "x.elf", "", "", "", "", "", "", {}, [],
+                              overlays=["overlays/a", "overlays/b", "overlays/c"])
+        self.parts = {name: game.Game(overlay(name, image, resident), name, "", "", "", "",
+                                      "", "", "", {}, [], base=self.base)
+                      for name, image, resident in (("a", "1", ["2"]), ("b", "2", ["1"]),
+                                                    ("c", "3", ["2"]))}
+
+    def test_an_overlay_whose_every_neighbour_it_lists(self):
+        self.assertTrue(game.callers_known(self.parts["a"]))
+        self.assertTrue(game.callers_known(self.parts["c"]))
+
+    def test_an_overlay_another_loads_beside_it_unlisted(self):
+        self.assertFalse(game.callers_known(self.parts["b"]))
+
+    def test_a_game_with_overlays(self):
+        self.assertFalse(game.callers_known(self.base))
+
+
 if __name__ == "__main__":
     unittest.main()

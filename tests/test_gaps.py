@@ -47,6 +47,36 @@ class TestRecover(unittest.TestCase):
         found = gaps.recover(image, 0x1000, [(0x1000, 0x1008)])
         self.assertIn((0x1010, 0x101C, "pointer"), found)
 
+    def test_stubs_laid_end_to_end_are_each_recovered(self):
+        # known: [0x1000, 0x1008); three tail-jump stubs after it, none referenced.
+        image = code(JR_RA, NOP, NOP, j(0x8000), NOP, j(0x8000), NOP, j(0x8000), NOP)
+        found = gaps.recover(image, 0x1000, [(0x1000, 0x1008)])
+        self.assertEqual([(s, e) for s, e, _ev in found],
+                         [(0x100C, 0x1014), (0x1014, 0x101C), (0x101C, 0x1024)])
+
+    def test_an_entry_after_a_tail_jump_inside_a_function_is_found(self):
+        # One "function" [0x1000, 0x1018): a stub that j's on, padding, then a
+        # frame opened at 0x100C (addiu $sp, $sp, -16) that a pointer names.
+        prologue = 0x27BDFFF0
+        image = code(j(0x8000), NOP, NOP, prologue, JR_RA, NOP)
+        is_prologue = lambda a: a == 0x100C
+        self.assertEqual(gaps.entries_inside(image, 0x1000, [(0x1000, 0x1018)], {0x100C}, is_prologue),
+                         [(0x1000, 0x100C)])
+
+    def test_a_case_that_opens_no_frame_is_not_an_entry(self):
+        image = code(j(0x8000), NOP, NOP, NOP, JR_RA, NOP)
+        self.assertEqual(gaps.entries_inside(image, 0x1000, [(0x1000, 0x1018)], {0x100C}, lambda a: False), [])
+
+    def test_an_adjacent_epilogue_of_another_frame_is_not_a_function(self):
+        # known: [0x1000, 0x1008); after it, code that reloads $ra (ld $ra, 0($sp))
+        # it never saved, and returns: another function's out-of-line tail.
+        ld_ra = (0x37 << 26) | (29 << 21) | (31 << 16)
+        image = code(JR_RA, NOP, ld_ra, JR_RA, NOP)
+        self.assertEqual(gaps.recover(image, 0x1000, [(0x1000, 0x1008)]), [])
+        # Named by a pointer, it is kept: the weak evidence alone is refused.
+        self.assertIn((0x1008, 0x1014, "pointer"),
+                      gaps.recover(image + code(0x1008), 0x1000, [(0x1000, 0x1008)]))
+
     def test_nothing_is_recovered_inside_a_known_function(self):
         image = code(NOP, NOP, JR_RA, NOP, 0x1004)
         self.assertEqual(gaps.recover(image, 0x1000, [(0x1000, 0x1010)]), [])

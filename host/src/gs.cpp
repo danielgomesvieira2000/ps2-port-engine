@@ -301,7 +301,12 @@ void Gs::WriteRegister(u32 address, u64 value) {
             LoadClut(tex0);
             break;
         }
-        case 0x18: case 0x19: ctx_[address - 0x18].xyoffset = value; break;
+        case 0x18: case 0x19:
+            if (trace && value != ctx_[address - 0x18].xyoffset)
+                std::fprintf(trace_out, "[gs] xyoffset_%u (%u, %u)\n", unsigned(address - 0x17),
+                             unsigned(value & 0xFFFF) / 16, unsigned((value >> 32) & 0xFFFF) / 16);
+            ctx_[address - 0x18].xyoffset = value;
+            break;
         case 0x1A: prmodecont_ = value; break;
         case 0x1B: prmode_ = value; break;
         case 0x1C: texclut_ = value; break;

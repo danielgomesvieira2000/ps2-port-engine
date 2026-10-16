@@ -73,10 +73,12 @@ struct Thread {
     u32 id = 0;
     u32 entry = 0, stack = 0, stack_size = 0, gp = 0;
     s32 priority = 0;
+    s32 initial_priority = 0;       // CreateThread's, for ReferThreadStatus
     State state = State::Dormant;
     u64 queued = 0;                 // order among ready threads of equal priority
     u32 waiting_on = 0;             // the semaphore, while Waiting
     s32 wakeups = 0;                // WakeupThread calls not yet consumed by a sleep
+    bool suspended = false;         // SuspendThread: not run, whatever its state, until resumed
     u64 runs = 0;                   // times the scheduler switched to it, for the report
     lifted::Context context = NewContext();
     std::vector<u32> calls;         // the guest call stack, for the report
@@ -197,7 +199,7 @@ void CALLBACK ThreadMain(void* parameter) {
 Thread* PickReady() {
     Thread* best = nullptr;
     for (auto& [id, t] : S().threads) {
-        if (t->state != State::Ready) continue;
+        if (t->state != State::Ready || t->suspended) continue;
         if (!best || t->priority < best->priority ||
             (t->priority == best->priority && t->queued < best->queued))
             best = t.get();
@@ -287,10 +289,22 @@ u64 g_real_time_from = 0;               // SetRealTimeFrom
 // main loop ran five times a frame, its clocks with it.
 std::atomic<u32> g_intc_stat{0};
 
+void SleepUntil(std::chrono::steady_clock::time_point when);
+bool g_paced = false;                   // SetPaced
+
 // One frame's interrupts, delivered to the handlers registered for them.
 bool DeliverFrame() {
     Scheduler& s = S();
     ++s.frames;
+    if (g_paced && s.virtual_time) {
+        // No sooner than the display's next blank (NTSC's 59.94 a second): the
+        // run stays exact, only slowed to where it can be played.
+        static auto next = std::chrono::steady_clock::now();
+        next += std::chrono::nanoseconds(16683350);
+        const auto now = std::chrono::steady_clock::now();
+        if (next < now - std::chrono::milliseconds(100)) next = now;   // fell behind: no catching up
+        SleepUntil(next);
+    }
     g_intc_stat.fetch_or((1u << kVblankStart) | (1u << kVblankEnd), std::memory_order_relaxed);
     if (s.virtual_time && g_real_time_from && s.frames >= g_real_time_from) StartRealTime();
     {
@@ -316,6 +330,7 @@ void DeliverPendingDmac() {
 }
 
 void SpendBudget(lifted::Context& c) {
+    *static_cast<volatile u32*>(&c.attention) = 1;   // read at its next loop head (lifted::Tick)
     reinterpret_cast<std::atomic<s64>*>(&c.budget)->store(0);
 }
 
@@ -361,7 +376,12 @@ bool TakeVblank(Scheduler& s) {
     if (g_hitch_blanks) {
         const u64 due = g_blank_due_ns.load(std::memory_order_relaxed), now = ClockNs();
         if (due && now > due + 4'000'000) {
-            SampleOnly(due + 500'000, now);
+            // The sampler's times are the steady clock's, which the host's
+            // clock is not after --real-time-from (it carries on from the
+            // virtual one): the same span, ending now on the steady clock.
+            const u64 steady = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch()).count());
+            SampleOnly(steady - (now - due) + 500'000, steady);
             std::fprintf(stderr, "[hitch] a blank taken %.1f ms late\n", (now - due) / 1e6);
         }
         g_blank_due_ns.store(0, std::memory_order_relaxed);
@@ -509,6 +529,7 @@ constexpr s64 kIdleSliceIterations = 256;
 // deliver interrupts, or the end of the run.
 void LoopHead(lifted::Context& c, u32 address) {
     Scheduler& s = S();
+    c.attention = 0;                    // taken: what asked for it is looked at below
     if (StopRequested() || s.in_interrupt || !s.current || &c != &s.current->context)
         throw lifted::Abort{address, 2};
     const bool idle = s.virtual_time && IdleLoops().count(address) != 0;
@@ -835,7 +856,13 @@ void RunThreads(const lifted::Context& initial, u32 entry, s64 loop_budget) {
                         iop::Run(50'000);           // a short slice: the blank may come meanwhile
                     }
                     if (IopReplyPending()) break;
-                    SleepUntil(std::chrono::steady_clock::now() + std::chrono::microseconds(200));    // (precise: SleepUntil)
+                    // Asleep until the timer marks a blank or an interrupt due
+                    // (TimerTick wakes this at once), or a millisecond: the
+                    // IOP's next slice. A fixed 200 us sleep was 5,000 wakes a
+                    // second - half a core in the kernel through gameplay -
+                    // and a longer one took the blanks late.
+                    u32 seen = g_timer_seq.load(std::memory_order_acquire);
+                    if (!s.vblank_due && !s.timer_due) WaitOnAddress(&g_timer_seq, &seen, sizeof seen, 1);
                 }
                 g_idle_ns.fetch_add(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                             std::chrono::steady_clock::now() - idle_from).count()),
@@ -878,8 +905,9 @@ std::string ThreadReport() {
     std::string out;
     for (auto& [id, t] : S().threads) {
         char line[160];
-        std::snprintf(line, sizeof line, "  thread %u: %s, priority %d, entry 0x%08X, ran %llu times\n", id,
-                      StateName(t->state), t->priority, t->entry, static_cast<unsigned long long>(t->runs));
+        std::snprintf(line, sizeof line, "  thread %u: %s%s, priority %d, entry 0x%08X, ran %llu times\n", id,
+                      StateName(t->state), t->suspended ? " (suspended)" : "", t->priority, t->entry,
+                      static_cast<unsigned long long>(t->runs));
         out += line;
         // Where it is: the innermost calls of its guest stack.
         const std::size_t from = t->calls.size() > 10 ? t->calls.size() - 10 : 0;
@@ -941,6 +969,7 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
             t->stack_size = u32(m.Read(a0 + 12, 4));
             t->gp = u32(m.Read(a0 + 16, 4));
             t->priority = s32(m.Read(a0 + 20, 4));
+            t->initial_priority = t->priority;
             result = t->id;
             s.threads[t->id] = std::move(t);
             return true;
@@ -974,6 +1003,29 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
         case 0x2F: case -0x2F:                       // GetThreadId / iGetThreadId
             result = s.current ? s.current->id : 1;
             return true;
+        case 0x37: case -0x38: {                     // SuspendThread / iSuspendThread(id)
+            // A suspended thread keeps its state - ready, waiting, sleeping - but
+            // is not run until ResumeThread; a wait that ends leaves it ready and
+            // still suspended. The kernel refuses to suspend the running thread
+            // from a thread (an interrupt handler may).
+            Thread* t = Find(a0);
+            if (!t || t->state == State::Dormant || t->suspended ||
+                (t == s.current && !s.in_interrupt)) {
+                result = u64(s64(-1));
+                return true;
+            }
+            t->suspended = true;
+            result = a0;
+            return true;
+        }
+        case 0x39: case -0x3A: {                     // ResumeThread / iResumeThread(id)
+            Thread* t = Find(a0);
+            if (!t || !t->suspended) { result = u64(s64(-1)); return true; }
+            t->suspended = false;
+            result = a0;
+            if (t->state == State::Ready) Preempt(*t);
+            return true;
+        }
         case 0x29: case -0x29: {                     // ChangeThreadPriority(id, priority)
             Thread* t = a0 == 0 ? s.current : Find(a0);
             if (!t) { result = u64(-1); return true; }
@@ -1007,6 +1059,32 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
             }
             result = 0;
             return true;
+        case 0x30: case -0x31: {                     // ReferThreadStatus / iReferThreadStatus(id, status*)
+            // ee_thread_status: status, entry, stack, stack size, gp, initial
+            // and current priority, attr, option, wait type, wait id, wakeups.
+            // Status: running 0x01, ready 0x02, waiting 0x04, suspended 0x08
+            // (with waiting: 0x0C), dormant 0x10. Games read their own priority
+            // so, and wake the threads that wait.
+            Thread* t = a0 == 0 ? s.current : Find(a0);
+            if (!t) { result = u64(s64(-1)); return true; }
+            u32 status = 0, wait_type = 0, wait_id = 0;
+            switch (t->state) {
+                case State::Running: status = 0x01; break;
+                case State::Ready: status = 0x02; break;
+                case State::Waiting: status = 0x04; wait_type = 2; wait_id = t->waiting_on; break;
+                case State::Sleeping: status = 0x04; wait_type = 1; break;
+                case State::Dormant: status = 0x10; break;
+            }
+            if (t->suspended) status = status == 0x04 ? 0x0C : status == 0x10 ? 0x10 : 0x08;
+            if (a1) {
+                const u32 fields[12] = {status, t->entry, t->stack, t->stack_size, t->gp,
+                                        u32(t->initial_priority), u32(t->priority), 0, 0,
+                                        wait_type, wait_id, u32(t->wakeups)};
+                for (int i = 0; i < 12; ++i) m.Write(a1 + 4 * i, fields[i], 4);
+            }
+            result = status;
+            return true;
+        }
         case 0x33: case 0x34: case -0x34: {          // WakeupThread / iWakeupThread
             Thread* t = Find(a0);
             if (!t) { result = u64(-1); return true; }
@@ -1131,6 +1209,7 @@ u64 LostVblanks() { return g_lost_vblanks.load(std::memory_order_relaxed); }
 u64 IdleNanoseconds() { return g_idle_ns.load(std::memory_order_relaxed); }
 void SetVif1Worker(bool on) { g_vif1_worker_wanted = on; }
 void SetRealTimeFrom(u64 frame) { g_real_time_from = frame; }
+void SetPaced(bool on) { g_paced = on; }
 
 void SetFastUntil(u64 frame, unsigned factor) {
     g_fast_until = frame;

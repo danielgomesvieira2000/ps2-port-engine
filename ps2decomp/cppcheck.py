@@ -64,9 +64,6 @@ CALL_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_uint64, ctypes.c_uint32,
 _BUILDS = 0
 
 from . import layout
-# Room left between the derived function's guest stack and a callee's.
-CALLEE_GAP = 0x100
-from .layout import callee_stack_top
 
 
 class CompilerUnavailable(Exception):
@@ -96,11 +93,18 @@ def functions_in(source: str) -> list:
     found = []
     for match in SIGNATURE.finditer(source):
         return_type, name, address, params = match.groups()
-        # arg0..arg7 are vector entries 0..7, farg0..farg7 entries 8..15.
-        indices = [int(n) + (8 if f else 0)
-                   for f, n in re.findall(r"\b(f?)arg(\d+)\b", params)]
-        found.append((int(address, 16), name, return_type, indices, params))
+        found.append((int(address, 16), name, return_type, _indices(params, "v0_in"),
+                      params))
     return found
+
+
+def _indices(params: str, v0_name: str) -> list:
+    """The vector entry of each parameter, in order: arg0..arg7 are entries 0..7,
+    farg0..farg7 entries 8..15, and the incoming $v0 (named `v0_name`) entry 16."""
+    indices = []
+    for f, n, v0 in re.findall(r"\b(?:(f?)arg(\d+)|(%s))\b" % v0_name, params):
+        indices.append(16 if v0 else int(n) + (8 if f else 0))
+    return indices
 
 
 def externs_in(source: str) -> list:
@@ -109,9 +113,8 @@ def externs_in(source: str) -> list:
     found = []
     for match in EXTERN.finditer(source):
         return_type, name, address, params = match.groups()
-        indices = [int(n) + (8 if f else 0)
-                   for f, n in re.findall(r"\b(f?)arg(\d+)\b", params)]
-        found.append((int(address, 16), name, indices, return_type == "u32"))
+        found.append((int(address, 16), name, _indices(params, "v0"),
+                      return_type == "u32"))
     return found
 
 
@@ -161,11 +164,9 @@ def harness_source(functions, typed: bool, externs=()) -> str:
         "u64 CallPointer(u32 address, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,",
         "                u64 a6, u64 a7, u64 f0, u64 f1, u64 f2, u64 f3, u64 f4, u64 f5,",
         "                u64 f6, u64 f7) {",
-        "    u64 vector[16] = {a0, a1, a2, a3, a4, a5, a6, a7,",
-        "                      f0, f1, f2, f3, f4, f5, f6, f7};",
-        "    u32 top = g_sp - 0x%X < 0x%08X ? g_sp - 0x%X : 0x%08X;"
-        % (CALLEE_GAP, callee_stack_top(), CALLEE_GAP, callee_stack_top()),
-        "    return g_call(address, vector, top, 0);",
+        "    u64 vector[17] = {a0, a1, a2, a3, a4, a5, a6, a7,",
+        "                      f0, f1, f2, f3, f4, f5, f6, f7, 0};",
+        "    return g_call(address, vector, g_sp, 0);",
         "}",
         "void StackLeave(u32 size) { g_sp += size; }",
     ]
@@ -173,17 +174,15 @@ def harness_source(functions, typed: bool, externs=()) -> str:
     for address, name, indices, returns_float in externs:
         params = ", ".join("u64 p%d" % index for index in indices) or "void"
         lines.append("%s %s(%s) {" % ("u32" if returns_float else "u64", name, params))
-        lines.append("    u64 vector[16] = {0};")
+        lines.append("    u64 vector[17] = {0};")
         for index in indices:
             lines.append("    vector[%d] = p%d;" % (index, index))
-        # Callees run where the model runs them, or lower if nested derived
-        # functions have already used more guest stack than that.
-        lines.append("    u32 top = g_sp - 0x%X < 0x%08X ? g_sp - 0x%X : 0x%08X;"
-                     % (CALLEE_GAP, callee_stack_top(), CALLEE_GAP, callee_stack_top()))
+        # Callees run at the caller's $sp, as in the original and the model
+        # (paths.Execution): StackEnter has taken the derived function's frame.
         if returns_float:
-            lines.append("    return (u32)g_call(0x%08X, vector, top, 1);" % address)
+            lines.append("    return (u32)g_call(0x%08X, vector, g_sp, 1);" % address)
         else:
-            lines.append("    return g_call(0x%08X, vector, top, 0);" % address)
+            lines.append("    return g_call(0x%08X, vector, g_sp, 0);" % address)
         lines.append("}")
     lines += port_memory("g_read(a, size, is_signed)", "g_write(a, v, size)")
     lines += [
@@ -197,6 +196,9 @@ def harness_source(functions, typed: bool, externs=()) -> str:
         "",
         "/* Returns 1 with *result set, 2 for a void function, 0 if unknown. */",
         'extern "C" __declspec(dllexport) int b3_call(u32 address, const u64* args, s32* result) {',
+        # Every case starts at the stack top: a path that traps returns without
+        # its StackLeave.
+        "    g_sp = 0x%08X;" % layout.CURRENT.stack_top,
         "    switch (address) {",
     ]
     for address, name, return_type, indices, _params in functions:
@@ -293,7 +295,7 @@ class CompiledFunctions:
 
     def _on_call(self, address, arguments, stack_top, float_result):
         try:
-            self.machine.call(address, [arguments[i] for i in range(16)],
+            self.machine.call(address, [arguments[i] for i in range(17)],
                               max_instructions=self.budget, stack_top=stack_top)
             if float_result:
                 return self.machine.fpr[0] & 0xFFFFFFFF
@@ -306,8 +308,8 @@ class CompiledFunctions:
         """An `evaluate(args)` for derive.run_cases, backed by compiled code."""
         def evaluate(args):
             self.error = None
-            values = (ctypes.c_uint64 * 16)(
-                *[(a & MASK64) for a in (list(args) + [0] * 16)[:16]])
+            values = (ctypes.c_uint64 * 17)(
+                *[(a & MASK64) for a in (list(args) + [0] * 17)[:17]])
             result = ctypes.c_int32(0)
             kind = self.library.b3_call(address, values, ctypes.byref(result))
             if self.error is not None:

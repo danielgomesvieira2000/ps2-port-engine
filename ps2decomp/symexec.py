@@ -99,10 +99,18 @@ INT_ARG_REGS = (4, 5, 6, 7, 8, 9, 10, 11)
 FLOAT_ARG_BASE = 8
 FLOAT_ARG_REGS = tuple(range(12, 20))
 ARG_COUNT = 16
+# $v0 as the function was entered with it: what a path that never sets $v0
+# returns. CodeWarrior leaves it so in a void function, or one returning a value
+# on some paths only - a state handler in a table, whose callers through the
+# table may read it. Entry 16 of the vector, after the arguments.
+V0_IN = ARG_COUNT
 
 
 def arg_name(index: int) -> str:
-    """`arg0`..`arg7` for integer arguments, `farg0`..`farg7` for float ones."""
+    """`arg0`..`arg7` for integer arguments, `farg0`..`farg7` for float ones,
+    `v0_in` for the incoming $v0."""
+    if index == V0_IN:
+        return "v0_in"
     if index >= FLOAT_ARG_BASE:
         return "farg%d" % (index - FLOAT_ARG_BASE)
     return "arg%d" % index
@@ -118,7 +126,8 @@ class Arg(Expr):
         return arg_name(self.index)
 
     def evaluate(self, args, read) -> int:
-        return args[self.index] & MASK64
+        # A vector without the incoming $v0 has it 0, as the interpreter's call.
+        return (args[self.index] if self.index < len(args) else 0) & MASK64
 
 
 @dataclasses.dataclass(frozen=True)

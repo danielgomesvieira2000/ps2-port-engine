@@ -665,6 +665,38 @@ def invert_empty_then(lines):
     return out
 
 
+_LABEL = re.compile(r"^L_([0-9A-F]{8}):;$")
+_GOTO = re.compile(r"goto L_([0-9A-F]{8});")
+
+
+def tick_backward_gotos(lines):
+    """A goto to a label above it is another turn of a loop, and spends budget
+    as one: `{ Tick(c, X); goto L_X; }` - unless the label is a loop header's,
+    with its Tick straight after. Without it a loop the structuring left as
+    gotos never gives the host control: Resident Evil Outbreak's 0x001A9AC0
+    polls a loader for ever, its head a one-instruction block copied onto every
+    edge into it (so no header with a Tick is ever emitted)."""
+    lines = list(lines)
+    seen, ticked = set(), set()
+    for k, line in enumerate(lines):
+        label = _LABEL.match(line.strip())
+        if label:
+            seen.add(label.group(1))
+            following = next((l.strip() for l in lines[k + 1:] if l.strip()), "")
+            if following.endswith("Tick(c, 0x%su);" % label.group(1)):
+                ticked.add(label.group(1))
+            continue
+
+        def guarded(match):
+            target = match.group(1)
+            if target not in seen or target in ticked:
+                return match.group(0)
+            return "{ Tick(c, 0x%su); goto L_%s; }" % (target, target)
+
+        lines[k] = _GOTO.sub(guarded, line)
+    return lines
+
+
 def loop_guards(lines):
     """A loop ending in `if (C) { A continue; } else { break; }` is `if (!C)
     break; A`; and a loop whose first test that is - `for (;;) { Tick; if (!C)
@@ -1032,6 +1064,6 @@ def structure_function(image: bytes, base: int, start: int, end: int,
     lines.append("    (void)out; (void)in; (void)leave;")
     body = drop_empty_else(hoist_delay_slots(fold_links(fold_addresses(fold_constants(out_lines, strings),
                                                                        strings))))
-    lines += loop_guards(loops_to_do_while(invert_empty_then(body)))
+    lines += tick_backward_gotos(loop_guards(loops_to_do_while(invert_empty_then(body))))
     lines.append("}")
     return "\n".join(lines) + "\n"

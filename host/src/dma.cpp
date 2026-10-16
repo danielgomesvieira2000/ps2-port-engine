@@ -45,16 +45,17 @@ void Send(std::uint32_t from, std::uint32_t quadwords, DmaOutcome& outcome, cons
 }  // namespace
 
 DmaOutcome SendDma(DmaChannelState& ch, const std::function<void(std::uint32_t)>& word,
-                   std::uint32_t max_tags) {
+                   std::uint32_t max_tags, bool tags) {
     return SendDmaBlocks(ch, [&word](const std::uint32_t* words, std::uint32_t count, std::uint32_t from) {
         for (std::uint32_t i = 0; i < count; ++i) {
             g_dma_source = from + 4 * i;
             word(words[i]);
         }
-    }, max_tags);
+    }, max_tags, tags);
 }
 
-DmaOutcome SendDmaBlocks(DmaChannelState& ch, const DmaBlockSink& word, std::uint32_t max_tags) {
+DmaOutcome SendDmaBlocks(DmaChannelState& ch, const DmaBlockSink& word, std::uint32_t max_tags,
+                         bool tags) {
     DmaOutcome outcome;
     const std::uint32_t mode = (ch.chcr >> 2) & 3;
     // Normal mode, or a chain resumed with QWC still owed: data from MADR first.
@@ -67,7 +68,12 @@ DmaOutcome SendDmaBlocks(DmaChannelState& ch, const DmaBlockSink& word, std::uin
         outcome.ended = true;
         return outcome;
     }
-    const bool transfer_tags = (ch.chcr >> 6) & 1, irq_ends = (ch.chcr >> 7) & 1;
+    // TTE: the VIFs take a tag's upper half as VIFcodes; the GIF does not. Sent
+    // there, the zeros ahead of a packet misaligned its GIFtag - Resident Evil
+    // Outbreak starts PATH3 with TTE set in a scene after a door, its frame's
+    // register packet (ZBUF's depth clear among them) was lost, and the scene
+    // was drawn against a depth buffer never cleared: black.
+    const bool transfer_tags = tags && ((ch.chcr >> 6) & 1), irq_ends = (ch.chcr >> 7) & 1;
     std::uint32_t depth = (ch.chcr >> 4) & 3;       // ASP: call stack depth
     Memory& m = GuestMemory();
     while (outcome.tags < max_tags) {

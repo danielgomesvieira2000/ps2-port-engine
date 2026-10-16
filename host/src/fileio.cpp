@@ -17,6 +17,11 @@
  *   procedure 2  read   descriptor 0x0C, EE buffer 0x10, size 0x14      -> bytes read
  *   procedure 4  lseek  descriptor 0x0C, offset 0x10, whence 0x14       -> position
  *
+ * Procedure 0xFF initialises the service: its 8-byte answer begins with the
+ * module's release, four characters ("2800"), which newer libraries check
+ * against their own before any request (Resident Evil Outbreak's sceOpen fails
+ * without it); the second word is 0.
+ *
  * Any other procedure is noted and fails (-1); they are added as games need them.
  */
 
@@ -107,7 +112,11 @@ s32 Seek(const std::vector<u8>& data) {
 }
 
 std::vector<u8> FileIo(u32 procedure, const std::vector<u8>& data) {
-    if (procedure == 0xFF) return std::vector<u8>(8, 0);   // the service's initialisation
+    if (procedure == 0xFF) {                                  // the service's initialisation
+        std::vector<u8> answer(8, 0);
+        std::memcpy(answer.data(), IopRelease(), 4);
+        return answer;
+    }
     s32 result;
     switch (procedure) {
         case 0: result = Open(data); break;

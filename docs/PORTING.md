@@ -379,6 +379,15 @@ function already translated runs that translation directly.
 These translations are not verified - the interpreter never runs them - and the
 generated source says so.
 
+**Overlays** - code a game loads from its disc over free memory, several of them
+at the same address in turn - are decompiled as games of their own
+(ARCHITECTURE.md, *Overlays*) and listed in the game's `game.json`
+(`"overlays": ["overlays/game", ...]`). port.py builds each overlay's
+translations in a namespace of its own, and a table of its functions with the
+first 16 bytes of each one's original code. A call into an overlay's range runs
+the function of the overlay whose code is in memory there; a FlushCache, which
+a program issues after loading code, makes calls look again.
+
 ## Overrides
 
 `ps2host::Override(address, function, name)` replaces the guest function at an

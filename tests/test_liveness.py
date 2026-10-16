@@ -49,6 +49,37 @@ class TestFold(unittest.TestCase):
         self.assertEqual(code[0], "t0 = lo + 1;")
 
 
+class TestReferenceOutputs(unittest.TestCase):
+    def test_hi_is_not_read_after_the_next_divide(self):
+        # CRI's adxt_stat_decinfo (Resident Evil Outbreak 0x001341B0): div; addiu;
+        # mfhi; div. mfhi takes the first remainder - the loop's 488-byte skip.
+        code, _ = fold(["Divide(hi, lo, v0, t0, true);", "v0 = Sx32(v0 + 0x7FFu);", "v1 = hi;",
+                        "Divide(hi, lo, v0, t0, true);", "v1 = Sx32(t0 - v1);", "Write32((u32)a0, (u32)v1);"])
+        mfhi = code.index("v1 = hi;") if "v1 = hi;" in code else None
+        self.assertIsNotNone(mfhi, code)
+        self.assertLess(mfhi, code.index("Divide(hi, lo, v0, t0, true);", 1) if code.count(
+            "Divide(hi, lo, v0, t0, true);") > 1 else len(code), code)
+        second = [k for k, line in enumerate(code) if line.startswith("Divide(") and k > 0][-1]
+        self.assertLess(mfhi, second, code)
+
+    def test_a_multiply_defines_hi_and_lo(self):
+        _, defined = liveness.uses_defs("Multiply(hi, lo, a0, a1, true, false); v0 = lo;", SYNCED, RETURNED)
+        self.assertEqual(defined, {"hi", "lo", "v0"})
+
+    def test_a_lane_operation_defines_its_destination(self):
+        _, defined = liveness.uses_defs("Lanes(kPadduw, v0, c.rh[2], a0, c.rh[4], a1, c.rh[5]);",
+                                        SYNCED, RETURNED)
+        self.assertEqual(defined, {"v0"})
+        # t0 = v0 + 1 may not move past the Lanes that rewrites v0.
+        code, _ = fold(["t0 = v0 + 1;", "Lanes(kPadduw, v0, c.rh[2], a0, c.rh[4], a1, c.rh[5]);",
+                        "v1 = t0;"])
+        self.assertEqual(code[0], "t0 = v0 + 1;")
+
+    def test_nothing_folds_into_a_reference(self):
+        code, _ = fold(["hi = a0;", "Multiply(hi, lo, a1, t0, true, true); v0 = lo;"])
+        self.assertEqual(code[0], "hi = a0;")
+
+
 class TestConditionalAssignment(unittest.TestCase):
     def test_a_conditional_assignment_does_not_kill_its_target(self):
         # movn after a shift: the shifted value survives when the condition fails.

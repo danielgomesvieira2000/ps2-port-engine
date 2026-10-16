@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <map>
 #include <vector>
 
 #include "ps2rt/types.h"
@@ -50,6 +51,12 @@ public:
 
     u64 Read(u32 address, u32 size);
     void Write(u32 address, u64 value, u32 size);
+    /* `count` bytes, as that many one-byte Writes would store them: at once where
+       they land in plain memory and no store is watched (a disc read, an RPC's
+       answer - byte by byte, a megabyte took a million Writes). */
+    void WriteBytes(u32 address, const u8* bytes, std::size_t count);
+    /* And `count` bytes read, as one-byte Reads would. */
+    void ReadBytes(u32 address, u8* bytes, std::size_t count);
 
     /* Device registers: a read hook returns the value to read; a write hook
        receives the value written (already stored as plain memory). Hooks are
@@ -69,10 +76,17 @@ public:
        scratchpad (no register hooks there) may go straight through Translate. */
     bool watching() const { return !watched_.empty(); }
 
+    /* The device registers the EE's thread read or wrote, by address, and how
+       often (the run's report). Counted in arrays like the hooks: a map's
+       lookup on each of the millions of accesses a game makes cost more than
+       the access. */
+    std::map<u32, u64> RegisterCounts(bool written) const;
+
 private:
     std::vector<u8> rdram_, scratchpad_, ee_registers_, vu_memory_, gs_registers_, iop_ram_, bios_;
     std::vector<ReadHook> read_hooks_;      /* per register word, both windows */
     std::vector<WriteHook> write_hooks_;
+    std::vector<u64> read_counts_, write_counts_;   /* per register word, as the hooks */
     std::vector<u32> watched_;               /* physical addresses */
     void Watched(u32 address, u64 value, u32 size);
 };

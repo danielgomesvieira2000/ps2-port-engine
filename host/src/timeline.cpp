@@ -17,6 +17,12 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 namespace ps2host::timeline {
 
 namespace {
@@ -81,7 +87,61 @@ u64 Now() {
                    std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+namespace {
+// The named threads, for ThreadCpu: a handle each, and their CPU time and the
+// clock at the last report.
+struct Named {
+    std::string name;
+#ifdef _WIN32
+    HANDLE handle = nullptr;
+#endif
+    u64 last_cpu_100ns = 0;
+};
+std::mutex g_named_mutex;
+std::vector<Named> g_named;
+std::chrono::steady_clock::time_point g_named_since = std::chrono::steady_clock::now();
+}  // namespace
+
+std::string ThreadCpu() {
+    std::lock_guard<std::mutex> hold(g_named_mutex);
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - g_named_since).count();
+    g_named_since = now;
+    std::string out;
+#ifdef _WIN32
+    for (Named& n : g_named) {
+        FILETIME created, exited, kernel, user;
+        if (!GetThreadTimes(n.handle, &created, &exited, &kernel, &user)) continue;
+        const u64 cpu = (u64(kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime) +
+                        (u64(user.dwHighDateTime) << 32 | user.dwLowDateTime);
+        const u64 used = cpu - n.last_cpu_100ns;
+        n.last_cpu_100ns = cpu;
+        if (seconds <= 0) continue;
+        char one[96];
+        std::snprintf(one, sizeof one, "%s%s %d%%", out.empty() ? "" : ", ", n.name.c_str(),
+                      int(100.0 * double(used) / 1e7 / seconds + 0.5));
+        out += one;
+    }
+#endif
+    return out;
+}
+
 void NameThread(const char* name) {
+#ifdef _WIN32
+    {
+        wchar_t wide[64] = {};
+        for (int i = 0; i < 63 && name[i]; ++i) wide[i] = wchar_t(name[i]);
+        SetThreadDescription(GetCurrentThread(), wide);
+        HANDLE self = nullptr;
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self,
+                        THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0);
+        std::lock_guard<std::mutex> hold(g_named_mutex);
+        Named n;
+        n.name = name;
+        n.handle = self;
+        g_named.push_back(n);
+    }
+#endif
     if (!Path()) return;
     Lane& lane = ThisLane();
     std::lock_guard<std::mutex> hold(g_lanes_mutex);

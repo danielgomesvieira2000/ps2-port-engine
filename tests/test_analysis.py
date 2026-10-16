@@ -104,5 +104,49 @@ class TestSwitches(unittest.TestCase):
         self.assertEqual(a.functions[BASE].end, BASE + 0x40)
 
 
+
+class TestScheduledEntry(unittest.TestCase):
+    """An instruction scheduled above the frame setup belongs to the function.
+
+        f:  jr $ra; nop
+        g:  lui $v0, 0x21; addiu $sp, $sp, -0x10; lw $v1, 0($v0); ...; jr $ra
+    """
+
+    LUI_V0 = (0x0F << 26) | (2 << 16) | 0x21
+    ADDIU_SP = (0x09 << 26) | (29 << 21) | (29 << 16) | 0xFFF0
+    ADDIU_SP_BACK = (0x09 << 26) | (29 << 21) | (29 << 16) | 0x10
+    LW_V1_V0 = (0x23 << 26) | (2 << 21) | (3 << 16)
+
+    def run_on(self, words):
+        a = analyzer(words)
+        a.run()
+        return sorted(a.functions)
+
+    def test_the_function_starts_at_the_scheduled_instruction(self):
+        words = [JR_RA, NOP, self.LUI_V0, self.ADDIU_SP, self.LW_V1_V0, JR_RA,
+                 self.ADDIU_SP_BACK]
+        self.assertIn(BASE + 8, self.run_on(words))
+        self.assertNotIn(BASE + 12, self.run_on(words))
+
+    def test_padding_may_come_between(self):
+        words = [JR_RA, NOP, NOP, self.LUI_V0, self.ADDIU_SP, self.LW_V1_V0, JR_RA,
+                 self.ADDIU_SP_BACK]
+        self.assertIn(BASE + 12, self.run_on(words))
+        self.assertNotIn(BASE + 16, self.run_on(words))
+
+    def test_five_scheduled_instructions(self):
+        # 0x001ADF00: sll, lui, addu, sll, sll, then the frame setup.
+        SLL_V0 = (2 << 11) | (4 << 16) | (1 << 6)
+        words = [JR_RA, NOP] + [SLL_V0] * 4 + [self.LUI_V0, self.ADDIU_SP, self.LW_V1_V0,
+                                               JR_RA, self.ADDIU_SP_BACK]
+        self.assertIn(BASE + 8, self.run_on(words))
+        self.assertNotIn(BASE + 28, self.run_on(words))
+
+    def test_a_branch_before_the_setup_is_not_taken_in(self):
+        words = [JR_RA, NOP, B_FORWARD, self.ADDIU_SP, self.LW_V1_V0, JR_RA,
+                 self.ADDIU_SP_BACK]
+        self.assertNotIn(BASE + 8, self.run_on(words))
+
+
 if __name__ == "__main__":
     unittest.main()

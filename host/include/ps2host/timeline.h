@@ -20,6 +20,7 @@
 #define PS2HOST_TIMELINE_H
 
 #include <cstdint>
+#include <string>
 
 namespace ps2host::timeline {
 
@@ -27,8 +28,13 @@ namespace ps2host::timeline {
 bool On();
 /* Now, in the timeline's clock (steady, nanoseconds). */
 std::uint64_t Now();
-/* The calling thread's lane name ("EE", "GS", "VIF1", "present"...). */
+/* The calling thread's name ("EE", "GS", "VIF1 worker", "present"...): its
+   lane's, the system's (debuggers and profilers show it), and one the
+   threads' CPU report (ThreadCpu) counts. Always, profiling on or off. */
 void NameThread(const char* name);
+/* --frame-times: each named thread's share of a core since the last call
+   ("EE 21%, VIF1 worker 46%, ..."), user and system time together. */
+std::string ThreadCpu();
 /* A span of work on the calling thread, [from, to); one of the same name
    ending within 20 us before it is extended instead (the file stays small). */
 void Span(const char* name, std::uint64_t from_ns, std::uint64_t to_ns);

@@ -183,17 +183,7 @@ void Lanes(int op, u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
     LanesScalar(op, lo, hi, alo, ahi, blo, bhi);
 }
 
-void ShiftHalfwordsRight(u64& lo, u64& hi, u64 blo, u64 bhi, u32 amount) {
-    const u64 in[2] = {blo, bhi};
-    u64 out[2] = {0, 0};
-    for (int half = 0; half < 2; ++half)
-        for (int shift = 0; shift < 64; shift += 16)
-            out[half] |= (((in[half] >> shift) & 0xFFFF) >> (amount & 0xF)) << shift;
-    lo = out[0];
-    hi = out[1];
-}
-
-void ShiftLanes(u64& lo, u64& hi, u64 blo, u64 bhi, u32 width, u32 kind, u32 amount) {
+void ShiftLanesScalar(u64& lo, u64& hi, u64 blo, u64 bhi, u32 width, u32 kind, u32 amount) {
     const u64 mask = (1ull << width) - 1;
     amount &= width - 1;
     const u64 in[2] = {blo, bhi};
@@ -215,6 +205,29 @@ void ShiftLanes(u64& lo, u64& hi, u64 blo, u64 bhi, u32 width, u32 kind, u32 amo
     }
     lo = out[0];
     hi = out[1];
+}
+
+/* Halfword and word lanes in SSE2 (psllw/psrlw/psraw, and the d forms): the
+   same shifts, eight or four lanes at once; a movie's decoder makes them by
+   the million (Resident Evil Outbreak's Sofdec). */
+void ShiftLanes(u64& lo, u64& hi, u64 blo, u64 bhi, u32 width, u32 kind, u32 amount) {
+#if defined(__SSE2__) || defined(_M_X64)
+    if ((width == 16 || width == 32) && kind <= 2) {
+        const __m128i x = _mm_set_epi64x(s64(bhi), s64(blo));
+        const __m128i n = _mm_cvtsi32_si128(int(amount & (width - 1)));
+        __m128i r;
+        if (width == 16) r = kind == 0 ? _mm_sll_epi16(x, n) : kind == 1 ? _mm_srl_epi16(x, n) : _mm_sra_epi16(x, n);
+        else r = kind == 0 ? _mm_sll_epi32(x, n) : kind == 1 ? _mm_srl_epi32(x, n) : _mm_sra_epi32(x, n);
+        lo = u64(_mm_cvtsi128_si64(r));
+        hi = u64(_mm_cvtsi128_si64(_mm_unpackhi_epi64(r, r)));
+        return;
+    }
+#endif
+    ShiftLanesScalar(lo, hi, blo, bhi, width, kind, amount);
+}
+
+void ShiftHalfwordsRight(u64& lo, u64& hi, u64 blo, u64 bhi, u32 amount) {
+    ShiftLanes(lo, hi, blo, bhi, 16, 1, amount);
 }
 
 void InterleaveScalar(u64& lo, u64& hi, u64 a, u64 b, u32 width) {

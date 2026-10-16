@@ -295,7 +295,9 @@ std::string Walk(const Channel& ch, u32 chcr, bool describe) {
     char text[160] = "";
     try {
         Timed timed(Section::Dma);      // (VU1 and the GS, which it drives, timed apart)
-        const DmaOutcome outcome = SendDmaBlocks(state, sink);
+        // The GIF takes no chain tags (TTE): dma.h.
+        const bool tags = ch.base != 0x1000A000u;
+        const DmaOutcome outcome = SendDmaBlocks(state, sink, 1u << 16, tags);
         if (describe)
             std::snprintf(text, sizeof text, "%llu quadwords, %u tags%s",
                       static_cast<unsigned long long>(outcome.quadwords), outcome.tags,
@@ -416,7 +418,7 @@ void FrameTimes(u64 frame) {
     const u64 gs_us = GsBusyMicroseconds();
     const Clock::time_point now = Clock::now();
     const double seconds = std::chrono::duration<double>(now - last).count();
-    char job_text[512] = "";
+    char job_text[1024] = "";
     if (seconds > 0)
         std::snprintf(job_text, sizeof job_text, "%s, GS thread busy %d%%",
                       worker_us != last_worker_us
@@ -478,6 +480,13 @@ void FrameTimes(u64 frame) {
     last_skipped = skipped;
     // Frames here are vertical blanks; a game that cannot keep up draws a
     // picture every other one (or less), which the VIF1 transfers show.
+    {
+        const std::string cpu = timeline::ThreadCpu();
+        if (!cpu.empty()) {
+            const std::size_t used = std::strlen(job_text);
+            std::snprintf(job_text + used, sizeof job_text - used, "; CPU: %s", cpu.c_str());
+        }
+    }
     std::fprintf(stderr, "[frames] %llu-%llu: %.2f s, %.1f frames a second, %.1f VIF1 transfers a second%s\n",
                  static_cast<unsigned long long>(last_frame), static_cast<unsigned long long>(frame), seconds,
                  seconds > 0 ? double(frame - last_frame) / seconds : 0.0,

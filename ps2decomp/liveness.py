@@ -35,6 +35,49 @@ def names(text: str) -> set:
     return set(_NAME.findall(text))
 
 
+# The runtime's helpers that write through reference parameters (ps2rt/lifted.h),
+# and which arguments they write: `Divide(hi, lo, v0, s0, true);` defines hi and
+# lo as surely as `hi = ...;` would. Unseen, a `v1 = hi;` (mfhi) folded past the
+# next Divide into its use and read the later quotient's remainder - CRI's ADX
+# player skipped 489 bytes to its loop where 488 were due, and every looping
+# stream played full-scale noise after its first loop (Resident Evil Outbreak).
+_OUTPUTS = {"Multiply": (0, 1), "Divide": (0, 1), "AddBytes": (0, 1), "Lanes": (1, 2),
+            "LanesScalar": (1, 2), "InterleaveScalar": (0, 1), "ShiftHalfwordsRight": (0, 1),
+            "ShiftLanes": (0, 1), "ShiftLanesScalar": (0, 1), "Interleave": (0, 1),
+            "PackHalfwords": (0, 1), "PackBytes": (0, 1), "FunnelShift": (0, 1)}
+_HELPER = re.compile(r"\b(%s)\(" % "|".join(_OUTPUTS))
+_WHOLE_NAME = re.compile(r"^%s$" % REGISTER)
+
+
+def _arguments(text: str, start: int) -> list:
+    """The top-level arguments of the call whose `(` ends just before `start`."""
+    args, depth, begin = [], 0, start
+    for k in range(start, len(text)):
+        ch = text[k]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                args.append(text[begin:k].strip())
+                return args
+            depth -= 1
+        elif ch == "," and depth == 0:
+            args.append(text[begin:k].strip())
+            begin = k + 1
+    return args
+
+
+def outputs(statement: str) -> set:
+    """The registers a statement's helper calls write through their references."""
+    found = set()
+    for match in _HELPER.finditer(statement):
+        args = _arguments(statement, match.end())
+        for index in _OUTPUTS[match.group(1)]:
+            if index < len(args) and _WHOLE_NAME.match(args[index]):
+                found.add(args[index])
+    return found
+
+
 def simple(statement: str):
     """(target, expression) for `x = expr;` with a side-effect-free expression."""
     match = _SIMPLE.match(statement)
@@ -62,7 +105,7 @@ def uses_defs(statement: str, synced: set, returned: set):
     if target is not None:
         return names(target[1]), {target[0]}
     assigned = set(re.findall(r"\b(%s) = " % REGISTER, statement))
-    return names(statement), assigned
+    return names(statement), assigned | outputs(statement)
 
 
 def live_out(blocks, succs, synced, returned, condition_of, slot_of):
@@ -144,8 +187,10 @@ def fold(code: list, condition: str, live_after: set, synced: set, returned: set
                 textual = len(pattern.findall(text))
                 s_use, s_def = uses_defs(text, synced, returned)
                 if target in s_use or textual:
-                    if use_at is not None or textual != 1 or "{" in text:
-                        ok = False         # a second use, a hidden one, or a compound
+                    if use_at is not None or textual != 1 or "{" in text or target in outputs(text):
+                        # A second use, a hidden one, a compound - or a helper's
+                        # reference, which takes the register, not a value.
+                        ok = False
                         break
                     use_at = j
                     if target in s_def:

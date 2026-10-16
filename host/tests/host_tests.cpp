@@ -15,6 +15,8 @@
 #include "ps2host/disc.h"
 #include "ps2host/dma.h"
 #include "ps2host/gs.h"
+#include "ps2host/host.h"
+#include "ps2host/run.h"
 #include "ps2host/ipu.h"
 #include "iop_vm_internal.h"
 #include "spu2.h"
@@ -231,6 +233,14 @@ void DmaChainsAreWalked() {
           words[8] == 0xE0u, "tags' upper halves, then each tag's data, in order");
     Check(((ch.chcr >> 28) & 7) == 7 && ((ch.chcr >> 4) & 3) == 0,
           "the TAG field and the call depth are left as at the end");
+    // The GIF takes no tags: with TTE set, only the data reaches it (Resident
+    // Evil Outbreak's PATH3 after a door, its register packet misaligned).
+    PutTag(chain, 1, 7, 0, 0, 0);                   // end, its one qword after it
+    for (u32 i = 0; i < 4; ++i) m.Write(chain + 16 + 4 * i, 0xF0 + i, 4);
+    ps2host::DmaChannelState gif{0x145u, 0, 0, chain, 0, 0};
+    std::vector<u32> gif_words;
+    ps2host::SendDma(gif, [&gif_words](u32 w) { gif_words.push_back(w); }, 1u << 16, false);
+    Check(gif_words.size() == 4 && gif_words[0] == 0xF0u, "a channel taking no tags ignores TTE");
     // A chain that never ends is stopped, not followed forever.
     PutTag(chain, 0, 2, chain, 0, 0);               // next -> itself
     ps2host::DmaChannelState loop{0x105u, 0, 0, chain, 0, 0};
@@ -1291,6 +1301,17 @@ void MmiLanesAreScalar() {
             ++checked;
             if (lo1 != lo2 || hi1 != hi2) ++wrong;
         }
+    for (u32 width : {16u, 32u, 64u})
+        for (u32 kind = 0; kind < 3; ++kind)
+            for (int trial = 0; trial < 2000; ++trial) {
+                const u64 blo = value(), bhi = value();
+                const u32 amount = u32(value());
+                u64 lo1, hi1, lo2, hi2;
+                lifted::ShiftLanes(lo1, hi1, blo, bhi, width, kind, amount);
+                lifted::ShiftLanesScalar(lo2, hi2, blo, bhi, width, kind, amount);
+                ++checked;
+                if (lo1 != lo2 || hi1 != hi2) ++wrong;
+            }
     char what[128];
     std::snprintf(what, sizeof what, "MMI lanes in SSE2 are the model's (%u of %u differ)", wrong, checked);
     Check(wrong == 0, what);
@@ -1354,6 +1375,165 @@ void IopInstructionsMatchTheR5900() {
 }
 
 }  // namespace
+
+// A core's sound-data input (a block transfer's PCM): heard at its BVOL in the
+// dry mix MMIX lets it into; silent at BVOL 0, and once stopped.
+void SpuPlaysItsSoundDataInput() {
+    using ps2host::iop::Spu2;
+    std::vector<Spu2::u8> pcm(0x800);
+    for (int block = 0; block < 2; ++block)
+        for (int i = 0; i < 256; ++i) {
+            const Spu2::s16 left = 8192, right = -8192;
+            std::memcpy(&pcm[block * 0x400 + i * 2], &left, 2);
+            std::memcpy(&pcm[block * 0x400 + 0x200 + i * 2], &right, 2);
+        }
+    auto play = [&](Spu2::u32 bvol, bool stop) {
+        Spu2 spu;
+        std::vector<Spu2::s16> heard;
+        spu.SetOutput([&](const Spu2::s16* frames, Spu2::u32 count) { heard.assign(frames, frames + 2 * count); });
+        spu.SetParam(0x0801, 0x00C0);                   // MMIX, core 1: the input, dry
+        spu.SetParam(0x0F01, bvol);                     // BVOLL
+        spu.SetParam(0x1001, bvol);                     // BVOLR
+        spu.SetInput(1, pcm.data(), Spu2::u32(pcm.size()));
+        if (stop) spu.SetInput(1, nullptr, 0);
+        spu.Advance(1000, [](Spu2::u32) {});
+        spu.Advance(11000, [](Spu2::u32) {});           // 10 ms: 480 samples
+        return heard;
+    };
+    const std::vector<Spu2::s16> loud = play(0x7FFF, false);
+    Check(loud.size() >= 2 && loud[loud.size() - 2] > 1000 && loud.back() < -1000,
+          "SPU2: the sound-data input, left and right");
+    const std::vector<Spu2::s16> muted = play(0, false), stopped = play(0x7FFF, true);
+    Check(!muted.empty() && muted[muted.size() - 2] == 0 && muted.back() == 0,
+          "SPU2: the sound-data input at BVOL 0 is silent");
+    Check(!stopped.empty() && stopped.back() == 0, "SPU2: a stopped input is silent");
+}
+
+// The cores' routing (PCSX2's mixer): core 0's output is core 1's external
+// input, heard at core 1's AVOL (silent at 0); MMIX's external bits (0-3) do
+// not let the sound-data input in - its own are 4-7.
+void SpuRoutesCore0ThroughCore1() {
+    using ps2host::iop::Spu2;
+    auto play = [](Spu2::u32 avol) {
+        Spu2 spu;
+        Spu2::u8 loop[16] = {0x00, 0x07};
+        for (int i = 2; i < 16; ++i) loop[i] = 0x11;
+        spu.Write(0x5000, loop, 16);
+        std::vector<Spu2::s16> heard;
+        spu.SetOutput([&](const Spu2::s16* frames, Spu2::u32 count) { heard.assign(frames, frames + 2 * count); });
+        spu.SetAddr(0x2000, 0x5000);                // voice 0 of core 0
+        spu.SetParam(0x0000, 0x3FFF);
+        spu.SetParam(0x0100, 0x3FFF);
+        spu.SetParam(0x0200, 0x1000);
+        spu.SetParam(0x0300, 0x000F);
+        spu.SetParam(0x0400, 0x1FC0);
+        spu.SetParam(0x0D01, avol);                 // AVOLL, core 1
+        spu.SetParam(0x0E01, avol);
+        spu.SetSwitch(0x1800, 1);
+        spu.SetSwitch(0x1A00, 1);
+        spu.SetSwitch(0x1500, 1);
+        spu.Advance(1000, [](Spu2::u32) {});
+        spu.Advance(2000, [](Spu2::u32) {});
+        return heard.size() == 96 ? int(heard[90]) : -1;
+    };
+    Check(play(0x7FFF) > 3500, "SPU2: core 0 heard through core 1");
+    Check(play(0) == 0, "SPU2: core 0 silent at core 1's AVOL 0");
+    std::vector<Spu2::u8> pcm(0x800, 0x40);
+    Spu2 spu;
+    std::vector<Spu2::s16> heard;
+    spu.SetOutput([&](const Spu2::s16* frames, Spu2::u32 count) { heard.assign(frames, frames + 2 * count); });
+    spu.SetParam(0x0801, 0x000F);                   // MMIX, core 1: the external input only
+    spu.SetInput(1, pcm.data(), Spu2::u32(pcm.size()));
+    spu.Advance(1000, [](Spu2::u32) {});
+    spu.Advance(2000, [](Spu2::u32) {});
+    Check(!heard.empty() && heard.back() == 0, "SPU2: the external bits keep the sound-data input out");
+}
+
+// A voice's samples go through the hardware's Gaussian interpolation, whose
+// four taps sum to 0x7F80, not 0x8000: a block of 4096s plays as ~4080 (4095
+// through linear interpolation, as before).
+void SpuInterpolatesAsTheHardware() {
+    using ps2host::iop::Spu2;
+    Spu2 spu;
+    Spu2::u8 loop[16] = {0x00, 0x07};
+    for (int i = 2; i < 16; ++i) loop[i] = 0x11;
+    spu.Write(0x5000, loop, 16);
+    std::vector<Spu2::s16> heard;
+    spu.SetOutput([&](const Spu2::s16* frames, Spu2::u32 count) { heard.assign(frames, frames + 2 * count); });
+    spu.SetAddr(0x2000, 0x5000);
+    spu.SetParam(0x0000, 0x3FFF);
+    spu.SetParam(0x0100, 0x3FFF);
+    spu.SetParam(0x0200, 0x1000);
+    spu.SetParam(0x0300, 0x000F);
+    spu.SetParam(0x0400, 0x1FC0);
+    spu.SetSwitch(0x1800, 1);
+    spu.SetSwitch(0x1A00, 1);
+    spu.SetSwitch(0x1500, 1);
+    spu.Advance(1000, [](Spu2::u32) {});
+    spu.Advance(2000, [](Spu2::u32) {});
+    Check(heard.size() == 96 && heard[90] >= 4070 && heard[90] <= 4088,
+          "SPU2: a voice's samples through the Gaussian table");
+}
+
+// The reverb runs at 24 kHz, its input and output resampled by the hardware's
+// half-band FIR: a 1.5 kHz tone through it, its 24 kHz image (22.5 kHz) below
+// -40 dB of the tone. A step's output held for two samples left it at -20 dB.
+void SpuReverbHasNoImage() {
+    using ps2host::iop::Spu2;
+    std::vector<Spu2::u8> pcm(0x1000);              // 1,024 samples: 32 periods of 1.5 kHz
+    for (int block = 0; block < 4; ++block)
+        for (int i = 0; i < 256; ++i) {
+            const double t = double(block * 256 + i) / 48000.0;
+            const Spu2::s16 s = Spu2::s16(8000.0 * std::sin(2.0 * 3.14159265358979 * 1500.0 * t));
+            std::memcpy(&pcm[block * 0x400 + i * 2], &s, 2);
+            std::memcpy(&pcm[block * 0x400 + 0x200 + i * 2], &s, 2);
+        }
+    Spu2 spu;
+    std::vector<Spu2::s16> heard;
+    spu.SetOutput([&](const Spu2::s16* frames, Spu2::u32 count) { heard.insert(heard.end(), frames, frames + 2 * count); });
+    spu.SetParam(0x0801, 0x0030);                   // MMIX, core 1: the input, wet only
+    spu.SetParam(0x0F01, 0x7FFF);
+    spu.SetParam(0x1001, 0x7FFF);
+    Check(spu.SetEffectAttr(1, 0x101, 0x3FFF, 0x3FFF, 0, 0) == 0, "SPU2: the Room preset on core 1");
+    spu.SetCoreAttr(0x3, 1);                        // SD_CORE_EFFECT_ENABLE, core 1
+    spu.SetInput(1, pcm.data(), Spu2::u32(pcm.size()));
+    spu.Advance(1000, [](Spu2::u32) {});
+    spu.Advance(1000 + 300000, [](Spu2::u32) {});   // 300 ms
+    auto bin = [&](double hz) {
+        double re = 0, im = 0;
+        const std::size_t from = heard.size() / 2 - 9600;
+        for (std::size_t k = 0; k < 9600; ++k) {
+            const double w = 2.0 * 3.14159265358979 * hz * double(k) / 48000.0;
+            re += heard[2 * (from + k)] * std::cos(w);
+            im += heard[2 * (from + k)] * std::sin(w);
+        }
+        return std::sqrt(re * re + im * im);
+    };
+    const double tone = bin(1500), image = bin(22500);
+    Check(tone > 1e5, "SPU2: the reverb passes the tone");
+    Check(image < tone * 0.01, "SPU2: the reverb's output has no 24 kHz image");
+}
+
+// The input's half-buffer interrupt comes from where the SPU2 plays: each half
+// begun stops the Advance there (the IOP refills the half before it is read
+// again), InputHalf says which half plays, and PlayedUs where it stopped.
+void SpuInputInterruptsAtEachHalf() {
+    using ps2host::iop::Spu2;
+    std::vector<Spu2::u8> pcm(0x1000);              // two halves of 512 samples
+    Spu2 spu;
+    Spu2::u32 played = 0;
+    spu.SetOutput([&](const Spu2::s16*, Spu2::u32 count) { played += count; });
+    spu.SetInput(1, pcm.data(), Spu2::u32(pcm.size()));
+    std::vector<Spu2::u32> halves;
+    auto half = [&](Spu2::u32 core) { halves.push_back(spu.InputHalf(core)); };
+    spu.Advance(1000, [](Spu2::u32) {}, half);
+    spu.Advance(1000 + 30000, [](Spu2::u32) {}, half);  // 30 ms: 1,440 samples due
+    Check(played == 512 && halves.size() == 1 && halves[0] == 1, "SPU2: the input stops at its second half");
+    Check(spu.PlayedUs() < 1000 + 30000, "SPU2: an input's stop leaves the rest owed");
+    spu.Advance(1000 + 30000, [](Spu2::u32) {}, half);
+    spu.Advance(1000 + 30000, [](Spu2::u32) {}, half);
+    Check(played == 1440 && halves.size() == 2 && halves[1] == 0, "SPU2: the rest played, a half at a time");
+}
 
 void SpuDecodesAdpcmAndPlaysAVoice() {
     using ps2host::iop::Spu2;
@@ -1564,7 +1744,46 @@ void SpuDecodesAdpcmAndPlaysAVoice() {
     Check(wet.SetEffectAttr(0, 10, 0, 0, 0, 0) == -1, "SPU2: no eleventh preset");
 }
 
+// Two overlays loaded at the same address: a call runs the function of the one
+// whose code is in memory, and FlushCache makes a call look again.
+int g_overlay_ran = 0;
+void OverlayA(lifted::Context&) { g_overlay_ran = 1; }
+void OverlayB(lifted::Context&) { g_overlay_ran = 2; }
+
+void OverlaysRunWhatIsLoaded() {
+    static const ps2host::FunctionEntry a[] = {{0x00500000u, OverlayA, "a", 16u}};
+    static const ps2host::FunctionEntry b[] = {{0x00500000u, OverlayB, "b", 16u}};
+    static const u32 a_checks[] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+    static const u32 b_checks[] = {0x55555555u, 0x66666666u, 0x77777777u, 0x88888888u};
+    static const ps2host::OverlayEntry overlays[] = {
+        {"a", 0x00500000u, 0x00500100u, a, 1, a_checks},
+        {"b", 0x00500000u, 0x00500100u, b, 1, b_checks},
+    };
+    ps2host::RegisterOverlays(overlays, 2);
+    ps2host::Memory& m = ps2host::GuestMemory();
+    lifted::Context c{};
+    for (int i = 0; i < 4; ++i) m.Write(0x00500000u + 4 * i, b_checks[i], 4);
+    ps2host::CodeChanged();
+    ps2host::Dispatch(c, 0x00500000u);
+    Check(g_overlay_ran == 2, "overlays: the loaded one's function runs");
+    for (int i = 0; i < 4; ++i) m.Write(0x00500000u + 4 * i, a_checks[i], 4);
+    ps2host::CodeChanged();
+    ps2host::Dispatch(c, 0x00500000u);
+    Check(g_overlay_ran == 1, "overlays: another loaded over it, and flushed: its function runs");
+    m.Write(0x00500000u, 0u, 4);
+    ps2host::CodeChanged();
+    bool refused = false;
+    try {
+        ps2host::Dispatch(c, 0x00500000u);
+    } catch (const ps2host::Unimplemented&) {
+        refused = true;
+    }
+    Check(refused, "overlays: code neither overlay's is not run as either");
+    ps2host::RegisterOverlays(nullptr, 0);
+}
+
 int main() {
+    OverlaysRunWhatIsLoaded();
     MirrorsReachTheSameRam();
     LoadsExtendAsTheEeDoes();
     OutsideMemoryFaults();
@@ -1603,6 +1822,11 @@ int main() {
     IpuDecodesAndRetriesCleanly();
     IopInstructionsMatchTheR5900();
     SpuDecodesAdpcmAndPlaysAVoice();
+    SpuPlaysItsSoundDataInput();
+    SpuInputInterruptsAtEachHalf();
+    SpuReverbHasNoImage();
+    SpuInterpolatesAsTheHardware();
+    SpuRoutesCore0ThroughCore1();
     std::printf(g_failures ? "host tests: %d failed\n" : "host tests: all passed\n", g_failures);
     return g_failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

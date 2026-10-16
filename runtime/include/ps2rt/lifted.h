@@ -36,6 +36,9 @@ struct Context {
     u32 vc[32];     /* VU0 control registers: VI0-VI15, then R (20), I (21), Q (22) */
     u32 vacc[4];    /* VU0 accumulator */
     u32 sa;         /* the shift amount qfsrv uses, in bits */
+    /* Set by another thread to get control at this context's next loop head
+       (Tick), whatever its budget: the host's blank timer, in real time. */
+    u32 attention;
 };
 
 /* Thrown, and caught at the entry point, when a run cannot go on: a trap
@@ -75,9 +78,15 @@ inline u64 Read64(u32 address) { return generated::ReadU64(address); }
 extern void (*loop_head_hook)(Context& c, u32 address);
 void BudgetSpent(Context& c, u32 address);
 
-/* At every loop head, so a loop that never ends cannot hang the host. */
+/* At every loop head, so a loop that never ends cannot hang the host - and
+   where another thread gets control of it (`attention`). Not by zeroing the
+   budget from there: a loop stores its budget every few cycles, and the store
+   still in its core's buffer lands after the other thread's zero - Resident
+   Evil Outbreak's spin on a flag (0x0018D650) lost nearly every one, and its
+   menus' frames waited 20-80 ms for a blank the timer had long delivered.
+   The flag is only read here, never written, so it is never lost. */
 inline void Tick(Context& c, u32 address) {
-    if (--c.budget < 0) BudgetSpent(c, address);
+    if (--c.budget < 0 || *static_cast<volatile u32*>(&c.attention)) BudgetSpent(c, address);
 }
 
 inline void Trap(u32 address) { throw Abort{address, 1}; }
@@ -107,6 +116,8 @@ void ShiftHalfwordsRight(u64& lo, u64& hi, u64 blo, u64 bhi, u32 amount);   /* p
 /* More 128-bit MMI: lane shifts (kind 0 sll, 1 srl, 2 sra), the low-doubleword
    interleave (pextlb/pextlh), ppach, and qfsrv's funnel shift by `sa` bits. */
 void ShiftLanes(u64& lo, u64& hi, u64 blo, u64 bhi, u32 width, u32 kind, u32 amount);
+/* ShiftLanes lane by lane: the model its SSE2 form is checked against. */
+void ShiftLanesScalar(u64& lo, u64& hi, u64 blo, u64 bhi, u32 width, u32 kind, u32 amount);
 void Interleave(u64& lo, u64& hi, u64 a, u64 b, u32 width);
 void PackHalfwords(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi);
 void PackBytes(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi);     /* ppacb */

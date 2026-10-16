@@ -46,6 +46,12 @@ using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 
 constexpr u32 kRing = 1u << 22;                 // words (16 MB)
+// What wakes the GS thread at once: this much waiting (16 KB), or a frame's
+// end, a privileged register, the producer waiting for it. Less waits for
+// its next look (kLookMs): woken for every few packets, it slept and woke
+// 10,000-13,000 times a second - 30% of a core in waits through gameplay.
+constexpr u32 kWakeWords = 4096;
+constexpr int kLookMs = 1;
 constexpr u32 kMaxRun = kRing / 8;              // the longest run of words one entry carries
 enum : u32 { kQword = 1, kWord = 2, kWords = 3, kPrivileged = 4, kWrap = 5, kFrame = 6, kSkipDraws = 7 };
 
@@ -153,6 +159,7 @@ struct Feed {
     void WaitFor(u32 words) {
         const u64 at = head.load(std::memory_order_relaxed);
         if (at + words - tail.load(std::memory_order_acquire) <= kRing) return;
+        Wake();
         Timed timed(Section::GsWait);
         while (at + words - tail.load(std::memory_order_acquire) > kRing) {
             Rethrow();
@@ -160,17 +167,22 @@ struct Feed {
         }
     }
 
-    void Publish(u32 words) {
-        head.store(head.load(std::memory_order_relaxed) + words, std::memory_order_release);
-        if (sleeping.load()) {
-            std::lock_guard<std::mutex> lock(mutex);
-            wake.notify_one();
-        }
+    void Publish(u32 words, bool now = false) {
+        const u64 h = head.load(std::memory_order_relaxed) + words;
+        head.store(h, std::memory_order_release);
+        if (sleeping.load() && (now || h - tail.load(std::memory_order_acquire) >= kWakeWords)) Wake();
+    }
+
+    void Wake() {
+        if (!sleeping.load()) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        wake.notify_one();
     }
 
     void Sync() {
         const u64 target = head.load(std::memory_order_relaxed);
         if (tail.load(std::memory_order_acquire) >= target) return Rethrow();
+        Wake();
         Timed timed(Section::GsWait);
         for (int spins = 0; tail.load(std::memory_order_acquire) < target; ++spins) {
             Rethrow();
@@ -194,7 +206,8 @@ struct Feed {
                 if (t == h) {
                     std::unique_lock<std::mutex> lock(mutex);
                     sleeping = true;
-                    wake.wait(lock, [&] { return stop.load() || head.load() != tail.load(); });
+                    wake.wait_for(lock, std::chrono::milliseconds(kLookMs),
+                                  [&] { return stop.load() || head.load() != tail.load(); });
                     sleeping = false;
                     if (stop.load() && head.load() == tail.load()) return;
                     continue;
@@ -407,7 +420,7 @@ bool GsFrame(u64 frame) {
     e[0] = Header(kFrame, 0, 0);
     e[1] = u32(frame);
     e[2] = u32(frame >> 32);
-    g_feed->Publish(3);
+    g_feed->Publish(3, true);
     return true;
 }
 
@@ -437,7 +450,7 @@ void GsPrivileged(u32 address, u64 value) {
     e[1] = address;
     e[2] = u32(value);
     e[3] = u32(value >> 32);
-    g_feed->Publish(4);
+    g_feed->Publish(4, true);
 }
 
 }  // namespace ps2host

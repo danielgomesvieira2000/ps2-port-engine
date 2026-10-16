@@ -26,6 +26,7 @@ import os
 import struct
 
 from . import layout as layout_module
+from . import overlay as overlay_module
 from .elf import ElfFile
 from .r5900 import DISASM
 
@@ -38,6 +39,8 @@ DEFAULTS = {
     "status": "config/functions.csv",
     "layout": {},
     "vu_regions": [],
+    "overlay": None,
+    "overlays": [],
 }
 
 
@@ -54,6 +57,12 @@ class Game:
     status: str
     layout: dict
     vu_regions: list
+    # An overlay's: its functions' ranges (ps2decomp/overlay.py); empty for a game.
+    code_ranges: list = dataclasses.field(default_factory=list)
+    # An overlay's: the game it is loaded by; None for a game.
+    base: "Game | None" = None
+    # A game's: the directories of its overlays, relative to its own.
+    overlays: list = dataclasses.field(default_factory=list)
 
     def path(self, relative: str) -> str:
         return os.path.normpath(os.path.join(self.directory, relative))
@@ -80,15 +89,67 @@ def load(directory: str) -> Game:
         directory = os.path.dirname(directory)
     with open(os.path.join(directory, "game.json"), encoding="utf-8") as handle:
         values = dict(DEFAULTS, **json.load(handle))
+    base = None
+    if values["overlay"]:
+        # An overlay (ps2decomp/overlay.py): its executable is the base game's
+        # with the overlay laid over it, built in its own build directory.
+        described = values["overlay"]
+        base = load(os.path.join(directory, described["of"]))
+        values.setdefault("executable", "overlay.elf")
+        values["extracted"] = values["build"]
+        values["layout"] = dict(base.layout, **values["layout"])
+        values["vu_regions"] = values["vu_regions"] or [
+            ["0x%X" % low, "0x%X" % high] for low, high in base.vu_regions]
+        images = [(os.path.normpath(os.path.join(directory, entry["image"])),
+                   _number(entry["address"]), _number(entry.get("size", 0)))
+                  for entry in described.get("resident", []) + [described]]
+        target = os.path.join(directory, values["build"], values["executable"])
+        if all(os.path.exists(path) for path in [base.elf_path] + [i[0] for i in images]):
+            overlay_module.build(base.elf_path, images, target)
     game = Game(directory=directory, name=values.get("name", values["executable"]),
                 executable=values["executable"], iso=values["iso"],
                 extracted=values["extracted"], build=values["build"],
                 database=values["database"],
                 generated=values["generated"], status=values["status"],
                 layout=values["layout"],
-                vu_regions=[tuple(_number(v) for v in pair) for pair in values["vu_regions"]])
+                vu_regions=[tuple(_number(v) for v in pair) for pair in values["vu_regions"]],
+                code_ranges=[tuple(_number(v) for v in pair)
+                             for pair in (values["overlay"] or {}).get("code", [])],
+                base=base, overlays=list(values["overlays"]))
     configure_layout(game)
     return game
+
+
+def _overlay_images(directory: str):
+    """(its own image, every image in memory with it) of an overlay, as paths."""
+    with open(os.path.join(directory, "game.json"), encoding="utf-8") as handle:
+        described = json.load(handle).get("overlay") or {}
+    own = os.path.normpath(os.path.join(directory, described["image"]))
+    resident = {os.path.normpath(os.path.join(directory, entry["image"]))
+                for entry in described.get("resident", [])}
+    return own, resident | {own}
+
+
+def callers_known(game: Game) -> bool:
+    """Whether every part that can be in memory with this one is in its analysis.
+
+    An overlay's analysis holds the executable and the overlays resident with
+    it, so it sees each call into it - unless some other overlay, resident with
+    it but not in its list, can be loaded beside it as well. A game with
+    overlays never sees its overlays' calls into it.
+    """
+    if game.base is None:
+        return not game.overlays
+    _own, together = _overlay_images(game.directory)
+    own = _own
+    for relative in game.base.overlays:
+        sibling = os.path.normpath(os.path.join(game.base.directory, relative))
+        if os.path.normcase(sibling) == os.path.normcase(os.path.normpath(game.directory)):
+            continue
+        _theirs, theirs = _overlay_images(sibling)
+        if own in theirs and not theirs <= together:
+            return False
+    return True
 
 
 def configure_layout(game: Game) -> layout_module.Layout:

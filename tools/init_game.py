@@ -30,7 +30,8 @@ sys.path.insert(0, ENGINE)
 from ps2decomp.iso9660 import Iso9660  # noqa: E402
 
 # What a repository's .gitignore must keep out (templates/repo/gitignore).
-REQUIRED_IGNORES = ["*.iso", "*.bin", "*.cue", "extracted/", "asm/", "build/", "bios/", "games/*/src/"]
+REQUIRED_IGNORES = ["*.iso", "*.bin", "*.cue", "extracted/", "asm/", "build/", "bios/", "games/*/src/",
+                    "games/*/overlays/*/src/"]
 
 
 def boot_executable(iso_path: str) -> str:

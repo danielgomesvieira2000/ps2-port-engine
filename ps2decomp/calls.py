@@ -84,11 +84,17 @@ class Parameters(dict):
     """{function: argument-vector indices it reads}, plus `preserves_v0`: the
     functions after a call to which $v0 still holds the caller's value, and
     `returns_float`: the functions whose callers read their result from $f0;
-    `returns_int`: those whose callers read $v0 after calling them."""
+    `returns_int`: those whose callers read $v0 after calling them;
+    `address_taken`: those a pointer can reach; `preserved`: {function: the
+    caller-saved registers it leaves untouched}."""
 
     preserves_v0 = frozenset()
     returns_float = frozenset()
     returns_int = frozenset()
+    address_taken = frozenset()
+    preserved = {}
+    stack_readers = frozenset()
+    sets_v0 = frozenset()
 
 
 def parameters(database, image, base) -> dict:
@@ -97,11 +103,31 @@ def parameters(database, image, base) -> dict:
     Live-in analysis over each function's control flow, to a fixed point over the
     call graph (see live_parameters).
     """
+    # An overlay's callees in the executable and the other overlays resident
+    # with it (analyze.py's `external_functions`) are analysed with its own:
+    # a call to one is a call to a known function.
+    if database.get("external_functions"):
+        database = dict(database, functions=database["functions"] + database["external_functions"])
     found = Parameters(live_parameters(database, image, base))
     found.preserves_v0 = v0_preserving(database, image, base)
     found.returns_float = float_returning(database, image, base)
     found.returns_int = int_returning(database, image, base)
+    found.address_taken = address_taken(database, image, base)
+    found.preserved = preserved_registers(database, image, base)
+    found.stack_readers = stack_readers(database, image, base)
+    found.sets_v0 = v0_setting(database, image, base)
     return found
+
+
+def address_taken(database, image, base) -> frozenset:
+    """Functions whose address a word of the image holds or code builds (the
+    analysis's xrefs): reached through a pointer, by callers no scan of call
+    sites sees - so int_returning's silence says nothing about them."""
+    starts = {f["addr"] for f in database["functions"]}
+    words = struct.unpack_from("<%dI" % (len(image) // 4), image, 0)
+    taken = {word for word in words if word in starts}
+    taken |= {x["to"] for x in database.get("xrefs", ()) if x["to"] in starts}
+    return frozenset(taken)
 
 
 # How far after a call a read of $f0 still counts as reading its result.
@@ -231,6 +257,234 @@ def v0_preserving(database, image, base) -> frozenset:
     return frozenset(preserving)
 
 
+def v0_setting(database, image, base) -> frozenset:
+    """Functions that write $v0 on every path to their return.
+
+    Any other may hand back the $v0 it was called with - a handler returning a
+    value on one path and nothing on another - so a call to it passes the
+    caller's $v0 along (paths.Call.v0). A path is followed from the entry
+    while $v0 is unwritten: a write ends it (a conditional move does not
+    write for sure), as does a call or tail call to a function in the set or a
+    kernel call (which returns in $v0); a return, a call through a register, a
+    jump table, a branch or jump out of the function to anything else, or
+    running off its end means $v0 may come back as it was. Recursion is
+    resolved as a greatest fixed point: a path that only returns through
+    itself returns through one of its other paths.
+    """
+    from .structs import _written_register
+
+    functions = {f["addr"]: f for f in database["functions"] if f["size"]}
+
+    def decode(pc):
+        return DISASM.decode(struct.unpack_from("<I", image, pc - base)[0], pc)
+
+    def writes(ins):
+        return _written_register(ins) == 2 and ins.mnemonic not in ("movz", "movn")
+
+    def sets(func, setting) -> bool:
+        start, end = func["addr"], func["end"]
+        seen, work = set(), [start]
+        while work:
+            pc = work.pop()
+            if pc in seen:
+                continue
+            seen.add(pc)
+            if not (start <= pc < end) or pc + 4 > base + len(image):
+                return False
+            ins = decode(pc)
+            if not ins.has_delay_slot:
+                if ins.mnemonic == "syscall" or writes(ins):
+                    continue
+                if ins.is_jump or ins.is_branch:
+                    return False
+                work.append(pc + 4)
+                continue
+            if pc + 8 > end:
+                return False
+            slot = decode(pc + 4)
+            slot_writes = writes(slot)
+            if ins.is_call:
+                if slot_writes:
+                    continue
+                if ins.mnemonic == "jal" and ins.target in setting:
+                    continue
+                if ins.mnemonic != "jal":
+                    return False                  # through a register
+                work.append(pc + 8)
+                continue
+            if ins.is_return:
+                if not slot_writes:
+                    return False
+                continue
+            targets = []
+            if ins.is_branch:
+                if not slot_writes:
+                    targets.append(ins.target)    # taken: the slot runs
+                if ins.is_likely or not slot_writes:
+                    work.append(pc + 8)           # not taken: a likely one skips it
+            elif ins.mnemonic in ("j", "b") or (ins.is_jump and ins.target >= 0):
+                if slot_writes:
+                    continue
+                targets.append(ins.target)
+            else:
+                return False                      # a jump table
+            for target in targets:
+                if start <= target < end:
+                    work.append(target)
+                elif target not in setting:
+                    return False                  # a tail call or a chunk
+        return True
+
+    setting = set(functions)
+    changed = True
+    while changed:
+        changed = False
+        for address in sorted(setting):
+            if not sets(functions[address], setting):
+                setting.discard(address)
+                changed = True
+    return frozenset(setting)
+
+
+# Caller-saved general registers a callee may leave as they were: $v1, $a0-$t7,
+# $t8, $t9 ($v0 is v0_preserving's).
+PRESERVABLE = (3,) + tuple(range(4, 16)) + (24, 25)
+
+# Instructions that name a general register first and only read it.
+_READS_FIRST = frozenset({
+    "sb", "sh", "sw", "sd", "sq", "swl", "swr", "sdl", "sdr", "swc1", "sdc1", "sqc2",
+    "mtc0", "mtc1", "ctc1", "qmtc2", "ctc2", "mthi", "mtlo", "mthi1", "mtlo1",
+    "mtsa", "mtsab", "mtsah", "pmthi", "pmtlo", "pmthl", "jr", "cache", "pref", "sync",
+})
+
+
+def _may_write(ins):
+    """The general register an instruction may write, or None. Over-reports
+    rather than under: whatever names a register first, other than a store, a
+    branch or a move to another unit, is taken to write it."""
+    if ins.is_call:
+        return 31
+    if ins.is_branch or ins.is_jump or ins.mnemonic in _READS_FIRST:
+        return None
+    from .structs import _NUMBER, _REGISTER
+    for operand in ins.operands:
+        for name in _REGISTER.findall(str(operand)):
+            if name in _NUMBER:
+                return _NUMBER[name]
+    return None
+
+
+def preserved_registers(database, image, base) -> dict:
+    """{function: the PRESERVABLE registers it leaves as the caller had them}.
+
+    CodeWarrior keeps a value in a caller-saved register across a call to a
+    function that never touches it (Resident Evil Outbreak's 0x00190100 holds
+    its argument in $t1 across a call to 0x0018F570, and reads it after).
+    A register is preserved by a function that writes it nowhere - not in its
+    body, its cold chunks, or any function it calls or jumps to. A call through
+    a register, a kernel call, a jump table, a branch or a fall-through out of
+    the function's known code, or a call into the middle of something, and
+    nothing is: a fixed point over the call graph, from the conservative side.
+    """
+    functions = {f["addr"]: f for f in database["functions"] if f["size"]}
+    every = frozenset(PRESERVABLE)
+    kept, needs = {}, {}
+    for address, func in functions.items():
+        ranges = [(func["addr"], func["end"])] + [tuple(c) for c in func.get("chunks") or ()]
+
+        def inside(target):
+            return any(low <= target < high for low, high in ranges)
+
+        written, callees, unknown = set(), set(), False
+        for low, high in ranges:
+            last = DISASM.decode(struct.unpack_from("<I", image, high - 8 - base)[0], high - 8)
+            if not last.ends_block:
+                unknown = True                       # runs on past what is known
+            for pc in range(low, high, 4):
+                ins = DISASM.decode(struct.unpack_from("<I", image, pc - base)[0], pc)
+                if ins.mnemonic in ("syscall", "jalr") or (ins.mnemonic == "jr" and not ins.is_return):
+                    unknown = True
+                    break
+                register = _may_write(ins)
+                if register is not None:
+                    written.add(register)
+                if (ins.is_call or ins.is_jump or ins.is_branch) and not ins.is_return:
+                    if ins.target is None or ins.target < 0:
+                        unknown = True
+                    elif ins.is_call or not inside(ins.target):
+                        if ins.is_branch and not ins.is_call:
+                            unknown = True           # a branch out of the function
+                        elif ins.target in functions:
+                            callees.add(ins.target)
+                        else:
+                            unknown = True
+            if unknown:
+                break
+        kept[address] = frozenset() if unknown else every - written
+        needs[address] = callees
+    changed = True
+    while changed:
+        changed = False
+        for address, callees in needs.items():
+            value = kept[address]
+            for callee in callees:
+                value &= kept[callee]
+            if value != kept[address]:
+                kept[address] = value
+                changed = True
+    return {address: value for address, value in kept.items() if value}
+
+
+_LOADS = frozenset({"lb", "lbu", "lh", "lhu", "lw", "lwu", "ld", "lq", "lwl", "lwr", "ldl",
+                    "ldr", "lwc1", "ldc1", "lqc2"})
+
+
+def stack_readers(database, image, base) -> frozenset:
+    """Functions that read their caller's frame: arguments past the eighth, which
+    EABI passes at 0($sp) and up.
+
+    A load from `$sp` at an offset of at least the function's own frame (its
+    `addiu $sp, $sp, -F`), or such an address taken (a va_list), reads above
+    it. A function with no frame reads its caller's too through what it calls
+    or jumps to. The model keeps a caller's frame symbolic, so a callee reading
+    its arguments there read nothing (Resident Evil Outbreak's 0x00135078
+    passes a pointer at 0($sp) to 0x00127FC8, which wrote through null).
+    """
+    functions = {f["addr"]: f for f in database["functions"] if f["size"]}
+    readers, frameless_calls = set(), {}
+    for address, func in functions.items():
+        frame, reads, callees = 0, False, set()
+        for pc in range(func["addr"], func["end"], 4):
+            ins = DISASM.decode(struct.unpack_from("<I", image, pc - base)[0], pc)
+            if ins.mnemonic in ("addiu", "daddiu") and ins.rs == 29:
+                if ins.rt == 29:
+                    if ins.imm < 0 and not frame:
+                        frame = -ins.imm
+                    continue
+                if ins.imm >= frame:
+                    reads = True
+            elif ins.mnemonic in _LOADS and ins.rs == 29 and ins.imm >= frame:
+                reads = True
+            elif ins.mnemonic in ("daddu", "addu", "or") and 29 in (ins.rs, ins.rt) and not frame:
+                if ins.rd != 29:
+                    reads = True                 # $sp copied with no frame: its caller's
+            if (ins.is_call or ins.is_jump) and ins.target is not None and ins.target >= 0:
+                if not func["addr"] <= ins.target < func["end"]:
+                    callees.add(ins.target)
+        if reads:
+            readers.add(address)
+        elif not frame:
+            frameless_calls[address] = callees
+    changed = True
+    while changed:
+        changed = False
+        for address, callees in frameless_calls.items():
+            if address not in readers and callees & readers:
+                readers.add(address)
+                changed = True
+    return frozenset(readers)
+
+
 def scanned_parameters(database, image, base) -> dict:
     """{function: sorted argument-vector indices it reads}, for every known function.
 
@@ -265,10 +519,25 @@ def _effects(ins) -> tuple:
     from .structs import _read_registers, _written_register
 
     uses = defs = 0
+    if ins.mnemonic == "syscall":
+        # The kernel takes its arguments where a function does: a stub of
+        # `addiu $v1, N; syscall; jr $ra` reads them though no instruction
+        # names them. Read as none, a caller passing a local's address to
+        # ReferThreadStatus or SetOsdConfigParam kept its frame symbolic and
+        # read back a slot the kernel had filled (Resident Evil Outbreak, 14
+        # functions). How many a service takes is not recorded, so all eight.
+        uses |= (1 << FLOAT_ARG_BASE) - 1
     for reg in _read_registers(ins):
         if reg in _INT_INDEX:
             uses |= 1 << _INT_INDEX[reg]
     written = _written_register(ins)
+    if ins.mnemonic in ("movz", "movn"):
+        # A conditional move keeps the old value when its condition fails: it
+        # reads its destination, and kills nothing (Resident Evil Outbreak's
+        # 0x00197900 passes on $t0 untouched when its `movz` does not move).
+        if written in _INT_INDEX:
+            uses |= 1 << _INT_INDEX[written]
+        written = None
     if written in _INT_INDEX:
         defs |= 1 << _INT_INDEX[written]
     read, wrote = _float_operands(ins)
@@ -346,6 +615,11 @@ def _graph(func, image, base, functions) -> list:
 
 
 def _live_in(nodes, start, parameters) -> int:
+    return live_map(nodes, parameters).get(start, 0)
+
+
+def live_map(nodes, parameters) -> dict:
+    """{node: mask of the argument-vector indices live on entry to it}."""
     live = {key: 0 for key in nodes}
 
     def uses_of(node):
@@ -373,7 +647,7 @@ def _live_in(nodes, start, parameters) -> int:
             if value != live[key]:
                 live[key] = value
                 changed = True
-    return live.get(start, 0)
+    return live
 
 
 def live_parameters(database, image, base, rounds: int = 40) -> dict:

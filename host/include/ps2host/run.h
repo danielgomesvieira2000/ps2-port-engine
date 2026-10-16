@@ -47,8 +47,8 @@ inline lifted::Context NewContext() {
 /* What the run touched, for the report at the end. */
 struct Stats {
     std::map<u32, u64> calls;                  /* function -> times called */
-    std::map<s32, u64> syscalls;               /* service -> times called */
-    std::map<u32, u64> register_reads, register_writes;   /* device register -> count */
+    std::map<s32, u64> syscalls;               /* service -> times called, beyond the array's */
+    u64 syscall_counts[0x200] = {};            /* service + 0x100 -> times called */
     std::vector<u32> stopped_in;               /* the stack when the run stopped */
     std::vector<u32> interrupted_in;           /* ...and, if that was a handler, the thread's */
     std::vector<std::string> notes;            /* one line per first-time event */
@@ -64,6 +64,8 @@ bool Tracing();
 void Note(const std::string& key, const std::string& text);
 /* Whether a Note under `key` would be logged (so its text is worth making). */
 bool Noting(const std::string& key);
+// --notes: every event noted, repeats included (Noting's answer for any key).
+bool NotingAll();
 
 /* Threads (threads.cpp): run the program's first thread from `entry` under the
    kernel's scheduler; returns only by throwing why the run ended. */
@@ -122,6 +124,9 @@ void QueueRpcEnd(const std::vector<u8>& request, u32 server, u32 buffer, u32 cbu
 void InstallIopServers();
 void InstallFileIo();
 void InstallLoadFile();
+/* The release of the IOP's SDK modules ("2800"): the ROM's, or the replacement
+   image's the IOP was rebooted with. Four characters, not terminated. */
+const char* IopRelease();
 /* The IOP rebooted with a replacement image from the disc (IOPRPnnn.IMG):
    the releases of its modules - loadfile's answers its version check. */
 void UseIopImage(const std::string& path);
@@ -416,6 +421,17 @@ InputDevice LastInputDevice(u64* frame = nullptr);
 void SetPadHook(u16 (*hook)());
 /* --press: hold `button` (cross, start, up, ...) for 6 frames from `frame`. */
 bool ScriptPress(const std::string& button, u64 from, u64 to, u8 pressure = 0xFF);
+/* --record-input FILE: every pad report the game reads that differs from the
+   one before, as `frame byte byte ...` lines - buttons, sticks and pressures,
+   whatever gave them. --replay-input FILE: those reports instead of the pad's,
+   each from its frame on. With --virtual-time a recorded session replays
+   exactly: a bug met by playing becomes a scripted run. False when the file
+   cannot be opened or read. */
+bool RecordInput(const std::string& path);
+bool ReplayInput(const std::string& path);
+/* --paced: a --virtual-time run's vertical blanks no closer than the
+   display's, so a person can play it (and record it) at the game's speed. */
+void SetPaced(bool on);
 /* A game's own controls: the controller's state each pad read, before the
    game sees it - its buttons (DualShock 2 inputs, libpad's order) and their
    pressures to change as the filter likes; the keyboard and scripted presses
@@ -444,6 +460,17 @@ void DeliverTimers();
 u64 ClockNs();
 void SetVirtualClock(bool on);
 bool VirtualClock();
+/* Disc reads: in a drive's time (a 24x CD's, after a seek - the console's), or
+   fast, as quickly as a PC reads the image (cdvd.cpp). Fast with --fast-disc,
+   or in real time when the player's "fast_loading" setting says so - off
+   unless the game's port defaults it on (SetFastLoadingDefault), as a game may
+   time things by its reads (Mister Mosquito's stage loader does). Scripted
+   runs keep the drive's time, so their pictures stay as recorded. */
+bool FastDisc();
+/* Fast or not from now on: a settings menu's "fast_loading" taking effect at
+   once (a scripted run's stays the drive's). */
+void SetFastDisc(bool on);
+void SetFastLoadingDefault(bool on);
 void AdvanceClock(u64 ns);
 /* Run the INTC handlers for `cause`, if it is enabled (threads.cpp). */
 void RaiseIntc(u32 cause);

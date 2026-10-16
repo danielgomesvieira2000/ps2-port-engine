@@ -37,6 +37,10 @@
 #include <deque>
 #include <vector>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 #include "ps2host/memory.h"
 #include "ps2host/run.h"
 
@@ -116,19 +120,61 @@ constexpr u8 kNonLinearScale[32] = {0,  1,  2,  3,  4,  5,  6,  7,  8,  10, 12, 
 // The IDCT, separable, in double precision and rounded once (IEEE 1180's
 // reference): out[y][x] = sum C(u) C(v) / 4 F[v][u] cos((2x+1)u pi/16) cos((2y+1)v pi/16).
 void Idct(const s32 in[64], s32 out[64]) {
-    static const auto basis = [] {
-        std::array<std::array<double, 8>, 8> c{};
+    // basis[x][u], and its transpose (column u's eight terms, by x, together).
+    struct Basis {
+        alignas(32) double c[8][8], t[8][8];
+    };
+    static const Basis basis = [] {
+        Basis b{};
         const double pi = 3.14159265358979323846;
         for (int x = 0; x < 8; ++x)
-            for (int u = 0; u < 8; ++u)
-                c[x][u] = 0.5 * (u == 0 ? 1.0 / std::sqrt(2.0) : 1.0) * std::cos((2 * x + 1) * u * pi / 16.0);
-        return c;
+            for (int u = 0; u < 8; ++u) {
+                b.c[x][u] = 0.5 * (u == 0 ? 1.0 / std::sqrt(2.0) : 1.0) * std::cos((2 * x + 1) * u * pi / 16.0);
+                b.t[u][x] = b.c[x][u];
+            }
+        return b;
     }();
     // Most coefficients are zero, and a zero term adds nothing to a sum (a
     // signed zero at most, which no later sum or the rounding sees): only the
     // others are summed, in the same order - the same result, bit for bit.
-    double rows[64];
+    alignas(32) double rows[64];
     int terms[8], live[8], live_rows = 0;
+#if defined(__AVX2__)
+    // Four of a row's outputs at a time: each lane's products and sums are the
+    // scalar ones, in the same order (a multiply, then an add - never fused),
+    // so the pictures are the same; a movie's macroblocks took 6% of the EE.
+    for (int v = 0; v < 8; ++v) {
+        int n = 0;
+        for (int u = 0; u < 8; ++u)
+            if (in[v * 8 + u]) terms[n++] = u;
+        if (n) live[live_rows++] = v;
+        __m256d low = _mm256_setzero_pd(), high = _mm256_setzero_pd();
+        for (int k = 0; k < n; ++k) {
+            const __m256d f = _mm256_set1_pd(double(in[v * 8 + terms[k]]));
+            low = _mm256_add_pd(low, _mm256_mul_pd(_mm256_load_pd(&basis.t[terms[k]][0]), f));
+            high = _mm256_add_pd(high, _mm256_mul_pd(_mm256_load_pd(&basis.t[terms[k]][4]), f));
+        }
+        _mm256_store_pd(&rows[v * 8], low);
+        _mm256_store_pd(&rows[v * 8 + 4], high);
+    }
+    const __m256d half = _mm256_set1_pd(0.5);
+    const __m128i lowest = _mm_set1_epi32(-256), highest = _mm_set1_epi32(255);
+    for (int y = 0; y < 8; ++y) {
+        __m256d low = _mm256_setzero_pd(), high = _mm256_setzero_pd();
+        for (int k = 0; k < live_rows; ++k) {
+            const __m256d b = _mm256_set1_pd(basis.c[y][live[k]]);
+            low = _mm256_add_pd(low, _mm256_mul_pd(b, _mm256_load_pd(&rows[live[k] * 8])));
+            high = _mm256_add_pd(high, _mm256_mul_pd(b, _mm256_load_pd(&rows[live[k] * 8 + 4])));
+        }
+        // floor(sum + 0.5), then to an integer (exact: it is whole) and clamped.
+        const auto round = [&](__m256d sum) {
+            const __m128i whole = _mm256_cvttpd_epi32(_mm256_floor_pd(_mm256_add_pd(sum, half)));
+            return _mm_min_epi32(_mm_max_epi32(whole, lowest), highest);
+        };
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(&out[y * 8]), round(low));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(&out[y * 8 + 4]), round(high));
+    }
+#else
     for (int v = 0; v < 8; ++v) {
         int n = 0;
         for (int u = 0; u < 8; ++u)
@@ -136,16 +182,17 @@ void Idct(const s32 in[64], s32 out[64]) {
         if (n) live[live_rows++] = v;
         for (int x = 0; x < 8; ++x) {
             double sum = 0;
-            for (int k = 0; k < n; ++k) sum += basis[x][terms[k]] * in[v * 8 + terms[k]];
+            for (int k = 0; k < n; ++k) sum += basis.c[x][terms[k]] * in[v * 8 + terms[k]];
             rows[v * 8 + x] = sum;
         }
     }
     for (int y = 0; y < 8; ++y)
         for (int x = 0; x < 8; ++x) {
             double sum = 0;
-            for (int k = 0; k < live_rows; ++k) sum += basis[y][live[k]] * rows[live[k] * 8 + x];
+            for (int k = 0; k < live_rows; ++k) sum += basis.c[y][live[k]] * rows[live[k] * 8 + x];
             out[y * 8 + x] = std::clamp(s32(std::floor(sum + 0.5)), -256, 255);
         }
+#endif
 }
 
 // ---------------------------------------------------------------- DMA
@@ -158,7 +205,13 @@ u32 Physical(u32 address) {
     return (address >> 31) ? (0x70000000u | (address & 0x3FF0u)) : (address & 0x01FFFFF0u);
 }
 
-u32 Reg(u32 address) { return u32(GuestMemory().Read(address, 4)); }
+// The channels' registers, as the IPU keeps them: no device hooks read them,
+// and these reads are the IPU's own (not the program's, for the report).
+u32 Reg(u32 address) {
+    u32 value;
+    std::memcpy(&value, GuestMemory().Translate(address, 4), 4);
+    return value;
+}
 void SetReg(u32 address, u32 value) {
     *reinterpret_cast<u32*>(GuestMemory().Translate(address, 4)) = value;   // no hooks: the channel's own state
 }
@@ -179,7 +232,10 @@ struct Source {
         while (qwc == 0) {
             if (!chain || last) return false;
             tag_at = Physical(tadr);
-            const u64 tag = m.Read(tag_at, 8);
+            const u8* tag_bytes = m.Translate(tag_at, 8);       // a tag in memory: no hooks
+            if (!tag_bytes) throw MemoryFault{tag_at, false};
+            u64 tag;
+            std::memcpy(&tag, tag_bytes, 8);
             tag_read = tag;
             tag_seen = true;
             const u32 count = u32(tag & 0xFFFF), id = u32(tag >> 28) & 7;
@@ -274,7 +330,11 @@ public:
             s.madr != to.madr || s.qwc != to.qwc || s.tadr != to.tadr || s.asp != to.asp ||
             s.running != to_running || s.last != to.last)
             return false;
-        return !s.tag_seen || GuestMemory().Read(s.tag_at, 8) == s.tag;
+        if (!s.tag_seen) return true;
+        const u8* tag = GuestMemory().Translate(s.tag_at, 8);
+        u64 now = 0;
+        if (tag) std::memcpy(&now, tag, 8);
+        return tag && now == s.tag;
     }
 
     void Reset() {
@@ -695,11 +755,10 @@ public:
             }
         }
         // RAW16: Y (16 x 16), Cb (8 x 8), Cr (8 x 8), 384 halfwords.
-        std::vector<s16> halfwords;
-        halfwords.reserve(384);
-        for (auto& row : y) halfwords.insert(halfwords.end(), row, row + 16);
-        halfwords.insert(halfwords.end(), cb, cb + 64);
-        halfwords.insert(halfwords.end(), cr, cr + 64);
+        s16 halfwords[384];
+        std::memcpy(halfwords, y, sizeof y);
+        std::memcpy(halfwords + 256, cb, sizeof cb);
+        std::memcpy(halfwords + 320, cr, sizeof cr);
         // Past the macroblock: zero bits are a slice's stuffing - the IPU
         // goes to the byte boundary and over the zero bytes to the next start
         // code and says so (SCD), or flags an error (ECD) at anything else.
@@ -717,7 +776,7 @@ public:
                 r.Skip(8);
             }
         }
-        Emit(reinterpret_cast<const u8*>(halfwords.data()), 768);
+        Emit(reinterpret_cast<const u8*>(halfwords), sizeof halfwords);
         busy = false;
     }
 
@@ -762,6 +821,42 @@ public:
             green_of[i] = ((-0x68 * cr) >> 6) + ((-0x32 * cb) >> 6) + 1;
             blue_of[i] = ((0x102 * cb) >> 6) + 1;
         }
+#if defined(__AVX2__)
+        // RGBA32, eight pixels at a time: the same integer arithmetic, lane by
+        // lane (a movie's every macroblock comes through here).
+        if (!rgb16) {
+            const __m256i zero = _mm256_setzero_si256(), top = _mm256_set1_epi32(255);
+            const __m256i sixteen = _mm256_set1_epi32(16), k95 = _mm256_set1_epi32(0x95);
+            const __m256i t0 = _mm256_set1_epi32(int(th0)), t1 = _mm256_set1_epi32(int(th1));
+            const __m256i pairs = _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3);
+            for (int py = 0; py < 16; ++py)
+                for (int px = 0; px < 16; px += 8) {
+                    const __m256i y = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(&raw[py * 16 + px])));
+                    const __m256i luma = _mm256_srai_epi32(_mm256_mullo_epi32(_mm256_max_epi32(_mm256_sub_epi32(y, sixteen), zero), k95), 6);
+                    const int c = (py >> 1) * 8 + (px >> 1);
+                    auto chroma = [&](const int* of) {
+                        return _mm256_permutevar8x32_epi32(_mm256_castsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(of + c))), pairs);
+                    };
+                    auto channel = [&](const int* of) {
+                        return _mm256_min_epi32(_mm256_max_epi32(_mm256_srai_epi32(_mm256_add_epi32(luma, chroma(of)), 1), zero), top);
+                    };
+                    const __m256i red = channel(red_of), green = channel(green_of), blue = channel(blue_of);
+                    // Alpha: 0 if all three are below TH0, 0x40 if below TH1, else 0x80.
+                    auto below = [&](__m256i t) {
+                        return _mm256_and_si256(_mm256_and_si256(_mm256_cmpgt_epi32(t, red), _mm256_cmpgt_epi32(t, green)),
+                                                _mm256_cmpgt_epi32(t, blue));
+                    };
+                    const __m256i alpha = _mm256_andnot_si256(below(t0),
+                                                              _mm256_blendv_epi8(_mm256_set1_epi32(0x80), _mm256_set1_epi32(0x40), below(t1)));
+                    const __m256i pixel = _mm256_or_si256(_mm256_or_si256(red, _mm256_slli_epi32(green, 8)),
+                                                          _mm256_or_si256(_mm256_slli_epi32(blue, 16), _mm256_slli_epi32(alpha, 24)));
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(&rgba[py * 16 + px]), pixel);
+                }
+            Emit(reinterpret_cast<const u8*>(rgba), sizeof rgba);
+            if (--left == 0) busy = false;
+            return;
+        }
+#endif
         for (int py = 0; py < 16; ++py)
             for (int px = 0; px < 16; ++px) {
                 const int luma = kLuma[raw[py * 16 + px]];

@@ -15,6 +15,7 @@ bios/
 # A game's own code in C++ - lifted, derived and reconstructed - is the game's,
 # regenerated from the player's disc by the tools: never committed.
 games/*/src/
+games/*/overlays/*/src/
 games/*/include/*/
 !games/*/include/ps2/
 

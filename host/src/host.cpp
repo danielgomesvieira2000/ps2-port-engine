@@ -13,10 +13,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <set>
+#include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 
 #include "ps2host/disc.h"
 #include "ps2host/gs.h"
@@ -235,9 +238,45 @@ struct CachedCall {
 constexpr std::size_t kCallCache = 1u << 14;
 CachedCall g_call_cache[kCallCache];
 
+const OverlayEntry* g_overlays = nullptr;
+std::size_t g_overlay_count = 0;
+
+// The function of the overlay whose code is in memory at `address`, if the
+// address is in an overlay and one is: its first bytes there are the original's.
+// OverrideInOverlay's: (overlay name, address) -> the host's function.
+std::map<std::pair<std::string, u32>, FunctionEntry> g_overlay_overrides;
+
+const FunctionEntry* FindInOverlay(u32 address, bool* in_overlay) {
+    for (std::size_t i = 0; i < g_overlay_count; ++i) {
+        const OverlayEntry& o = g_overlays[i];
+        if (address < o.start || address >= o.end) continue;
+        *in_overlay = true;
+        const FunctionEntry* end = o.table + o.count;
+        const FunctionEntry* at = std::lower_bound(
+            o.table, end, address, [](const FunctionEntry& e, u32 a) { return e.address < a; });
+        if (at == end || at->address != address) continue;
+        const u32* check = o.checks + 4 * (at - o.table);
+        const u32 length = at->size && at->size < 16 ? at->size : 16;
+        const u8* here = GuestMemory().Translate(address, length);
+        if (here && std::memcmp(here, check, length) == 0) {
+            if (!g_overlay_overrides.empty()) {
+                const auto mine = g_overlay_overrides.find({o.name, address});
+                if (mine != g_overlay_overrides.end()) return &mine->second;
+            }
+            return at;
+        }
+    }
+    return nullptr;
+}
+
 const FunctionEntry* Find(u32 address) {
     auto found = g_overrides.find(address);
     if (found != g_overrides.end()) return &found->second;
+    if (g_overlay_count) {
+        bool in_overlay = false;
+        const FunctionEntry* entry = FindInOverlay(address, &in_overlay);
+        if (entry || in_overlay) return entry;
+    }
     const FunctionEntry* end = g_table + g_count;
     const FunctionEntry* at = std::lower_bound(
         g_table, end, address, [](const FunctionEntry& e, u32 a) { return e.address < a; });
@@ -303,6 +342,9 @@ u32 FindSource(u32 address) {
     // Code in the executable itself that no function starts at - a tail call's
     // target the analysis missed - is its own source.
     if (address >= g_image_start && address < g_image_end) return address;
+    // So is code in an overlay's range: port.py translates it from the overlay.
+    for (std::size_t i = 0; i < g_overlay_count; ++i)
+        if (address >= g_overlays[i].start && address < g_overlays[i].end) return address;
     constexpr u32 kPattern = 32;
     Memory& memory = GuestMemory();
     const u8* here = memory.Translate(address, kPattern);
@@ -325,8 +367,24 @@ void RegisterFunctions(const FunctionEntry* table, std::size_t count) {
     ApplySdkOverrides(table, count);
 }
 
+void RegisterOverlays(const OverlayEntry* overlays, std::size_t count) {
+    g_overlays = overlays;
+    g_overlay_count = count;
+    CodeChanged();
+}
+
+void CodeChanged() {
+    if (!g_overlay_count) return;           // the executable's code never moves
+    for (CachedCall& line : g_call_cache) line = CachedCall{};
+}
+
 void Override(u32 address, GuestFunction function, const char* name) {
     g_overrides[address] = FunctionEntry{address, function, name, 0};
+    for (CachedCall& line : g_call_cache) line = CachedCall{};
+}
+
+void OverrideInOverlay(const char* overlay, u32 address, GuestFunction function, const char* name) {
+    g_overlay_overrides[{overlay, address}] = FunctionEntry{address, function, name, 0};
     for (CachedCall& line : g_call_cache) line = CachedCall{};
 }
 
@@ -336,6 +394,16 @@ const char* FunctionName(u32 address) {
 }
 
 bool Tracing() { return g_trace; }
+
+bool NotingAll() { return g_all_notes; }
+
+namespace {
+bool g_fast_disc = false, g_fast_loading_default = false;
+}  // namespace
+
+bool FastDisc() { return g_fast_disc; }
+void SetFastDisc(bool on) { g_fast_disc = on; }
+void SetFastLoadingDefault(bool on) { g_fast_loading_default = on; }
 
 Stats& RunStats() {
     static Stats stats;
@@ -517,7 +585,10 @@ void Report(const Options& options, const std::string& outcome) {
     if (!samples.empty()) std::printf("%s", samples.c_str());
     if (!GpuShadowSummary().empty()) std::printf("%s\n", GpuShadowSummary().c_str());
     std::printf("kernel services used:\n");
-    for (const auto& [service, count] : stats.syscalls)
+    std::map<s32, u64> services = stats.syscalls;
+    for (s32 i = 0; i < 0x200; ++i)
+        if (stats.syscall_counts[i]) services[i - 0x100] += stats.syscall_counts[i];
+    for (const auto& [service, count] : services)
         std::printf("  %4d  %-24s x%llu\n", service, SyscallName(service),
                     (unsigned long long)count);
     auto registers = [&](const char* title, const std::map<u32, u64>& seen) {
@@ -538,8 +609,8 @@ void Report(const Options& options, const std::string& outcome) {
         for (std::size_t i = 0; i < hot.size() && i < std::size_t(options.report_limit); ++i)
             std::printf("  %-40s x%llu\n", Describe(hot[i].second).c_str(), (unsigned long long)hot[i].first);
     }
-    registers("device registers read", stats.register_reads);
-    registers("device registers written", stats.register_writes);
+    registers("device registers read", GuestMemory().RegisterCounts(false));
+    registers("device registers written", GuestMemory().RegisterCounts(true));
     for (const auto& [run, source] : stats.discovered)
         std::printf("discovered: code at %s is a copy of %s\n", Hex(run).c_str(), Hex(source).c_str());
     if (!options.discover_path.empty()) {
@@ -643,6 +714,8 @@ int Run(const Options& options) {
         }
         LoadSettings((where / "pc_settings.ini").string());
     }
+    g_fast_disc = options.fast_disc || (!options.virtual_time && SettingOn("fast_loading", g_fast_loading_default));
+    if (g_fast_disc) std::fprintf(stderr, "[host] disc reads fast (no drive time)\n");
     // --setting KEY=VALUE: a scripted run's own (a wider picture), for this run.
     for (const std::string& setting : options.settings) {
         const auto equals = setting.find('=');
@@ -685,6 +758,11 @@ int Run(const Options& options) {
     for (const auto& press : options.presses)
         if (!ScriptPress(press.button, press.from, press.to, press.pressure))
             std::fprintf(stderr, "--press: no button %s\n", press.button.c_str());
+    if (!options.record_input.empty() && !RecordInput(options.record_input))
+        std::fprintf(stderr, "--record-input: cannot write %s\n", options.record_input.c_str());
+    if (!options.replay_input.empty() && !ReplayInput(options.replay_input))
+        std::fprintf(stderr, "--replay-input: nothing to read in %s\n", options.replay_input.c_str());
+    SetPaced(options.paced);
     if (!options.frames_dir.empty())
         SetFrameDumps(options.frames_dir, options.frames_every, 200, u64(options.frames_from));
     g_watch = options.watch;
@@ -760,6 +838,7 @@ int Main(int argc, char** argv) {
         else if (arg == "--sample-gs") options.sample = options.sample_gs = true;
         else if (arg == "--sample-vif1") options.sample = options.sample_vif1 = true;
         else if (arg == "--vif1-sync") options.vif1_sync = true;
+        else if (arg == "--fast-disc") options.fast_disc = true;
         else if (arg == "--check-guesses") options.check_guesses = true;
         else if (arg == "--vu-snapshot" && i + 3 < argc) {
             options.vu_snapshot = argv[++i];
@@ -801,6 +880,9 @@ int Main(int argc, char** argv) {
                 options.presses.push_back({spec.substr(0, at), from, to, pressure});
             }
         }
+        else if (arg == "--record-input" && i + 1 < argc) options.record_input = argv[++i];
+        else if (arg == "--replay-input" && i + 1 < argc) options.replay_input = argv[++i];
+        else if (arg == "--paced") options.paced = true;
         else if (arg == "--real-time-from" && i + 1 < argc) {
             options.real_time_from = std::stoull(argv[++i]);
             SetRealTimeFrom(options.real_time_from);

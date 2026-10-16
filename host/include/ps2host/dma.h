@@ -12,8 +12,9 @@
  *      3 ref   data at ADDR, next tag                 next tag (end when empty)
  *              after this one                 7 end   data after the tag, then end
  * With CHCR.TTE the tag's upper 64 bits go to the peripheral ahead of its data,
- * which is how VIF chains carry VIFcodes in their tags. With CHCR.TIE a tag with
- * IRQ set ends the transfer after its data.
+ * which is how VIF chains carry VIFcodes in their tags - the VIFs' alone: a
+ * channel that does not take tags (`tags` false: the GIF's) ignores TTE. With
+ * CHCR.TIE a tag with IRQ set ends the transfer after its data.
  */
 
 #ifndef PS2HOST_DMA_H
@@ -43,14 +44,14 @@ struct DmaOutcome {
 extern std::uint32_t g_dma_source;
 
 DmaOutcome SendDma(DmaChannelState& channel, const std::function<void(std::uint32_t)>& word,
-                   std::uint32_t max_tags = 1u << 16);
+                   std::uint32_t max_tags = 1u << 16, bool tags = true);
 
 /* The same, a run of words at a time: `count` words read from guest address
    `from` on (the receiver keeps g_dma_source as it takes each). One call a
    run rather than one a word: VIF1 takes most of a frame's data. */
 using DmaBlockSink = std::function<void(const std::uint32_t* words, std::uint32_t count, std::uint32_t from)>;
 DmaOutcome SendDmaBlocks(DmaChannelState& channel, const DmaBlockSink& words,
-                         std::uint32_t max_tags = 1u << 16);
+                         std::uint32_t max_tags = 1u << 16, bool tags = true);
 
 }  // namespace ps2host
 

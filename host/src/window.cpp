@@ -62,6 +62,7 @@ int Scancode(int key) {
         case VK_NUMPAD4: return SDL_SCANCODE_KP_4;
         case VK_NUMPAD5: return SDL_SCANCODE_KP_5;
         case VK_NUMPAD6: return SDL_SCANCODE_KP_6;
+        case VK_SPACE: return SDL_SCANCODE_SPACE;        // (Resident Evil Outbreak's cheat menu)
         default: break;
     }
     if (key >= VK_F1 && key <= VK_F11) return SDL_SCANCODE_F1 + (key - VK_F1);

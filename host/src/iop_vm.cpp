@@ -377,12 +377,29 @@ u32 Vm::Call(u32 function, std::vector<u32> args) {
 
 // ---------------------------------------------------------------- scheduling
 
+// `compare` counts of the timer's clock - the system clock (36.864 MHz), the
+// pixel clock (13.5 MHz) or the horizontal blank (15,734 Hz, NTSC) - after its
+// prescaler.
+u64 HardTimerPeriodUs(const HardTimer& t) {
+    const double hz = t.source & 4 ? 15734.25 : t.source & 2 ? 13500000.0 : 36864000.0;
+    return std::max<u64>(1, u64(double(t.compare) * t.prescale * 1e6 / hz));
+}
+
+// The last Run ended with threads still to run (its slice spent): the IOP
+// was held, not idle, until this one - its sound waits for its work.
+namespace {
+bool g_iop_held = false;
+}  // namespace
+
 void Run(u64 slice) {
     Vm& vm = TheVm();
-    if (vm.threads.empty() && vm.alarms.empty() && vm.completions.empty()) return;
+    if (vm.threads.empty() && vm.alarms.empty() && vm.completions.empty() &&
+        vm.hard_timers.empty()) return;
     const u64 start = vm.instructions;
+    bool idle = !g_iop_held;        // nothing to run since the last Run: the sound may catch up
     for (;;) {
-        SoundInterrupts(vm);
+        const bool behind = SoundInterrupts(vm, idle);
+        idle = false;
         // Completion callbacks of finished SIF DMA (sceSifSetDmaIntr), as interrupts.
         while (!vm.completions.empty()) {
             const auto done = vm.completions.front();
@@ -402,12 +419,30 @@ void Run(u64 slice) {
             const u32 again = vm.Call(alarm.handler, {alarm.arg});
             if (again) vm.alarms[alarm.handler] = {now + again / 37, alarm.handler, alarm.arg};
         }
+        for (auto& [id, timer] : vm.hard_timers) {
+            if (!timer.running || !timer.handler || now < timer.due_us) continue;
+            const u32 next = vm.Call(timer.handler, {timer.common});
+            if (!next) { timer.running = false; continue; }
+            timer.compare = next;
+            timer.due_us = std::max(timer.due_us + HardTimerPeriodUs(timer), now);
+        }
         Thread* best = nullptr;
         for (auto& [id, t] : vm.threads)
             if (t.ready && (!best || t.priority < best->priority ||
                             (t.priority == best->priority && t.queued < best->queued)))
                 best = &t;
-        if (!best || vm.instructions - start > slice) return;
+        if (vm.instructions - start > slice) {
+            g_iop_held = best != nullptr;
+            return;
+        }
+        if (!best) {
+            // Nothing to run: the sound on to the present, a half at a time
+            // (each half's interrupt may wake the stream's decoder).
+            g_iop_held = false;
+            if (!behind) return;
+            idle = true;
+            continue;
+        }
         vm.current = best->id;
         vm.reschedule = false;
         bool stopped = false;
@@ -508,6 +543,23 @@ bool LoadModule(const std::string& path, const std::vector<u8>& image,
             const u32 index = vm.Read(stub + 4, 4) & 0xFFFF;
             Library function = FindLibrary(library, index);
             const std::string name = ExportName(library, index);
+            // A library the host lacks, that a module exports: the stub jumps to
+            // the module's function, which returns to the caller.
+            const auto exported = vm.exports.find(library);
+            if (!function && exported != vm.exports.end()) {
+                u32 target = 0;
+                for (u32 i = 0, at = exported->second + 20; i <= index; ++i, at += 4) {
+                    target = vm.Read(at, 4);
+                    if (!target) break;
+                }
+                if (target) {
+                    vm.stubs[stub] = {library, index};
+                    vm.Write(stub, 0x08000000u | ((target >> 2) & 0x03FFFFFFu), 4);   // j target
+                    vm.Write(stub + 4, 0, 4);                                         // nop
+                    stub += 8;
+                    continue;
+                }
+            }
             if (!function) {
                 missing.push_back(library + "#" + std::to_string(index) + " " + name);
                 function = [library, index, name](Vm&, Context&) -> Outcome {
@@ -556,6 +608,13 @@ bool LoadModule(const std::string& path, const std::vector<u8>& image,
     loader.c.r[5] = argv;
     loader.c.r[29] = loader.stack + loader.stack_size - 16;
     loader.c.r[31] = kThreadExit;
+    // $gp as the IOP's module loader sets it: the base plus .iopmod's gp value
+    // (its third word). Its threads take it from there (StartThread).
+    for (u16 i = 0; i < shnum; ++i) {
+        const std::size_t sh = shoff + std::size_t(i) * shentsize;
+        if (u32at(sh + 4) == 0x70000080u && u32at(sh + 20) >= 12)
+            loader.c.r[28] = base + u32at(u32at(sh + 16) + 8);
+    }
     loader.c.pc = loader.entry;
     loader.c.npc = loader.entry + 4;
     Thread& started = vm.threads[loader.id] = loader;
@@ -673,7 +732,8 @@ std::string Report() {
         }
     }
     static const char* waits[] = {"ready", "waiting on a semaphore", "waiting on an event flag",
-                                  "sleeping", "delayed", "dormant", "serving RPC"};
+                                  "sleeping", "delayed", "dormant", "serving RPC",
+                                  "waiting on a message box"};
     for (auto& [id, t] : vm.threads) {
         char line[160];
         std::snprintf(line, sizeof line, "  IOP thread %u: %s, priority %d, entry 0x%08X, at 0x%08X\n",

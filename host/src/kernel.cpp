@@ -9,6 +9,7 @@
  * so the report shows what the game asked for.
  */
 
+#include <atomic>
 #include <cstdio>
 #include <map>
 #include <string>
@@ -99,13 +100,21 @@ const char* SyscallName(s32 service) {
 void KernelSyscall(lifted::Context& c) {
     const s32 service = s32(u32(c.r[3]));
     const s32 number = service < 0 ? -service : service;
-    RunStats().syscalls[service]++;
-    char text[160];
-    std::snprintf(text, sizeof text, "kernel %s (0x%02X) a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X",
-                  SyscallName(service), unsigned(number), Arg(c, 0), Arg(c, 1), Arg(c, 2),
-                  Arg(c, 3));
-    if (Tracing()) std::fprintf(stderr, "[%s]\n", text);
-    else Note("syscall " + std::to_string(service), text);
+    if (number < 0x100) ++RunStats().syscall_counts[service + 0x100];
+    else ++RunStats().syscalls[service];
+    // Only the first call of each service is noted (unless every call is): a game
+    // makes hundreds of thousands a minute (Resident Evil Outbreak's thread
+    // scheduler), and formatting each one's note cost 2-4% of the EE.
+    static std::atomic<bool> noted[0x200];
+    const bool first = number < 0x100 ? !noted[service + 0x100].exchange(true) : true;
+    if (first || Tracing() || NotingAll()) {
+        char text[160];
+        std::snprintf(text, sizeof text, "kernel %s (0x%02X) a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X",
+                      SyscallName(service), unsigned(number), Arg(c, 0), Arg(c, 1), Arg(c, 2),
+                      Arg(c, 3));
+        if (Tracing()) std::fprintf(stderr, "[%s]\n", text);
+        else Note("syscall " + std::to_string(service), text);
+    }
     Kernel& k = K();
     // A service the program installed itself (SetSyscall) runs its own handler,
     // in kernel mode on the console - here, as any other guest function.
@@ -124,6 +133,14 @@ void KernelSyscall(lifted::Context& c) {
         case 0x06: case 0x07:                        // LoadExecPS2 / ExecPS2
             throw Unimplemented{std::string("the kernel service ") + SyscallName(service) +
                                 ", which starts another program"};
+        case 0x64:                                   // FlushCache(which)
+            // Invalidating the instruction cache (2): the program wrote code it is
+            // about to run - an overlay loaded. 0 (writing back the data cache,
+            // before a DMA) leaves code as it was; Resident Evil Outbreak issues it
+            // every frame, and each emptied the whole call cache.
+            if (Arg(c, 0) == 2) CodeChanged();
+            Return(c, 0);
+            return;
         case 0x3C: {                                 // SetupThread(gp, stack, size, args, root)
             const u32 stack = Arg(c, 1), size = Arg(c, 2);
             // A stack of -1 means "at the top of RAM"; the thread's stack pointer
@@ -155,6 +172,7 @@ void KernelSyscall(lifted::Context& c) {
             // drives the kernel's own interrupt dispatch. The host keeps those
             // calls: its alarms are the same API, run by its own scheduler.
             if (Arg(c, 0) >= 0xFC && Arg(c, 0) <= 0xFF) {
+                char text[160];
                 std::snprintf(text, sizeof text, "kernel: the program's patch of syscall 0x%02X is not "
                               "installed: the host's alarms stand", unsigned(Arg(c, 0)));
                 Note("syscall patch " + std::to_string(Arg(c, 0)), text);

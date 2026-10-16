@@ -25,6 +25,47 @@ constexpr Spu2::u32 kVmixel = 0x19 - 0x13, kVmixer = 0x1B - 0x13;   // into the 
 
 Spu2::s32 Clamp16(Spu2::s32 v) { return std::min(32767, std::max(-32768, v)); }
 
+/* A voice's samples are interpolated as the hardware does, from the four
+   latest by a 512-entry Gaussian table indexed by the pitch counter's bits
+   4-11 (psx-spx, "4-Point Gaussian Interpolation"; the SPU2 kept the PS1
+   SPU's): a gentle low-pass the console's sound has, where linear
+   interpolation was brighter and aliased more. Any four taps used together
+   sum to 0x7F7F-0x7F81. */
+const Spu2::s16 kGauss[512] = {
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 3, 3,
+    3, 4, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11, 12, 13, 14,
+    15, 16, 17, 18, 19, 21, 22, 24, 25, 27, 28, 30, 32, 33, 35, 37,
+    39, 41, 44, 46, 48, 51, 53, 56, 58, 61, 64, 67, 70, 73, 77, 80,
+    84, 87, 91, 95, 99, 103, 107, 111, 116, 120, 125, 130, 135, 140, 145, 150,
+    156, 161, 167, 173, 179, 186, 192, 199, 205, 212, 219, 227, 234, 242, 250, 257,
+    266, 274, 283, 291, 300, 309, 319, 328, 338, 348, 358, 369, 379, 390, 401, 412,
+    424, 436, 448, 460, 473, 485, 498, 512, 525, 539, 553, 567, 582, 597, 612, 627,
+    643, 659, 675, 692, 708, 726, 743, 761, 779, 797, 816, 835, 854, 874, 894, 914,
+    935, 956, 977, 999, 1020, 1043, 1066, 1089, 1112, 1136, 1160, 1184, 1209, 1234, 1260, 1286,
+    1312, 1339, 1366, 1394, 1422, 1450, 1479, 1508, 1537, 1567, 1598, 1628, 1660, 1691, 1723, 1756,
+    1789, 1822, 1856, 1890, 1924, 1959, 1995, 2031, 2067, 2104, 2141, 2179, 2217, 2256, 2295, 2334,
+    2374, 2415, 2456, 2497, 2539, 2582, 2624, 2668, 2712, 2756, 2801, 2846, 2892, 2938, 2985, 3032,
+    3079, 3128, 3176, 3225, 3275, 3325, 3376, 3427, 3479, 3531, 3584, 3637, 3691, 3745, 3799, 3855,
+    3910, 3967, 4023, 4081, 4138, 4197, 4255, 4315, 4374, 4435, 4495, 4557, 4619, 4681, 4744, 4807,
+    4871, 4935, 5000, 5065, 5131, 5197, 5264, 5332, 5399, 5468, 5536, 5606, 5676, 5746, 5817, 5888,
+    5959, 6032, 6104, 6177, 6251, 6325, 6400, 6475, 6550, 6626, 6702, 6779, 6856, 6934, 7012, 7091,
+    7170, 7249, 7329, 7409, 7490, 7571, 7653, 7735, 7817, 7900, 7983, 8066, 8150, 8234, 8319, 8404,
+    8489, 8575, 8661, 8748, 8834, 8922, 9009, 9097, 9185, 9273, 9362, 9451, 9541, 9630, 9720, 9811,
+    9901, 9992, 10083, 10174, 10266, 10358, 10450, 10542, 10635, 10727, 10820, 10913, 11007, 11100, 11194, 11288,
+    11382, 11476, 11571, 11665, 11760, 11855, 11950, 12045, 12140, 12236, 12331, 12427, 12522, 12618, 12714, 12809,
+    12905, 13001, 13097, 13193, 13289, 13385, 13481, 13577, 13673, 13769, 13865, 13961, 14056, 14152, 14248, 14343,
+    14439, 14534, 14630, 14725, 14820, 14915, 15010, 15104, 15199, 15293, 15387, 15481, 15575, 15669, 15762, 15855,
+    15948, 16041, 16133, 16226, 16317, 16409, 16500, 16592, 16682, 16773, 16863, 16953, 17042, 17131, 17220, 17308,
+    17396, 17484, 17571, 17658, 17744, 17830, 17916, 18001, 18086, 18170, 18254, 18337, 18420, 18502, 18584, 18665,
+    18746, 18826, 18905, 18985, 19063, 19141, 19219, 19295, 19372, 19447, 19522, 19597, 19671, 19744, 19816, 19888,
+    19959, 20030, 20100, 20169, 20238, 20306, 20373, 20439, 20505, 20570, 20634, 20698, 20760, 20822, 20884, 20944,
+    21004, 21063, 21121, 21178, 21235, 21290, 21345, 21399, 21452, 21505, 21556, 21607, 21657, 21706, 21754, 21801,
+    21848, 21893, 21938, 21982, 22025, 22066, 22107, 22148, 22187, 22225, 22262, 22299, 22334, 22369, 22402, 22435,
+    22467, 22498, 22527, 22556, 22584, 22611, 22637, 22662, 22686, 22709, 22731, 22752, 22772, 22791, 22809, 22826,
+    22842, 22857, 22872, 22885, 22897, 22908, 22918, 22927, 22935, 22942, 22948, 22953, 22957, 22960, 22962, 22963
+};
+
 // A volume register's fixed value (bit 15 clear: 15 bits, signed). A sweep's
 // (bit 15 set) is where it has brought the volume: Spu2::Level. Reverb's EVOL
 // has no sweep.
@@ -49,8 +90,7 @@ void Spu2::Level::Set(u32 value) {
 /* A sample of a sweep, by the envelope's rules (Envelope): the rate's shift
    and step, slower near the top going up exponentially, in proportion going
    down; the phase bit makes the volume negative. Rate 0x7F holds it. */
-void Spu2::Level::Step() {
-    if (!(reg & 0x8000)) return;
+void Spu2::Level::Sweep() {
     const u32 rate = reg & 0x7F;
     if (rate == 0x7F) return;
     const bool exponential = (reg & 0x4000) != 0, decreasing = (reg & 0x2000) != 0, negative = (reg & 0x1000) != 0;
@@ -108,13 +148,13 @@ void Spu2::SetParam(u32 entry, u32 value) {
         case 0x02: v.pitch = value & 0x3FFF; break;
         case 0x03: v.adsr1 = value; break;
         case 0x04: v.adsr2 = value; break;
-        case 0x08: c.mmix = value & (CoreOf(entry) ? 0xFFF : 0xFF0); break;
-        case 0x0D: c.avoll = value & 0xFFFF; break;
-        case 0x0E: c.avolr = value & 0xFFFF; break;
-        case 0x0F: c.bvoll = value & 0xFFFF; break;
-        case 0x10: c.bvolr = value & 0xFFFF; break;
         case 0x09: c.mvoll = value; c.main_left.Set(value); break;     // SD_P_MVOLL
         case 0x0A: c.mvolr = value; c.main_right.Set(value); break;    // SD_P_MVOLR
+        case 0x08: c.mmix = value & (CoreOf(entry) ? 0xFFF : 0xFF0); break;   // SD_P_MMIX (core 0: no external input)
+        case 0x0D: c.avoll = value; break;             // SD_P_AVOLL: the external input
+        case 0x0E: c.avolr = value; break;
+        case 0x0F: c.bvoll = value; break;             // SD_P_BVOLL: the sound-data input
+        case 0x10: c.bvolr = value; break;
         case 0x0B: c.evoll = value; break;             // SD_P_EVOLL: the reverb's output
         case 0x0C: c.evolr = value; break;             // SD_P_EVOLR
         default: break;
@@ -149,7 +189,8 @@ Spu2::u32 Spu2::GetParam(u32 entry) const {
 void Spu2::Start(Voice& v) {
     v.nax = v.ssa & ~15u;
     v.counter = 0;
-    v.older = v.old = v.previous = 0;
+    v.older = v.old = 0;
+    v.history[0] = v.history[1] = v.history[2] = 0;
     v.playing = true;
     v.phase = Phase::Attack;
     v.level = 0;
@@ -279,6 +320,25 @@ enum : int { kDApf1 = 0, kDApf2 = 1, kVIir = 2, kVComb1 = 3, kVComb2 = 4, kVComb
              kMLComb4 = 22, kMRComb4 = 23, kDLDiff = 24, kDRDiff = 25, kMLApf1 = 26, kMRApf1 = 27, kMLApf2 = 28,
              kMRApf2 = 29, kVLIn = 30, kVRIn = 31 };
 
+/* The reverb runs at 24 kHz: what goes in is filtered down to it, what comes
+   out filtered up from it, by the same 39-tap half-band FIR (psx-spx, "SPU
+   Reverb Buffer Resampling"; the SPU2 kept the PS1's) - every other tap 0
+   but the middle one's, the sum 32,766. Taken a pair a step and its output
+   held for both, the reverb's tail had the 24 kHz images of everything in
+   it (a metallic hiss). Here the taps from the middle out: kReverbFir[0] is
+   the middle's, [1] the next ones' (the samples 1 from it either side), ... */
+const Spu2::s32 kReverbFir[20] = {0x4000, 0x2806, 0, -0x0B90, 0, 0x0534, 0, -0x0268, 0, 0x010A,
+                                  0, -0x0067, 0, 0x0023, 0, -0x000A, 0, 0x0002, 0, -0x0001};
+
+// The FIR over a ring's last 39 (ending at `at`), its middle 19 back.
+Spu2::s32 ReverbFir(const Spu2::s32* ring, Spu2::u32 at) {
+    const Spu2::u32 middle = at - 19;
+    std::int64_t sum = std::int64_t(ring[middle & 63]) * kReverbFir[0];
+    for (Spu2::u32 k = 1; k < 20; k += 2)
+        sum += std::int64_t(ring[(middle - k) & 63] + ring[(middle + k) & 63]) * kReverbFir[k];
+    return Spu2::s32(sum >> 15);
+}
+
 Spu2::s32 Mul(Spu2::s32 a, Spu2::u16 coefficient) {
     return Spu2::s32((std::int64_t(a) * Spu2::s16(coefficient)) >> 15);
 }
@@ -357,8 +417,11 @@ void Spu2::Reverb(Core& c, s32 in_left, s32 in_right) {
         ram[a] = u8(v);
         ram[a + 1] = u8(v >> 8);
     };
-    auto at = [&](int reg) { return (u32(r[reg]) * 8) % size; };
-    auto before = [&](int reg) { return (at(reg) + size - 2) % size; };
+    // x % size, without the division where x is already within twice the
+    // area (nearly always): ~40 a step, 48,000 steps a second.
+    auto wrap = [size](u32 x) { return x < size ? x : x - size < size ? x - size : x % size; };
+    auto at = [&](int reg) { return wrap(u32(r[reg]) * 8); };
+    auto before = [&](int reg) { return wrap(at(reg) + size - 2); };
     const s32 lin = Mul(in_left, r[kVLIn]), rin = Mul(in_right, r[kVRIn]);
     // Same side, then the other side's reflection.
     const s32 lsame = Mul(lin + Mul(ReverbRead(c, at(kDLSame)), r[kVWall]) - ReverbRead(c, before(kMLSame)),
@@ -380,7 +443,7 @@ void Spu2::Reverb(Core& c, s32 in_left, s32 in_right) {
                Mul(ReverbRead(c, at(kMRComb3)), r[kVComb3]) + Mul(ReverbRead(c, at(kMRComb4)), r[kVComb4]);
     // Late reverb: two all-pass filters.
     const u32 apf1 = at(kDApf1), apf2 = at(kDApf2);
-    auto delayed = [&](int reg, u32 by) { return (at(reg) + size - by % size) % size; };
+    auto delayed = [&](int reg, u32 by) { return wrap(at(reg) + size - wrap(by)); };
     lout = Clamp16(lout - Mul(ReverbRead(c, delayed(kMLApf1, apf1)), r[kVApf1]));
     ReverbWrite(c, at(kMLApf1), lout);
     lout = Mul(lout, r[kVApf1]) + ReverbRead(c, delayed(kMLApf1, apf1));
@@ -427,6 +490,10 @@ void Spu2::Read(u32 address, u8* data, u32 size) const {
 // voices.
 void Spu2::NextBlock(Core& c, u32 index, const std::function<void(u32)>& irq) {
     Voice& v = c.voices[index];
+    // The block's last three: the interpolation's history into the next.
+    v.history[0] = v.samples[kSamplesPerBlock - 3];
+    v.history[1] = v.samples[kSamplesPerBlock - 2];
+    v.history[2] = v.samples[kSamplesPerBlock - 1];
     const u32 block = v.nax & kRamMask & ~15u;
     const u8 flags = ram_[(block + 1) & kRamMask];
     CheckIrq(0, block, block + kBlockBytes, irq);
@@ -515,41 +582,51 @@ void Spu2::Envelope(Voice& v) {
     }
 }
 
-void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
+void Spu2::SetInput(u32 core, const u8* data, u32 size) {
+    Core& c = cores_[core & 1];
+    c.input = size >= 0x400 ? data : nullptr;
+    c.input_size = size;
+    c.input_sample = 0;
+    c.input_hash[0] = c.input_hash[1] = 0;
+}
+
+namespace {
+// Samples in a core's input buffer (256 a 0x400-byte block).
+Spu2::u32 InputFrames(Spu2::u32 size) { return size / 0x400 * 256; }
+}  // namespace
+
+Spu2::u32 Spu2::InputHalf(u32 core) const {
+    const Core& c = cores_[core & 1];
+    const u32 frames = InputFrames(c.input_size);
+    if (!c.input || frames < 2) return 0;
+    return c.input_sample >= frames / 2 ? 1 : 0;
+}
+
+void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq,
+                   const std::function<void(u32 core)>& input_half) {
     // Transfers that touched IRQA.
     for (std::size_t i = 0; i + 1 < pending_irqs_.size(); i += 2)
         CheckIrq(0, pending_irqs_[i], pending_irqs_[i + 1] > pending_irqs_[i] ? pending_irqs_[i + 1] : pending_irqs_[i] + 1, irq);
     pending_irqs_.clear();
-    if (!last_us_) last_us_ = now_us;
-    const double samples = double(now_us - last_us_) * kRate / 1e6;
-    last_us_ = now_us;
-    if (samples <= 0) return;
-    // Capture buffers are 512 signed samples each, written on the same
-    // 48 kHz clock as the voices. Sound drivers read their wet mix back
-    // through libsd DMA to process it (Burnout 3's player engine does so).
-    const u64 first_sample = u64(clock_);
-    clock_ += samples;
+    // Samples are counted from the clock's start - the first Advance at a time
+    // past 0 (at 0 it has not begun) - those due by `now_us`, less those
+    // played: exact, in whole samples (a stopped Advance's rest is due still).
+    if (!start_us_) start_us_ = now_us;
+    if (!start_us_) return;
+    const u64 due = (now_us - std::min(now_us, start_us_)) * 48000 / 1000000;
+    if (due <= clock_) return;
     // The voices, a sample at a time; at most a second's worth at once (a host
     // that stalled longer than that catches up the clock, not the sound).
-    owed_ += samples;
-    u32 count = u32(owed_);
-    owed_ -= count;
-    count = std::min<u32>(count, u32(kRate));
+    if (due - clock_ > u64(kRate)) clock_ = due - u64(kRate);
+    u32 count = u32(due - clock_);
+    const u64 first_sample = clock_;
     // PS2HOST_SPU_LOG=1: once a second, the voices sounding and how their
     // volumes are set (fixed, or a sweep), and the cores' main volumes.
     static const bool log = std::getenv("PS2HOST_SPU_LOG") != nullptr;
-    if (log && u64(clock_) / 48000 != u64(clock_ - samples) / 48000) {
+    if (log && clock_ / 48000 != logged_second_) {
+        logged_second_ = clock_ / 48000;
         for (u32 core = 0; core < 2; ++core) {
             const Core& c = cores_[core];
-            const u32 pcm_base = core == 0 ? 0x4000 : 0x4800;
-            s32 pcm_peak[2] = {};
-            for (u32 side = 0; side < 2; ++side)
-                for (u32 i = 0; i < 512; ++i) {
-                    const u32 a = pcm_base + side * 0x400 + i * 2;
-                    const s32 v = s16(u16(ram_[a]) | u16(ram_[a + 1]) << 8);
-                    pcm_peak[side] = std::max(pcm_peak[side], v < 0 ? -v : v);
-                }
-            std::fprintf(stderr, "[spu2-pcm] core %u: input volume %04X/%04X, peak %d/%d; MMIX %03X\n", core, c.bvoll, c.bvolr, pcm_peak[0], pcm_peak[1], c.mmix);
             u32 sounding = 0, sweeping = 0;
             std::string sweeps;
             for (u32 i = 0; i < 24; ++i) {
@@ -563,14 +640,43 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
                     sweeps += one;
                 }
             }
-            std::fprintf(stderr, "[spu2] core %u: %u voices sounding, %u sweeping%s; main %04X/%04X, effect %04X/%04X\n",
+            char input[96] = "";
+            if (c.input_halves)
+                std::snprintf(input, sizeof input, "; input: %u halves, %u stale", unsigned(c.input_halves),
+                              unsigned(c.input_stale));
+            // The second's peaks: the voices' sum, the input's, the reverb's,
+            // and the loudest voice - where it plays from, how.
+            u32 loudest = 0;
+            for (u32 i = 1; i < 24; ++i)
+                if (c.voice_peak[i] > c.voice_peak[loudest]) loudest = i;
+            const Voice& lv = c.voices[loudest];
+            char peaks[260];
+            std::snprintf(peaks, sizeof peaks, "; mmix %03X avol %04X/%04X bvol %04X/%04X; peaks: voices %d, input %d, reverb %d; loudest %u (%d): "
+                          "pitch %04X ssa %05X nax %05X adsr %04X/%04X vol %04X/%04X",
+                          unsigned(c.mmix), unsigned(c.avoll), unsigned(c.avolr), unsigned(c.bvoll), unsigned(c.bvolr),
+                          int(c.peak_voices), int(c.peak_input), int(c.peak_reverb), unsigned(loudest),
+                          int(c.voice_peak[loudest]), unsigned(lv.pitch), unsigned(lv.ssa), unsigned(lv.nax),
+                          unsigned(lv.adsr1), unsigned(lv.adsr2), unsigned(lv.voll), unsigned(lv.volr));
+            std::fprintf(stderr, "[spu2] core %u: %u voices sounding, %u sweeping%s; main %04X/%04X, effect %04X/%04X%s%s\n",
                          unsigned(core), unsigned(sounding), unsigned(sweeping), sweeps.c_str(), unsigned(c.mvoll),
-                         unsigned(c.mvolr), unsigned(c.evoll), unsigned(c.evolr));
+                         unsigned(c.mvolr), unsigned(c.evoll), unsigned(c.evolr), input, peaks);
+            Core& w = cores_[core];
+            w.input_halves = w.input_stale = 0;
+            w.peak_voices = w.peak_input = w.peak_reverb = 0;
+            std::memset(w.voice_peak, 0, sizeof w.voice_peak);
         }
     }
     mixed_.assign(std::size_t(count) * 2, 0);
-    for (u32 n = 0; n < count; ++n) {
-        s32 left = 0, right = 0;
+    bool stop = false;
+    u32 n = 0;
+    for (; n < count && !stop; ++n) {
+        // Core 0's output: core 1's external input.
+        s32 ext_left = 0, ext_right = 0, left = 0, right = 0;
+        // The capture rings (PCSX2's layout, byte addresses): 512 samples
+        // each, written on the voices' clock - voices 1 and 3 of each core,
+        // core 0's output, each core's dry and wet mixes. A driver reads them
+        // back to process (Burnout 3's player engine, its wet mix). Each
+        // write checks IRQA, as the hardware's do.
         const u32 capture_offset = u32((first_sample + n) & 511) * 2;
         auto capture = [&](u32 base, s32 sample) {
             const u32 address = base + capture_offset;
@@ -581,6 +687,7 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
         };
         for (u32 core = 0; core < 2; ++core) {
             Core& c = cores_[core];
+            // The voices' dry and wet sums (VMIX), then the core's: MMIX's.
             s32 core_left = 0, core_right = 0, wet_left = 0, wet_right = 0;
             for (u32 i = 0; i < 24; ++i) {
                 Voice& v = c.voices[i];
@@ -588,11 +695,16 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
                 v.right.Step();
                 s32 shaped = 0;
                 if (v.pitch && v.phase != Phase::Off) {
-                    const u32 index = v.counter >> 12;
-                    const s32 current = v.samples[index];
-                    const s32 sample = v.previous + ((current - v.previous) * s32(v.counter & 0xFFF) >> 12);
+                    // new, old, older, oldest: the sample at the counter and
+                    // the three before it (from the last block's history).
+                    const int at = int(v.counter >> 12);
+                    auto s = [&v](int k) { return k >= 0 ? v.samples[k] : v.history[3 + k]; };
+                    const u32 f = (v.counter >> 4) & 0xFF;
+                    const s32 sample = ((kGauss[0x0FF - f] * s(at - 3)) >> 15) + ((kGauss[0x1FF - f] * s(at - 2)) >> 15) +
+                                       ((kGauss[0x100 + f] * s(at - 1)) >> 15) + ((kGauss[f] * s(at)) >> 15);
                     shaped = (sample * v.level) >> 15;
                     const s32 sent_left = (shaped * v.left.now) >> 15, sent_right = (shaped * v.right.now) >> 15;
+                    if (log) c.voice_peak[i] = std::max(c.voice_peak[i], std::max(std::abs(sent_left), std::abs(sent_right)));
                     if (c.switches[kVmixl] & (1u << i)) core_left += sent_left;
                     if (c.switches[kVmixr] & (1u << i)) core_right += sent_right;
                     if (c.switches[kVmixel] & (1u << i)) wet_left += sent_left;
@@ -602,80 +714,150 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq) {
                 if (i == 1) capture(core == 0 ? 0x0800 : 0x1800, shaped);
                 if (i == 3) capture(core == 0 ? 0x0C00 : 0x1C00, shaped);
                 if (!v.pitch) continue;
-                const u32 before_index = v.counter >> 12;
-                s32 last = v.samples[before_index];
-                bool crossed = false;
                 v.counter += v.pitch;
                 while (v.counter >= kBlockSpan) {
                     v.counter -= kBlockSpan;
-                    last = v.samples[kSamplesPerBlock - 1];
                     NextBlock(c, i, irq);
-                    crossed = true;
                 }
-                const u32 index = v.counter >> 12;
-                if (crossed || index != before_index)
-                    v.previous = index ? v.samples[index - 1] : last;
             }
+            if (log) c.peak_voices = std::max(c.peak_voices, std::max(std::abs(core_left), std::abs(core_right)));
             const u32 mix_base = core == 0 ? 0x2000 : 0x3000;
             capture(mix_base, core_left);
             capture(mix_base + 0x400, core_right);
             capture(mix_base + 0x800, wet_left);
             capture(mix_base + 0xC00, wet_right);
+            const u32 mix = c.mmix;
+            core_left = mix & 0x800 ? Clamp16(core_left) : 0;
+            core_right = mix & 0x400 ? Clamp16(core_right) : 0;
+            wet_left = mix & 0x200 ? Clamp16(wet_left) : 0;
+            wet_right = mix & 0x100 ? Clamp16(wet_right) : 0;
+            // AVOL and BVOL: signed 16-bit, no sweeps (0x8000 inverts).
+            auto volume = [](u32 v) { return s32(s16(u16(v))); };
+            if (core == 1) {
+                const s32 in_left = (ext_left * volume(c.avoll)) >> 15, in_right = (ext_right * volume(c.avolr)) >> 15;
+                if (mix & 0x8) core_left += in_left;
+                if (mix & 0x4) core_right += in_right;
+                if (mix & 0x2) wet_left += in_left;
+                if (mix & 0x1) wet_right += in_right;
+            }
+            // The sound-data input: a stereo sample a tick from its ring in SPU
+            // RAM (0x4000/0x4400 core 0, 0x4800/0x4C00 core 1), planar, at
+            // BVOL - where a driver's own transfers write it (Burnout 3's
+            // engine sound), and where a block transfer's PCM (sceSdBlockTrans)
+            // lands, as the hardware's AutoDMA puts it there: its next sample
+            // a tick, from the IOP's buffer.
+            const u32 input_base = core == 0 ? 0x4000 : 0x4800;
+            if (c.input) {
+                const u32 at = c.input_sample;
+                const u8* block = c.input + (at / 256) * 0x400 + (at % 256) * 2;
+                for (u32 side = 0; side < 2; ++side) {
+                    ram_[input_base + side * 0x400 + capture_offset] = block[side * 0x200];
+                    ram_[input_base + side * 0x400 + capture_offset + 1] = block[side * 0x200 + 1];
+                }
+                const u32 frames = InputFrames(c.input_size);
+                c.input_sample = (at + 1) % frames;
+                if (frames >= 2 && c.input_sample % (frames / 2) == 0) {
+                    InputHalfBegun(c);
+                    if (input_half) {
+                        input_half(core);
+                        stop = true;
+                    }
+                }
+            }
             auto pcm = [&](u32 base) {
                 const u32 address = base + capture_offset;
                 CheckIrq(0, address, address + 2, irq);
                 return s32(s16(u16(ram_[address]) | u16(ram_[address + 1]) << 8));
             };
-            const u32 input_base = core == 0 ? 0x4000 : 0x4800;
+            const s32 in_left = pcm(input_base), in_right = pcm(input_base + 0x400);
+            // PS2HOST_SPU_INPUT_DUMP=<file>: a block transfer's input as
+            // played, raw 16-bit stereo - to compare a stream with its source.
+            static std::FILE* const dump = [] {
+                const char* path = std::getenv("PS2HOST_SPU_INPUT_DUMP");
+                return path ? std::fopen(path, "wb") : nullptr;
+            }();
+            if (dump && c.input) {
+                const s16 pair[2] = {s16(in_left), s16(in_right)};
+                std::fwrite(pair, 2, 2, dump);
+            }
             if (c.input_gain_remaining) {
                 c.input_gain += (c.input_gain_target - c.input_gain) / s32(c.input_gain_remaining);
                 --c.input_gain_remaining;
             }
-            s32 input_left = (pcm(input_base) * s32(s16(c.bvoll))) >> 15;
-            s32 input_right = (pcm(input_base + 0x400) * s32(s16(c.bvolr))) >> 15;
-            if (c.input_gain != 65536) {
-                input_left = s32((std::int64_t(input_left) * c.input_gain) >> 16);
-                input_right = s32((std::int64_t(input_right) * c.input_gain) >> 16);
+            s32 sent_left = (in_left * volume(c.bvoll)) >> 15;
+            s32 sent_right = (in_right * volume(c.bvolr)) >> 15;
+            if (c.input_gain != 65536) {        // SetInputVolume: a port's own volume
+                sent_left = s32((std::int64_t(sent_left) * c.input_gain) >> 16);
+                sent_right = s32((std::int64_t(sent_right) * c.input_gain) >> 16);
             }
-            const s32 external_left = core == 1 ? (Clamp16(left) * s32(s16(c.avoll))) >> 15 : 0;
-            const s32 external_right = core == 1 ? (Clamp16(right) * s32(s16(c.avolr))) >> 15 : 0;
-            core_left = (c.mmix & 0x800) ? Clamp16(core_left) : 0;
-            core_right = (c.mmix & 0x400) ? Clamp16(core_right) : 0;
-            wet_left = (c.mmix & 0x200) ? Clamp16(wet_left) : 0;
-            wet_right = (c.mmix & 0x100) ? Clamp16(wet_right) : 0;
-            if (c.mmix & 0x080) core_left += input_left;
-            if (c.mmix & 0x040) core_right += input_right;
-            if (c.mmix & 0x020) wet_left += input_left;
-            if (c.mmix & 0x010) wet_right += input_right;
-            if (c.mmix & 0x008) core_left += external_left;
-            if (c.mmix & 0x004) core_right += external_right;
-            if (c.mmix & 0x002) wet_left += external_left;
-            if (c.mmix & 0x001) wet_right += external_right;
+            if (log) c.peak_input = std::max(c.peak_input, std::max(std::abs(sent_left), std::abs(sent_right)));
+            if (mix & 0x80) core_left += sent_left;
+            if (mix & 0x40) core_right += sent_right;
+            if (mix & 0x20) wet_left += sent_left;
+            if (mix & 0x10) wet_right += sent_right;
             // The reverb (SD_CORE_EFFECT_ENABLE, attr bit 2): a step every
             // other sample, on the pair's first input; its output held for
             // the pair.
             static const bool no_reverb = std::getenv("PS2HOST_SPU_NO_REVERB") != nullptr;   // to hear without it
             if ((c.attr & 4) && !no_reverb) {
-                if ((u64(clock_) + n) & 1) Reverb(c, Clamp16(c.reverb_in_left), Clamp16(c.reverb_in_right));
-                else { c.reverb_in_left = wet_left; c.reverb_in_right = wet_right; }
-                core_left += (c.reverb_out_left * Volume(c.evoll)) >> 15;
-                core_right += (c.reverb_out_right * Volume(c.evolr)) >> 15;
+                // In at 48 kHz; every other sample a step of the reverb on the
+                // input filtered down; out its steps filtered up (a zero
+                // between each: twice the filter's gain).
+                const u32 at = ++c.reverb_at;
+                c.reverb_in[0][at & 63] = Clamp16(wet_left);
+                c.reverb_in[1][at & 63] = Clamp16(wet_right);
+                if ((first_sample + n) & 1) {
+                    Reverb(c, Clamp16(ReverbFir(c.reverb_in[0], at)), Clamp16(ReverbFir(c.reverb_in[1], at)));
+                    c.reverb_up[0][at & 63] = c.reverb_out_left;
+                    c.reverb_up[1][at & 63] = c.reverb_out_right;
+                } else {
+                    c.reverb_up[0][at & 63] = c.reverb_up[1][at & 63] = 0;
+                }
+                const s32 wet_out_left = Clamp16(ReverbFir(c.reverb_up[0], at) * 2);
+                const s32 wet_out_right = Clamp16(ReverbFir(c.reverb_up[1], at) * 2);
+                if (log) c.peak_reverb = std::max(c.peak_reverb, std::max(std::abs(wet_out_left), std::abs(wet_out_right)));
+                core_left += (wet_out_left * Volume(c.evoll)) >> 15;
+                core_right += (wet_out_right * Volume(c.evolr)) >> 15;
             }
             c.main_left.Step();
             c.main_right.Step();
-            const s32 out_left = (core_left * c.main_left.now) >> 15;
-            const s32 out_right = (core_right * c.main_right.now) >> 15;
+            const s32 out_left = (Clamp16(core_left) * c.main_left.now) >> 15;
+            const s32 out_right = (Clamp16(core_right) * c.main_right.now) >> 15;
             if (core == 0) {
                 capture(0x1000, out_left);
                 capture(0x1400, out_right);
+                ext_left = out_left;
+                ext_right = out_right;
+            } else {
+                left = out_left;
+                right = out_right;
             }
-            left = out_left;
-            right = out_right;
         }
         mixed_[2 * n] = s16(Clamp16(left));
         mixed_[2 * n + 1] = s16(Clamp16(right));
     }
+    count = n;
+    clock_ += count;
     if (output_ && count) output_(mixed_.data(), count);
+}
+
+// A half of a core's input buffer begun: counted, and whether it is as it
+// was the last time round - not refilled (silence aside).
+void Spu2::InputHalfBegun(Core& c) {
+    const u32 frames = InputFrames(c.input_size), half = c.input_sample / (frames / 2);
+    const u32 bytes = c.input_size / 2;
+    const u8* p = c.input + half * bytes;
+    u64 hash = 1469598103934665603ull;
+    bool silent = true;
+    for (u32 i = 0; i + 8 <= bytes; i += 8) {
+        u64 word;
+        std::memcpy(&word, p + i, 8);
+        silent &= word == 0;
+        hash = (hash ^ word) * 1099511628211ull;
+    }
+    ++c.input_halves;
+    if (!silent && hash == c.input_hash[half]) ++c.input_stale;
+    c.input_hash[half] = hash;
 }
 
 }  // namespace iop

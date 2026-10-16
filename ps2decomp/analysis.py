@@ -482,8 +482,42 @@ class ImageAnalyzer:
                 continue
             if not self._looks_like_code(addr):
                 continue
-            candidates.append(addr)
+            candidates.append(self._scheduled_entry(addr, inside_function))
         return candidates
+
+    # How far back from a frame's setup the entry is looked for. The walk stops
+    # at the first branch, jump or padding anyway; four left out 0x001ADF00 of
+    # Resident Evil Outbreak, five instructions above its `addiu $sp`, called
+    # only from an overlay - whose port stopped there entering a room.
+    MAX_SCHEDULED = 16
+
+    def _scheduled_entry(self, addr: int, inside_function) -> int:
+        """The entry of a function whose frame is set up at `addr`.
+
+        CodeWarrior schedules an instruction or two above the `addiu $sp`: a
+        `lui` of a global's address (`lui $v0, 0x21; addiu $sp, $sp, -0x30;
+        lw $v1, -0x6208($v0)`, Resident Evil Outbreak's 0x0011B920), an `srl`.
+        Taking the frame setup for the entry left them out, and the function
+        read a register it never set. Plain instructions between the previous
+        function's last delay slot and the setup are reachable only as this
+        function's start, so it begins there; anything else - a branch, a
+        jump, padding, another function's code - and it begins at `addr`.
+        """
+        entry = addr
+        for _step in range(self.MAX_SCHEDULED + 1):
+            # After a terminator's delay slot, or the padding after it (0x00106880:
+            # `lui $v0, 0x21` after a `nop`, the `addiu $sp` at 0x00106884).
+            if self._follows_terminator(entry):
+                return entry
+            before = entry - 4
+            if not self.contains(before) or inside_function(before):
+                return addr
+            word = self.word_at(before)
+            ins = DISASM.decode(word, before)
+            if word == 0 or ins.is_branch or ins.is_jump or ins.is_return or ins.has_delay_slot:
+                return addr
+            entry = before
+        return addr
 
     # -- driver ---------------------------------------------------------
 

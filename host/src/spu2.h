@@ -19,14 +19,27 @@
  * output joins the core's at EVOL. The algorithm is the PS1 SPU's, which the
  * SPU2 kept (no-cash psx-spx, "SPU Reverb Formula").
  *
- * Capture RAM holds raw voice 1/3, dry/wet mixes and core 0 output in
- * 512-sample rings. Their writes raise IRQA, so drivers can DMA-read the
- * captured audio to process and play it through their normal sound path.
+ * Sound-data input: a core's ring in SPU RAM - planar 16-bit PCM, 512 left
+ * samples at 0x4000 then 512 right at 0x4400 (core 0), 0x4800/0x4C00 (core
+ * 1) - read a stereo sample per 48 kHz tick at the core's BVOL, into its dry
+ * and wet mixes as MMIX bits 4-7 say. A driver writes it itself (Burnout 3's
+ * engine sound), or a block transfer (sceSdBlockTrans - how CRI's ADX streams
+ * its music) fills it from IOP memory a sample a tick, as the hardware's
+ * AutoDMA does: 0x200 bytes of left samples, then 0x200 of right, looping
+ * over the buffer.
  *
- * Sound-data inputs read planar signed PCM from byte addresses 0x4000/0x4400
- * (core 0) and 0x4800/0x4C00 (core 1), with MMIX gates and BVOL. Core 0's
- * output reaches core 1 through AVOL and its external-input MMIX gates.
- * Not modelled yet: noise, pitch modulation and AutoDMA block-input refill.
+ * Capture: the SPU2 writes what it mixes back into SPU RAM, 512-sample rings
+ * - voices 1 and 3 of each core, core 0's output, each core's dry and wet
+ * mixes - and the writes raise IRQA, so a driver can read the sound back to
+ * process it.
+ *
+ * The cores (PCSX2's mixer): each sums its voices (VMIX), its sound-data
+ * input (BVOL) and its external input into a dry and a wet mix, as MMIX lets
+ * each in; the wet goes through the reverb (EVOL); the sum, at MVOL, is the
+ * core's output. Core 0's is core 1's external input (at core 1's AVOL), and
+ * core 1's is what is heard.
+ *
+ * Not modelled yet: noise, pitch modulation.
  *
  * libsd's entries (ps2sdk libsd-common.h): a voice parameter or address is
  * (param << 8) | core | voice << 1; a switch or core address (n << 8) | core.
@@ -51,7 +64,10 @@ public:
     using s32 = std::int32_t;
     using u64 = std::uint64_t;
 
-    Spu2() : ram_(2u << 20) { cores_[1].mmix = 0xFFC; }
+    Spu2() : ram_(2u << 20) {
+        cores_[0].mmix = 0xFF0;
+        cores_[1].mmix = 0xFFC;
+    }
 
     // Host gain for a core's PCM input, applied after the game's own volume.
     // A 5 ms ramp makes live menu changes click-free; capture RAM is unchanged.
@@ -71,12 +87,27 @@ public:
     /* What the last SetEffectAttr was given (libsd keeps it). */
     void GetEffectAttr(u32 core, u32* mode, s32* depth_left, s32* depth_right, u32* delay, u32* feedback) const;
 
+    /* A core's sound-data input: `size` bytes of PCM at `data` (it stays
+       there, the source's memory), from its start; null stops it. */
+    void SetInput(u32 core, const u8* data, u32 size);
+
     /* Data into (or out of) SPU RAM at a byte address, as a transfer would. */
     void Write(u32 address, const u8* data, u32 size);
     void Read(u32 address, u8* data, u32 size) const;
 
-    /* Advance playback to `now_us`; `irq(core)` for each interrupt raised. */
-    void Advance(u64 now_us, const std::function<void(u32 core)>& irq);
+    /* Advance playback to `now_us`; `irq(core)` for each interrupt raised.
+       With `input_half`, a core's sound-data input reaching a half of its
+       buffer calls it (the block transfer's interrupt: the half before is
+       free to refill) and playback stops there, the rest owed (Behind): the
+       IOP's handler and the stream's decoder run before the SPU2 reads on
+       (PlayedUs: where it stopped). */
+    void Advance(u64 now_us, const std::function<void(u32 core)>& irq,
+                 const std::function<void(u32 core)>& input_half = nullptr);
+    /* The time played to: the last Advance's, or short of it where it stopped. */
+    u64 PlayedUs() const { return start_us_ + clock_ * 1000000 / 48000; }
+    /* The half of its buffer a core's sound-data input is playing (0 or 1). */
+    u32 InputHalf(u32 core) const;
+    bool InputActive(u32 core) const { return cores_[core & 1].input != nullptr; }
 
     /* Where the mixed output goes: interleaved 16-bit stereo at 48 kHz. */
     using Output = std::function<void(const s16* frames, u32 count)>;
@@ -98,7 +129,12 @@ private:
         u32 counter = 0;
         explicit Level(u32 value = 0) { Set(value); }
         void Set(u32 value);
-        void Step();
+        // A sample of a sweep; a fixed volume (bit 15 clear) stays as it is.
+        // Inline: 100 levels step at 48 kHz, nearly all of them fixed.
+        void Step() {
+            if (reg & 0x8000) Sweep();
+        }
+        void Sweep();
     };
     struct Voice {
         u32 pitch = 0, ssa = 0, lsax = 0, nax = 0;
@@ -108,7 +144,7 @@ private:
         u32 counter = 0;                // 4.12 fixed point: samples into the block
         s32 samples[28] = {};           // the current block, decoded
         s32 older = 0, old = 0;         // the decoder's history
-        s32 previous = 0;               // the sample before the current one
+        s32 history[3] = {};            // the last block's last three samples (Gaussian interpolation's)
         Phase phase = Phase::Off;
         s32 level = 0;                  // the envelope, 0-0x7FFF
         u32 envelope_counter = 0;
@@ -123,12 +159,23 @@ private:
         Voice voices[24];
         u32 endx = 0, irqa = 0, attr = 0, esa = 0, eea = 0, tsa = 0;
         u32 switches[16] = {};          // by switch number - 0x13
-        u32 mmix = 0xFF0;
-        u32 avoll = 0x7FFF, avolr = 0x7FFF;  // signed 16-bit external-input volumes
-        s32 input_gain = 65536, input_gain_target = 65536;
+        s32 input_gain = 65536, input_gain_target = 65536;   // SetInputVolume's, 16.16
         u32 input_gain_remaining = 0;
-        u32 bvoll = 0x7FFF, bvolr = 0x7FFF;  // signed 16-bit PCM-input volumes
         u32 mvoll = 0x3FFF, mvolr = 0x3FFF;
+        // The inputs' volumes: AVOL the external input's (core 1's: core 0's
+        // output), BVOL the sound-data input's - at their maximum until set.
+        u32 avoll = 0x7FFF, avolr = 0x7FFF, bvoll = 0x7FFF, bvolr = 0x7FFF;
+        // MMIX, what goes where, wet R, wet L, dry R, dry L in each four bits:
+        // 0-3 the external input, 4-7 the sound-data input, 8-11 the core's
+        // voices (PCSX2's gates). After sceSdInit 0xFF0 and 0xFFC (Spu2()).
+        u32 mmix = 0xFFF;
+        const u8* input = nullptr;      // the sound-data input, while a block transfer runs
+        u32 input_size = 0, input_sample = 0;
+        // PS2HOST_SPU_LOG: halves begun, and those begun as they were the
+        // last time round (not refilled: the decoder behind its reader).
+        u32 input_halves = 0, input_stale = 0;
+        u64 input_hash[2] = {};
+        s32 peak_voices = 0, peak_input = 0, peak_reverb = 0, voice_peak[24] = {};   // PS2HOST_SPU_LOG: the second's
         Level main_left{0x3FFF}, main_right{0x3FFF};     // MVOLL, MVOLR as they are now
         bool irq_enabled = false;
         // Reverb: the registers (libsd's order: dAPF1, dAPF2, vIIR, vCOMB1-4,
@@ -139,17 +186,21 @@ private:
         u32 effect_mode = 0, effect_delay = 0, effect_feedback = 0;
         s32 effect_depth_left = 0, effect_depth_right = 0;
         u32 reverb_position = 0;        // bytes into the work area
-        s32 reverb_in_left = 0, reverb_in_right = 0;     // the first of each pair of samples
-        s32 reverb_out_left = 0, reverb_out_right = 0;   // held for the pair
+        s32 reverb_out_left = 0, reverb_out_right = 0;   // the last step's
+        // The reverb's resampling (ReverbResample): the last 64 samples into
+        // it at 48 kHz, and out of it - its steps, a zero between each.
+        s32 reverb_in[2][64] = {}, reverb_up[2][64] = {};
+        u32 reverb_at = 0;
     };
     Core cores_[2];
     std::vector<u8> ram_;
-    u64 last_us_ = 0;
-    double clock_ = 0;               // samples since the SPU2 started
-    double owed_ = 0;                // a fraction of a sample not yet produced
+    u64 start_us_ = 0;               // the clock's start: the first Advance past 0
+    u64 clock_ = 0;                  // samples since then, played (or passed over)
+    u64 logged_second_ = ~0ull;      // PS2HOST_SPU_LOG: the last second logged
     Output output_;
     std::vector<s16> mixed_;
 
+    void InputHalfBegun(Core& c);
     static u32 CoreOf(u32 entry) { return entry & 1; }
     static u32 VoiceOf(u32 entry) { return ((entry >> 1) & 0x1F) % 24; }
     void CheckIrq(u32 core_hint, u32 from, u32 to, const std::function<void(u32)>& irq);

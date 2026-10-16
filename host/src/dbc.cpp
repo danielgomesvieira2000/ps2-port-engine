@@ -113,6 +113,34 @@ u64 g_last_input_frame = 0;
 u16 g_keys_before = 0, g_controller_before = 0;
 bool g_sticks_before = false;
 
+// --record-input and --replay-input (RecordInput, ReplayInput): the reports,
+// by the frame each starts at.
+std::FILE* g_record = nullptr;
+u8 g_recorded[kDataBytes] = {};
+bool g_recorded_any = false;
+struct Report { u64 frame; u8 data[kDataBytes]; };
+std::vector<Report> g_replay;
+std::size_t g_replay_next = 0;
+bool g_replaying = false;
+
+// The report as recorded or replayed: a replay's replaces the pad's whole.
+void RecordOrReplay(u8* data) {
+    if (g_replaying) {
+        while (g_replay_next < g_replay.size() && g_replay[g_replay_next].frame <= g_frame) ++g_replay_next;
+        if (g_replay_next) std::memcpy(data, g_replay[g_replay_next - 1].data, kDataBytes);
+        else for (u32 i = 0; i < kDataBytes; ++i) data[i] = i < 2 ? 0xFF : i < 6 ? 0x80 : 0;
+        g_held = u16(~(u32(data[0]) | u32(data[1]) << 8));
+    }
+    if (g_record && (!g_recorded_any || std::memcmp(data, g_recorded, kDataBytes) != 0)) {
+        std::fprintf(g_record, "%llu", (unsigned long long)g_frame);
+        for (u32 i = 0; i < kDataBytes; ++i) std::fprintf(g_record, " %02X", data[i]);
+        std::fputc('\n', g_record);
+        std::fflush(g_record);
+        std::memcpy(g_recorded, data, kDataBytes);
+        g_recorded_any = true;
+    }
+}
+
 void PadData(u8* data) {
     u16 buttons = 0xFFFF;                                   // active low: nothing pressed
     u8 pressure[16] = {};                                   // each input's, the most any source gives
@@ -189,6 +217,7 @@ void PadData(u8* data) {
     for (u32 i = 2; i < 6; ++i) data[i] = controller ? pad.sticks[i - 2] : 0x80;
     static const int kPressure[12] = {5, 7, 4, 6, 12, 13, 14, 15, 10, 11, 8, 9};
     for (u32 i = 0; i < 12; ++i) data[6 + i] = (buttons >> kPressure[i]) & 1 ? 0 : pressure[kPressure[i]];
+    RecordOrReplay(data);
 }
 
 std::vector<u8> Server(u32 procedure, const std::vector<u8>& request) {
@@ -386,6 +415,34 @@ bool ScriptPress(const std::string& button, u64 from, u64 to, u8 pressure) {
             return true;
         }
     return false;
+}
+
+bool RecordInput(const std::string& path) {
+    g_record = std::fopen(path.c_str(), "w");
+    return g_record != nullptr;
+}
+
+bool ReplayInput(const std::string& path) {
+    std::FILE* file = std::fopen(path.c_str(), "r");
+    if (!file) return false;
+    char line[256];
+    while (std::fgets(line, sizeof line, file)) {
+        Report r{};
+        char* at = line;
+        r.frame = std::strtoull(at, &at, 10);
+        u32 i = 0;
+        for (; i < kDataBytes; ++i) {
+            char* end = nullptr;
+            const unsigned long value = std::strtoul(at, &end, 16);
+            if (end == at) break;
+            r.data[i] = u8(value);
+            at = end;
+        }
+        if (i == kDataBytes) g_replay.push_back(r);
+    }
+    std::fclose(file);
+    g_replaying = true;
+    return !g_replay.empty();
 }
 
 // Each frame: every socket's device writes its state into the next block.

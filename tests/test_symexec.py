@@ -544,10 +544,10 @@ class TestVoidFunctions(unittest.TestCase):
         self.assertFalse(result.is_void)
         self.assertIn("return", result.render())
 
-    def test_mixed_void_and_value_paths_are_refused(self):
-        """One route returning a value and another not is ambiguous, so refuse it.
-
-        Choosing either reading would be a guess about the signature.
+    def test_mixed_void_and_value_paths_return_the_incoming_v0(self):
+        """One route returning a value and another leaving $v0 unset returns a
+        value on both: on the second, the $v0 it was called with (V0_IN), which
+        a caller may read. Once refused as ambiguous; void would be a guess.
         """
         # beq $a0,$zero,+2 ; nop ; jr $ra ; nop   (taken path leaves $v0 unset)
         # followed by a path that sets $v0, reached by falling through.
@@ -560,10 +560,12 @@ class TestVoidFunctions(unittest.TestCase):
             JR_RA,                        # the branch target: returns with $v0 unset
             0,
         ]
-        from ps2decomp.symexec import Unsupported
+        from ps2decomp.symexec import Arg, Const, V0_IN, simplify
 
-        with self.assertRaises(Unsupported):
-            self._derive(words)
+        result = self._derive(words)
+        self.assertFalse(result.is_void)
+        self.assertEqual(sorted(map(repr, (simplify(p.expression) for p in result.paths))),
+                         sorted(map(repr, (Arg(V0_IN), Const(7)))))
 
     def test_branching_void_paths_return_and_capture(self):
         """Each non-final void path must leave, and capture before it writes.

@@ -25,6 +25,8 @@ import struct
 from .r5900 import DISASM
 from .symexec import (
     ARG_COUNT,
+    V0_IN,
+    arguments_used,
     vu_written,
     VU_KEYS,
     vf_lane,
@@ -67,9 +69,12 @@ from .symexec import (
 )
 
 # Caps that keep a pathological function from exploding the enumeration. A small
-# accessor or predicate has a handful of paths; anything past these is not the kind
-# of function this module is meant for.
-MAX_PATHS = 24
+# accessor or predicate has a handful of paths, but a game's flag handlers and
+# state updates test several independent conditions in turn - 2^n paths. At 24,
+# half of Resident Evil Outbreak's game.bin functions refused for "too many
+# paths" or the step budget derived at 128-256 (a sample: 0 of 30 at 24, 15 at
+# 128, 18 at 512, the slowest explorations then 20 s apiece).
+MAX_PATHS = 256
 
 # Loop unrolling bounds. MAX_UNROLL caps how often any one instruction may execute on
 # a single path, i.e. the largest trip count that will be unrolled. MAX_PATH_STEPS
@@ -83,7 +88,7 @@ MAX_PATH_STEPS = 2048
 # fork on every iteration for a very long time before any path completes. One such
 # function - a ring-buffer walk at 0x0020DD08, forking four ways per iteration - grew
 # roughly as 4^64 and never returned. Capping the work, not the results, bounds it.
-MAX_TOTAL_STEPS = 20_000
+MAX_TOTAL_STEPS = 150_000
 
 # Largest expression, counted as a tree, that a derivation may hold. Step counts do
 # not bound this: an unrolled loop that uses a value twice per iteration doubles the
@@ -133,6 +138,13 @@ class Call:
     # For a call through a register - a function pointer or a virtual method - the
     # expression the target address is taken from; `target` is then -1.
     pointer: Expr = None
+    # The caller's $sp at the call, where the original runs the callee; None
+    # when it is not a frame address.
+    sp: int = None
+    # The caller's $v0 at the call. A callee that leaves $v0 alone on some path
+    # returns it there; the model and the compiled check hand it over, as the
+    # original does.
+    v0: Expr = None
 
 
 @dataclasses.dataclass(eq=False)
@@ -427,13 +439,15 @@ def _run_tree(statements, args, execution):
             )
         elif kind == "call":
             call = statement[1]
-            vector = [0] * ARG_COUNT
+            vector = [0] * (ARG_COUNT + 1)
             for index, expr in call.arguments:
                 vector[index] = simplify(expr).evaluate(args, execution)
+            if call.v0 is not None:
+                vector[V0_IN] = simplify(call.v0).evaluate(args, execution)
             target = call.target
             if call.pointer is not None:
                 target = simplify(call.pointer).evaluate(args, execution) & MASK32
-            execution.call(call.index, target, vector)
+            execution.call(call.index, target, vector, call.sp)
         elif kind == "barrier":
             execution.barrier(statement[1].index)
         elif kind == "loop":
@@ -546,12 +560,16 @@ class Execution:
         self.flush()
         self.markers[index] = len(self.memory._journal)
 
-    def call(self, index, target, vector):
+    def call(self, index, target, vector, sp=None):
         self.flush()
         # Below this function's frame, which may hold an out-parameter the callee
         # writes - running the callee at the usual stack top would trample it.
+        # At the caller's own $sp, as the original does: a callee that stores a
+        # stack address (an RPC's request block, Resident Evil Outbreak's
+        # 0x00119B28) stored a different one at a fixed depth, and some 20
+        # functions calling it disagreed by two bytes.
         self.machine.call(target, vector, max_instructions=self.budget,
-                          stack_top=callee_stack_top())
+                          stack_top=callee_stack_top() if sp is None else sp)
         self.results[index] = self.machine.get(2) & MASK64
         self.float_results[index] = self.machine.fpr[0] & 0xFFFFFFFF
         self.markers[index] = len(self.memory._journal)
@@ -616,6 +634,20 @@ def _constant_truth(predicate):
         return bool(predicate.evaluate((0, 0, 0, 0), None))
     except Exception:
         return None
+
+
+_SWITCH_ANALYZERS: dict = {}
+
+
+def _switch_targets(image: bytes, base: int, jr_addr: int, register: int):
+    """The case addresses of the switch ending in `jr register` at `jr_addr`, or
+    None (analysis.jump_table: its table, bounded by the index's check)."""
+    from .analysis import ImageAnalyzer           # analysis imports this module's users
+    analyzer = _SWITCH_ANALYZERS.get(base)
+    if analyzer is None or analyzer.data is not image:
+        _SWITCH_ANALYZERS.clear()
+        analyzer = _SWITCH_ANALYZERS[base] = ImageAnalyzer(image, base)
+    return analyzer.jump_table(jr_addr, register)
 
 
 def _condition_for(ins, get):
@@ -1056,6 +1088,14 @@ def _step(regs: dict, stores: list, frame: dict, memory: dict, ins, get,
                 _frame_write(frame, slot, size, get(ins.rt))
             return
         value = get(ins.rt)
+        if size <= 8 and _is_frame_address(value):
+            # A local's address stored where a callee can find it - a request
+            # block's reply buffer (Resident Evil Outbreak's 0x00119B28 and
+            # eighteen like it): from here on the frame is real memory, as when
+            # the address is passed in a register.
+            if not isinstance(frame, Frame):
+                raise Unsupported("stores a stack address")
+            frame.escape(stores, memory)
         if size == 16 and (ins.rt == 0 or upper(ins.rt) in regs) and not (
                 _is_frame_address(target) and isinstance(frame, Frame)
                 and id(value) in frame.seeds):
@@ -1117,10 +1157,111 @@ def _step(regs: dict, stores: list, frame: dict, memory: dict, ins, get,
     _apply(regs, ins, get, epoch)
 
 
+# The halves of an unaligned access: (the other half, the whole's opcode, the
+# high half's offset above the low's).
+_UNALIGNED_HALVES = {
+    "ldl": ("ldr", 0x37, 7), "ldr": ("ldl", 0x37, 7),     # ld
+    "lwl": ("lwr", 0x23, 3), "lwr": ("lwl", 0x23, 3),     # lw: sign-extended either way
+    "sdl": ("sdr", 0x3F, 7), "sdr": ("sdl", 0x3F, 7),     # sd
+    "swl": ("swr", 0x2B, 3), "swr": ("swl", 0x2B, 3),     # sw
+}
+
+
+def _fuse_unaligned(image: bytes, base: int, start: int, end: int) -> dict:
+    """{address: word} rewriting each pair of halves in [start, end) as the
+    aligned access they make together (_unaligned_pair): the first half
+    becomes the whole, the second a `nop`.
+
+    The halves are adjacent, or - a store only - the second is the delay slot
+    of the jump or branch after the first (`sdl $v1, 0xF($a0); jr $ra; sdr
+    $v1, 0x8($a0)`), which runs it before control moves. A pair is left as it
+    is, and its halves refused, where code could arrive between them: a branch
+    or switch case targeting the second half, or the jump between them, or
+    where the first half is itself a delay slot.
+    """
+    def decode(address):
+        return DISASM.decode(struct.unpack_from("<I", image, address - base)[0], address)
+
+    if not (base <= start and end <= base + len(image)):
+        return {}
+    code = {address: decode(address) for address in range(start, end, 4)}
+    targets = set()
+    for address, ins in code.items():
+        if (ins.is_branch or ins.is_jump) and ins.target is not None:
+            targets.add(ins.target)
+        if ins.mnemonic == "jr" and not ins.is_return:
+            targets |= set(_switch_targets(image, base, address, ins.rs) or ())
+    fused = {}
+    for address, ins in code.items():
+        if ins.mnemonic not in _UNALIGNED_HALVES or address in fused:
+            continue
+        before = code.get(address - 4)
+        if before is not None and before.has_delay_slot:
+            continue
+        nxt = code.get(address + 4)
+        if nxt is None:
+            continue
+        whole = _unaligned_pair(ins, nxt)
+        if whole is not None and address + 4 not in targets:
+            fused[address], fused[address + 4] = whole.raw, 0
+            continue
+        slot = code.get(address + 8)
+        if (slot is None or not nxt.has_delay_slot or nxt.is_likely
+                or not ins.mnemonic.startswith("s") or address + 4 in targets
+                or address + 8 in targets):
+            continue
+        whole = _unaligned_pair(ins, slot)
+        if whole is not None:
+            fused[address], fused[address + 8] = whole.raw, 0
+    return fused
+
+
+def _unaligned_pair(first, second):
+    """The aligned access an adjacent pair of halves makes, or None.
+
+    `ldl $t, A+7($b); ldr $t, A($b)` (either order) reads the eight bytes at
+    A, whatever A's alignment: each half fills the bytes the other leaves, so
+    together they are `ld $t, A($b)` - CodeWarrior's copy of a struct that may
+    not be aligned (89 of Resident Evil Outbreak's refusals). The same holds
+    for sdl/sdr and swl/swr writing them. A load whose first half overwrites
+    its own base is not a pair: the second half reads another address.
+    """
+    other, opcode, span = _UNALIGNED_HALVES[first.mnemonic]
+    if second.mnemonic != other or second.rt != first.rt or second.rs != first.rs:
+        return None
+    if first.mnemonic.startswith("l") and (first.rt == first.rs or first.rt == 0):
+        return None
+    high, low = (first, second) if first.mnemonic.endswith("l") else (second, first)
+    if high.imm - low.imm != span:
+        return None
+    word = (opcode << 26) | (low.rs << 21) | (low.rt << 16) | (low.imm & 0xFFFF)
+    return DISASM.decode(word, low.addr)
+
+
 # Registers a call may clobber. After inlining a callee these are dropped rather
 # than left holding stale values: if the caller then reads one, the derivation is
 # refused instead of quietly using a value the real code would not have had.
 CALLER_SAVED = tuple(range(2, 4)) + tuple(range(4, 8)) + tuple(range(8, 16)) + (24, 25)
+
+
+def _preserved_across(regs: dict, target, parameters, own) -> dict:
+    """The caller-saved registers, both halves, that a call to `target` leaves
+    as they were (calls.preserved_registers): a value CodeWarrior keeps in $t1
+    across a call to a function that never touches it is still there after.
+
+    Only values made from the function's own parameters (`own`, liveness's):
+    liveness takes a call to kill every argument register, so an incoming
+    argument still in place after one is no parameter to it, and kept, it
+    would make one - 0x0015FB20, passing $a1-$t3 on to a printf, would take
+    eight, and none of its callers passes them."""
+    if target is None or parameters is None:
+        return {}
+    kept = {}
+    for index in getattr(parameters, "preserved", {}).get(target, ()):
+        for key in (index, upper(index)):
+            if key in regs and arguments_used(regs[key]) <= own:
+                kept[key] = regs[key]
+    return kept
 
 
 def _call_arguments(regs: dict) -> dict:
@@ -1130,7 +1271,25 @@ def _call_arguments(regs: dict) -> dict:
     for k, reg in enumerate(FLOAT_ARG_REGS):
         if fpr(reg) in regs:
             arguments[FLOAT_ARG_BASE + k] = regs[fpr(reg)]
+    if 2 in regs:
+        arguments[V0_IN] = regs[2]
     return arguments
+
+
+def _check_v0_known(callee, arguments) -> None:
+    """Refuse to inline a callee that reads its incoming $v0 when the caller's is
+    not known: substitution would leave it the caller's own incoming $v0."""
+    if V0_IN in arguments:
+        return
+    for path in callee.paths:
+        exprs = [path.expression] + list(path.conditions)
+        exprs += [part for store in path.stores for part in (store.address, store.value)]
+        exprs += [expr for call in path.calls for _i, expr in call.arguments]
+        exprs += [call.v0 for call in path.calls]
+        exprs += [expr for _n, kind, obj in path.marks if kind == "loop"
+                  for expr in tree_expressions([("loop", obj)])]
+        if any(expr is not None and V0_IN in arguments_used(expr) for expr in exprs):
+            raise Unsupported("passes an unknown $v0 to a callee that reads it")
 
 
 def _contains_load(expr) -> bool:
@@ -1255,13 +1414,24 @@ def derive_paths(image: bytes, base: int, start: int, end: int, *args, **kwargs)
     try:
         return _derive_paths(image, base, start, end, *args, **kwargs)
     except FloatResult:
-        return _derive_paths(image, base, start, end, *args, force_float=True, **kwargs)
+        try:
+            return _derive_paths(image, base, start, end, *args, force_float=True, **kwargs)
+        except Unsupported as exc:
+            # A float result that some paths never set is no float result: $f0
+            # was the function's scratch (a comparison), and $v0 a callee's
+            # leftover - a void function, as one whose paths never write $v0
+            # is. Resident Evil Outbreak's state handlers, reached through
+            # pointers, were refused this way: 216 of game.bin's functions.
+            if str(exc) != "reads uninitialised register $%d" % fpr(0):
+                raise
+            return _derive_paths(image, base, start, end, *args, leftover_void=True, **kwargs)
 
 
 def _derive_paths(image: bytes, base: int, start: int, end: int,
                  gp_value: int = None, known: dict = None,
                  parameters: dict = None, loops: bool = False,
-                 merge: bool = False, force_float: bool = False) -> PathDerivation:
+                 merge: bool = False, force_float: bool = False,
+                 leftover_void: bool = False) -> PathDerivation:
     """Derive a function as guarded paths, handling acyclic control flow.
 
     `known` maps an address to an already-derived `PathDerivation`. A call to one of
@@ -1277,9 +1447,14 @@ def _derive_paths(image: bytes, base: int, start: int, end: int,
     # (calls.float_returning).
     returns_float = force_float or start in getattr(parameters, "returns_float", ())
 
+    fused = _fuse_unaligned(image, base, start, end)
+    own_parameters = set(parameters.get(start, ())) if parameters is not None else set()
+
     def word_at(addr: int) -> int:
         if not (base <= addr < base + len(image) - 3):
             raise Unsupported("address outside the image")
+        if addr in fused:
+            return fused[addr]
         return struct.unpack_from("<I", image, addr - base)[0]
 
     paths = []
@@ -1288,6 +1463,31 @@ def _derive_paths(image: bytes, base: int, start: int, end: int,
     epochs = [0]
     loop_ids = [0]
     loop_info = _loop_info(image, base, start, end) if loops else {}
+    liveness = {}
+
+    def dead_arguments(address):
+        """The argument registers (and their upper halves) that nothing from
+        `address` on reads - calls.live_map over this function's own code. A
+        loop exit still holds the arguments a call in the body made dead, and
+        keeping them as variables gave the function every argument as a
+        parameter: 0x00102F08 of Resident Evil Outbreak, a wait loop calling
+        printf, took sixteen, and its 139 callers passed the eight liveness
+        found, so none of them could be emitted."""
+        if parameters is None or not start <= address < end:
+            return frozenset()
+        if "map" not in liveness:
+            from .calls import _graph, live_map
+            liveness["map"] = live_map(
+                _graph({"addr": start, "end": end}, image, base, parameters), parameters)
+        live = liveness["map"].get(address)
+        if live is None:
+            return frozenset()
+        dead = set()
+        for index in range(ARG_COUNT):
+            if not live >> index & 1:
+                register = _arg_register(index)
+                dead |= {register, upper(register)} if index < FLOAT_ARG_BASE else {register}
+        return frozenset(dead)
     joins = _join_points(image, base, start, end) if merge else {}
 
     def shared_code(address: int) -> bool:
@@ -1330,6 +1530,13 @@ def _derive_paths(image: bytes, base: int, start: int, end: int,
             raise Unsupported("calls an address that is not a known function start")
         else:
             indices = parameters[target]
+            if target in getattr(parameters, "stack_readers", ()):
+                # The callee reads its arguments past the eighth from this
+                # function's frame: the frame becomes memory, as for a local's
+                # address passed.
+                if not isinstance(frame, Frame):
+                    raise Unsupported("passes stack arguments to an underived function")
+                frame.escape(stores, memory)
         arguments = []
         for index in indices:
             reg = _arg_register(index)
@@ -1348,8 +1555,16 @@ def _derive_paths(image: bytes, base: int, start: int, end: int,
                 frame.escape(stores, memory)
             arguments.append((index, regs[reg]))
         index = memory.next_epoch() if isinstance(memory, Overlay) else epoch + 1
-        call = Call(index, target, tuple(arguments), pointer)
+        stack = regs.get(29)
+        sp = (simplify(stack).value & MASK32
+              if stack is not None and _is_frame_address(stack) else None)
+        # A callee that may return the $v0 it is given is given the caller's.
+        v0 = (regs.get(2) if pointer is None
+              and target not in getattr(parameters, "sets_v0", ()) else None)
+        call = Call(index, target, tuple(arguments), pointer, sp, v0)
         before_v0 = regs.get(2)
+        kept = _preserved_across(regs, None if pointer is not None else target, parameters,
+                                 own_parameters)
         for index in CALLER_SAVED + (REG_HI, REG_LO, FP_COND):
             regs.pop(index, None)
         for index in CALLER_SAVED:
@@ -1364,6 +1579,7 @@ def _derive_paths(image: bytes, base: int, start: int, end: int,
                 regs[2] = before_v0
         else:
             regs[2] = CallResult(call.index, target)
+        regs.update(kept)
         # A float result comes back in $f0. Whatever the callee left there is
         # what the original reads, so it is a result like $v0 - one the emitted
         # code can only name for a callee called by address (derive._call).
@@ -1388,10 +1604,31 @@ def _derive_paths(image: bytes, base: int, start: int, end: int,
         body_paths = []
         body_frame = frame.fork()
         body_frame.frozen = True
-        walk(head, body_regs, [], body_frame, Overlay(epoch=head_epoch, counter=epochs),
-             (), {}, (), loop=context, sink=body_paths)
+        try:
+            walk(head, body_regs, [], body_frame, Overlay(epoch=head_epoch, counter=epochs),
+                 (), {}, (), loop=context, sink=body_paths)
+        except Unsupported as exc:
+            # A body that writes a local - a counter, a buffer filled a byte at a
+            # time - or passes one's address cannot keep the frame symbolic: a
+            # slot written on one iteration is read on the next. The frame
+            # becomes real memory before the loop, as for a call given a local's
+            # address, and the body is derived again over loads and stores (57
+            # and 54 of Resident Evil Outbreak's refusals).
+            if (str(exc) not in _FRAME_IN_LOOP or not isinstance(frame, Frame)
+                    or frame.frozen):
+                raise
+            frame.escaped = False               # flush the slots written since, too
+            frame.escape(stores, memory)
+            head_epoch = memory.next_epoch()
+            context = LoopContext(identity, head, body, carried, [])
+            body_paths = []
+            body_frame = frame.fork()
+            body_frame.frozen = True
+            walk(head, body_regs, [], body_frame, Overlay(epoch=head_epoch, counter=epochs),
+                 (), {}, (), loop=context, sink=body_paths)
         tree = _build_tree([(path.events(), path.end()) for path in body_paths])
-        carried, tree = _prune_loop_variables(identity, carried, tree, context.exits)
+        carried, tree = _prune_loop_variables(identity, carried, tree, context.exits,
+                                              dead_arguments)
         init = tuple((register, value) for register, value in init if register in carried)
         after_epoch = memory.next_epoch()
         node = Loop(identity, head, init, carried, tree, head_epoch, after_epoch,
@@ -1406,7 +1643,11 @@ def _derive_paths(image: bytes, base: int, start: int, end: int,
             guards = [LoopExit(identity, j).negate() for j in range(index)]
             if index < count - 1:
                 guards.append(LoopExit(identity, index))
-            walk(exit_address, dict(exit_regs), list(stores), frame.fork(),
+            # A register nothing after the exit reads may hold a variable pruned
+            # above; it is dropped, so a read the liveness missed refuses.
+            dead = dead_arguments(exit_address)
+            exit_regs = {r: v for r, v in exit_regs.items() if r not in dead}
+            walk(exit_address, exit_regs, list(stores), frame.fork(),
                  Overlay(epoch=after_epoch, counter=epochs),
                  conditions + tuple(guards), visited,
                  marks + (loop_mark,) + tuple((len(stores), "cond", g) for g in guards),
@@ -1526,9 +1767,44 @@ def _derive_paths(image: bytes, base: int, start: int, end: int,
                 sink.append(Path(conditions, None, tuple(stores), marks, leaf=("trap", addr)))
                 return
 
-            if m == "jr":
-                if not ins.is_return:
+            if m == "jr" and not ins.is_return:
+                # A switch: the register holds a case's address, loaded from a
+                # table the analysis can bound (analysis.jump_table). Each case
+                # is a path, on the condition that the address is that case's -
+                # so it holds whatever the index arithmetic was. A jump through
+                # anything else is still refused.
+                cases = _switch_targets(image, base, addr, ins.rs)
+                if not cases:
                     raise Unsupported("indirect jump")
+                jump = get(ins.rs)                # read before the delay slot runs
+                _step(regs, stores, frame, memory,
+                      DISASM.decode(word_at(addr + 4), addr + 4), get, epoch)
+                marks = _drain(memory, marks)
+                # An if-else ladder (paths part in twos): each case is not any
+                # case before it; the last is what is left.
+                ordered = sorted(set(cases))
+                for case in ordered:
+                    if not (start <= case < end) and not shared_code(case):
+                        raise Unsupported("control flow leaves the function")
+                ladder, ladder_marks = conditions, marks
+                for i, case in enumerate(ordered):
+                    case_memory = memory.fork()
+                    if i == len(ordered) - 1:
+                        walk(case, dict(regs), list(stores), frame.fork(), case_memory,
+                             ladder, visited, _drain(case_memory, ladder_marks),
+                             loop=loop, sink=sink, stop=stop)
+                        break
+                    predicate = Predicate("eq", jump, Const(case))
+                    walk(case, dict(regs), list(stores), frame.fork(), case_memory,
+                         ladder + (predicate,), visited,
+                         _drain(case_memory, ladder_marks + ((len(stores), "cond", predicate),)),
+                         loop=loop, sink=sink, stop=stop)
+                    negated = predicate.negate()
+                    ladder = ladder + (negated,)
+                    ladder_marks = ladder_marks + ((len(stores), "cond", negated),)
+                return
+
+            if m == "jr":
                 _step(regs, stores, frame, memory,
                       DISASM.decode(word_at(addr + 4), addr + 4), get, epoch)
                 marks = _drain(memory, marks)
@@ -1551,6 +1827,9 @@ def _derive_paths(image: bytes, base: int, start: int, end: int,
                 # about what it really returns.
                 if (isinstance(result, CallResult) and result.register == 2
                         and regs.get(fpr(0)) is not None):
+                    if leftover_void:
+                        sink.append(Path(conditions, None, tuple(stores), marks))
+                        return
                     if start not in getattr(parameters, "returns_int", ()):
                         raise FloatResult("returns a float in $f0")
                     raise Unsupported("returns a float in $f0")
@@ -1659,6 +1938,7 @@ def _derive_paths(image: bytes, base: int, start: int, end: int,
                 if callee.returns_float != returns_float and not callee.is_void:
                     raise Unsupported("tail-calls a function returning the other kind")
                 arguments = _call_arguments(regs)
+                _check_v0_known(callee, arguments)
                 epoch, marks = _settle_for_callee(callee, arguments, memory, stores, marks,
                                                   frame)
 
@@ -1719,6 +1999,7 @@ def _derive_paths(image: bytes, base: int, start: int, end: int,
                       DISASM.decode(word_at(addr + 4), addr + 4), get, epoch)
                 marks = _drain(memory, marks)
                 arguments = _call_arguments(regs)
+                _check_v0_known(callee, arguments)
                 epoch, marks = _settle_for_callee(callee, arguments, memory, stores, marks,
                                                   frame)
 
@@ -1735,11 +2016,14 @@ def _derive_paths(image: bytes, base: int, start: int, end: int,
                     extra = _apply_callee_path(
                         callee_path, arguments, branch_stores, branch_memory, epoch
                     )
+                    kept = _preserved_across(branch_regs, ins.target, parameters,
+                                             own_parameters)
                     for index in CALLER_SAVED:
                         branch_regs.pop(index, None)
                         branch_regs.pop(upper(index), None)
                     for index in VU_KEYS:
                         branch_regs.pop(index, None)
+                    branch_regs.update(kept)
                     if callee_path.expression is not None:
                         # A float result comes back in $f0, anything else in $v0.
                         branch_regs[fpr(0) if callee.returns_float else 2] = simplify(
@@ -1789,6 +2073,7 @@ def _derive_paths(image: bytes, base: int, start: int, end: int,
         regs[reg] = Arg(i)
     for k, reg in enumerate(FLOAT_ARG_REGS):
         regs[fpr(reg)] = Arg(FLOAT_ARG_BASE + k)
+    regs[2] = Arg(V0_IN)
     seeds = frozenset(id(regs[index]) for index in
                       list(range(16, 24)) + [30, 31] + [fpr(i) for i in range(20, 32)])
     walk(start, regs, [], Frame(seeds=seeds), Overlay(counter=epochs), (), {})
@@ -1799,18 +2084,35 @@ def _derive_paths(image: bytes, base: int, start: int, end: int,
         raise Unsupported("every path traps")
     # A tail call to an underived function hands on whatever the callee left in
     # $v0. In a function whose other paths return nothing, that is no value either.
+    # And with no caller known to read $v0 (calls.int_returning), any callee's
+    # leftover is: Resident Evil Outbreak's handlers call a function on one path
+    # and return on another, and 32 of 40 sampled "inconsistent void and value"
+    # refusals returned nothing but such leftovers. Known only from the calls
+    # the scan sees: a function whose address is taken has callers it cannot.
+    # A path that leaves $v0 as it came is void, as one that never wrote it -
+    # unless other paths return a value: then the function returns one, and
+    # those paths the caller's (V0_IN). Kept as found for that case.
+    found = list(paths)
+    for index, path in enumerate(paths):
+        if path.leaf is None and path.expression == Arg(V0_IN):
+            paths[index] = dataclasses.replace(path, expression=None)
     if any(path.expression is None for path in paths):
+        unread = (start not in getattr(parameters, "returns_int", ())
+                  and start not in getattr(parameters, "address_taken", ()))
         for index, path in enumerate(paths):
             if isinstance(path.expression, CallResult) and path.calls and \
-                    path.expression.index == path.calls[-1].index:
+                    (unread or path.expression.index == path.calls[-1].index):
                 paths[index] = Path(path.conditions, None, path.stores, path.marks)
     returned = list(_returned_values(paths))
     void_paths = sum(1 for value in returned if value is None)
     if void_paths and void_paths != len(returned):
-        # Some paths produce a value and others do not. That is either a function
-        # whose result is only meaningful on some routes, or a misread; either way
-        # the signature is ambiguous, so refuse rather than choose.
-        raise Unsupported("inconsistent void and value-returning paths")
+        # Some paths produce a value and others do not. With the incoming $v0
+        # the ones leaving it are values too; a path with no value at all (a
+        # float leftover, a void callee's) is ambiguous still, so refuse rather
+        # than choose.
+        if any(value is None for value in _returned_values(found)):
+            raise Unsupported("inconsistent void and value-returning paths")
+        paths = found
     derivation = PathDerivation(start, tuple(paths), returns_float)
     if not derivation.sequential and _touches_frame_memory(derivation):
         # The frame is symbolic unless it escaped, and escaping always makes the
@@ -1821,7 +2123,11 @@ def _derive_paths(image: bytes, base: int, start: int, end: int,
     return derivation
 
 
-def _prune_loop_variables(identity, carried, tree, exits) -> tuple:
+# What a loop body refuses for when it needs the frame as memory.
+_FRAME_IN_LOOP = ("a loop writes the stack frame", "a loop passes the address of a local")
+
+
+def _prune_loop_variables(identity, carried, tree, exits, dead_at=None) -> tuple:
     """Drop loop variables that nothing reads; returns (carried, tree).
 
     Every register the body writes starts as a variable, but one that is always
@@ -1829,7 +2135,9 @@ def _prune_loop_variables(identity, carried, tree, exits) -> tuple:
     iterations. Keeping it would also give it an initial value from before the
     loop: `$t0` started as argument 4, which made the function appear to take a
     fifth argument it never reads. A variable is kept if any expression of the
-    body other than its own update reads it, or any exit's registers do.
+    body other than its own update reads it, or any exit's registers do -
+    those the code after the exit can read (`dead_at(exit)`: the registers it
+    cannot).
     """
     def mentions(expr, wanted):
         found, seen, stack = set(), set(), [expr]
@@ -1871,6 +2179,9 @@ def _prune_loop_variables(identity, carried, tree, exits) -> tuple:
                 out.append(statement)
         return out
 
+    if dead_at is not None:
+        exits = [(address, {r: v for r, v in regs.items() if r not in dead_at(address)})
+                 for address, regs in exits]
     keep = set(carried)
     while True:
         used = readers(tree, keep)

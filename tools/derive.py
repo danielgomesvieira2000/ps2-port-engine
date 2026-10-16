@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import dataclasses
 import json
 import os
 import re
@@ -59,6 +60,7 @@ from ps2decomp.symexec import (
     Unsupported,
     FLOAT_ARG_BASE,
     FLOAT_RESULT,
+    V0_IN,
     arg_name,
     arg_renderer,
     arguments_used,
@@ -66,9 +68,11 @@ from ps2decomp.symexec import (
     load_renderer,
     low32,
     simplify,
+    substitute,
 )
 
 from ps2decomp import layout
+from ps2decomp import testmem
 from ps2decomp import testplan
 from ps2decomp.testplan import (ARG_SETS, VERIFY_BUDGET, _effects_digest,  # noqa: F401
                                 _failed, failure_reason, global_pointers,
@@ -128,7 +132,22 @@ def derivation_args(derivation) -> set:
                 args |= used_args(expr)
             if call.pointer is not None:
                 args |= used_args(call.pointer)
+            # The $v0 a call hands over matters where its result is used: the
+            # callee may return it.
+            if call.v0 is not None and V0_IN in used_args(call.v0) and                     _path_uses_call(path, call.index):
+                args.add(V0_IN)
     return args
+
+
+def _path_uses_call(path, index) -> bool:
+    """Whether a path uses the integer result of its call `index`."""
+    exprs = [path.expression] + list(path.conditions)
+    exprs += [part for store in path.stores for part in (store.address, store.value)]
+    exprs += [expr for call in path.calls for _i, expr in call.arguments]
+    exprs += [call.pointer for call in path.calls] + [call.v0 for call in path.calls]
+    exprs += [expr for _n, kind, obj in path.marks if kind == "loop"
+              for expr in tree_expressions([("loop", obj)])]
+    return any(expr is not None and _mentions_call(expr, index, 2) for expr in exprs)
 
 
 def _render_load_as_helper(node, render_child) -> str:
@@ -367,9 +386,17 @@ class StatementEmitter:
     def __init__(self, derivation) -> None:
         self.tree = derivation.tree()
         self.void = derivation.is_void
+        # Whether the function takes its incoming $v0 (V0_IN); where it does
+        # not, the model ran with it 0, and so does the emitted code.
+        self.v0_declared = V0_IN in derivation_args(derivation)
         self.replaced = {}        # id(original node) -> Temp
         self.counter = 0
         self.frame_size = _frame_size([simplify(e) for e in self._expressions(self.tree)])
+        # At least down to the deepest $sp a call is made at: callees run there in
+        # the original and the model, and the compiled code's at StackEnter's.
+        deepest = min(_call_stack_pointers(self.tree), default=None)
+        if deepest is not None and deepest < layout.CURRENT.stack_top:
+            self.frame_size = max(self.frame_size, layout.CURRENT.stack_top - deepest)
         self.loops = {}
         self.active = []          # loops whose body is being emitted, innermost last
         self.hoisted = set()      # call results declared before a loop, assigned in it
@@ -377,6 +404,11 @@ class StatementEmitter:
         # can be read after its loop - in the enclosing loop's exit code - where a
         # declaration inside the loop's block would no longer be in scope.
         self.declared = []
+        # Per loop, the values from its body's memory that code after it uses,
+        # as (node, local): assigned at each `break`, before the body's stores can
+        # change what they read (0x00107ED0 re-read a word after the loop that
+        # its last iteration had overwritten).
+        self.exit_captures = {}
 
     def render(self) -> list:
         """The statements, with a guest stack frame around them if one is needed.
@@ -463,6 +495,8 @@ class StatementEmitter:
         lines = []
         for position, statement in enumerate(statements):
             later = self._expressions(statements[position + 1:])
+            for loop_id in _breaks_in(statements[position + 1:]):
+                later += [node for node, _name in self.exit_captures.get(loop_id, ())]
             kind = statement[0]
             if kind == "store":
                 store = statement[1]
@@ -496,6 +530,14 @@ class StatementEmitter:
             elif kind == "continue":
                 lines += self._continue(statement[1], statement[2])
             elif kind == "break":
+                for node, name in self.exit_captures.get(statement[1], ()):
+                    if self._beyond(node, epoch):
+                        if self.loops[statement[1]].exits > 1:
+                            # Read on another exit's route: the code after this
+                            # one has no use for it (or the compiled check says).
+                            continue
+                        raise Unsupported("uses a value after a loop that its exit did not read")
+                    lines.append("%s = %s;" % (name, render_cpp(self._apply(node))))
                 if self.loops[statement[1]].exits > 1:
                     lines.append("l%d_exit = %d;" % (statement[1], statement[2]))
                 lines.append("break;")
@@ -542,9 +584,28 @@ class StatementEmitter:
         # A call result inside the loop may be used after it, where a local
         # declared in the body no longer exists, so it is declared here.
         for index in sorted(_calls_in(loop.body)):
+            # Only the integer result is declared; one whose float result the
+            # code after the loop reads named a local that did not exist
+            # (Resident Evil Outbreak's game.bin 0x005A5E10, `return rf8;`),
+            # and the check at the call, which sees only the body, missed it.
+            if any(_mentions_call(expr, index, FLOAT_RESULT) for expr in later):
+                raise Unsupported("uses the float result of a call in a loop")
             if index not in self.hoisted:
                 self.hoisted.add(index)
                 lines.append("u64 r%d = 0;" % index)
+        # Values read in the body and used after the loop: a body that stores or
+        # calls may have written over them since, so each exit assigns them to
+        # locals. One that does neither leaves memory as it read it.
+        inside = lambda load: loop.head_epoch <= load.epoch < loop.after_epoch
+        captures = []
+        for node in (_maximal(later, inside,
+                              lambda node: _beyond(node, loop.after_epoch - 1),
+                              self.replaced)
+                     if _writes_memory(loop.body) else ()):
+            name = "l%d_out%d" % (loop.id, len(captures))
+            self.declared.append(name)
+            captures.append((node, name))
+        self.exit_captures[loop.id] = captures
         initial = dict(loop.init)
         for register in loop.carried:
             value = render_cpp(self._apply(initial[register])) if register in initial else "0"
@@ -563,6 +624,8 @@ class StatementEmitter:
         lines += ["    " + line for line in self._block(loop.body, loop.head_epoch)]
         self.active.pop()
         self.replaced = outer
+        for node, name in captures:
+            self.replaced[id(node)] = Temp(name)
         lines.append("}")
         return lines
 
@@ -610,6 +673,13 @@ class StatementEmitter:
             raise Unsupported("no writer for %d-byte store" % store.size)
         return ["%s(%s, %s);" % (WRITERS[store.size], render_cpp(address), value)]
 
+    def _v0(self, call):
+        """The $v0 a call hands over, as this function's code has it."""
+        expr = call.v0
+        if not self.v0_declared:
+            expr = substitute(expr, {V0_IN: Const(0)})
+        return expr
+
     def _call(self, call, later) -> str:
         passed = dict(call.arguments)
         if call.pointer is not None:
@@ -618,9 +688,18 @@ class StatementEmitter:
         if signature is None:
             indices = [index for index, _expr in call.arguments]
             _EXTERNS[call.target] = tuple(indices)
+            if call.v0 is not None and any(_mentions_call(expr, call.index, 2)
+                                           for expr in later):
+                # Its result is used, and it may be the $v0 handed over: the
+                # declaration takes it as a last parameter, 0 where not passed.
+                _V0_EXTERNS.add(call.target)
+                passed[V0_IN] = self._v0(call)
+                indices.append(V0_IN)
             returns_value = True
         else:
             return_type, indices = signature
+            if V0_IN in indices and call.v0 is not None:
+                passed[V0_IN] = self._v0(call)
             missing = [index for index in indices if index not in passed]
             if missing:
                 raise Unsupported("callee declares an argument the call does not pass")
@@ -704,6 +783,66 @@ def _pointer_call_text(emitter, call, passed) -> str:
     return "CallPointer(%s)" % ", ".join(arguments)
 
 
+def _writes_memory(statements) -> bool:
+    """Whether a statement tree stores or calls anywhere."""
+    for statement in statements:
+        if statement[0] in ("store", "call"):
+            return True
+        if statement[0] == "if" and (_writes_memory(statement[2]) or _writes_memory(statement[3])):
+            return True
+        if statement[0] == "loop" and _writes_memory(statement[1].body):
+            return True
+    return False
+
+
+def _breaks_in(statements) -> set:
+    """The loops a statement tree's `break`s leave."""
+    found = set()
+    for statement in statements:
+        if statement[0] == "break":
+            found.add(statement[1])
+        elif statement[0] == "if":
+            found |= _breaks_in(statement[2]) | _breaks_in(statement[3])
+        elif statement[0] == "loop":
+            found |= _breaks_in(statement[1].body)
+    return found
+
+
+def _maximal(exprs, affected, future, replaced) -> list:
+    """The maximal subexpressions of `exprs` holding an affected load and
+    nothing from the future, each once; as `_capture` finds them."""
+    state, found, seen = {}, [], set()
+
+    def contains(node):
+        key = id(node)
+        if key in replaced:
+            return (False, False)
+        if key in state:
+            return state[key]
+        hit = isinstance(node, Load) and affected(node)
+        ahead = future(node)
+        for child in children(node):
+            child_hit, child_ahead = contains(child)
+            hit, ahead = hit or child_hit, ahead or child_ahead
+        state[key] = (hit, ahead)
+        return state[key]
+
+    def visit(node):
+        hit, ahead = contains(node)
+        if not hit or id(node) in seen:
+            return
+        if not ahead:
+            seen.add(id(node))
+            found.append(node)
+            return
+        for child in children(node):
+            visit(child)
+
+    for expr in exprs:
+        visit(expr)
+    return found
+
+
 def _beyond(node, epoch: int) -> bool:
     """True for a node that only exists after epoch `epoch`: a later load or call."""
     if isinstance(node, Load):
@@ -711,6 +850,19 @@ def _beyond(node, epoch: int) -> bool:
     if isinstance(node, CallResult):
         return node.index > epoch
     return False
+
+
+def _call_stack_pointers(statements) -> set:
+    """The $sp of every call in a statement tree that records one."""
+    found = set()
+    for statement in statements:
+        if statement[0] == "call" and statement[1].sp is not None:
+            found.add(statement[1].sp)
+        elif statement[0] == "if":
+            found |= _call_stack_pointers(statement[2]) | _call_stack_pointers(statement[3])
+        elif statement[0] == "loop":
+            found |= _call_stack_pointers(statement[1].body)
+    return found
 
 
 def _calls_in(statements) -> set:
@@ -761,6 +913,8 @@ NOT_EMITTED = {}
 # used: the extern declaration returns one or the other, so a callee cannot be both.
 _FLOAT_EXTERNS = set()
 _INTEGER_EXTERNS = set()
+# Underived callees handed the caller's $v0 at some call (StatementEmitter._call).
+_V0_EXTERNS = set()
 
 
 def render_body(derivation) -> list:
@@ -911,6 +1065,8 @@ def _derive_worker(connection, game_directory, seeds):
     """One derivation process: tests whatever addresses it is sent, against the
     derivations it has been told are verified so far."""
     _game, database, image, section, machine = worker_machine(game_directory, seeds)
+    global CALLERS_KNOWN
+    CALLERS_KNOWN = game_config.callers_known(_game)
     parameters = calls.parameters(database, image, section.addr)
     functions = {f["addr"]: f for f in database["functions"]}
 
@@ -1170,6 +1326,11 @@ def _attempt(func, image, base, machine, read, known, rejected, parameters=None)
             rejected["reason"] = failure_reason()
             return None
         arg_sets, profile = plan
+        if V0_IN in derivation_args(derivation):
+            # It returns or reads the $v0 it is called with: each case calls it
+            # with one of its own, which the model and the C++ take as V0_IN.
+            arg_sets = [tuple(args) + (_incoming_v0(func["addr"], case),)
+                        for case, args in enumerate(arg_sets)]
 
         def evaluate(args):
             if derivation.sequential:
@@ -1179,6 +1340,23 @@ def _attempt(func, image, base, machine, read, known, rejected, parameters=None)
         record = []
         outcome, tested = run_cases(func, machine, arg_sets, profile, evaluate, record,
                                     float_result=derivation.returns_float)
+        if outcome == "mismatch" and _unobservable_result(func, derivation, parameters):
+            # No caller can read what it returns, so only its effects are its
+            # behaviour: the value a tail call hands back may be the caller's
+            # own $v0, left by a callee that does not set it, and no model of
+            # the call has it (Resident Evil Outbreak: 91 of game.bin's
+            # disagreeing functions, 15 of the executable's).
+            derivation = PathDerivation(
+                derivation.address,
+                tuple(dataclasses.replace(path, expression=None) for path in derivation.paths))
+            record = []
+            outcome, tested = run_cases(func, machine, arg_sets, profile, evaluate, record)
+        if outcome == "ok" and tested < 5:
+            fuller = fuller_profile(func, machine, arg_sets, tested)
+            if fuller is not None:
+                profile, record = fuller, []
+                outcome, tested = run_cases(func, machine, arg_sets, profile, evaluate,
+                                            record, float_result=derivation.returns_float)
         # A disagreement and an untestable function are different findings and are
         # counted once each. An earlier version fell through from one to the other
         # and so reported every disagreement twice.
@@ -1204,6 +1382,65 @@ def _attempt(func, image, base, machine, read, known, rejected, parameters=None)
         argument_dependent = bool(derivation_args(derivation))
         EXPECTATIONS[func["addr"]] = (arg_sets, profile, record)
         return (func, derivation, tested, argument_dependent)
+
+
+def _incoming_v0(address: int, case: int) -> int:
+    """A case's $v0 on entry: a word in scratch memory, different per case."""
+    mixed = (address * 0x9E3779B1 + (case + 1) * 0x85EBCA6B) & 0xFFF0
+    return layout.CURRENT.scratch + 0x100 + mixed
+
+
+# Whether every caller of this part's functions is in its analysis
+# (game.callers_known): only then does no caller reading $v0 mean none does.
+CALLERS_KNOWN = False
+
+
+def _unobservable_result(func, derivation, parameters) -> bool:
+    """Whether nothing can read the value a derivation returns: every caller is
+    known (CALLERS_KNOWN) and none reads its $v0 (calls.int_returning), nothing
+    takes its address, and it has no loop, whose body may return on its own."""
+    if (not CALLERS_KNOWN or parameters is None or derivation.is_void
+            or derivation.returns_float):
+        return False
+    if func["addr"] in parameters.returns_int or func["addr"] in parameters.address_taken:
+        return False
+    return not any(kind == "loop" for path in derivation.paths for _n, kind, _o in path.marks)
+
+
+def fuller_profile(func, machine, arg_sets, ran: int):
+    """A profile under which the original completes more of `arg_sets` than the
+    `ran` the plan's did, or None: the one completing most, the earliest of
+    those tied.
+
+    The plan's profile is the first the original finishes on with the first
+    argument set; on the others it may spin (a tree walk on random links
+    meets a cycle) and leave too few cases. Of a sample of 60 such functions
+    in Resident Evil Outbreak's game.bin, 57 completed five or more under
+    some profile. Which inputs are tried changes only what the test reaches;
+    every case that runs is still compared.
+    """
+    best, best_ran = None, ran
+    for profile in testmem.PROFILES:
+        completed = 0
+        for case, args in enumerate(arg_sets):
+            mark = machine.memory.page_mark()
+            machine.memory.end_journal()
+            machine.memory.write(layout.CURRENT.scratch, testmem.build(profile, func["addr"] + case))
+            machine.memory.begin_journal()
+            try:
+                machine.call(func["addr"], args, max_instructions=VERIFY_BUDGET)
+                completed += 1
+            except Exception:
+                pass
+            finally:
+                machine.memory.rollback()
+                machine.memory.end_journal()
+            machine.memory.unmap_to(mark)
+        if completed > best_ran:
+            best, best_ran = profile, completed
+            if completed == len(arg_sets):
+                break
+    return best
 
 
 def emit(verified, out_dir: str, source_name: str, catalog=None) -> None:
@@ -1274,6 +1511,7 @@ def emit(verified, out_dir: str, source_name: str, catalog=None) -> None:
         _EXTERNS.clear()
         _FLOAT_EXTERNS.clear()
         _INTEGER_EXTERNS.clear()
+        _V0_EXTERNS.clear()
         headers = {}
         for func, derivation, _tested, _strong in emitted:
             headers[func["addr"]] = _signature(func, derivation, catalog)
@@ -1345,7 +1583,10 @@ def emit(verified, out_dir: str, source_name: str, catalog=None) -> None:
         lines.append("   did; a port links them to their eventual reconstructions, and the")
         lines.append("   compiled check links them to the original machine code. */")
         for address, indices in sorted(_EXTERNS.items()):
-            params = ", ".join("u64 %s" % arg_name(index) for index in indices) or "void"
+            params = ", ".join("u64 %s" % arg_name(index) for index in indices)
+            if address in _V0_EXTERNS:
+                params = (params + ", " if params else "") + "u64 v0 = 0"
+            params = params or "void"
             if address in _FLOAT_EXTERNS:
                 lines.append("u32 func_%08X(%s);  /* not yet derived; returns a float, "
                              "as its bits */" % (address, params))
@@ -1382,7 +1623,8 @@ def _signature(func, derivation, catalog):
     indices = sorted(derivation_args(derivation))
     params, roots = [], set()
     for index in indices:
-        root = catalog.slot(func["addr"], index) if catalog is not None else None
+        root = (catalog.slot(func["addr"], index)
+                if catalog is not None and index < FLOAT_ARG_BASE else None)
         if index >= FLOAT_ARG_BASE or root is None:
             # A float argument holds a 32-bit pattern, but is declared u64 like
             # every other value: as a u32, `farg0 & 0x7FFFFFFF` + -127 wrapped at
@@ -1466,7 +1708,7 @@ def check_compiled(verified, machine, out_dir: str, database: dict, work: str,
     # rather than aborting the whole check: one rendering gap must not cost every
     # other function its verdict.
     source = os.path.join(out_dir, "accessors.cpp")
-    for _attempt_number in range(8):
+    for _attempt_number in range(24):
         try:
             stage = time.time()
             dll, _functions = cppcheck.build(source, runtime,
@@ -1547,6 +1789,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     game = game_config.from_args(args)
+    global CALLERS_KNOWN
+    CALLERS_KNOWN = game_config.callers_known(game)
     database = game.load_database()
     elf = game.load_elf()
     section = elf.exec_sections[0]
@@ -1669,6 +1913,7 @@ def main(argv=None) -> int:
                 ),
             }
         rows = [existing[key] for key in sorted(existing)]
+        os.makedirs(os.path.dirname(os.path.abspath(args.csv)), exist_ok=True)
         with open(args.csv, "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(
                 handle, fieldnames=["address", "name", "status", "source", "notes"]

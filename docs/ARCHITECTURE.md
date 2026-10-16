@@ -412,6 +412,20 @@ Three reliable kinds of leaked information:
 Everything here generates *hints*. Nothing renames a function without a recorded
 reason.
 
+## Overlays - code loaded from the disc
+
+Some games keep most of their code out of the executable, in overlays read from
+the disc at run time over memory the executable leaves free (Resident Evil
+Outbreak: a 1.4 MB executable, 3.4 MB of overlays, three of them at the same
+address). An overlay is decompiled as a game of its own: a directory whose
+`game.json` names its base game, its image (unpacked by the game's own tools to
+how it lies in memory) and its address (`ps2decomp/overlay.py`). Loading it builds
+an executable of the base image with the overlay - and the overlays resident with
+it - laid over it, so every tool works on it through `--game` and the interpreter
+runs its calls into the executable and the other overlays as they are. The
+analysis keeps only the functions in the overlay's `code` ranges; the rest are
+the base's, or another overlay's, to decompile.
+
 ## Data flow
 
 Paths are relative to the game's directory, as `game.json` names them.
