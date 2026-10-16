@@ -349,13 +349,6 @@ bool HostPad(HostPadState* state) {
     return false;   // the GDI window has none
 }
 
-int HostPadLabels() {
-#ifdef PS2HOST_VULKAN
-    if (g_display) return g_display->PadLabels();
-#endif
-    return 0;
-}
-
 namespace {
 // --gpu-show: where the window's picture comes from instead of the software GS.
 std::function<bool(std::vector<u32>*, u32*, u32*)> g_picture_source;

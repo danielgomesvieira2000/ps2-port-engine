@@ -119,11 +119,6 @@ public:
     };
     enum ControllerFamily : std::uint8_t { kOtherController, kPlayStationController, kXboxController };
     virtual bool Pad(PadState* state) const { (void)state; return false; }
-    /* What that controller's face buttons say: 0 the DualShock's shapes (or
-       not known), 1 A at the bottom (Xbox and most others), 2 B at the
-       bottom, A on the right (Nintendo's). Pad's buttons go by position
-       whatever they say. */
-    virtual int PadLabels() const { return 0; }
     /* The controller's motors, 0-65535 each (the low-frequency, large one;
        the high-frequency, small one), until set again - 0, 0 stops them.
        Taken up by the window's own thread (Pump). */
