@@ -115,7 +115,9 @@ public:
                                         // Triangle Circle Cross Square)
         std::uint8_t sticks[4] = {0x80, 0x80, 0x80, 0x80};   // right X, Y, left X, Y; 0x80 centred
         std::uint8_t l2 = 0, r2 = 0;    // the triggers' travel, 0-255
+        std::uint8_t family = 0;        // whose it is (its buttons' names): ControllerFamily
     };
+    enum ControllerFamily : std::uint8_t { kOtherController, kPlayStationController, kXboxController };
     virtual bool Pad(PadState* state) const { (void)state; return false; }
     /* What that controller's face buttons say: 0 the DualShock's shapes (or
        not known), 1 A at the bottom (Xbox and most others), 2 B at the

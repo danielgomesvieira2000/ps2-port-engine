@@ -236,6 +236,12 @@ class TestSaveSlots(unittest.TestCase):
     def test_a_128_bit_load_into_a_saved_register_keeps_the_saves(self):
         self.assertIsNone(self.slots([0x78900010]))                 # lq $s0, 0x10($a0)
 
+    def test_a_store_after_the_register_is_set_is_data_not_a_save(self):
+        # daddu $s0, $a3, $zero; sd $s0, 8($sp): before the first call, but
+        # $s0 is no longer the caller's - an argument the callee reads from
+        # the stack (0x00817898 in Resident Evil Outbreak's single.bin).
+        self.assertEqual(self.slots([0x00E0802D, 0xFFB00008]), {("s0", 0)})
+
 
 if __name__ == "__main__":
     unittest.main()

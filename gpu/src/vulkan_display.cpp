@@ -1504,6 +1504,19 @@ bool VulkanDisplay::Pad(PadState* state) const {
         const int v = SDL_GetGamepadAxis(gamepad_, kAxes[i]);
         s.sticks[i] = (v > -4096 && v < 4096) ? 0x80 : std::uint8_t((v + 32768) >> 8);
     }
+    switch (SDL_GetGamepadType(gamepad_)) {
+        case SDL_GAMEPAD_TYPE_PS3:
+        case SDL_GAMEPAD_TYPE_PS4:
+        case SDL_GAMEPAD_TYPE_PS5:
+            s.family = kPlayStationController;
+            break;
+        case SDL_GAMEPAD_TYPE_XBOX360:
+        case SDL_GAMEPAD_TYPE_XBOXONE:
+            s.family = kXboxController;
+            break;
+        default:
+            s.family = kOtherController;
+    }
     *state = s;
     return true;
 }

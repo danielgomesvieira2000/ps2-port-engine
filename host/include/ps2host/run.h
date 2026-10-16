@@ -361,11 +361,13 @@ bool HostKeyDown(int key);
 /* The window's game controller, as a DualShock 2 reads (window.cpp): false
    when none is plugged in. `buttons` bit n is input n held; the sticks are
    right X, Y, left X, Y (0x80 centred); l2, r2 the triggers' travel. */
+enum class ControllerFamily : u8 { kOther, kPlayStation, kXbox };
 struct HostPadState {
     u16 buttons = 0;
     u8 sticks[4] = {0x80, 0x80, 0x80, 0x80};
     u8 l2 = 0, r2 = 0;
     u8 pressure[16] = {};       // each input's pressure (a controller filter's to change; 0xFF pressed)
+    ControllerFamily family = ControllerFamily::kOther;     // whose: its buttons' names and marks
 };
 bool HostPad(HostPadState* state);
 /* What the controller's face buttons say (window.cpp): 0 the DualShock's
@@ -421,6 +423,16 @@ InputDevice LastInputDevice(u64* frame = nullptr);
 void SetPadHook(u16 (*hook)());
 /* --press: hold `button` (cross, start, up, ...) for 6 frames from `frame`. */
 bool ScriptPress(const std::string& button, u64 from, u64 to, u8 pressure = 0xFF);
+/* --key: hold a key (a Win32 virtual key) from frame `from` to `to`, as if
+   the player held it in a window with the focus - a game's own keys
+   (SetKeyboardMapper) tested in a scripted run. `key` is a letter or digit,
+   a name (enter, escape, space, backspace, tab, up, down, left, right,
+   lshift, rshift, lctrl, rctrl) or a virtual key's number (0x20). */
+bool ScriptKey(const std::string& key, u64 from, u64 to);
+/* Whether a scripted key is held now (HostKeyDown), and whether there are
+   any (a scripted run's keys count as the focused window's). */
+bool ScriptedKeyDown(int key);
+bool KeysScripted();
 /* --record-input FILE: every pad report the game reads that differs from the
    one before, as `frame byte byte ...` lines - buttons, sticks and pressures,
    whatever gave them. --replay-input FILE: those reports instead of the pad's,
@@ -437,6 +449,12 @@ void SetPaced(bool on);
    pressures to change as the filter likes; the keyboard and scripted presses
    are not given to it. LastInputDevice sees what the player pressed. */
 void SetControllerFilter(void (*filter)(HostPadState* pad));
+/* A game's own keys: the DualShock 2 inputs the keyboard holds (bit n: input
+   n), asked each pad read in place of the host's keys (Backspace Select,
+   Enter Start, the arrows the D-pad, 1 3 Q E L2 R2 L1 R1, V C X Z Triangle
+   Circle Cross Square) - a game whose player chooses them. Read with
+   HostKeyDown while WindowFocused. */
+void SetKeyboardMapper(u16 (*mapper)());
 /* --mouse FRAME:X,Y[,L|R|U|D]: the mouse at (X, Y) of the picture (0 to 1)
    from that frame - and its left or right button clicked, or the wheel
    turned up or down, then. With any, the window's own mouse is not read. */

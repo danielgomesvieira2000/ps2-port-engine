@@ -38,6 +38,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -95,18 +96,25 @@ const std::pair<int, int> kKeys[] = {
     {8, '1'}, {9, '3'}, {10, 'Q'}, {11, 'E'}, {12, 'V'}, {13, 'C'}, {14, 'X'}, {15, 'Z'},
 };
 
-bool Pressed(int key) { return WindowFocused() && HostKeyDown(key); }
-
 // Scripted presses (--press): (input, first frame, last frame, pressure).
 struct Press { int input; u64 from, to; u8 pressure; };
 std::vector<Press>& Script() {
     static std::vector<Press> presses;
     return presses;
 }
+// Scripted keys (--key): (virtual key, first frame, last frame).
+struct KeyPress { int key; u64 from, to; };
+std::vector<KeyPress>& KeyScript() {
+    static std::vector<KeyPress> keys;
+    return keys;
+}
 u64 g_frame = 0;
+
+bool Pressed(int key) { return (WindowFocused() || KeysScripted()) && HostKeyDown(key); }
 u16 g_held = 0;                     // PadButtonsHeld
 u16 (*g_pad_hook)() = nullptr;      // SetPadHook
 void (*g_controller_filter)(HostPadState*) = nullptr;     // SetControllerFilter
+u16 (*g_keyboard_mapper)() = nullptr;                       // SetKeyboardMapper
 // LastInputDevice: the device of the last press, and when; what each held.
 InputDevice g_last_device = InputDevice::kNone;
 u64 g_last_input_frame = 0;
@@ -145,8 +153,14 @@ void PadData(u8* data) {
     u16 buttons = 0xFFFF;                                   // active low: nothing pressed
     u8 pressure[16] = {};                                   // each input's, the most any source gives
     u16 keys = 0;
-    for (const auto& [input, key] : kKeys)
-        if (Pressed(key)) keys |= u16(1u << input), pressure[input] = 0xFF;
+    if (g_keyboard_mapper) {
+        keys = g_keyboard_mapper();
+        for (int i = 0; i < 16; ++i)
+            if (keys & (1u << i)) pressure[i] = 0xFF;
+    } else {
+        for (const auto& [input, key] : kKeys)
+            if (Pressed(key)) keys |= u16(1u << input), pressure[input] = 0xFF;
+    }
     buttons &= u16(~keys);
     // PS2HOST_SCRIPT_CONTROLLER=1: scripted presses as a controller's (a
     // game's controller filter sees them; L2's and R2's pressure the
@@ -417,6 +431,33 @@ bool ScriptPress(const std::string& button, u64 from, u64 to, u8 pressure) {
     return false;
 }
 
+bool ScriptKey(const std::string& key, u64 from, u64 to) {
+    static const std::pair<const char*, int> kNames[] = {
+        {"enter", VK_RETURN}, {"escape", VK_ESCAPE}, {"space", VK_SPACE}, {"backspace", VK_BACK},
+        {"tab", VK_TAB},      {"up", VK_UP},         {"down", VK_DOWN},   {"left", VK_LEFT},
+        {"right", VK_RIGHT},  {"lshift", VK_LSHIFT}, {"rshift", VK_RSHIFT}, {"lctrl", VK_LCONTROL},
+        {"rctrl", VK_RCONTROL}};
+    int vk = 0;
+    if (key.size() == 1 && std::isalnum(static_cast<unsigned char>(key[0])))
+        vk = std::toupper(static_cast<unsigned char>(key[0]));
+    else if (key.size() > 2 && key[0] == '0' && (key[1] == 'x' || key[1] == 'X'))
+        vk = int(std::strtol(key.c_str() + 2, nullptr, 16));
+    else
+        for (const auto& [name, code] : kNames)
+            if (key == name) vk = code;
+    if (vk <= 0 || vk > 0xFE) return false;
+    KeyScript().push_back({vk, from, to});
+    return true;
+}
+
+bool ScriptedKeyDown(int key) {
+    for (const KeyPress& k : KeyScript())
+        if (k.key == key && g_frame >= k.from && g_frame <= k.to) return true;
+    return false;
+}
+
+bool KeysScripted() { return !KeyScript().empty(); }
+
 bool RecordInput(const std::string& path) {
     g_record = std::fopen(path.c_str(), "w");
     return g_record != nullptr;
@@ -496,6 +537,7 @@ InputDevice LastInputDevice(u64* frame) {
 void SetPadHook(u16 (*hook)()) { g_pad_hook = hook; }
 
 void SetControllerFilter(void (*filter)(HostPadState* pad)) { g_controller_filter = filter; }
+void SetKeyboardMapper(u16 (*mapper)()) { g_keyboard_mapper = mapper; }
 
 namespace {
 struct MouseStep {

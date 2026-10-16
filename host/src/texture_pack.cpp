@@ -605,6 +605,34 @@ bool SetOverride(const std::string& text, const std::uint8_t* png, std::size_t b
     return true;
 }
 
+std::shared_ptr<const Image> MakeImage(std::vector<u32> rgba, u32 width, u32 height) {
+    if (!width || !height || rgba.size() != std::size_t(width) * height) return nullptr;
+    std::shared_ptr<Image> image = Rgba({std::move(rgba)}, width, height);
+    Overrides& o = TheOverrides();
+    std::lock_guard<std::mutex> hold(o.lock);
+    image->id = o.next_id++;
+    return image;
+}
+
+bool SetOverride(const std::string& text, std::shared_ptr<const Image> image) {
+    Name name;
+    if (!ParseName(text, &name)) return false;
+    Overrides& o = TheOverrides();
+    std::lock_guard<std::mutex> hold(o.lock);
+    auto found = o.images.find(name);
+    if (!image) {
+        if (found != o.images.end()) {
+            o.images.erase(found);
+            IndexOverrides(o);
+        }
+        return true;
+    }
+    if (found != o.images.end() && found->second == image) return true;
+    o.images[name] = std::move(image);
+    IndexOverrides(o);
+    return true;
+}
+
 void ClearOverrides() {
     Overrides& o = TheOverrides();
     std::lock_guard<std::mutex> hold(o.lock);

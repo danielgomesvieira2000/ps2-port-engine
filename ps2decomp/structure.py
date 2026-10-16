@@ -55,12 +55,16 @@ def _save_slots(code, start: int):
     """{(register name, stack offset)} the prologue saves callee-saved registers
     in: the stores of them to the stack before the first branch, jump or call.
     None when the function writes a callee-saved register it never saves - its
-    callers would see the change, so nothing about its saves can be elided."""
+    callers would see the change, so nothing about its saves can be elided.
+    A store of one the function has already set is not a save but data - in
+    0x00817820 (Resident Evil Outbreak) `daddu $s3, $a3` then `sd $s3,
+    8($sp)` passed a callee an argument on the stack, and dropping it as a
+    save left the slot's old value (1.0f) to be read as a pointer."""
     slots, saved, written = set(), set(), set()
     in_prologue = True
     for ins in code:
         if in_prologue and ins.mnemonic in ("sd", "sq", "sw") and ins.rs == 29 \
-                and (ins.rt in CALLEE_SAVED or ins.rt == 31):
+                and (ins.rt in CALLEE_SAVED or ins.rt == 31) and ins.rt not in written:
             slots.add((GPR_NAMES[ins.rt], ins.imm & 0xFFFF))
             saved.add(ins.rt)
         if ins.is_branch or ins.is_jump or ins.is_call:

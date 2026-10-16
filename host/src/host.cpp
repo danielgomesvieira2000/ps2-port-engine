@@ -880,6 +880,20 @@ int Main(int argc, char** argv) {
                 options.presses.push_back({spec.substr(0, at), from, to, pressure});
             }
         }
+        else if (arg == "--key" && i + 1 < argc) {
+            // --key NAME@FROM[-TO]: a key held (six frames without TO).
+            const std::string spec = argv[++i];
+            const std::size_t at = spec.find('@');
+            bool ok = at != std::string::npos;
+            if (ok) {
+                const std::string when = spec.substr(at + 1);
+                const std::size_t dash = when.find('-');
+                const u64 from = std::stoull(when.substr(0, dash));
+                const u64 to = dash == std::string::npos ? from + 5 : std::stoull(when.substr(dash + 1));
+                ok = ScriptKey(spec.substr(0, at), from, to);
+            }
+            if (!ok) std::fprintf(stderr, "--key %s: KEY@FROM[-TO]\n", spec.c_str());
+        }
         else if (arg == "--record-input" && i + 1 < argc) options.record_input = argv[++i];
         else if (arg == "--replay-input" && i + 1 < argc) options.replay_input = argv[++i];
         else if (arg == "--paced") options.paced = true;

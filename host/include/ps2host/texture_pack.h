@@ -87,6 +87,13 @@ std::shared_ptr<const Image> Find(const Name& name, bool* pending);
    not decoded again. False for a name or PNG that cannot be read. Each
    change bumps Generation. */
 bool SetOverride(const std::string& name, const std::uint8_t* png, std::size_t bytes);
+/* An override a game draws itself: its pixels (RGBA8 as a PNG's, rows top
+   down, alpha as the GS's) as an image, its smaller levels made - kept to
+   use (SetOverride below) as often as the game likes, no work again. */
+std::shared_ptr<const Image> MakeImage(std::vector<std::uint32_t> rgba, std::uint32_t width, std::uint32_t height);
+/* That image for the texture `name` names (as SetOverride's PNG); null
+   clears it. False for a name that cannot be read. */
+bool SetOverride(const std::string& name, std::shared_ptr<const Image> image);
 void ClearOverrides();
 
 /* Whether anything could be replaced: overrides, or a pack that is on. */
