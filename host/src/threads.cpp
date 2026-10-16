@@ -941,7 +941,11 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
     Memory& m = GuestMemory();
     const u32 a0 = u32(c.r[4]), a1 = u32(c.r[5]);
     switch (number) {
-        case 0xFC: case -0xFD: {                     // SetAlarm / iSetAlarm(time, callback, common)
+        // The kernel's numbers (libkernl's stubs): SetAlarm 0xFC, ReleaseAlarm
+        // 0xFD, iSetAlarm -0xFE, iReleaseAlarm -0xFF. Burnout 3's network RPC
+        // polls its replies with an alarm that re-arms itself (iSetAlarm): taken
+        // for a release, it returned 0 as the new alarm and the polling stopped.
+        case 0xFC: case -0xFC: case -0xFE: {         // SetAlarm / iSetAlarm(time, callback, common)
             // time is in horizontal blanks: 262.5 a field, NTSC.
             const u32 time = a0 & 0xFFFF;
             std::lock_guard<std::mutex> hold(s.alarms_lock);
@@ -951,7 +955,7 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
             if (!s.in_interrupt) RequestDelivery();   // one already due runs at once
             return true;
         }
-        case 0xFE: case -0xFF: {                     // ReleaseAlarm / iReleaseAlarm(id)
+        case 0xFD: case -0xFD: case -0xFF: {         // ReleaseAlarm / iReleaseAlarm(id)
             std::lock_guard<std::mutex> hold(s.alarms_lock);
             result = s.alarms.erase(s32(a0)) ? 0 : u64(s64(-1));
             return true;
@@ -996,7 +1000,7 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
             }
             result = 0;
             return true;
-        case 0x2F:                                   // GetThreadId
+        case 0x2F: case -0x2F:                       // GetThreadId / iGetThreadId
             result = s.current ? s.current->id : 1;
             return true;
         case 0x37: case -0x38: {                     // SuspendThread / iSuspendThread(id)

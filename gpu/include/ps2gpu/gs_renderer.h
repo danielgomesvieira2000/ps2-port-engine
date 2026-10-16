@@ -297,6 +297,10 @@ public:
     }
 };
 std::unique_ptr<GsRenderer> CreateGsRenderer(Gpu& gpu, std::string* error);
+/* `inner` on a thread of its own (threaded_renderer.cpp): what only hands
+   work over is queued and made there in order; what answers or reads waits
+   for the queue to empty first. One caller thread. */
+std::unique_ptr<GsRenderer> MakeThreadedGsRenderer(std::unique_ptr<GsRenderer> inner);
 
 /* How often the CPU has waited for the GPU to finish what was submitted, and
    for how long in all: "N submissions, S s waiting". */

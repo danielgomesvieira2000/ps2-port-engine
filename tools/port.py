@@ -255,6 +255,34 @@ def _visual_studio_tool(*parts) -> str:
     return os.path.join(root, "Common7", "IDE", "CommonExtensions", "Microsoft", "CMake", *parts)
 
 
+def _clang_cl() -> str | None:
+    """LLVM's clang-cl, when installed and not declined (PS2_COMPILER=msvc).
+    It builds the same sources with MSVC's headers and libraries; Burnout 3's
+    race measured 33 -> 36-40 pictures a second on an i7-10700F (the GS
+    thread no longer the limit)."""
+    if os.environ.get("PS2_COMPILER", "").lower() == "msvc":
+        return None
+    for root in (os.environ.get("LLVM_ROOT", ""), r"C:\Program Files\LLVM"):
+        path = os.path.join(root, "bin", "clang-cl.exe") if root else ""
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def _forget_other_compiler(binary: str, clang: bool) -> None:
+    """A build directory configured for the other compiler (clang-cl or
+    MSVC's cl) is configured again from scratch: CMake keeps the first one."""
+    cache = os.path.join(binary, "CMakeCache.txt")
+    if not os.path.exists(cache):
+        return
+    text = open(cache, encoding="utf-8", errors="replace").read()
+    found = re.search(r"^CMAKE_CXX_COMPILER:[A-Z]+=(.*)$", text, re.M)
+    if found and (os.path.basename(found.group(1)).lower() == "clang-cl.exe") != clang:
+        os.remove(cache)
+        import shutil
+        shutil.rmtree(os.path.join(binary, "CMakeFiles"), ignore_errors=True)
+
+
 def build(game, generated: str) -> str:
     """Configure and build the port; returns the executable's path."""
     source = game.path("port")
@@ -262,12 +290,17 @@ def build(game, generated: str) -> str:
     os.makedirs(binary, exist_ok=True)
     cmake = _visual_studio_tool("CMake", "bin", "cmake.exe")
     ninja = _visual_studio_tool("Ninja", "ninja.exe")
+    clang = _clang_cl()
+    compilers = ""
+    if clang:
+        compilers = ' -DCMAKE_C_COMPILER="%s" -DCMAKE_CXX_COMPILER="%s"' % (clang, clang)
+    _forget_other_compiler(binary, clang is not None)
     script = os.path.join(binary, "build.bat")
     with open(script, "w", encoding="utf-8") as handle:
         handle.write('@echo off\ncall "%s" >nul\n' % cppcheck.find_vcvars())
-        handle.write('"%s" -S "%s" -B "%s" -G Ninja -DCMAKE_BUILD_TYPE=Release '
+        handle.write('"%s" -S "%s" -B "%s" -G Ninja -DCMAKE_BUILD_TYPE=Release%s '
                      '-DCMAKE_MAKE_PROGRAM="%s" -DPS2_GENERATED_DIR="%s" >nul || exit /b 1\n'
-                     % (cmake, source, binary, ninja, generated.replace("\\", "/")))
+                     % (cmake, source, binary, compilers, ninja, generated.replace("\\", "/")))
         handle.write('"%s" --build "%s" || exit /b 1\n' % (cmake, binary))
     result = subprocess.run(["cmd", "/c", script], capture_output=True, text=True)
     if result.returncode:

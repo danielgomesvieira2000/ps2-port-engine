@@ -953,7 +953,8 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
         // PS2HOST_GPU_TEXDUMP=TBP (hex): each decode of a texture there, as the
         // GPU has it, to gpu_tex_<n>_<primitive>.bmp (the CPU's beside it as
         // cpu_tex_<n>.bmp) - what a draw sampled, against the GS model.
-        if (const char* want = std::getenv("PS2HOST_GPU_TEXDUMP")) {
+        static const char* const want = std::getenv("PS2HOST_GPU_TEXDUMP");
+        if (want) {
             static int dumped = 0;
             if (tbp == u32(std::strtoul(want, nullptr, 16)) && dumped < 64) {
                 std::vector<u32> pixels;
@@ -967,7 +968,8 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
                 ++dumped;
             }
         }
-        if (std::getenv("PS2HOST_GPU_COUNT")) {
+        static const bool count = std::getenv("PS2HOST_GPU_COUNT") != nullptr;
+        if (count) {
             char key[96];
             std::snprintf(key, sizeof key, "psm %02X tbp %04X tbw %u %ux%u clutrows %d", unsigned(psm), unsigned(tbp),
                           unsigned(tbw), unsigned(tw), unsigned(th), int((clut_rows & ~b.clut_cpu) != 0));
@@ -1614,6 +1616,11 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     }
     bridge.renderer = ps2gpu::CreateGsRenderer(*device, error);
     if (!bridge.renderer) return false;
+    // Vulkan's recording on a thread of its own, beside the GS thread's
+    // (PS2HOST_GPU_THREAD=0: on the GS thread, as before).
+    const char* threaded = std::getenv("PS2HOST_GPU_THREAD");
+    if (!threaded || std::strcmp(threaded, "0") != 0)
+        bridge.renderer = ps2gpu::MakeThreadedGsRenderer(std::move(bridge.renderer));
     g_bridge = &bridge;
     OpenTexturePack();
     bridge.primary = mode == GpuMode::Primary;

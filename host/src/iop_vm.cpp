@@ -242,6 +242,11 @@ Outcome Execute(Vm& vm, Context& c, u32 stop, u64 limit, bool* stopped) {
                                          ExportName(stub.first, stub.second).c_str(), a0, a1, a2, a3,
                                          r[2], outcome == Outcome::Block ? " (waits)" : "", r[31] - 8);
                         }
+                        if (outcome == Outcome::Retry) {             // the stub runs again on waking
+                            c.pc = pc;
+                            c.npc = pc + 4;
+                            return Outcome::Block;
+                        }
                         c.pc = r[31];
                         c.npc = r[31] + 4;
                         if (outcome != Outcome::Return) return outcome;

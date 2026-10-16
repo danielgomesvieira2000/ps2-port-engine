@@ -53,7 +53,7 @@ constexpr u32 kRing = 1u << 22;                 // words (16 MB)
 constexpr u32 kWakeWords = 4096;
 constexpr int kLookMs = 1;
 constexpr u32 kMaxRun = kRing / 8;              // the longest run of words one entry carries
-enum : u32 { kQword = 1, kWord = 2, kWords = 3, kPrivileged = 4, kWrap = 5, kFrame = 6 };
+enum : u32 { kQword = 1, kWord = 2, kWords = 3, kPrivileged = 4, kWrap = 5, kFrame = 6, kSkipDraws = 7 };
 
 std::atomic<u64> g_gs_busy_us{0};       // the GS thread at work, not waiting for more (--frame-times)
 
@@ -258,6 +258,10 @@ struct Feed {
                             }
                             size = 3;
                             break;
+                        case kSkipDraws:
+                            g.skip_draws = e[1] != 0;
+                            size = 2;
+                            break;
                         case kWrap:
                             size = kRing - at;
                             break;
@@ -418,6 +422,21 @@ bool GsFrame(u64 frame) {
     e[2] = u32(frame >> 32);
     g_feed->Publish(3, true);
     return true;
+}
+
+void GsSkipDraws(bool on) {
+    if (Vif1Async() && !OnVif1Worker()) {
+        Vif1Run([on] { GsSkipDraws(on); });
+        return;
+    }
+    if (!g_feed) {
+        gs::TheGs().skip_draws = on;
+        return;
+    }
+    u32* e = g_feed->Reserve(2);
+    e[0] = Header(kSkipDraws, 0, 0);
+    e[1] = on ? 1 : 0;
+    g_feed->Publish(2);
 }
 
 void GsPrivileged(u32 address, u64 value) {

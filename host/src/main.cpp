@@ -3,6 +3,7 @@
  * table engine/tools/port.py generates) and its overrides; the rest is shared.
  */
 
+#include <cctype>
 #include <cstdio>
 #include <fcntl.h>
 #include <filesystem>
@@ -96,6 +97,19 @@ std::vector<std::string> PlayArguments(const char* self) {
     const std::filesystem::path here = std::filesystem::path(exe).parent_path();
     ps2host::LoadSettings((here / "pc_settings.ini").string());     // where --memcard puts them
     std::string disc = ps2host::Setting("disc");
+    // None chosen yet, or gone: an image of the game's disc beside the
+    // executable is taken without asking.
+    if (!IsGameDisc(disc)) {
+        std::error_code error;
+        for (const auto& entry : std::filesystem::directory_iterator(here, error)) {
+            std::string ext = entry.path().extension().string();
+            for (char& ch : ext) ch = char(tolower(static_cast<unsigned char>(ch)));
+            if ((ext == ".iso" || ext == ".bin" || ext == ".cue") && IsGameDisc(entry.path().string())) {
+                disc = entry.path().string();
+                break;
+            }
+        }
+    }
     while (!IsGameDisc(disc)) {
         if (!disc.empty() && GetFileAttributesA(disc.c_str()) != INVALID_FILE_ATTRIBUTES)
             MessageBoxA(nullptr, ("This is not an image of the " PS2HOST_GAME_NAME " disc "

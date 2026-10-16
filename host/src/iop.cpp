@@ -235,10 +235,14 @@ void SifDma(u32 transfers, u32 count) {
             data.clear();
         } else {
             // Extra data, DMA'd into IOP memory where the sender said - a
-            // module reads it there. Data for the host's own servers is bound
-            // for their pretended addresses, above any module's memory.
-            if (dest < kServerBase)
-                m.WriteBytes(kIopRamBase + dest, bytes.data(), size);
+            // module reads it there. The address may be a segment's
+            // (0x80000000, 0xA0000000: EA's DirtySock sends its RPC ring's
+            // descriptor to 0xA0xxxxxx); the IOP's RAM is what it names. Data
+            // for the host's own servers is bound for their pretended
+            // addresses, above any module's memory.
+            const u32 physical = dest & 0x1FFFFFFFu;
+            if (physical < kServerBase)
+                m.WriteBytes(kIopRamBase + physical, bytes.data(), size);
             if (std::getenv("PS2HOST_SIF_LOG"))
                 std::fprintf(stderr, "[sif] data %u bytes from 0x%08X to IOP 0x%08X: %08X %08X %08X %08X\n",
                              unsigned(size), unsigned(src), unsigned(dest), unsigned(Word(bytes, 0)),

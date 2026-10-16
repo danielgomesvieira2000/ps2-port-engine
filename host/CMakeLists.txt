@@ -35,6 +35,7 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/mcserv.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/iop_vm.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/iop_libs.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/iop_inet.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/iopheap.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/spu2.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/audio.cpp
@@ -105,6 +106,9 @@ if(MSVC)
     target_compile_options(ps2rt PRIVATE /Z7)
     target_link_libraries(ps2host PRIVATE dbghelp winmm)  # ...which resolves them; 1 ms sleeps
 endif()
+if(WIN32)
+    target_link_libraries(ps2host PRIVATE ws2_32)         # the IOP's inet (iop_inet.cpp)
+endif()
 
 # The host's own tests, which need no game.
 # vu_corpus.cpp: random microprograms, compiled by engine/tools/vurecomp.py
@@ -114,7 +118,7 @@ set(PS2HOST_VURECOMP ${CMAKE_CURRENT_LIST_DIR}/../tools/vurecomp.py)
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/vu_corpus.cpp
     COMMAND ${Python3_EXECUTABLE} ${PS2HOST_VURECOMP} --corpus --count 120 --seed 1
             --out ${CMAKE_CURRENT_BINARY_DIR}/vu_corpus.cpp
-    DEPENDS ${PS2HOST_VURECOMP}
+    DEPENDS ${PS2HOST_VURECOMP} ${CMAKE_CURRENT_LIST_DIR}/../tools/vunative.py
     COMMENT "vurecomp: the VU test corpus")
 add_executable(ps2host_tests ${CMAKE_CURRENT_LIST_DIR}/tests/host_tests.cpp
                              ${CMAKE_CURRENT_BINARY_DIR}/vu_corpus.cpp)

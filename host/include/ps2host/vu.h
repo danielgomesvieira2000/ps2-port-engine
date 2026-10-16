@@ -100,6 +100,10 @@ public:
        exact but for those flags - which a later run reading them before an
        FMAC of its own lands would see. */
     bool fast = false;
+    /* Compiled programs run their native blocks (vunative.py: the pipeline
+       worked out as the code was generated, registers in locals), which end
+       in the same state as the exact ones; --vu-exact runs the exact ones. */
+    bool native = true;
     /* For tests: everything a run can change, the same in both (`flags`
        false: but the MAC and STATUS flags, landed, latest and in flight). */
     bool SameState(const Vu& other, bool flags = true) const;
@@ -115,7 +119,7 @@ public:
        port has them, in `passes` passes; the fastest pass's time a pair, and a
        hash of every run's registers and memory after (what a change to the
        VU must leave alone). Returns 0, or 1 when the file cannot be read. */
-    static int Bench(const std::string& path, int passes = 5, bool fast = false);
+    static int Bench(const std::string& path, int passes = 5, bool fast = false, bool native = false);
     /* How often each program address was started, for reports. */
     const std::map<u32, u64>& starts() const { return starts_; }
 

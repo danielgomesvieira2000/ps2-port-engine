@@ -331,8 +331,10 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
         return false;
     }
     // Controllers: optional (the keyboard still plays), and read whichever
-    // window has focus - the console's pad does not care either.
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    // window has focus - the console's pad does not care either. With
+    // PS2HOST_PAD_FOCUS=1, only while this window has it: two instances on
+    // one PC each take the pad in turn.
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, std::getenv("PS2HOST_PAD_FOCUS") ? "0" : "1");
     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         std::fprintf(stderr, "[window] no game controllers: %s\n", SDL_GetError());
     } else {

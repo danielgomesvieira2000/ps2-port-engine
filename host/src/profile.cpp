@@ -192,6 +192,31 @@ void SampleFrame(unsigned long long frame) {
 
 #ifdef _WIN32
 
+/* The suspended thread's call stack from its context, into a fixed array
+   (nothing here may allocate or lock). A walk that faults - a sample caught
+   where the unwind tables do not describe the stack, as clang-cl's code was
+   - keeps the frames found so far. */
+void WalkStack(CONTEXT ctx, std::uint64_t* frames) {
+    frames[0] = ctx.Rip;
+    __try {
+        for (int n = 1; n < kFrames; ++n) {
+            DWORD64 base = 0;
+            PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
+            if (entry) {
+                void* handler = nullptr;
+                DWORD64 frame = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, entry, &ctx, &handler, &frame, nullptr);
+            } else {                // a leaf: its return address is on top of the stack
+                ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
+                ctx.Rsp += 8;
+            }
+            if (!ctx.Rip) break;
+            frames[n] = ctx.Rip;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
 void StartSampler() {
     Sampler& s = TheSampler();
     HANDLE target = nullptr;
@@ -218,23 +243,7 @@ void StartSampler() {
             CONTEXT ctx{};
             ctx.ContextFlags = CONTEXT_FULL;
             if (SuspendThread(target) == DWORD(-1)) break;
-            if (GetThreadContext(target, &ctx)) {
-                frames[0] = ctx.Rip;
-                for (int n = 1; n < kFrames; ++n) {
-                    DWORD64 base = 0;
-                    PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
-                    if (entry) {
-                        void* handler = nullptr;
-                        DWORD64 frame = 0;
-                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, entry, &ctx, &handler, &frame, nullptr);
-                    } else {                // a leaf: its return address is on top of the stack
-                        ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
-                        ctx.Rsp += 8;
-                    }
-                    if (!ctx.Rip) break;
-                    frames[n] = ctx.Rip;
-                }
-            }
+            if (GetThreadContext(target, &ctx)) WalkStack(ctx, frames);
             if (sample_guest) GuestCallsNow(guest, kGuest);
             ResumeThread(target);
             local.insert(local.end(), frames, frames + kFrames);
@@ -338,6 +347,19 @@ std::string SampleReport(int top) {
         }
         if (f[1]) ++callers[leaf][name(f[1])];
     }
+    // PS2HOST_SAMPLE_STACKS=text: the whole stacks (function and line) of the
+    // samples whose innermost function's name holds the text, most taken first.
+    std::map<std::string, std::uint64_t> wanted_stacks;
+    static const char* const wanted = std::getenv("PS2HOST_SAMPLE_STACKS");
+    if (wanted)
+        for (std::size_t i = 0; i < samples; ++i) {
+            const std::uint64_t* f = &s.stacks[i * kFrames];
+            if (!f[0] || !counted[i] || name(f[0]).find(wanted) == std::string::npos) continue;
+            std::string stack;
+            for (int n = 0; n < kFrames && f[n]; ++n)
+                stack += (n ? "\n        <- " : "") + name(f[n]).substr(0, 80) + " (" + line_of(f[n]) + ")";
+            ++wanted_stacks[stack];
+        }
     SymCleanup(process);
     std::map<std::string, std::uint64_t> guest_total, guest_self, guest_stacks;
     std::size_t guest_samples = 0;
@@ -432,6 +454,14 @@ std::string SampleReport(int top) {
                       100.0 * double(by_total[i].first) / double(samples ? samples : 1),
                       by_total[i].second.substr(0, 120).c_str());
         out += line;
+    }
+    if (wanted) {
+        out += std::string("  stacks of ") + wanted + ":\n";
+        const auto by_stack = ranked(wanted_stacks);
+        for (int i = 0; i < 8 && i < int(by_stack.size()); ++i) {
+            std::snprintf(line, sizeof line, "  %5.1f%%  ", 100.0 * double(by_stack[i].first) / double(samples ? samples : 1));
+            out += line + by_stack[i].second + "\n";
+        }
     }
     return out;
 }

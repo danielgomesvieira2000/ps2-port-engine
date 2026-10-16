@@ -297,8 +297,12 @@ void Gs::Draw() {
     // Timed only when it rasterises: under --gpu the bridge times itself, and
     // a timer per primitive is a measurable share of a race.
     std::optional<Timed> timed;
-    if (rasterize) timed.emplace(Section::GsDraw);
     ++primitives_;
+    if (skip_draws) {
+        setup_stale_ = true;
+        return;
+    }
+    if (rasterize) timed.emplace(Section::GsDraw);
     // The software rasteriser's state; without it (--gpu), made only if the
     // texture is decoded from it - a few thousand of 73 million primitives.
     if (rasterize) Prepare();
