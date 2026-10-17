@@ -19,6 +19,10 @@ layout(location = 2) noperspective in float fog;
 layout(location = 3) flat in vec4 range;   // a sprite's S, T at its first and last pixels (gs.vert)
 
 layout(set = 0, binding = 0) uniform sampler2D texture_image;
+// The same image's texels as 32-bit words (R in bits 0-7, A in 24-31): the
+// four texels a bilinear sample mixes in one gather - one read of the
+// texture rather than four (Sample).
+layout(set = 0, binding = 1) uniform usampler2D texture_words;
 // The GPU's CLUT (decode.comp's), 256 entries as the GS expands them: a target
 // read as PSMT8H (tex_format 4) indexes it by its alpha byte.
 layout(std430, set = 1, binding = 0) readonly buffer Clut { uint clut[256]; };
@@ -40,7 +44,9 @@ layout(push_constant) uniform Params {
     uint minu, maxu, minv, maxv;
     uint tw, th;        // TEX0's size (0: the image's own)
     uint tex_format;    // a target read as 0 32-bit, 1 24-bit, 2 16-bit texels, 4 PSMT8H through the CLUT
-    uint ta0, ta1, aem; // TEXA
+    uint texa;          // TEXA: TA0 in bits 0-7, TA1 8-15, AEM 16
+    uint image_size;    // the bound image's size in its pixels, width in bits 0-15, height 16-31 - not
+                        // asked of the image (textureSize: a sampler's message per pixel on some GPUs)
     uint logic;         // FBMSK masking part of a channel: 1 the AND pass, 2 the OR pass, 0 neither
     uint keep;          // ...the bits FBMSK keeps, RGBA bytes as the target holds them
     uint scale;         // a target drawn larger (the internal resolution): its pixels to a GS texel
@@ -48,55 +54,79 @@ layout(push_constant) uniform Params {
                         // 16: a 16-bit target (five bits a channel stored)
 } p;
 
+// What a draw may use, from its parameters (gs_renderer.cpp's Features): a
+// pipeline made for a kind of draw leaves out the rest - the same results,
+// the work and registers of what it never does gone (an integrated GPU's
+// time at 2x was this shader's: the whole of it, everything a draw might
+// do, for every pixel). Everything by default: the shader as it is.
+layout(constant_id = 0) const uint kFeatures = 0xFFFFFFFFu;
+const uint kTextured = 1u, kReplaced = 2u, kMip = 4u, kLinear = 8u, kExpand = 16u, kFine = 32u, kSnap = 64u,
+           kFog = 128u, kAlphaTest = 256u, kPabe = 512u, kLogic = 1024u, kSixteen = 2048u;
+bool Has(uint feature) { return (kFeatures & feature) != 0u; }
+const float kEdge = 1.0 / 16384.0;       // Sample's nudge past a texel's edge
+
+float Ta0() { return float(p.texa & 255u); }
+float Ta1() { return float((p.texa >> 8) & 255u); }
+bool Aem() { return ((p.texa >> 16) & 1u) != 0u; }
+ivec2 ImageSize() { return ivec2(int(p.image_size & 0xFFFFu), int(p.image_size >> 16)); }
+
+// A target drawn larger: its pixels to a GS texel (1 where none can be).
+uint Scale() { return Has(kFine) ? p.scale : 1u; }
+
 // A texel coordinate wrapped as CLAMP says, as the software GS's Wrap. A
 // target drawn larger (Fine) is addressed in its own pixels: its size and a
 // region's bounds scaled; REGION_REPEAT's masks do not scale (Texel takes
 // those in GS texels).
 int Wrap(int i, int size, uint mode, uint lo, uint hi, int k) {
-    if (mode == 0u) return k == 1 ? (i & (size - 1)) : ((i % size) + size) % size;
+    // (A power of two - TEX0's sizes are, and a target drawn at 2x or 4x -
+    // wraps by its mask, the same for negative i: two integer divisions a
+    // call otherwise, four calls a bilinear pixel.)
+    if (mode == 0u) return k == 1 || (size & (size - 1)) == 0 ? (i & (size - 1)) : ((i % size) + size) % size;
     if (mode == 1u) return clamp(i, 0, size - 1);
     if (mode == 2u) return clamp(i, int(lo) * k, int(hi) * k + k - 1);
     return (i & int(lo)) | int(hi);
 }
 
 // Whether the texture is a target drawn larger, addressed in its own pixels.
-bool Fine() { return p.scale > 1u && p.wms != 3u && p.wmt != 3u; }
+bool Fine() { return Scale() > 1u && p.wms != 3u && p.wmt != 3u; }
 
 ivec2 TextureSize() {
-    return p.tw != 0u ? ivec2(int(p.tw), int(p.th)) : textureSize(texture_image, 0);
+    return p.tw != 0u ? ivec2(int(p.tw), int(p.th)) : ImageSize();
 }
 
 // A texel as the GS expands it: TEXA's alpha for 24- and 16-bit texels, a
 // target read as PSMT8H through the CLUT.
 vec4 Expand(vec4 t) {
+    if (!Has(kExpand)) return t;
     if (p.tex_format == 4u) {                       // PSMT8H: the alpha byte indexes the CLUT
         const uint c = clut[uint(t.a) & 255u];
         return vec4(float(c & 255u), float((c >> 8) & 255u), float((c >> 16) & 255u), float(c >> 24));
     }
     bool black = t.r + t.g + t.b == 0.0;
     if (p.tex_format == 1u) {                       // 24-bit: TEXA's alpha
-        t.a = (p.aem != 0u && black) ? 0.0 : float(p.ta0);
+        t.a = (Aem() && black) ? 0.0 : Ta0();
     } else if (p.tex_format == 2u) {                // 16-bit: 5 bits a channel, alpha by its bit
         bool bit = t.a >= 128.0;
         t.rgb = floor(t.rgb / 8.0) * 8.0;
         black = t.r + t.g + t.b == 0.0;
-        t.a = bit ? float(p.ta1) : ((p.aem != 0u && black) ? 0.0 : float(p.ta0));
+        t.a = bit ? Ta1() : ((Aem() && black) ? 0.0 : Ta0());
     }
     return t;
 }
 
 vec4 Fetch(ivec2 at) { return Expand(floor(texelFetch(texture_image, at, 0) * 255.0 + 0.5)); }
+vec4 Unpack(uint w) { return Expand(vec4(float(w & 255u), float((w >> 8) & 255u), float((w >> 16) & 255u), float(w >> 24))); }
 
 vec4 Texel(int u, int v) {
-    const int k = Fine() ? int(p.scale) : 1;
+    const int k = Fine() ? int(Scale()) : 1;
     ivec2 size = TextureSize() * k;
     ivec2 at = ivec2(Wrap(u, size.x, p.wms, p.minu, p.maxu, k), Wrap(v, size.y, p.wmt, p.minv, p.maxv, k));
     if (k == 1) at &= 2047;
     // A target drawn larger with REGION_REPEAT: the GS texel, and the middle
     // of its square.
-    if (k == 1 && p.scale > 1u) at = at * int(p.scale) + int(p.scale / 2u);
+    if (k == 1 && Scale() > 1u) at = at * int(Scale()) + int(Scale() / 2u);
     // A target may be smaller than TEX0 says: what lies beyond is not drawn here.
-    at = min(at, textureSize(texture_image, 0) - 1);
+    at = min(at, ImageSize() - 1);
     return Fetch(at);
 }
 
@@ -118,7 +148,7 @@ vec4 Texel(int u, int v, int n) {
 // out together (x0, x1, y0, y1): a bilinear sample otherwise repeats the
 // size, wrap and mip work four times. The same texels as Texel's.
 ivec4 Neighbours(ivec2 i0, int n) {
-    const int k = n == 0 && Fine() ? int(p.scale) : 1;
+    const int k = n == 0 && Fine() ? int(Scale()) : 1;
     const ivec2 size = n == 0 ? TextureSize() * k : max(TextureSize() >> n, ivec2(1));
     ivec2 a = ivec2(Wrap(i0.x, size.x, p.wms, p.minu >> n, p.maxu >> n, k),
                     Wrap(i0.y, size.y, p.wmt, p.minv >> n, p.maxv >> n, k));
@@ -126,9 +156,9 @@ ivec4 Neighbours(ivec2 i0, int n) {
                     Wrap(i0.y + 1, size.y, p.wmt, p.minv >> n, p.maxv >> n, k));
     if (n == 0) {
         if (k == 1) { a &= 2047; b &= 2047; }
-        if (k == 1 && p.scale > 1u) { a = a * int(p.scale) + int(p.scale / 2u); b = b * int(p.scale) + int(p.scale / 2u); }
-        a = min(a, textureSize(texture_image, 0) - 1);
-        b = min(b, textureSize(texture_image, 0) - 1);
+        if (k == 1 && Scale() > 1u) { a = a * int(Scale()) + int(Scale() / 2u); b = b * int(Scale()) + int(Scale() / 2u); }
+        a = min(a, ImageSize() - 1);
+        b = min(b, ImageSize() - 1);
     } else {
         a = clamp(a, ivec2(0), size - 1);
         b = clamp(b, ivec2(0), size - 1);
@@ -146,14 +176,34 @@ ivec4 Neighbours(ivec2 i0, int n) {
 // game that filters its last frame back in relies on the loss (the software
 // GS's Texel).
 vec4 Sample(vec2 uv, int n, bool linear) {
-    if (Fine()) uv *= float(p.scale);               // in the target's own pixels
+    if (Fine()) uv *= float(Scale());               // in the target's own pixels
     uv /= float(1 << n);
-    if (!linear) return Texel(int(floor(uv.x)), int(floor(uv.y)), n);
-    const ivec2 xy = ivec2(floor((uv - 0.5) * 16.0));
+    // A coordinate the GS has on a texel's edge (its fixed point: sprites'
+    // texels one to a pixel) comes out of the GPU's interpolation a hair to
+    // either side, as the GPU rounds: nudged on (kEdge: about a float's
+    // last bit at a coordinate of 1024 - larger nudges took coordinates
+    // genuinely just short of an edge over it too), every GPU takes the same
+    // texel.
+    if (!linear) return Texel(int(floor(uv.x + kEdge)), int(floor(uv.y + kEdge)), n);
+    const ivec2 xy = ivec2(floor((uv - 0.5) * 16.0 + kEdge * 16.0));
     const ivec2 i0 = xy >> 4;
     const vec4 f = vec4(xy & 15, 0, 0);
     const ivec4 at = Neighbours(i0, n);
-    const vec4 c00 = Fetch(at.xz), c10 = Fetch(at.yz), c01 = Fetch(at.xw), c11 = Fetch(at.yw);
+    vec4 c00, c10, c01, c11;
+    if (at.y == at.x + 1 && at.w == at.z + 1) {
+        // Side by side in the image (almost always - not where a wrap or a
+        // clamp parts them): gathered at the corner they share.
+        const uvec4 w = textureGather(texture_words, vec2(at.yw) / vec2(ImageSize()), 0);
+        c01 = Unpack(w.x);
+        c11 = Unpack(w.y);
+        c10 = Unpack(w.z);
+        c00 = Unpack(w.w);
+    } else {
+        c00 = Fetch(at.xz);
+        c10 = Fetch(at.yz);
+        c01 = Fetch(at.xw);
+        c11 = Fetch(at.yw);
+    }
     const vec4 top = c00 + floor((c10 - c00) * f.x / 16.0), bottom = c01 + floor((c11 - c01) * f.x / 16.0);
     return top + floor((bottom - top) * f.y / 16.0);
 }
@@ -165,7 +215,7 @@ vec4 Sample(vec2 uv, int n, bool linear) {
 // texels to one; filtered as the game filters, with the level the pixel's
 // footprint in the replacement's texels asks for (the GS's LOD knows only its
 // own texels).
-bool Replaced() { return (p.tex_format & 0x100u) != 0u; }
+bool Replaced() { return Has(kReplaced) && (p.tex_format & 0x100u) != 0u; }
 
 ivec2 ReplacedSize(int n) { return textureSize(texture_image, n); }
 
@@ -218,7 +268,7 @@ vec4 ReplacedSample(vec2 r, float footprint) {
 // (the software GS's ChooseLevel).
 vec4 Sample(vec2 uv) {
     const uint m = p.bilinear;
-    if ((m & 2u) == 0u) return Sample(uv, 0, (m & 1u) != 0u);
+    if (!Has(kMip) || (m & 2u) == 0u) return Sample(uv, 0, Has(kLinear) && (m & 1u) != 0u);
     const int mxl = int((m >> 2) & 7u);
     const uint mmin = (m >> 5) & 7u;
     float lod = float(int(m << 4) >> 20) / 16.0;    // K, 4 fractional bits
@@ -246,7 +296,7 @@ layout(location = 0, index = 1) out vec4 factor;
 void main() {
     vec4 v = round(shade * 255.0);
     vec4 c = v;
-    if (p.textured != 0u) {
+    if (Has(kTextured) && p.textured != 0u) {
         vec2 uv = coordinate.xy / coordinate.z * vec2(TextureSize());
         // A sprite on a target drawn larger: sampled as finely as the target
         // is drawn, within the coordinates the GS reads at its first and last
@@ -254,7 +304,7 @@ void main() {
         // another), and - REPEAT, the sprite within one copy of the texture -
         // not wrapping round to its far side (a tile's edge: seams).
         const uint snap = (p.blend_ops >> 8) & 255u;
-        if (snap > 1u) {
+        if (Has(kSnap) && snap > 1u) {
             const vec2 size = vec2(TextureSize());
             const vec2 lo = min(range.xy, range.zw), hi = max(range.xy, range.zw);
             uv = clamp(uv, lo * size, hi * size);
@@ -290,31 +340,37 @@ void main() {
         c = min(c, vec4(255.0));
     }
 
-    if (p.fge != 0u) {
+    if (Has(kFog) && p.fge != 0u) {
         // Towards FOGCOL as F falls, colour only.
         float f = round(fog * 255.0);
         vec3 fc = vec3(float(p.fogcol & 0xFFu), float((p.fogcol >> 8) & 0xFFu), float((p.fogcol >> 16) & 0xFFu));
         c.rgb = floor((f * c.rgb + (255.0 - f) * fc) / 256.0);
     }
 
-    uint a = uint(c.a);
-    bool pass = true;
-    switch (p.atst) {
-        case 0u: pass = false; break;
-        case 2u: pass = a < p.aref; break;
-        case 3u: pass = a <= p.aref; break;
-        case 4u: pass = a == p.aref; break;
-        case 5u: pass = a >= p.aref; break;
-        case 6u: pass = a > p.aref; break;
-        case 7u: pass = a != p.aref; break;
-        default: break;
+    // (Without kAlphaTest: the test ALWAYS, and no pass of failing pixels -
+    // nothing discarded, as the GPU likes it: depth tested before shading.)
+    if (Has(kAlphaTest)) {
+        uint a = uint(c.a);
+        bool pass = true;
+        switch (p.atst) {
+            case 0u: pass = false; break;
+            case 2u: pass = a < p.aref; break;
+            case 3u: pass = a <= p.aref; break;
+            case 4u: pass = a == p.aref; break;
+            case 5u: pass = a >= p.aref; break;
+            case 6u: pass = a > p.aref; break;
+            case 7u: pass = a != p.aref; break;
+            default: break;
+        }
+        // The renderer draws AFAIL as passes: 0 keeps the passing pixels, 1 the
+        // failing ones (with only what AFAIL writes), 2 all of them.
+        if (p.afail == 0u && !pass) discard;
+        if (p.afail == 1u && pass) discard;
     }
-    // The renderer draws AFAIL as passes: 0 keeps the passing pixels, 1 the
-    // failing ones (with only what AFAIL writes), 2 all of them.
-    if (p.afail == 0u && !pass) discard;
-    if (p.afail == 1u && pass) discard;
-    if (p.pabe == 1u && c.a < 128.0) discard;
-    if (p.pabe == 2u && c.a >= 128.0) discard;
+    if (Has(kPabe)) {
+        if (p.pabe == 1u && c.a < 128.0) discard;
+        if (p.pabe == 2u && c.a >= 128.0) discard;
+    }
 
 #ifdef SHADER_BLEND
     // Cv = ((A - B) * C >> 7) + D, clamped (COLCLAMP), as the software GS.
@@ -327,12 +383,14 @@ void main() {
     c.rgb = clamp(floor((op_a - op_b) * op_c / 128.0) + op_d, 0.0, 255.0);
 #endif
     // A 16-bit target keeps the top five bits of each colour byte.
-    if (((p.blend_ops >> 16) & 1u) != 0u) c.rgb = floor(c.rgb / 8.0) * 8.0;
+    if (Has(kSixteen) && ((p.blend_ops >> 16) & 1u) != 0u) c.rgb = floor(c.rgb / 8.0) * 8.0;
     colour = c / 255.0;
     // A partly masked channel: the target ANDed with what FBMSK keeps, then
     // ORed with the rest of the source's bits (the pipelines' logic ops).
-    if (p.logic == 1u) colour = unpackUnorm4x8(p.keep);
-    if (p.logic == 2u) colour = unpackUnorm4x8(packUnorm4x8(c / 255.0) & ~p.keep);
+    if (Has(kLogic)) {
+        if (p.logic == 1u) colour = unpackUnorm4x8(p.keep);
+        if (p.logic == 2u) colour = unpackUnorm4x8(packUnorm4x8(c / 255.0) & ~p.keep);
+    }
 #ifndef SINGLE_OUTPUT
     float k = p.fix_factor != 0u ? float(p.fix) : c.a;
     factor = vec4(k / 128.0);

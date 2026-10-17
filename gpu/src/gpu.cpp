@@ -5,14 +5,31 @@
 
 #include "gpu_internal.h"
 
-#include <cstdlib>
-
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <vector>
 
 namespace ps2gpu {
 
 void SetGpuWaitObserver(GpuWaitObserver observer) { g_wait_observer = observer; }
+
+namespace {
+/* A GPU's preference: PS2HOST_GPU=<part of its name> (any case: "intel",
+   "4070") first - a laptop's integrated GPU measured beside its discrete
+   one - then a discrete GPU. */
+int DeviceScore(const VkPhysicalDeviceProperties& p) {
+    int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : 1;
+    if (const char* want = std::getenv("PS2HOST_GPU")) {
+        std::string name = p.deviceName, part = want;
+        for (char& ch : name) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+        for (char& ch : part) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+        if (!part.empty() && name.find(part) != std::string::npos) score += 10;
+    }
+    return score;
+}
+}  // namespace
 
 bool VulkanGpu::Init(std::string* error) {
     auto fail = [&](const char* what, VkResult r) {
@@ -46,7 +63,7 @@ bool VulkanGpu::Init(std::string* error) {
         vkGetPhysicalDeviceQueueFamilyProperties(candidate, &families, props.data());
         for (std::uint32_t f = 0; f < families; ++f) {
             if (!(props[f].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
-            const int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : 1;
+            const int score = DeviceScore(p);
             if (score > best) {
                 best = score;
                 gpu = candidate;

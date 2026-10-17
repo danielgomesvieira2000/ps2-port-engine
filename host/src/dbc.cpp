@@ -399,7 +399,8 @@ void PadmanFrame() {
         if (!present) continue;
         u8 data[kDataBytes];
         PadData(data);
-        if (std::getenv("PS2HOST_PAD_LOG") && (data[0] != 0xFF || data[1] != 0xFF))
+        static const bool pad_log = std::getenv("PS2HOST_PAD_LOG") != nullptr;
+        if (pad_log && (data[0] != 0xFF || data[1] != 0xFF))
             std::fprintf(stderr, "[pad] frame %llu port %u area 0x%08X frame# %u buttons %02X%02X\n",
                          (unsigned long long)g_frame, unsigned(p.port), unsigned(f), unsigned(p.frame), data[1], data[0]);
         const u32 length = 2 + 2 * (kPadmanMode & 0xF);

@@ -22,6 +22,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <functional>
@@ -199,7 +200,11 @@ struct Feed {
             u64 h = head.load(std::memory_order_acquire);
             if (t == h) {
                 // Briefly busy, then asleep until there is more.
-                for (int spins = 0; spins < 200 && t == h; ++spins) {
+                static const int kSpins = [] {
+                    const char* n = std::getenv("PS2HOST_GS_SPIN");
+                    return n ? std::atoi(n) : 200;
+                }();
+                for (int spins = 0; spins < kSpins && t == h; ++spins) {
                     Pause();
                     h = head.load(std::memory_order_acquire);
                 }

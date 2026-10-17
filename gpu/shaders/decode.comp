@@ -4,13 +4,24 @@
 // coordinates wrapped by CLAMP's mode (the region modes at decode time), the
 // texel read in its format's layout (gs_memory.cpp's tables), then expanded:
 // TEXA for 24- and 16-bit texels, the CLUT for palettized ones. Z formats
-// read as their CT counterparts. Out: RGBA, rows top-down, tw wide.
+// read as their CT counterparts. Out: RGBA, rows top-down, tw wide - or,
+// built with TO_IMAGE, straight into the texture's image (a storage image,
+// set 1), the level's rows from row0: no staging buffer, no copy, and no
+// barrier between a texture's levels (their rows are their own).
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(std430, binding = 0) readonly buffer Memory { uint mem[]; };
 layout(std430, binding = 1) writeonly buffer Linear { uint lin[]; };
 layout(std430, binding = 2) buffer Clut { uint clut[256]; };
+// The layout tables below, copied once into a buffer (mode 2, at start) and
+// read from there texel by texel: a constant array indexed at run time is
+// copied into each invocation's own memory on some GPUs (Intel's: decodes
+// were more than half its frame), a buffer is read through the cache.
+layout(std430, binding = 3) buffer Tables { uint tables[768]; };
+#ifdef TO_IMAGE
+layout(set = 1, binding = 0, rgba8) uniform writeonly image2D dst;
+#endif
 
 layout(push_constant) uniform Params {
     uint tbp, tbw, psm, tw, th;
@@ -18,7 +29,8 @@ layout(push_constant) uniform Params {
     uint texa_lo;       // TA0 (bits 0-7), AEM (bit 15)
     uint ta1;
     uint csa;
-    uint mode;          // 0 a texture decoded; 1 a CLUT loaded (below)
+    uint mode;          // 0 a texture decoded; 1 a CLUT loaded (below); 2 the tables copied
+    uint row0;          // TO_IMAGE: the level's first row in the image
 } p;
 
 const uint PSMCT32 = 0x00u, PSMCT24 = 0x01u, PSMCT16 = 0x02u, PSMCT16S = 0x0Au;
@@ -79,6 +91,27 @@ const uint kColumn4[256] = uint[](
 
 const uint kMask = (4u << 20) - 1u;
 
+// Where each table is in the buffer (mode 2 writes them there in this order).
+const uint kAtBlock32 = 0u, kAtBlockZ32 = 32u, kAtBlock16 = 64u, kAtBlock16S = 96u, kAtBlockZ16 = 128u,
+           kAtBlockZ16S = 160u, kAtColumn32 = 192u, kAtColumn16 = 256u, kAtColumn8 = 384u, kAtColumn4 = 512u;
+
+void CopyTables() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (gl_GlobalInvocationID.y != 0u || i >= 768u) return;
+    uint v;
+    if (i < 32u) v = kBlock32[i];
+    else if (i < 64u) v = kBlockZ32[i - 32u];
+    else if (i < 96u) v = kBlock16[i - 64u];
+    else if (i < 128u) v = kBlock16S[i - 96u];
+    else if (i < 160u) v = kBlockZ16[i - 128u];
+    else if (i < 192u) v = kBlockZ16S[i - 160u];
+    else if (i < 256u) v = kColumn32[i - 192u];
+    else if (i < 384u) v = kColumn16[i - 256u];
+    else if (i < 512u) v = kColumn8[i - 384u];
+    else v = kColumn4[i - 512u];
+    tables[i] = v;
+}
+
 uint Page(uint ppr, uint px, uint py) { return p.tbp + 32u * (py * max(ppr, 1u) + px); }
 
 uint Byte(uint a) { return (mem[a >> 2] >> ((a & 3u) * 8u)) & 0xFFu; }
@@ -87,31 +120,28 @@ uint Byte(uint a) { return (mem[a >> 2] >> ((a & 3u) * 8u)) & 0xFFu; }
 uint Raw(uint x, uint y) {
     const uint psm = p.psm;
     if (psm == PSMT8) {
-        const uint block = Page(p.tbw / 2u, x / 128u, y / 64u) + kBlock32[((y % 64u) / 16u) * 8u + (x % 128u) / 16u];
+        const uint block = Page(p.tbw / 2u, x / 128u, y / 64u) + tables[kAtBlock32 + ((y % 64u) / 16u) * 8u + (x % 128u) / 16u];
         const uint row = y % 16u;
-        return Byte((block * 256u + kColumn8[(row % 8u) * 16u + x % 16u] + (row >= 8u ? 128u : 0u)) & kMask);
+        return Byte((block * 256u + tables[kAtColumn8 + (row % 8u) * 16u + x % 16u] + (row >= 8u ? 128u : 0u)) & kMask);
     }
     if (psm == PSMT4) {
-        const uint block = Page(p.tbw / 2u, x / 128u, y / 128u) + kBlock16[((y % 128u) / 16u) * 4u + (x % 128u) / 32u];
+        const uint block = Page(p.tbw / 2u, x / 128u, y / 128u) + tables[kAtBlock16 + ((y % 128u) / 16u) * 4u + (x % 128u) / 32u];
         const uint row = y % 16u;
-        const uint index = kColumn4[(row % 8u) * 32u + x % 32u] + (row >= 8u ? 256u : 0u);
+        const uint index = tables[kAtColumn4 + (row % 8u) * 32u + x % 32u] + (row >= 8u ? 256u : 0u);
         const uint b = Byte((block * 256u + index / 2u) & kMask);
         return (index & 1u) != 0u ? b >> 4 : b & 15u;
     }
     if (psm == PSMCT16 || psm == PSMCT16S || psm == PSMZ16 || psm == PSMZ16S) {
         const uint i = ((y % 64u) / 8u) * 4u + (x % 64u) / 16u;
-        uint b;
-        if (psm == PSMCT16) b = kBlock16[i];
-        else if (psm == PSMCT16S) b = kBlock16S[i];
-        else if (psm == PSMZ16) b = kBlockZ16[i];
-        else b = kBlockZ16S[i];
-        const uint a = ((Page(p.tbw, x / 64u, y / 64u) + b) * 256u + kColumn16[(y % 8u) * 16u + x % 16u] * 2u) & kMask;
+        const uint at = psm == PSMCT16 ? kAtBlock16 : psm == PSMCT16S ? kAtBlock16S : psm == PSMZ16 ? kAtBlockZ16 : kAtBlockZ16S;
+        const uint b = tables[at + i];
+        const uint a = ((Page(p.tbw, x / 64u, y / 64u) + b) * 256u + tables[kAtColumn16 + (y % 8u) * 16u + x % 16u] * 2u) & kMask;
         return (mem[a >> 2] >> ((a & 2u) * 8u)) & 0xFFFFu;
     }
     // The 32-bit layouts: CT32, CT24, Z32, Z24, and T8H/T4HL/T4HH in CT32's top byte.
     const uint i = ((y % 32u) / 8u) * 8u + (x % 64u) / 8u;
-    const uint b = (psm == PSMZ32 || psm == PSMZ24) ? kBlockZ32[i] : kBlock32[i];
-    const uint a = ((Page(p.tbw, x / 64u, y / 32u) + b) * 256u + kColumn32[(y % 8u) * 8u + x % 8u] * 4u) & kMask;
+    const uint b = tables[((psm == PSMZ32 || psm == PSMZ24) ? kAtBlockZ32 : kAtBlock32) + i];
+    const uint a = ((Page(p.tbw, x / 64u, y / 32u) + b) * 256u + tables[kAtColumn32 + (y % 8u) * 8u + x % 8u] * 4u) & kMask;
     const uint w = mem[a >> 2];
     if (psm == PSMT8H) return w >> 24;
     if (psm == PSMT4HL) return (w >> 24) & 15u;
@@ -171,9 +201,18 @@ void main() {
         LoadClut();
         return;
     }
+    if (p.mode == 2u) {
+        CopyTables();
+        return;
+    }
     const uint u = gl_GlobalInvocationID.x, v = gl_GlobalInvocationID.y;
     if (u >= p.tw || v >= p.th) return;
     const uint x = Wrap(int(u), p.tw, p.wms, p.minu, p.maxu) & 2047u;
     const uint y = Wrap(int(v), p.th, p.wmt, p.minv, p.maxv) & 2047u;
+#ifdef TO_IMAGE
+    // The bytes as an RGBA8 image stores them (c / 255 back to c exactly).
+    imageStore(dst, ivec2(int(u), int(p.row0 + v)), unpackUnorm4x8(Expand(Raw(x, y))));
+#else
     lin[v * p.tw + u] = Expand(Raw(x, y));
+#endif
 }

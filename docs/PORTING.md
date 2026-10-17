@@ -39,6 +39,20 @@ python engine/tools/port.py --game games/<g>                      # build and ru
 python engine/tools/port.py --game games/<g> run -- --trace       # log every call
 ```
 
+A port is built for processors with AVX2 (`PS2HOST_AVX2`, on by default:
+the VU's lanes and the rest in three-operand SIMD, 6% of a race). For those
+without it - Intel's Pentium and Celeron of before 2021 (Pentium Silver,
+Celeron N, the Pentium Gold of desktops) - `port.py --game games/<g> --sse4
+build` builds `<name>-sse4.exe` (SSE4.1, in `build/port/cmake-sse4`, copied
+beside the main one); a release ships both. The executable's entry
+(`src/cpu_check.cpp`, a library of its own built without AVX) checks the
+processor before anything else runs - the runtime's start and static
+constructors are AVX2 code too - and on one without AVX2 starts the SSE4
+build beside it with the same command line, or says what is needed
+(`PS2HOST_TEST_NO_AVX2=1` takes that way on a processor with it). `port.py`
+builds with a compiler per 2.5 GB of memory: a file of compiled VU code
+takes one 2 GB and more.
+
 Options for finding out why boot stops, passed after `run --`:
 
 | option | what it shows |
@@ -77,8 +91,8 @@ Options for finding out why boot stops, passed after `run --`:
 | `--memcard DIR` | a memory card in slot 1, kept as a directory: the game's saves are files there (`ps2host/mc2.h` answers libmc2's handlers; the port binds them). Without it the slot is empty |
 | `--setting KEY=VALUE` | a PC setting for this run, not saved (`--setting aspect=16:9`: a scripted run in a wider picture); any number of them |
 | `--vu-record FILE`, `--vu-interpret` | record the VU microprograms a run starts, for compiling ahead of time; run them interpreted (see below) |
-| `--vu-fast` | compiled VU1 programs leave out the MAC and STATUS flags no instruction of theirs can read ("Fast mode" below): exact but for those flags, ~15% less VU1 time; exact is the default |
-| `--vu-exact` | compiled VU programs run their exact blocks, not the native ones ("Native blocks" below; native is the default and ends in the same state) |
+| `--vu-fast` | compiled VU1 programs leave out the MAC and STATUS flags no instruction of theirs can read ("Fast mode" below): exact but for those flags, ~15% less VU1 time; exact is the default unless the game's port chooses it (`SetVuFastDefault`) |
+| `--vu-exact` | compiled VU programs run exactly: their exact blocks, not the native ones ("Native blocks" below; native is the default and ends in the same state), and VU1's exact flags even where the game's port defaults to fast mode |
 | `--audio-wav FILE` | the same output recorded to a WAV file, for checking sound without listening |
 | `PS2HOST_AUDIO_LOG=1`, `PS2HOST_AUDIO_MUTE=1`, `PS2HOST_SPU_LOG=1`, `PS2HOST_SPU_NO_REVERB=1` | sound, looked into: every two seconds how the SPU2's samples came (the longest wait between batches) and what the device made of them (ran out, dropped, fewest buffers queued); the device played unheard; once a second the voices sounding, their volumes fixed or sweeping, the main volumes; the reverb left out |
 | `--watch-write ADDR` | every store to a guest address, with the function making it and four of its callers |

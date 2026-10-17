@@ -60,7 +60,11 @@ rewriting published history is their decision.
    (`/MT` - nothing for the player to install), the symbols' file named
    without a path (`/PDBALTPATH:%_PDB%`), source paths trimmed to the
    repository (`/d1trimfile`), nothing read at run time from where it was
-   built (data built in).
+   built (data built in). Then the build for processors without AVX2
+   (`port.py --game games/<name> --sse4 build`: `<name>-sse4.exe` beside
+   the main one, which starts it on such a processor - `--sse4` before
+   `build`, or it is taken for the port's own options); a release ships
+   both.
 3. **The icon** is the project's own (`port/icon.ico`). A logo icon a player
    makes from their disc (`build/port/icon.ico`) is for their own build only.
 4. **Regressions** pass (skill `ps2-port`) and the benchmark has no new late

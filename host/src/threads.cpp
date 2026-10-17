@@ -439,6 +439,32 @@ void SleepUntil(std::chrono::steady_clock::time_point when) {
     else std::this_thread::sleep_until(when);
 }
 
+/* Whether a deadline may be waited for by spinning its last stretch (a
+   sleep's wake-up can be late by a little): only with cores to spare - more
+   than three for the process. With fewer, a time-critical thread spinning
+   takes a core the game's threads need, the game falls behind, and the
+   timer, retrying the blank it has not taken, spins the more: on two cores
+   the race lost a third of its blanks and stopped for seconds at a time.
+   There the high-resolution timer's sleep is the whole wait.
+   PS2HOST_SPIN=0 or 1 decides instead. Looked at again now and then (the
+   process's cores can change). */
+bool SpareCores() {
+    static const char* forced = std::getenv("PS2HOST_SPIN");
+    if (forced) return forced[0] == '1';
+    static std::atomic<int> looks{0};
+    static std::atomic<bool> spare{true};
+    if (looks.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
+        DWORD_PTR process = 0, system = 0;
+        int cores = int(std::thread::hardware_concurrency());
+        if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) && process) {
+            cores = 0;
+            for (DWORD_PTR m = process; m; m &= m - 1) ++cores;
+        }
+        spare.store(cores >= 4, std::memory_order_relaxed);
+    }
+    return spare.load(std::memory_order_relaxed);
+}
+
 void VblankTimer() {
     using clock = std::chrono::steady_clock;
     const auto period = std::chrono::microseconds(16683);      // NTSC, 59.94 Hz
@@ -452,6 +478,13 @@ void VblankTimer() {
         s64 timer = NanosToNextTimerEvent();
         const s64 alarm = NanosToNextAlarm();
         if (alarm >= 0 && (timer < 0 || alarm < timer)) timer = alarm;
+        // A timer interrupt marked due and not yet taken is due "now" until
+        // the EE takes it: waking for it again at once was this thread - the
+        // highest priority - spinning until the EE got to run. On two cores
+        // that held one while the EE, the GS and VIF1 shared the other: the
+        // race lost blanks by the thousand and stopped for seconds. It waits
+        // as a blank not yet taken does, the half millisecond's retry.
+        if (timer >= 0 && timer < 500000 && s.timer_due.load()) timer = 500000;
         const auto timer_at = timer >= 0 ? clock::now() + std::chrono::nanoseconds(timer) : clock::time_point::max();
         wake = std::min(wake, timer_at);
         const bool untaken = s.vblank_due.load() || s.timer_due.load();
@@ -471,8 +504,12 @@ void VblankTimer() {
             TimerTick();
             continue;
         }
-        if (wake - clock::now() > margin) SleepUntil(wake - margin);
-        while (clock::now() < wake && !StopRequested() && !g_timer_stop) std::this_thread::yield();
+        if (!SpareCores()) {
+            SleepUntil(wake);
+        } else {
+            if (wake - clock::now() > margin) SleepUntil(wake - margin);
+            while (clock::now() < wake && !StopRequested() && !g_timer_stop) std::this_thread::yield();
+        }
         if (clock::now() >= next) {
             const auto late = clock::now() - next;
             if (late > std::chrono::milliseconds(1) && timeline::On())
@@ -1234,7 +1271,12 @@ void FastThread() {
     throttling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
     throttling.StateMask = 0;               // never throttled
     SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &throttling, sizeof throttling);
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    // Above the rest only with cores to spare (SpareCores): on a machine
+    // with few, the EE, the GS thread and VIF1's worker together keep every
+    // core busy, and at a higher priority the threads they depend on - the
+    // GPU driver's, the window's - waited seconds for one (until Windows
+    // lifts a starved thread, after about four).
+    if (SpareCores()) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 }
 
 }  // namespace ps2host

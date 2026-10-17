@@ -404,6 +404,8 @@ bool g_fast_disc = false, g_fast_loading_default = false;
 bool FastDisc() { return g_fast_disc; }
 void SetFastDisc(bool on) { g_fast_disc = on; }
 void SetFastLoadingDefault(bool on) { g_fast_loading_default = on; }
+bool g_vu_fast_default = false;
+void SetVuFastDefault(bool on) { g_vu_fast_default = on; }
 
 Stats& RunStats() {
     static Stats stats;
@@ -735,7 +737,8 @@ int Run(const Options& options) {
     if (!options.vu_record.empty()) Vu::RecordPrograms(options.vu_record);
     if (!options.memcard.empty()) mc2::SetCardDirectory(options.memcard);
     if (options.vu_interpret) Vu1().use_compiled = Vu0().use_compiled = false;
-    Vu1().fast = options.vu_fast;
+    Vu1().fast = options.vu_fast || (g_vu_fast_default && !options.vu_exact);
+    if (Vu1().fast && !options.vu_fast) std::fprintf(stderr, "[host] VU1 fast mode (the game's default; --vu-exact for the exact flags)\n");
     Vu1().native = Vu0().native = options.vu_native;
     SetUntilFrame(options.until_frame);
     SetFrameTimes(options.frame_times);
@@ -816,6 +819,22 @@ int Run(const Options& options) {
 }
 
 int Main(int argc, char** argv) {
+    // PS2HOST_CORES=N: the process held to its first N logical cores from
+    // the start, before any thread (the GPU driver's pools too) is made - a
+    // machine with that many, to measure a low-end one on a big one. Or a
+    // mask (0x5: logical cores 0 and 2 - two physical cores where the first
+    // ones are hyperthreaded pairs).
+    if (const char* cores = std::getenv("PS2HOST_CORES")) {
+        DWORD_PTR mask = 0;
+        if (cores[0] == '0' && (cores[1] == 'x' || cores[1] == 'X')) {
+            mask = DWORD_PTR(std::strtoull(cores + 2, nullptr, 16));
+        } else {
+            const int n = std::atoi(cores);
+            if (n > 0 && n < int(8 * sizeof(DWORD_PTR))) mask = (DWORD_PTR(1) << n) - 1;
+        }
+        if (mask && SetProcessAffinityMask(GetCurrentProcess(), mask))
+            std::fprintf(stderr, "[host] held to cores 0x%llX (PS2HOST_CORES)\n", (unsigned long long)mask);
+    }
     Options options;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -858,7 +877,10 @@ int Main(int argc, char** argv) {
         else if (arg == "--vu-interpret") options.vu_interpret = true;
         else if (arg == "--vu-fast") options.vu_fast = true;
         else if (arg == "--vu-native") options.vu_native = true;
-        else if (arg == "--vu-exact") options.vu_native = false;
+        else if (arg == "--vu-exact") {
+            options.vu_native = false;
+            options.vu_exact = true;
+        }
         else if (arg == "--memcard" && i + 1 < argc) options.memcard = argv[++i];
         else if (arg == "--setting" && i + 1 < argc) options.settings.push_back(argv[++i]);
         else if (arg == "--audio") options.audio = true;

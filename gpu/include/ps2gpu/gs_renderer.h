@@ -301,6 +301,17 @@ std::unique_ptr<GsRenderer> CreateGsRenderer(Gpu& gpu, std::string* error);
    work over is queued and made there in order; what answers or reads waits
    for the queue to empty first. One caller thread. */
 std::unique_ptr<GsRenderer> MakeThreadedGsRenderer(std::unique_ptr<GsRenderer> inner);
+/* Where the renderer keeps what it learns between runs: a folder (the PC
+   settings'), for its pipeline cache (gpu_pipeline_cache.bin) and the
+   pipelines the game has drawn with (gpu_pipelines.txt) - made again at the
+   start, from the cache, so none is built in the middle of a race. Set
+   before CreateGsRenderer; "" (a scripted run) keeps nothing. */
+void SetPipelineCacheDir(const std::string& dir);
+/* Pipelines a game is known to draw with (keys as gpu_pipelines.txt has
+   them), made by the renderer's worker from the start as the last runs'
+   are - a player's first run then makes none in the middle of a race. Keys
+   of an older engine are only made in vain. Set before CreateGsRenderer. */
+void SetPipelineHints(const std::uint32_t* keys, std::size_t count);
 
 /* How often the CPU has waited for the GPU to finish what was submitted, and
    for how long in all: "N submissions, S s waiting". */

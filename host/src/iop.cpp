@@ -243,7 +243,8 @@ void SifDma(u32 transfers, u32 count) {
             const u32 physical = dest & 0x1FFFFFFFu;
             if (physical < kServerBase)
                 m.WriteBytes(kIopRamBase + physical, bytes.data(), size);
-            if (std::getenv("PS2HOST_SIF_LOG"))
+            static const bool sif_log = std::getenv("PS2HOST_SIF_LOG") != nullptr;
+            if (sif_log)
                 std::fprintf(stderr, "[sif] data %u bytes from 0x%08X to IOP 0x%08X: %08X %08X %08X %08X\n",
                              unsigned(size), unsigned(src), unsigned(dest), unsigned(Word(bytes, 0)),
                              unsigned(Word(bytes, 4)), unsigned(Word(bytes, 8)), unsigned(Word(bytes, 12)));

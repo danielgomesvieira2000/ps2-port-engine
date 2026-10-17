@@ -26,6 +26,7 @@
 #include <windows.h>
 #endif
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -34,6 +35,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -317,6 +319,22 @@ Gpu* VulkanDisplay::SharedGpu() {
     return shared_.get();
 }
 
+namespace {
+/* A GPU's preference: PS2HOST_GPU=<part of its name> (any case: "intel",
+   "4070") first - a laptop's integrated GPU measured beside its discrete
+   one - then a discrete GPU. */
+int DeviceScore(const VkPhysicalDeviceProperties& p) {
+    int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : 1;
+    if (const char* want = std::getenv("PS2HOST_GPU")) {
+        std::string name = p.deviceName, part = want;
+        for (char& ch : name) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+        for (char& ch : part) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+        if (!part.empty() && name.find(part) != std::string::npos) score += 10;
+    }
+    return score;
+}
+}  // namespace
+
 bool VulkanDisplay::Check(VkResult result, const char* what) {
     if (result == VK_SUCCESS) return true;
     char text[160];
@@ -390,7 +408,7 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
             if (!(props[f].queueFlags & VK_QUEUE_GRAPHICS_BIT) || !present) continue;
             VkPhysicalDeviceProperties p;
             vkGetPhysicalDeviceProperties(candidate, &p);
-            const int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : 1;
+            const int score = DeviceScore(p);
             if (score > best) {
                 best = score;
                 gpu_ = candidate;
@@ -1111,6 +1129,32 @@ void SleepUntil(std::chrono::steady_clock::time_point when) {
 #endif
     std::this_thread::sleep_until(when);
 }
+
+/* Whether a deadline may be waited for by spinning its last stretch (a
+   sleep's wake-up can be late by a little): only with cores to spare - more
+   than three for the process. With fewer, a time-critical thread spinning
+   takes a core the game's threads need, the game falls behind, and the
+   timer, retrying the blank it has not taken, spins the more: on two cores
+   the race lost a third of its blanks and stopped for seconds at a time.
+   There the high-resolution timer's sleep is the whole wait.
+   PS2HOST_SPIN=0 or 1 decides instead. Looked at again now and then (the
+   process's cores can change). */
+bool SpareCores() {
+    static const char* forced = std::getenv("PS2HOST_SPIN");
+    if (forced) return forced[0] == '1';
+    static std::atomic<int> looks{0};
+    static std::atomic<bool> spare{true};
+    if (looks.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
+        DWORD_PTR process = 0, system = 0;
+        int cores = int(std::thread::hardware_concurrency());
+        if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) && process) {
+            cores = 0;
+            for (DWORD_PTR m = process; m; m &= m - 1) ++cores;
+        }
+        spare.store(cores >= 4, std::memory_order_relaxed);
+    }
+    return spare.load(std::memory_order_relaxed);
+}
 }  // namespace
 
 void VulkanDisplay::PresentLoop() {
@@ -1139,8 +1183,12 @@ void VulkanDisplay::PresentLoop() {
         // In order, each when it is due.
         const Clock::time_point due = std::min(Clock::time_point{std::chrono::nanoseconds(paced_[slot].due_ns)},
                                                Clock::now() + std::chrono::milliseconds(50));
-        if (Clock::now() + std::chrono::microseconds(1500) < due) SleepUntil(due - std::chrono::microseconds(700));
-        while (Clock::now() < due) std::this_thread::yield();
+        if (!SpareCores()) {
+            SleepUntil(due);
+        } else {
+            if (Clock::now() + std::chrono::microseconds(1500) < due) SleepUntil(due - std::chrono::microseconds(700));
+            while (Clock::now() < due) std::this_thread::yield();
+        }
         {
             std::lock_guard<std::mutex> hold(paced_lock_);
             if (stop_) {

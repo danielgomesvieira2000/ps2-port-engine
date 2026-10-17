@@ -485,6 +485,16 @@ bool FastDisc();
    once (a scripted run's stays the drive's). */
 void SetFastDisc(bool on);
 void SetFastLoadingDefault(bool on);
+/* VU1's fast mode (--vu-fast: no MAC/STATUS flags where nothing can read
+   them - the same pictures, less VU1 time) as the default, for a game whose
+   scripted runs draw every picture the same with it; --vu-exact turns it
+   off again. */
+void SetVuFastDefault(bool on);
+/* The GPU pipelines a game is known to draw with (the keys of a
+   gpu_pipelines.txt a run kept beside its settings), made from the start in
+   the background - none made in the middle of a player's first race
+   (ps2gpu::SetPipelineHints). Called as the game's overrides register. */
+void SetGpuPipelineHints(const u32* keys, std::size_t count);
 void AdvanceClock(u64 ns);
 /* Run the INTC handlers for `cause`, if it is enabled (threads.cpp). */
 void RaiseIntc(u32 cause);

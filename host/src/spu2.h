@@ -142,9 +142,11 @@ private:
         Level left, right;              // VOLL, VOLR as they are now
         bool playing = false;           // sounding (a stopped voice still runs on)
         u32 counter = 0;                // 4.12 fixed point: samples into the block
-        s32 samples[28] = {};           // the current block, decoded
+        // The last block's last three samples (the Gaussian interpolation's
+        // history), then the current block, decoded: one run, so the four
+        // taps are read straight from it.
+        s32 window[3 + 28] = {};
         s32 older = 0, old = 0;         // the decoder's history
-        s32 history[3] = {};            // the last block's last three samples (Gaussian interpolation's)
         Phase phase = Phase::Off;
         s32 level = 0;                  // the envelope, 0-0x7FFF
         u32 envelope_counter = 0;

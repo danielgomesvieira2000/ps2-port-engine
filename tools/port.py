@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -283,10 +284,35 @@ def _forget_other_compiler(binary: str, clang: bool) -> None:
         shutil.rmtree(os.path.join(binary, "CMakeFiles"), ignore_errors=True)
 
 
-def build(game, generated: str) -> str:
-    """Configure and build the port; returns the executable's path."""
+def _build_jobs() -> int:
+    """Compilers at once: by the memory there is, not the processors - a
+    file of compiled VU code takes the compiler 2 GB and more, and a build
+    from nothing with Ninja's default (processors + 2) ran out of it on 16 GB."""
+    jobs = os.cpu_count() or 4
+    if sys.platform == "win32":
+        import ctypes
+
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong),
+                        ("total_physical", ctypes.c_ulonglong), ("free_physical", ctypes.c_ulonglong),
+                        ("total_page", ctypes.c_ulonglong), ("free_page", ctypes.c_ulonglong),
+                        ("total_virtual", ctypes.c_ulonglong), ("free_virtual", ctypes.c_ulonglong),
+                        ("free_extended", ctypes.c_ulonglong)]
+
+        status = MemoryStatus()
+        status.length = ctypes.sizeof(MemoryStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            jobs = min(jobs, int(status.total_physical / (2.5 * 2 ** 30)))
+    return max(1, jobs)
+
+
+def build(game, generated: str, sse4: bool = False) -> str:
+    """Configure and build the port; returns the executable's path. `sse4`:
+    the build for processors without AVX2 (PS2HOST_AVX2=OFF), in a folder of
+    its own, copied beside the main build as <name>-sse4.exe - which the main
+    build starts on such a processor (engine/host/src/cpu_check.cpp)."""
     source = game.path("port")
-    binary = game.path(os.path.join(game.build, "port", "cmake"))
+    binary = game.path(os.path.join(game.build, "port", "cmake-sse4" if sse4 else "cmake"))
     os.makedirs(binary, exist_ok=True)
     cmake = _visual_studio_tool("CMake", "bin", "cmake.exe")
     ninja = _visual_studio_tool("Ninja", "ninja.exe")
@@ -299,9 +325,9 @@ def build(game, generated: str) -> str:
     with open(script, "w", encoding="utf-8") as handle:
         handle.write('@echo off\ncall "%s" >nul\n' % cppcheck.find_vcvars())
         handle.write('"%s" -S "%s" -B "%s" -G Ninja -DCMAKE_BUILD_TYPE=Release%s '
-                     '-DCMAKE_MAKE_PROGRAM="%s" -DPS2_GENERATED_DIR="%s" >nul || exit /b 1\n'
-                     % (cmake, source, binary, compilers, ninja, generated.replace("\\", "/")))
-        handle.write('"%s" --build "%s" || exit /b 1\n' % (cmake, binary))
+                     '-DCMAKE_MAKE_PROGRAM="%s" -DPS2_GENERATED_DIR="%s" -DPS2HOST_AVX2=%s >nul || exit /b 1\n'
+                     % (cmake, source, binary, compilers, ninja, generated.replace("\\", "/"), "OFF" if sse4 else "ON"))
+        handle.write('"%s" --build "%s" -j %d || exit /b 1\n' % (cmake, binary, _build_jobs()))
     result = subprocess.run(["cmd", "/c", script], capture_output=True, text=True)
     if result.returncode:
         errors = [line for line in (result.stdout + result.stderr).splitlines()
@@ -315,6 +341,11 @@ def build(game, generated: str) -> str:
         raise SystemExit("the host's own tests failed")
     target = os.path.basename(os.path.normpath(game.directory))
     executable = os.path.join(binary, target + ".exe")
+    if sse4:
+        beside = game.path(os.path.join(game.build, "port", "cmake", target + "-sse4.exe"))
+        os.makedirs(os.path.dirname(beside), exist_ok=True)
+        shutil.copyfile(executable, beside)
+        executable = beside
     print("built %s" % executable)
     return executable
 
@@ -362,6 +393,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     game_config.add_argument(parser)
     parser.add_argument("action", nargs="?", default="all", choices=("all", "build", "run"))
+    parser.add_argument("--sse4", action="store_true",
+                        help="build: the build for processors without AVX2 (<name>-sse4.exe beside the main one)")
     parser.add_argument("--rounds", type=int, default=60,
                         help="build-and-run rounds to translate code found at run time")
     parser.add_argument("extra", nargs=argparse.REMAINDER,
@@ -374,7 +407,7 @@ def main(argv=None) -> int:
         executable = game.path(os.path.join(game.build, "port", "cmake", target + ".exe"))
         return run(game, executable, extra)
     if args.action == "build":
-        build(game, generate(game))
+        build(game, generate(game), sse4=args.sse4)
         return 0
     # Build and run until a run finds no more code copied at run time.
     for _round in range(args.rounds):

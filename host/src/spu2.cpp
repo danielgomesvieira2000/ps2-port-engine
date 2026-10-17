@@ -190,7 +190,7 @@ void Spu2::Start(Voice& v) {
     v.nax = v.ssa & ~15u;
     v.counter = 0;
     v.older = v.old = 0;
-    v.history[0] = v.history[1] = v.history[2] = 0;
+    v.window[0] = v.window[1] = v.window[2] = 0;
     v.playing = true;
     v.phase = Phase::Attack;
     v.level = 0;
@@ -203,7 +203,7 @@ void Spu2::Decode(Voice& v) {
     u8 bytes[kBlockBytes];
     for (u32 i = 0; i < kBlockBytes; ++i) bytes[i] = ram_[(block + i) & kRamMask];
     if (bytes[1] & 4) v.lsax = block;               // loop start: where a repeat returns
-    DecodeBlock(bytes, v.samples, &v.older, &v.old);
+    DecodeBlock(bytes, v.window + 3, &v.older, &v.old);
 }
 
 void Spu2::SetSwitch(u32 entry, u32 value) {
@@ -491,9 +491,9 @@ void Spu2::Read(u32 address, u8* data, u32 size) const {
 void Spu2::NextBlock(Core& c, u32 index, const std::function<void(u32)>& irq) {
     Voice& v = c.voices[index];
     // The block's last three: the interpolation's history into the next.
-    v.history[0] = v.samples[kSamplesPerBlock - 3];
-    v.history[1] = v.samples[kSamplesPerBlock - 2];
-    v.history[2] = v.samples[kSamplesPerBlock - 1];
+    v.window[0] = v.window[3 + kSamplesPerBlock - 3];
+    v.window[1] = v.window[3 + kSamplesPerBlock - 2];
+    v.window[2] = v.window[3 + kSamplesPerBlock - 1];
     const u32 block = v.nax & kRamMask & ~15u;
     const u8 flags = ram_[(block + 1) & kRamMask];
     CheckIrq(0, block, block + kBlockBytes, irq);
@@ -695,14 +695,21 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq,
                 v.right.Step();
                 s32 shaped = 0;
                 if (v.pitch && v.phase != Phase::Off) {
-                    // new, old, older, oldest: the sample at the counter and
-                    // the three before it (from the last block's history).
-                    const int at = int(v.counter >> 12);
-                    auto s = [&v](int k) { return k >= 0 ? v.samples[k] : v.history[3 + k]; };
-                    const u32 f = (v.counter >> 4) & 0xFF;
-                    const s32 sample = ((kGauss[0x0FF - f] * s(at - 3)) >> 15) + ((kGauss[0x1FF - f] * s(at - 2)) >> 15) +
-                                       ((kGauss[0x100 + f] * s(at - 1)) >> 15) + ((kGauss[f] * s(at)) >> 15);
-                    shaped = (sample * v.level) >> 15;
+                    // A voice heard nowhere - silent (level 0), or swept to
+                    // nothing both sides (Burnout 3 leaves some twenty so) -
+                    // sends nothing, exactly: its sample is not worked out.
+                    // Voices 1 and 3 are, for the capture rings.
+                    const bool heard = v.level != 0 && (v.left.now != 0 || v.right.now != 0 || log);
+                    if (heard || i == 1 || i == 3) {
+                        // new, old, older, oldest: the sample at the counter and
+                        // the three before it (the window's first three are the
+                        // last block's).
+                        const s32* s = v.window + (v.counter >> 12);
+                        const u32 f = (v.counter >> 4) & 0xFF;
+                        const s32 sample = ((kGauss[0x0FF - f] * s[0]) >> 15) + ((kGauss[0x1FF - f] * s[1]) >> 15) +
+                                           ((kGauss[0x100 + f] * s[2]) >> 15) + ((kGauss[f] * s[3]) >> 15);
+                        shaped = (sample * v.level) >> 15;
+                    }
                     const s32 sent_left = (shaped * v.left.now) >> 15, sent_right = (shaped * v.right.now) >> 15;
                     if (log) c.voice_peak[i] = std::max(c.voice_peak[i], std::max(std::abs(sent_left), std::abs(sent_right)));
                     if (c.switches[kVmixl] & (1u << i)) core_left += sent_left;

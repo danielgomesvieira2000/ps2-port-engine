@@ -96,11 +96,27 @@ if(PS2HOST_VULKAN)
     target_compile_definitions(ps2host PRIVATE PS2HOST_VULKAN=1)
 endif()
 
+# AVX2: three-operand SIMD for the VU's lanes and the rest (6% of a race).
+# Off: a build for processors without it (Intel's Pentium and Celeron of
+# before 2021), SSE4.1 at least - a port ships both, the AVX2 one starting
+# the other where it must (src/cpu_check.cpp).
+option(PS2HOST_AVX2 "Build for processors with AVX2 (off: SSE4.1)" ON)
+# A game executable's entry (ps2_add_port's /ENTRY), before the runtime: the
+# processor checked by code built without AVX - a library of its own, apart
+# from ps2rt's flags - and the SSE4 build started instead where it must be.
+if(MSVC)
+    add_library(ps2_cpu_check STATIC ${CMAKE_CURRENT_LIST_DIR}/src/cpu_check.cpp)
+    if(PS2HOST_AVX2)
+        target_compile_definitions(ps2_cpu_check PRIVATE PS2HOST_BUILT_FOR_AVX2=1)
+    endif()
+endif()
+
 if(MSVC)
     # Translated code throws lifted::Abort; its chunks are large.
-    # AVX2: three-operand SIMD for the VU's lanes and the rest (6% of a race;
-    # main.cpp says so on a processor without it).
-    target_compile_options(ps2rt PUBLIC /EHsc /bigobj /W3 /wd4100 /wd4189 /arch:AVX2)
+    target_compile_options(ps2rt PUBLIC /EHsc /bigobj /W3 /wd4100 /wd4189)
+    if(PS2HOST_AVX2)
+        target_compile_options(ps2rt PUBLIC /arch:AVX2)
+    endif()
     target_compile_definitions(ps2rt PUBLIC _CRT_SECURE_NO_WARNINGS)
     target_compile_options(ps2host PRIVATE /Z7)     # symbols for --sample, as the ports'
     target_compile_options(ps2rt PRIVATE /Z7)
@@ -151,6 +167,9 @@ function(ps2_add_port target)
         ${generated}
         ${translated}
         ${PORT_SOURCES})
+    if(MSVC)
+        target_link_libraries(${target} PRIVATE ps2_cpu_check)
+    endif()
     target_link_libraries(${target} PRIVATE ps2host)
     if(PORT_GAME)
         get_filename_component(game_dir ${PORT_GAME} ABSOLUTE)
@@ -212,7 +231,7 @@ END
         if(MSVC)
             # A windowed program: started from Explorer, no console beside the
             # game (main.cpp attaches to a terminal's when there is one).
-            target_link_options(${target} PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
+            target_link_options(${target} PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:Ps2CheckedStart)
         endif()
     endif()
     if(MSVC)

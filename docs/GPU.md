@@ -237,3 +237,28 @@ proved itself in PCSX2's hardware renderers, made smaller:
    "GPU and memory in step" from 29% of the run to 5%; every picture as
    recorded. `GpuDecodesTexturesAsTheGs` checks each palettized format
    through a CLUT loaded on the GPU over a garbage one.
+
+## Pipelines
+
+A pipeline is keyed (`PipelineKey`, `Features` in gs_renderer.cpp) by the
+blend and its operands, the write mask and logic op (bits 0-15), and what
+the draw may use of gs.frag (bits 16-27, inverted: texturing, a texture
+pack's replacement, mipmaps, bilinear filtering, TEXA's expansion, a finer
+target, sprite snapping, fog, the alpha test, PABE, logic ops, 16-bit
+targets). Those are a specialisation constant: a kind of draw's pipeline
+leaves out the rest of the shader - the same results, without the work and
+registers of what it never does. On an Intel UHD at 2x the shader was the
+GPU's whole time (a trivial shader dropped no frames, the whole one 493 in
+the race); specialised, 76-88. Of what is left, the GS's exact bilinear
+filter is most, then the alpha test's discards.
+
+In a player's run (a folder for the settings) pipelines come from a cache
+kept there (gpu_pipeline_cache.bin) and the keys drawn with are listed
+beside it (gpu_pipelines.txt). A worker thread makes them: the listed keys
+and the game's own (`SetGpuPipelineHints`) from the start, a new kind of
+draw when it first comes - drawn meanwhile with the whole shader's pipeline
+for its blend (made at once if there is none). A cold driver takes 0.3-0.7 s
+for one; none is made in the middle of a race. Scripted runs keep no cache
+and make every pipeline at once, so their pictures test the specialised
+shaders. `PS2HOST_PIPELINE_LOG=1` logs each pipeline made and how long it
+took; `PS2HOST_GPU_UBERSHADER=1` draws everything with the whole shader.
