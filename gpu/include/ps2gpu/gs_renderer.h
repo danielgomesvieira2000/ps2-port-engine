@@ -297,10 +297,6 @@ public:
     }
 };
 std::unique_ptr<GsRenderer> CreateGsRenderer(Gpu& gpu, std::string* error);
-/* `inner` on a thread of its own (threaded_renderer.cpp): what only hands
-   work over is queued and made there in order; what answers or reads waits
-   for the queue to empty first. One caller thread. */
-std::unique_ptr<GsRenderer> MakeThreadedGsRenderer(std::unique_ptr<GsRenderer> inner);
 /* Where the renderer keeps what it learns between runs: a folder (the PC
    settings'), for its pipeline cache (gpu_pipeline_cache.bin) and the
    pipelines the game has drawn with (gpu_pipelines.txt) - made again at the
