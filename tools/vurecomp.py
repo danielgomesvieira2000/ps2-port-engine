@@ -530,6 +530,7 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
         body.append("C::Issue(v, cyc, t);")
     else:
         body.append("C::Issue(v, cyc, cyc);")
+    issue_at = len(body) - 1
     lower_lines, pending, branch = ([], False, None) if immediate else emit_lower(lower, pc, mask)
     if pending:
         body.append("C::Pending pd;")
@@ -545,6 +546,18 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
         set_flags = False
     upper_lines = fuse_flags(upper_lines)
     body += upper_lines
+    # Q and P land at a pair's issue only where it can tell: a pair that
+    # reads Q (an FMAC's Q operand) or P (MFP), starts a DIV or an EFU op
+    # (which would replace a result due but not landed), copies the VI file
+    # (MTIR, macro mode's COP2) or waits for either. Any other pair leaves
+    # them to the next that can tell, which lands all that is due by then -
+    # the same values in Q and P wherever they are read (IssueAt).
+    fmac = decode_fmac(upper)
+    lands = q_waits or p_waits or (fmac is not None and fmac[1] == 4) or any(
+        name in line for line in lower_lines + upper_lines
+        for name in ("Cop2(", "Mtir(", "Mfp(", "Divide(", "Efu("))
+    if not lands:
+        body[issue_at] = body[issue_at].replace("C::Issue(v, cyc, ", "C::IssueAt(cyc, ")
     for r, dest in lower_writes(lower_lines) + [(upper_written, lanes)]:
         for lane in range(4):
             if r > 0 and dest & (8 >> lane):
@@ -566,14 +579,18 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
     sets_mac = "true" if (upper & 0x7FF) != 0x1FF else "false"
     sets_clip = "true" if (upper & 0x7FF) == 0x1FF else "false"
     flags = "true" if set_flags else "false"
+    # VI0 back to 0 (End) after a block's first pair (a run may start with
+    # it otherwise) and after macro mode's COP2 operations, which may write
+    # it; every other pair leaves it 0 (Next).
+    vi0 = index == 0 or any("Cop2(" in line for line in body)
     if pending:
-        body.append("C::Finish(v, cyc, pd, %d, %du, %s, %s, %s);" % (written_reg, lanes, flags, sets_mac,
-                                                                    sets_clip))
+        body.append("C::Finish(v, cyc, pd, %d, %du, %s, %s, %s%s);" % (written_reg, lanes, flags, sets_mac,
+                                                                      sets_clip, "" if vi0 else ", false"))
     else:
         if written_reg > 0 or set_flags:
             body.append("C::FinishUpper(v, cyc, %d, %du, %s, %s, %s);" % (written_reg, lanes, flags, sets_mac,
                                                                           sets_clip))
-        body.append("C::End(v, cyc);")
+        body.append("C::End(v, cyc);" if vi0 else "C::Next(cyc);")
     next_pc = (pc + 8) & mask
     body.append("++count;")
     may_stop = after is None or bool(after[1] & 0x40000000)

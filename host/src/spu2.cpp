@@ -200,9 +200,14 @@ void Spu2::Start(Voice& v) {
 
 void Spu2::Decode(Voice& v) {
     const u32 block = v.nax & kRamMask & ~15u;
+    if (ram_[(block + 1) & kRamMask] & 4) v.lsax = block;    // loop start: where a repeat returns
+    // A silent voice runs on through its blocks (their flags, IRQA), but its
+    // samples are never heard - a key-on starts it afresh (Start: the
+    // decoder's history cleared, its block decoded again). Most of the 48
+    // voices are silent most of the time.
+    if (v.phase == Phase::Off) return;
     u8 bytes[kBlockBytes];
     for (u32 i = 0; i < kBlockBytes; ++i) bytes[i] = ram_[(block + i) & kRamMask];
-    if (bytes[1] & 4) v.lsax = block;               // loop start: where a repeat returns
     DecodeBlock(bytes, v.window + 3, &v.older, &v.old);
 }
 
@@ -668,6 +673,15 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq,
     }
     mixed_.assign(std::size_t(count) * 2, 0);
     bool stop = false;
+    // An interrupt from the playback ends the batch at its sample: the IOP
+    // runs its handler - and the thread it wakes - before the SPU2 plays on,
+    // as on the hardware, where they run within microseconds. (Burnout 3's
+    // B3ROUTE refills core 1's input ring on each; mixed on past it, the
+    // input played the ring's last lap until the batch's end - crackle.)
+    const std::function<void(u32)> irq_stop = [&](u32 core) {
+        irq(core);
+        stop = true;
+    };
     u32 n = 0;
     for (; n < count && !stop; ++n) {
         // Core 0's output: core 1's external input.
@@ -683,7 +697,7 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq,
             const u16 value = u16(s16(Clamp16(sample)));
             ram_[address] = u8(value);
             ram_[address + 1] = u8(value >> 8);
-            CheckIrq(0, address, address + 2, irq);
+            CheckIrq(0, address, address + 2, irq_stop);
         };
         for (u32 core = 0; core < 2; ++core) {
             Core& c = cores_[core];
@@ -724,7 +738,7 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq,
                 v.counter += v.pitch;
                 while (v.counter >= kBlockSpan) {
                     v.counter -= kBlockSpan;
-                    NextBlock(c, i, irq);
+                    NextBlock(c, i, irq_stop);
                 }
             }
             if (log) c.peak_voices = std::max(c.peak_voices, std::max(std::abs(core_left), std::abs(core_right)));
@@ -773,7 +787,7 @@ void Spu2::Advance(u64 now_us, const std::function<void(u32 core)>& irq,
             }
             auto pcm = [&](u32 base) {
                 const u32 address = base + capture_offset;
-                CheckIrq(0, address, address + 2, irq);
+                CheckIrq(0, address, address + 2, irq_stop);
                 return s32(s16(u16(ram_[address]) | u16(ram_[address + 1]) << 8));
             };
             const s32 in_left = pcm(input_base), in_right = pcm(input_base + 0x400);

@@ -64,7 +64,7 @@ const std::vector<Choice>& Choices() {
          [](const std::string& v) { SetWindowVsync(v == "on"); },
          "V-SYNC", {"OFF", "ON"}, "Wait for the screen's refresh: no tearing."},
         {"Frame pacing", {"on", "off"}, {"On", "Off"},
-         [] { return OnOff(SettingOn("frame_pacing", true)); },
+         [] { return OnOff(SettingOn("frame_pacing", FramePacingDefault())); },
          [](const std::string& v) { SetSettingOn("frame_pacing", v == "on"); },
          "PACING", {"ON", "OFF"}, "Frame pacing: pictures shown at an even pace."},
         {"Texture pack", {"on", "off"}, {"On", "Off"},

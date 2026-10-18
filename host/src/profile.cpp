@@ -275,7 +275,12 @@ std::string SampleReport(int top) {
     timeEndPeriod(1);
     HANDLE process = GetCurrentProcess();
     SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
-    if (!SymInitialize(process, nullptr, TRUE)) return "sample: no symbols";
+    // Symbols beside the executable (it names its PDB without a folder,
+    // /PDBALTPATH), wherever the run was started from.
+    char exe_dir[MAX_PATH] = "";
+    GetModuleFileNameA(nullptr, exe_dir, MAX_PATH);
+    if (char* slash = std::strrchr(exe_dir, '\\')) *slash = 0;
+    if (!SymInitialize(process, exe_dir, TRUE)) return "sample: no symbols";
     std::unordered_map<std::uint64_t, std::string> names;
     auto name = [&](std::uint64_t address) -> const std::string& {
         auto found = names.find(address);

@@ -307,11 +307,23 @@ Vu::Vu(int index)
     micro = {own_micro_.data(), own_micro_.size()};
     data = {own_data_.data(), own_data_.size()};
     regs.vf[0][3] = 0x3F800000u;    // vf0 = (0, 0, 0, 1)
+    start_counts_.assign(micro.size() / 8, 0);
+    entered_.assign(micro.size() / 8, Entered{});
 }
 
 void Vu::Attach(std::uint8_t* micro_memory, std::uint8_t* data_memory) {
-    if (micro_memory) micro.p = micro_memory;
+    if (micro_memory) {
+        micro.p = micro_memory;
+        ++micro_generation_;        // other memory: what was found in it, found again
+    }
     if (data_memory) data.p = data_memory;
+}
+
+const std::map<Vu::u32, Vu::u64>& Vu::starts() const {
+    starts_.clear();
+    for (std::size_t i = 0; i < start_counts_.size(); ++i)
+        if (start_counts_[i]) starts_[u32(i * 8)] = start_counts_[i];
+    return starts_;
 }
 
 Vu::u32* Vu::Quad(u32 address) {
@@ -824,7 +836,7 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     VuRounding rounding;
     const int unit = data_mask_ == 0x3FF ? 1 : 0;
     pc &= u32(micro.size() - 1) & ~7u;
-    ++starts_[pc];
+    ++start_counts_[pc / 8];
     if (g_record) RecordProgram(micro, unit, pc);
     if (unit == 1 && g_snapshotting.load(std::memory_order_relaxed) && g_snapshots_left) {
         Snapshot s{};
@@ -862,28 +874,38 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
     // From program to program (a jump to a register's address may go to
     // another), as long as one starts here and its code is in memory.
     while (!state.done && state.count < limit && state.delayed == kNone && !state.stopping) {
-        const auto found = Compiled().find(std::uint64_t(unit) << 32 | state.pc);
-        if (found == Compiled().end()) {
-            if (g_record && ran) RecordProgram(micro, unit, state.pc);
-            break;
-        }
+        Entered* entered = state.pc < micro.size() ? &entered_[state.pc / 8] : nullptr;
         const VuCompiled* program = nullptr;
-        for (const VuCompiled* candidate : found->second) {
-            u64& held_at = held_at_[candidate];
-            if (held_at == micro_generation_) { program = candidate; break; }
-            compiled_checked_ += 4 * (candidate->code[2] + 2);
-            if (Holds(micro, candidate->code)) {
-                held_at = micro_generation_;
-                program = candidate;
+        const std::vector<VuBlock>* blocks = nullptr;
+        if (entered && entered->generation == micro_generation_ && entered->fast == fast &&
+            entered->native == native) {
+            program = static_cast<const VuCompiled*>(entered->program);
+            blocks = static_cast<const std::vector<VuBlock>*>(entered->table);
+        } else {
+            const auto found = Compiled().find(std::uint64_t(unit) << 32 | state.pc);
+            if (found == Compiled().end()) {
+                if (g_record && ran) RecordProgram(micro, unit, state.pc);
                 break;
             }
-        }
-        if (!program) {
-            ++compiled_stale_;
-            break;
+            for (const VuCompiled* candidate : found->second) {
+                u64& held_at = held_at_[candidate];
+                if (held_at == micro_generation_) { program = candidate; break; }
+                compiled_checked_ += 4 * (candidate->code[2] + 2);
+                if (Holds(micro, candidate->code)) {
+                    held_at = micro_generation_;
+                    program = candidate;
+                    break;
+                }
+            }
+            if (!program) {
+                ++compiled_stale_;
+                break;
+            }
+            blocks = &BlockTable(program, micro.size() / 8, fast, native);
+            if (entered) *entered = Entered{program, blocks, micro_generation_, fast, native};
         }
         ++compiled_entries_;
-        const std::vector<VuBlock>& table = BlockTable(program, micro.size() / 8, fast, native);
+        const std::vector<VuBlock>& table = *blocks;
         const u64 before = state.count;
         const u32 started = state.pc;
         while (!state.done && state.count < limit) {

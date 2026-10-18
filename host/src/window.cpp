@@ -157,7 +157,10 @@ void PresentGdi() {
    pictures (drawn larger, SupersamplingFactor) averaged down. */
 ps2gpu::Display::AntiAliasing DisplayAntiAliasing(const std::string& mode) {
     using AA = ps2gpu::Display::AntiAliasing;
-    return mode == "fxaa" ? AA::kFxaa : mode == "ssaa2" || mode == "ssaa4" ? AA::kDownsample : AA::kOff;
+    return mode == "fxaa"                        ? AA::kFxaa
+           : mode == "smaa"                      ? AA::kSmaa
+           : mode == "ssaa2" || mode == "ssaa4" ? AA::kDownsample
+                                                 : AA::kOff;
 }
 #endif
 
@@ -331,22 +334,70 @@ void ShowHostCursor(bool on) {
 #endif
 }
 
+#ifdef PS2HOST_VULKAN
+namespace {
+ControllerFamily Family(std::uint8_t family) {
+    return family == ps2gpu::Display::kPlayStationController ? ControllerFamily::kPlayStation
+           : family == ps2gpu::Display::kXboxController      ? ControllerFamily::kXbox
+                                                             : ControllerFamily::kOther;
+}
+void Convert(const ps2gpu::Display::PadState& pad, HostPadState* state) {
+    state->buttons = pad.buttons;
+    for (int i = 0; i < 4; ++i) state->sticks[i] = pad.sticks[i];
+    state->l2 = pad.l2;
+    state->r2 = pad.r2;
+    state->family = Family(pad.family);
+}
+}  // namespace
+#endif
+
 bool HostPad(HostPadState* state) {
 #ifdef PS2HOST_VULKAN
     ps2gpu::Display::PadState pad;
     if (g_display && g_display->Pad(&pad)) {
-        state->buttons = pad.buttons;
-        for (int i = 0; i < 4; ++i) state->sticks[i] = pad.sticks[i];
-        state->l2 = pad.l2;
-        state->r2 = pad.r2;
-        state->family = pad.family == ps2gpu::Display::kPlayStationController ? ControllerFamily::kPlayStation
-                        : pad.family == ps2gpu::Display::kXboxController    ? ControllerFamily::kXbox
-                                                                             : ControllerFamily::kOther;
+        Convert(pad, state);
         return true;
     }
 #endif
     (void)state;
     return false;   // the GDI window has none
+}
+
+std::vector<HostDevice> WindowControllers() {
+    std::vector<HostDevice> list;
+#ifdef PS2HOST_VULKAN
+    if (g_display)
+        for (const auto& c : g_display->Controllers()) list.push_back({c.id, c.name, Family(c.family)});
+#endif
+    return list;
+}
+
+bool WindowControllerPad(u32 id, HostPadState* state) {
+#ifdef PS2HOST_VULKAN
+    ps2gpu::Display::PadState pad;
+    if (g_display && g_display->PadOf(id, &pad)) {
+        Convert(pad, state);
+        return true;
+    }
+#endif
+    (void)id, (void)state;
+    return false;
+}
+
+void HostRumbleOf(u32 id, u8 large, u8 small) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetRumbleOf(id, u16(large * 257), u16(small * 257));
+#else
+    (void)id, (void)large, (void)small;
+#endif
+}
+
+void HostTriggerTargets(const std::vector<u32>& ids) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetTriggerTargets(std::vector<std::uint32_t>(ids.begin(), ids.end()));
+#else
+    (void)ids;
+#endif
 }
 
 namespace {

@@ -44,11 +44,11 @@ namespace ps2host {
    PS2HOST_REPLAY_GPU=1: the GPU renderer draws instead (as --gpu), each
    picture to <dir>/gpu_<n>/ (screen.bmp at the internal resolution,
    PS2HOST_REPLAY_SCALE, default 1; screen_1x.bmp).
-   PS2HOST_REPLAY_BENCH=n (with the GPU): the stream played n times over
-   without trace or pictures, local memory as the dump has it before each,
-   and the time each pass took - the GS thread's work on a fixed sample, to
-   measure it; `sample`, under the sampler (--sample before --gs-replay). */
-int GsReplay(const std::string& file, const std::string& out, bool sample) {
+   PS2HOST_REPLAY_REPEAT=n: then the stream n times more, its pictures not
+   written, timed - the GS thread's work for a capture's frames (the GS model,
+   the GPU bridge, the renderer's recording), the same every run; with
+   PS2HOST_REPLAY_SAMPLE=1 sampled too (the sampler's report after). */
+int GsReplay(const std::string& file, const std::string& out) {
     std::FILE* f = std::fopen(file.c_str(), "rb");
     if (!f) {
         std::fprintf(stderr, "gs-replay: cannot open %s\n", file.c_str());
@@ -80,69 +80,6 @@ int GsReplay(const std::string& file, const std::string& out, bool sample) {
         if (scale) GpuSetScale(u32(std::max(1, std::atoi(scale))));
         if (g.on_memory) g.on_memory(0, 16384, true);       // local memory as the dump has it, on the GPU too
     }
-    const int bench = std::getenv("PS2HOST_REPLAY_BENCH") ? std::atoi(std::getenv("PS2HOST_REPLAY_BENCH")) : 0;
-    if (bench > 0) {
-        if (!gpu) {
-            std::fprintf(stderr, "gs-replay: PS2HOST_REPLAY_BENCH needs PS2HOST_REPLAY_GPU\n");
-            return 64;
-        }
-        if (sample) {
-            StartSampler();
-            SetSampleFrom(0);
-            SampleFrame(0);
-        }
-        std::vector<u32> bench_words;
-        std::vector<double> times;
-        u64 frame = 0;
-        // Every block written whole: nothing of the GPU's to read back first.
-        const std::vector<u8> whole(16384, 2);
-        const auto start = std::chrono::steady_clock::now();
-        for (int round = 0; round < bench; ++round) {
-            std::memcpy(g.memory.data(), data.data() + 5, kMemory);
-            if (g.on_write) g.on_write(0, 16384, whole.data());
-            const auto from = std::chrono::steady_clock::now();
-            for (std::size_t at = 5 + kMemory; at < data.size();) {
-                const char kind = char(data[at++]);
-                if (kind == 'R' || kind == 'P') {
-                    u32 r; u64 v;
-                    std::memcpy(&r, data.data() + at, 4);
-                    std::memcpy(&v, data.data() + at + 4, 8);
-                    if (kind == 'R') g.WriteRegister(r, v);
-                    else g.SetPrivileged(r, v);
-                    at += 12;
-                } else if (kind == 'W') {
-                    u32 bytes;
-                    std::memcpy(&bytes, data.data() + at + 1, 4);
-                    bench_words.resize(bytes / 4);
-                    std::memcpy(bench_words.data(), data.data() + at + 5, bench_words.size() * 4);
-                    g.Words(data[at], bench_words.data(), u32(bench_words.size()));
-                    at += 5 + bytes;
-                } else if (kind == 'V') {
-                    g.Finish();
-                    GpuShadowFrame(frame++, std::string());
-                } else {
-                    std::fprintf(stderr, "gs-replay: bad record at %zu\n", at - 1);
-                    return 65;
-                }
-            }
-            g.Finish();
-            times.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count());
-        }
-        // All of it drawn: a block read back waits for the GPU (and for a
-        // renderer's own thread before it).
-        if (g.on_memory) g.on_memory(0, 1, false);
-        const double total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-        std::vector<double> sorted = times;
-        std::sort(sorted.begin(), sorted.end());
-        double sum = 0;
-        for (double t : times) sum += t;
-        std::fprintf(stderr, "gs-replay bench: %d passes, %u primitives a pass; ms a pass: min %.2f, median %.2f, mean %.2f, max %.2f\n",
-                     bench, unsigned(g.primitives() / u64(bench)), sorted.front(), sorted[sorted.size() / 2],
-                     sum / bench, sorted.back());
-        std::fprintf(stderr, "gs-replay bench: %.2f ms a pass in all, to the last drawn\n", total / bench);
-        if (sample) std::printf("%s", SampleReport(std::getenv("PS2HOST_SAMPLE_TOP") ? std::atoi(std::getenv("PS2HOST_SAMPLE_TOP")) : 30).c_str());
-        return 0;
-    }
     std::FILE* trace = std::fopen((out + "/trace.txt").c_str(), "w");
     if (trace) {
         g.trace_out = trace;
@@ -153,6 +90,12 @@ int GsReplay(const std::string& file, const std::string& out, bool sample) {
     auto u64_at = [&](std::size_t o) { u64 v; std::memcpy(&v, data.data() + o, 8); return v; };
     int pictures = 0;
     std::vector<u32> words;
+    const std::size_t stream = at;
+    bool timing = false;                // PS2HOST_REPLAY_REPEAT's passes: nothing written
+    const int repeat = std::getenv("PS2HOST_REPLAY_REPEAT") ? std::atoi(std::getenv("PS2HOST_REPLAY_REPEAT")) : 0;
+    int pass = 0;
+    std::chrono::steady_clock::time_point started;
+    for (;;) {
     while (at < data.size()) {
         const char kind = char(data[at++]);
         if (kind == 'R') {
@@ -187,6 +130,10 @@ int GsReplay(const std::string& file, const std::string& out, bool sample) {
             }
         } else if (kind == 'V') {
             g.Finish();
+            if (timing) {
+                if (gpu) GpuShadowFrame(u64(pictures), std::string());
+                continue;
+            }
             if (trace) std::fprintf(trace, "[gs] ---- vertical blank %d\n", pictures);
             if (gpu) {
                 GpuShadowFrame(u64(pictures), std::string());
@@ -201,7 +148,34 @@ int GsReplay(const std::string& file, const std::string& out, bool sample) {
             return 65;
         }
     }
+    if (pass == 0 && trace) {           // the trace of the first pass alone
+        g.trace = false;
+        g.trace_out = stderr;
+        std::fclose(trace);
+        trace = nullptr;
+    }
+    if (pass == 0) {
+        if (repeat > 0 && std::getenv("PS2HOST_REPLAY_SAMPLE")) {
+            StartSampler();
+            SetSampleFrom(0);
+            SampleFrame(0);
+        }
+        started = std::chrono::steady_clock::now();
+    }
+    if (pass++ >= repeat) break;
+    timing = true;
+    at = stream;
+    }
     g.Finish();
+    if (repeat > 0) {
+        // To the last drawn: a block read back waits for the GPU (and for a
+        // renderer on a thread of its own, its queue).
+        if (gpu && g.on_memory) g.on_memory(0, 1, false);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        std::fprintf(stderr, "gs-replay: %d passes, %.2f ms a pass (%d pictures each)\n", repeat, ms / repeat, pictures);
+        if (std::getenv("PS2HOST_REPLAY_SAMPLE"))
+            std::printf("%s", SampleReport(std::getenv("PS2HOST_SAMPLE_TOP") ? std::atoi(std::getenv("PS2HOST_SAMPLE_TOP")) : 30).c_str());
+    }
     if (gpu && g.on_memory) g.on_memory(0, 16384, false);     // what the GPU drew, into local memory first
     if (std::FILE* m = std::fopen((out + "/gsmem.bin").c_str(), "wb")) {      // local memory at the end
         std::fwrite(g.memory.data(), 1, kMemory, m);
@@ -406,6 +380,9 @@ void SetFastDisc(bool on) { g_fast_disc = on; }
 void SetFastLoadingDefault(bool on) { g_fast_loading_default = on; }
 bool g_vu_fast_default = false;
 void SetVuFastDefault(bool on) { g_vu_fast_default = on; }
+bool g_frame_pacing_default = true;
+void SetFramePacingDefault(bool on) { g_frame_pacing_default = on; }
+bool FramePacingDefault() { return g_frame_pacing_default; }
 
 Stats& RunStats() {
     static Stats stats;
@@ -737,7 +714,7 @@ int Run(const Options& options) {
     if (!options.vu_record.empty()) Vu::RecordPrograms(options.vu_record);
     if (!options.memcard.empty()) mc2::SetCardDirectory(options.memcard);
     if (options.vu_interpret) Vu1().use_compiled = Vu0().use_compiled = false;
-    Vu1().fast = options.vu_fast || (g_vu_fast_default && !options.vu_exact);
+    Vu1().fast = options.vu_fast || (g_vu_fast_default && !options.vu_exact && SettingOn("vu_fast", true));
     if (Vu1().fast && !options.vu_fast) std::fprintf(stderr, "[host] VU1 fast mode (the game's default; --vu-exact for the exact flags)\n");
     Vu1().native = Vu0().native = options.vu_native;
     SetUntilFrame(options.until_frame);
@@ -867,7 +844,7 @@ int Main(int argc, char** argv) {
         else if (arg == "--vu-bench" && i + 1 < argc) options.vu_bench = argv[++i];
         else if (arg == "--gs-replay" && i + 2 < argc) {
             const std::string file = argv[++i], out = argv[++i];
-            return GsReplay(file, out, options.sample);
+            return GsReplay(file, out);
         }
         else if (arg == "--sample-from" && i + 1 < argc) {
             options.sample = true;

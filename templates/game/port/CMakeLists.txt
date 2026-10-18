@@ -14,7 +14,16 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 if(MSVC)
     get_filename_component(repo_root ${CMAKE_CURRENT_LIST_DIR}/../../.. ABSOLUTE)
     file(TO_NATIVE_PATH "${repo_root}/" repo_root_native)
-    add_compile_options("/d1trimfile:${repo_root_native}")
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        # clang-cl (engine/tools/port.py's default when LLVM is installed):
+        # the same paths taken off - its own flag, both ways a path is written -
+        # and no multiply-add fused into one rounding (MSVC fuses none): the
+        # game's floats, and the software GS's, as MSVC's build has them.
+        add_compile_options("/clang:-ffile-prefix-map=${repo_root}/=" "/clang:-ffile-prefix-map=${repo_root_native}="
+                            "/clang:-ffp-contract=off")
+    else()
+        add_compile_options("/d1trimfile:${repo_root_native}")
+    endif()
 endif()
 
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../../engine/host ${CMAKE_BINARY_DIR}/ps2host)

@@ -199,10 +199,14 @@ struct Feed {
             u64 t = tail.load(std::memory_order_relaxed);
             u64 h = head.load(std::memory_order_acquire);
             if (t == h) {
-                // Briefly busy, then asleep until there is more.
+                // Briefly busy, then asleep until there is more. Briefly: a
+                // pause is up to 140 cycles (Skylake on), and 200 of them each
+                // time the ring ran dry were a third of the thread's time in
+                // gameplay (20-26% of a core -> 14-16% with 16, the pictures'
+                // pacing the same). PS2HOST_GS_SPIN to measure another.
                 static const int kSpins = [] {
                     const char* n = std::getenv("PS2HOST_GS_SPIN");
-                    return n ? std::atoi(n) : 200;
+                    return n ? std::atoi(n) : 16;
                 }();
                 for (int spins = 0; spins < kSpins && t == h; ++spins) {
                     Pause();
@@ -313,6 +317,18 @@ void GsDrain() {
 
 void StopGsThread() {
     if (!g_feed) return;
+    // VIF1's worker first: what it still has queued (a VU1 program's XGKICKs,
+    // DIRECT) feeds the GS thread, and a feed gone under it was a crash at the
+    // run's end (GsWords between its check of g_feed and its use; seen with
+    // the car select's garage at 60 pictures a second keeping VU1 busy). The
+    // EE has stopped: nothing more is queued. A failure of the worker's at
+    // this point changes nothing - the run is over.
+    if (Vif1Async() && !OnVif1Worker()) {
+        try {
+            JoinVif1("stop");
+        } catch (...) {
+        }
+    }
     g_feed->Sync();
     g_feed->Stop();
     g_feed = nullptr;

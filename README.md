@@ -52,7 +52,11 @@ Code finds the skills in `engine/.claude/skills`.
 ## Requirements
 
 * Windows 10/11 x64, Python 3.10+ (standard library; Pillow for the art
-  scripts), Visual Studio 2022 with C++ (MSVC, its CMake and Ninja)
+  scripts), Visual Studio 2022 with C++ (MSVC, its CMake and Ninja); and
+  [LLVM](https://github.com/llvm/llvm-project/releases)'s clang-cl, which
+  `tools/port.py` builds with when it is installed (its code is about 17-20%
+  faster on the VU and GS, the pictures the same; `PS2_COMPILER=msvc` builds
+  with MSVC's own)
 * For a port: a Vulkan 1.3 GPU, a processor with AVX2
 * A disc image you own, for each game: an .iso, or a CD's raw .bin with its
   .cue (Mode 1 or Mode 2 sectors)
@@ -103,6 +107,15 @@ The host's own tests build with every port (`ps2host_tests`). A change to the
 engine is checked against every game's scripted runs
 (`engine/tools/regress.py`) before it is tagged: those need the games' discs,
 so they run on a developer's machine, not in CI.
+
+## Credits
+
+- **PaPe** ([@nynjardin](https://github.com/nynjardin)): Sony's inet on the
+  PC's sockets and the IOP's fixes for EA's network module (Burnout 3's LAN
+  play), the GPU renderer on a thread of its own, the sampler's fix
+  ([#1](https://github.com/danielgomesvieira2000/ps2-port-engine/pull/1)).
+- [SMAA](https://github.com/iryoku/smaa) (Jimenez et al., MIT licence) in
+  `gpu/third_party/smaa`, with its licence.
 
 ## Legal
 

@@ -74,29 +74,14 @@ std::string Vm::Where() {
     return " (IOP thread " + std::to_string(current) + ", $ra " + Hex(threads[current].c.r[31]) + ")";
 }
 
-u8* Vm::At(u32 address, u32 size) {
-    const u32 physical = address & 0x1FFFFFFFu;
-    if (physical < 0x00800000u) {                       // RAM and its mirrors
-        const u32 offset = physical & (kRamSize - 1);
-        if (offset + size <= kRamSize) return ram + offset;
-    }
-    return nullptr;
+void Vm::ReadFault(u32 address) {
+    Stop("a read of " + Hex(address) + " (IOP hardware or unmapped), by the instruction at " + Hex(executing) +
+         Where());
 }
 
-u32 Vm::Read(u32 address, u32 size) {
-    const u8* p = At(address, size);
-    if (!p) Stop("a read of " + Hex(address) + " (IOP hardware or unmapped), by the instruction at " +
-                 Hex(executing) + Where());
-    u32 value = 0;
-    std::memcpy(&value, p, size);
-    return value;
-}
-
-void Vm::Write(u32 address, u32 value, u32 size) {
-    u8* p = At(address, size);
-    if (!p) Stop("a write of " + Hex(value) + " to " + Hex(address) +
-                 " (IOP hardware or unmapped), by the instruction at " + Hex(executing) + Where());
-    std::memcpy(p, &value, size);
+void Vm::WriteFault(u32 address, u32 value) {
+    Stop("a write of " + Hex(value) + " to " + Hex(address) + " (IOP hardware or unmapped), by the instruction at " +
+         Hex(executing) + Where());
 }
 
 std::string Vm::String(u32 address, u32 limit) {

@@ -1608,6 +1608,10 @@ void SpuDecodesAdpcmAndPlaysAVoice() {
     auto capture_irq = [&](Spu2::u32 core) { capture_irqs |= 1u << core; };
     captured.Advance(1000, capture_irq);
     captured.Advance(2000, capture_irq);
+    // The interrupt (IRQA 0x2820: the ring's 16th sample) ends the batch
+    // there, for the IOP to answer it; the rest plays on the next Advance.
+    Check(capture_output.size() == 2 * 17, "SPU2: a batch stops at the sample its interrupt came on");
+    captured.Advance(2000, capture_irq);
     auto capture_sample = [&](unsigned address) {
         Spu2::u8 bytes[2]; captured.Read(address, bytes, 2);
         return int(Spu2::s16(unsigned(bytes[0]) | unsigned(bytes[1]) << 8));

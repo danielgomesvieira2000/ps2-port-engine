@@ -16,8 +16,13 @@
 #include <volk.h>
 
 #include "gpu_internal.h"
+#include "AreaTex.h"             // gpu/third_party/smaa
+#include "SearchTex.h"
 #include "downsample_comp.h"
 #include "fxaa_comp.h"
+#include "smaa_blend_comp.h"
+#include "smaa_edges_comp.h"
+#include "smaa_weights_comp.h"
 
 #include <algorithm>
 #ifdef _WIN32
@@ -138,24 +143,50 @@ private:
     void PresentLoop();
 
     SDL_Window* window_ = nullptr;
-    SDL_Gamepad* gamepad_ = nullptr;        // the first controller plugged in
-    std::atomic<std::uint32_t> rumble_{0};  // SetRumble: large << 16 | small
-    std::uint32_t rumble_sent_ = 0;
-    std::uint64_t rumble_renewed_ = 0;      // when SDL was last told (ms): its rumble lasts a while
+    // Every controller plugged in, in the order they were: opened and closed
+    // by the window's thread (Pump), read from the EE's - under pads_lock_.
+    struct Gamepad {
+        SDL_Gamepad* pad = nullptr;
+        std::uint32_t id = 0;
+        std::uint32_t rumble = 0;           // as wanted: large << 16 | small
+        std::uint32_t rumble_sent = 0;
+        std::uint64_t rumble_renewed = 0;   // when SDL was last told (ms): its rumble lasts a while
+        bool triggers_unsent = true;        // (plugged in since they were sent)
+        TriggerEffect triggers_sent[2];
+    };
+    mutable std::mutex pads_lock_;
+    std::vector<Gamepad> pads_;
+    std::vector<std::uint32_t> trigger_targets_;        // SetTriggerTargets: none, every controller
+    const Gamepad* FindPad(std::uint32_t id) const {
+        for (const Gamepad& g : pads_)
+            if (g.id == id) return &g;
+        return nullptr;
+    }
 public:
     void SetRumble(std::uint16_t large, std::uint16_t small) override {
-        rumble_.store(std::uint32_t(large) << 16 | small);
+        std::lock_guard<std::mutex> hold(pads_lock_);
+        for (Gamepad& g : pads_) g.rumble = std::uint32_t(large) << 16 | small;
+    }
+    void SetRumbleOf(std::uint32_t id, std::uint16_t large, std::uint16_t small) override {
+        std::lock_guard<std::mutex> hold(pads_lock_);
+        for (Gamepad& g : pads_)
+            if (g.id == id) g.rumble = std::uint32_t(large) << 16 | small;
     }
     void SetTriggerEffects(TriggerEffect left, TriggerEffect right) override {
         std::lock_guard<std::mutex> hold(triggers_lock_);
         triggers_[0] = left;
         triggers_[1] = right;
     }
+    void SetTriggerTargets(std::vector<std::uint32_t> ids) override {
+        std::lock_guard<std::mutex> hold(triggers_lock_);
+        trigger_targets_ = std::move(ids);
+    }
+    std::vector<ControllerInfo> Controllers() const override;
+    bool PadOf(std::uint32_t id, PadState* state) const override;
     void ReleaseController() override;
     std::mutex triggers_lock_;
-    TriggerEffect triggers_[2], triggers_sent_[2];      // left, right: wanted, and last sent
-    bool triggers_unsent_ = true;                       // (a controller plugged in since)
-    void SendTriggers(const TriggerEffect& left, const TriggerEffect& right);
+    TriggerEffect triggers_[2];                         // left, right: wanted
+    void SendTriggers(SDL_Gamepad* pad, const TriggerEffect& left, const TriggerEffect& right);
     bool TakeMouse(MouseState* state) override {
         std::lock_guard<std::mutex> hold(mouse_lock_);
         *state = mouse_;
@@ -278,6 +309,32 @@ private:
     /* `source` (TRANSFER_SRC, width x height) through `pipeline` into post_out_ (left
        TRANSFER_SRC), in cmd_. */
     void RecordPost(VkImage source, std::uint32_t width, std::uint32_t height, VkPipeline pipeline);
+    // SMAA: post_in_ through its edges and blending weights (images of the
+    // picture's size) into post_out_ - smaa_edges, smaa_weights and
+    // smaa_blend.comp, each with a set of its own (three samplers, an
+    // output image); its area and search tables uploaded once, from a
+    // staging buffer kept until the end.
+    enum { kSmaaEdges, kSmaaWeights, kSmaaArea, kSmaaSearch, kSmaaImages };
+    VkImage smaa_image_[kSmaaImages] = {};
+    VkDeviceMemory smaa_memory_[kSmaaImages] = {};
+    VkImageView smaa_view_[kSmaaImages] = {};
+    VkSampler smaa_point_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout smaa_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool smaa_descriptors_ = VK_NULL_HANDLE;
+    VkDescriptorSet smaa_sets_[3] = {};
+    VkPipelineLayout smaa_layout_ = VK_NULL_HANDLE;
+    VkPipeline smaa_pipelines_[3] = {};
+    VkBuffer smaa_staging_ = VK_NULL_HANDLE;
+    VkDeviceMemory smaa_staging_memory_ = VK_NULL_HANDLE;
+    bool smaa_tables_sent_ = false, smaa_failed_ = false;
+    std::uint32_t smaa_width_ = 0, smaa_height_ = 0;
+    VkImageView smaa_for_in_ = VK_NULL_HANDLE;      // post_in_'s view its sets were written with
+    bool MakeSmaaImage(int which, VkFormat format, std::uint32_t width, std::uint32_t height, VkImageUsageFlags usage);
+    /* The passes (once), their tables and images at this size; false when there are none. */
+    bool EnsureSmaa(std::uint32_t width, std::uint32_t height);
+    /* As RecordPost, through SMAA's three passes. */
+    void RecordSmaa(VkImage source, std::uint32_t width, std::uint32_t height);
+    void DestroySmaa();
     std::string describe_, error_;
     // PresentImageAt's pictures: copies of the frames' targets, three, each
     // its copy's command buffer and fence (the GS thread's own pool).
@@ -880,6 +937,250 @@ void VulkanDisplay::RecordPost(VkImage source, std::uint32_t width, std::uint32_
             VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 }
 
+bool VulkanDisplay::MakeSmaaImage(int which, VkFormat format, std::uint32_t width, std::uint32_t height,
+                                  VkImageUsageFlags usage) {
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = format;
+    ici.extent = {width, height, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = usage;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!Check(vkCreateImage(device_, &ici, nullptr, &smaa_image_[which]), "vkCreateImage (SMAA)")) return false;
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(device_, smaa_image_[which], &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (!Check(vkAllocateMemory(device_, &mai, nullptr, &smaa_memory_[which]), "vkAllocateMemory (SMAA)")) return false;
+    vkBindImageMemory(device_, smaa_image_[which], smaa_memory_[which], 0);
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = smaa_image_[which];
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = format;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    return Check(vkCreateImageView(device_, &vci, nullptr, &smaa_view_[which]), "vkCreateImageView (SMAA)");
+}
+
+void VulkanDisplay::DestroySmaa() {
+    if (!device_) return;
+    for (int i = 0; i < kSmaaImages; ++i) {
+        if (smaa_view_[i]) vkDestroyImageView(device_, smaa_view_[i], nullptr);
+        if (smaa_image_[i]) vkDestroyImage(device_, smaa_image_[i], nullptr);
+        if (smaa_memory_[i]) vkFreeMemory(device_, smaa_memory_[i], nullptr);
+        smaa_view_[i] = VK_NULL_HANDLE;
+        smaa_image_[i] = VK_NULL_HANDLE;
+        smaa_memory_[i] = VK_NULL_HANDLE;
+    }
+    for (VkPipeline& p : smaa_pipelines_)
+        if (p) vkDestroyPipeline(device_, p, nullptr), p = VK_NULL_HANDLE;
+    if (smaa_layout_) vkDestroyPipelineLayout(device_, smaa_layout_, nullptr);
+    if (smaa_descriptors_) vkDestroyDescriptorPool(device_, smaa_descriptors_, nullptr);
+    if (smaa_set_layout_) vkDestroyDescriptorSetLayout(device_, smaa_set_layout_, nullptr);
+    if (smaa_point_) vkDestroySampler(device_, smaa_point_, nullptr);
+    if (smaa_staging_) vkDestroyBuffer(device_, smaa_staging_, nullptr);
+    if (smaa_staging_memory_) vkFreeMemory(device_, smaa_staging_memory_, nullptr);
+    smaa_layout_ = VK_NULL_HANDLE;
+    smaa_descriptors_ = VK_NULL_HANDLE;
+    smaa_set_layout_ = VK_NULL_HANDLE;
+    smaa_point_ = VK_NULL_HANDLE;
+    smaa_staging_ = VK_NULL_HANDLE;
+    smaa_staging_memory_ = VK_NULL_HANDLE;
+}
+
+bool VulkanDisplay::EnsureSmaa(std::uint32_t width, std::uint32_t height) {
+    if (smaa_failed_) return false;
+    if (width == smaa_width_ && height == smaa_height_ && smaa_for_in_ == post_in_view_ && smaa_image_[kSmaaEdges])
+        return true;
+    smaa_failed_ = true;                    // until it is all made
+    if (!smaa_pipelines_[0]) {
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (!Check(vkCreateSampler(device_, &sci, nullptr, &smaa_point_), "vkCreateSampler (SMAA)")) return false;
+        VkDescriptorSetLayoutBinding bindings[4] = {};
+        for (std::uint32_t i = 0; i < 4; ++i) {
+            bindings[i].binding = i;
+            bindings[i].descriptorType = i < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[i].descriptorCount = 1;
+            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        lci.bindingCount = 4;
+        lci.pBindings = bindings;
+        if (!Check(vkCreateDescriptorSetLayout(device_, &lci, nullptr, &smaa_set_layout_), "SMAA set layout"))
+            return false;
+        const VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 9},
+                                               {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3}};
+        VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpi.maxSets = 3;
+        dpi.poolSizeCount = 2;
+        dpi.pPoolSizes = sizes;
+        if (!Check(vkCreateDescriptorPool(device_, &dpi, nullptr, &smaa_descriptors_), "SMAA descriptor pool"))
+            return false;
+        const VkDescriptorSetLayout layouts[3] = {smaa_set_layout_, smaa_set_layout_, smaa_set_layout_};
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorPool = smaa_descriptors_;
+        dai.descriptorSetCount = 3;
+        dai.pSetLayouts = layouts;
+        if (!Check(vkAllocateDescriptorSets(device_, &dai, smaa_sets_), "SMAA descriptor sets")) return false;
+        const VkPushConstantRange metrics{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &smaa_set_layout_;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &metrics;
+        if (!Check(vkCreatePipelineLayout(device_, &pli, nullptr, &smaa_layout_), "SMAA pipeline layout")) return false;
+        const struct { const std::uint32_t* code; std::size_t bytes; } shaders[3] = {
+            {spirv_smaa_edges_comp, sizeof spirv_smaa_edges_comp},
+            {spirv_smaa_weights_comp, sizeof spirv_smaa_weights_comp},
+            {spirv_smaa_blend_comp, sizeof spirv_smaa_blend_comp},
+        };
+        for (int i = 0; i < 3; ++i) {
+            VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            smi.codeSize = shaders[i].bytes;
+            smi.pCode = shaders[i].code;
+            VkShaderModule module = VK_NULL_HANDLE;
+            if (!Check(vkCreateShaderModule(device_, &smi, nullptr, &module), "SMAA shader")) return false;
+            VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            cpi.stage.module = module;
+            cpi.stage.pName = "main";
+            cpi.layout = smaa_layout_;
+            const VkResult made = vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpi, nullptr, &smaa_pipelines_[i]);
+            vkDestroyShaderModule(device_, module, nullptr);
+            if (!Check(made, "SMAA pipeline")) return false;
+        }
+        // The tables: their images, and their bytes in a staging buffer
+        // (RecordSmaa copies them over the first time).
+        const VkImageUsageFlags table = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (!MakeSmaaImage(kSmaaArea, VK_FORMAT_R8G8_UNORM, AREATEX_WIDTH, AREATEX_HEIGHT, table) ||
+            !MakeSmaaImage(kSmaaSearch, VK_FORMAT_R8_UNORM, SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, table))
+            return false;
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = sizeof areaTexBytes + sizeof searchTexBytes;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        if (!Check(vkCreateBuffer(device_, &bci, nullptr, &smaa_staging_), "SMAA staging buffer")) return false;
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(device_, smaa_staging_, &req);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (!Check(vkAllocateMemory(device_, &mai, nullptr, &smaa_staging_memory_), "SMAA staging memory")) return false;
+        vkBindBufferMemory(device_, smaa_staging_, smaa_staging_memory_, 0);
+        void* mapped = nullptr;
+        if (!Check(vkMapMemory(device_, smaa_staging_memory_, 0, bci.size, 0, &mapped), "SMAA staging map")) return false;
+        std::memcpy(mapped, areaTexBytes, sizeof areaTexBytes);
+        std::memcpy(static_cast<char*>(mapped) + sizeof areaTexBytes, searchTexBytes, sizeof searchTexBytes);
+        vkUnmapMemory(device_, smaa_staging_memory_);
+    }
+    // Earlier presents may still read the old images.
+    {
+        std::lock_guard<std::mutex> hold(g_queue_lock);
+        vkDeviceWaitIdle(device_);
+    }
+    for (int which : {int(kSmaaEdges), int(kSmaaWeights)}) {
+        if (smaa_view_[which]) vkDestroyImageView(device_, smaa_view_[which], nullptr);
+        if (smaa_image_[which]) vkDestroyImage(device_, smaa_image_[which], nullptr);
+        if (smaa_memory_[which]) vkFreeMemory(device_, smaa_memory_[which], nullptr);
+        smaa_view_[which] = VK_NULL_HANDLE;
+        smaa_image_[which] = VK_NULL_HANDLE;
+        smaa_memory_[which] = VK_NULL_HANDLE;
+        if (!MakeSmaaImage(which, VK_FORMAT_R8G8B8A8_UNORM, width, height,
+                           VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT))
+            return false;
+    }
+    // Each pass's set: its inputs (sampled; one unused stands for the
+    // others) and its output.
+    const VkImageLayout read = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    const VkDescriptorImageInfo colour{post_sampler_, post_in_view_, read};
+    const VkDescriptorImageInfo edges{post_sampler_, smaa_view_[kSmaaEdges], read};
+    const VkDescriptorImageInfo weights{post_sampler_, smaa_view_[kSmaaWeights], read};
+    const VkDescriptorImageInfo area{post_sampler_, smaa_view_[kSmaaArea], read};
+    const VkDescriptorImageInfo search{smaa_point_, smaa_view_[kSmaaSearch], read};
+    const VkDescriptorImageInfo out_edges{VK_NULL_HANDLE, smaa_view_[kSmaaEdges], VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorImageInfo out_weights{VK_NULL_HANDLE, smaa_view_[kSmaaWeights], VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorImageInfo out_picture{VK_NULL_HANDLE, post_out_view_, VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorImageInfo* inputs[3][4] = {{&colour, &colour, &colour, &out_edges},
+                                                 {&edges, &area, &search, &out_weights},
+                                                 {&colour, &weights, &colour, &out_picture}};
+    VkWriteDescriptorSet writes[12] = {};
+    for (int set = 0; set < 3; ++set)
+        for (std::uint32_t b = 0; b < 4; ++b) {
+            VkWriteDescriptorSet& w = writes[set * 4 + b];
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = smaa_sets_[set];
+            w.dstBinding = b;
+            w.descriptorCount = 1;
+            w.descriptorType = b < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w.pImageInfo = inputs[set][b];
+        }
+    vkUpdateDescriptorSets(device_, 12, writes, 0, nullptr);
+    smaa_width_ = width;
+    smaa_height_ = height;
+    smaa_for_in_ = post_in_view_;
+    smaa_failed_ = false;
+    return true;
+}
+
+void VulkanDisplay::RecordSmaa(VkImage source, std::uint32_t width, std::uint32_t height) {
+    // The picture as RGBA, to be sampled (as RecordPost).
+    Barrier(cmd_, post_in_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkImageBlit region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstSubresource = region.srcSubresource;
+    region.srcOffsets[1] = {std::int32_t(width), std::int32_t(height), 1};
+    region.dstOffsets[1] = region.srcOffsets[1];
+    vkCmdBlitImage(cmd_, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, post_in_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   1, &region, VK_FILTER_NEAREST);
+    Barrier(cmd_, post_in_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    if (!smaa_tables_sent_) {
+        const struct { int which; VkDeviceSize offset; std::uint32_t w, h; } tables[2] = {
+            {kSmaaArea, 0, AREATEX_WIDTH, AREATEX_HEIGHT},
+            {kSmaaSearch, sizeof areaTexBytes, SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT}};
+        for (const auto& t : tables) {
+            Barrier(cmd_, smaa_image_[t.which], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkBufferImageCopy copy{};
+            copy.bufferOffset = t.offset;
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageExtent = {t.w, t.h, 1};
+            vkCmdCopyBufferToImage(cmd_, smaa_staging_, smaa_image_[t.which], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                   &copy);
+            Barrier(cmd_, smaa_image_[t.which], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        }
+        smaa_tables_sent_ = true;
+    }
+    const float metrics[4] = {1.0f / float(width), 1.0f / float(height), float(width), float(height)};
+    const VkImage outputs[3] = {smaa_image_[kSmaaEdges], smaa_image_[kSmaaWeights], post_out_};
+    for (int pass = 0; pass < 3; ++pass) {
+        Barrier(cmd_, outputs[pass], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, smaa_pipelines_[pass]);
+        vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, smaa_layout_, 0, 1, &smaa_sets_[pass], 0, nullptr);
+        vkCmdPushConstants(cmd_, smaa_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof metrics, metrics);
+        vkCmdDispatch(cmd_, (width + 7) / 8, (height + 7) / 8, 1);
+        if (pass < 2)                       // read by the next pass
+            Barrier(cmd_, outputs[pass], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
+    Barrier(cmd_, post_out_, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+}
+
 bool VulkanDisplay::FinishPresent(std::uint32_t index, VkImage source, std::uint32_t width, std::uint32_t height) {
     const VkImage target = images_[index];
     Barrier(cmd_, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
@@ -907,6 +1208,9 @@ bool VulkanDisplay::FinishPresent(std::uint32_t index, VkImage source, std::uint
     const bool larger = width > std::uint32_t(dw) || height > std::uint32_t(dh);
     if (mode == AntiAliasing::kFxaa && EnsurePost(width, height, width, height)) {
         RecordPost(source, width, height, fxaa_pipeline_);
+        source = post_out_;
+    } else if (mode == AntiAliasing::kSmaa && EnsurePost(width, height, width, height) && EnsureSmaa(width, height)) {
+        RecordSmaa(source, width, height);
         source = post_out_;
     } else if (mode == AntiAliasing::kDownsample && larger && dw > 0 && dh > 0 &&
                EnsurePost(width, height, std::uint32_t(dw), std::uint32_t(dh))) {
@@ -1355,30 +1659,36 @@ bool VulkanDisplay::Pump() {
         if (title_changed_ && window_) SDL_SetWindowTitle(window_, title_.c_str());
         title_changed_ = false;
     }
-    // The triggers' effects as last set, when they change.
-    if (gamepad_) {
+    // Each controller's: the triggers' effects as last set, when they change
+    // (off on one SetTriggerTargets leaves out), and the motors as the game
+    // last set them - renewed before SDL's duration runs out, stopped when
+    // set to zero.
+    {
         TriggerEffect wanted[2];
+        std::vector<std::uint32_t> targets;
         {
             std::lock_guard<std::mutex> hold(triggers_lock_);
             wanted[0] = triggers_[0];
             wanted[1] = triggers_[1];
+            targets = trigger_targets_;
         }
-        if (triggers_unsent_ || !(wanted[0] == triggers_sent_[0]) || !(wanted[1] == triggers_sent_[1])) {
-            SendTriggers(wanted[0], wanted[1]);
-            triggers_sent_[0] = wanted[0];
-            triggers_sent_[1] = wanted[1];
-            triggers_unsent_ = false;
-        }
-    }
-    // The motors as the game last set them: renewed before SDL's duration
-    // runs out, stopped when set to zero.
-    if (gamepad_) {
-        const std::uint32_t r = rumble_.load();
         const std::uint64_t now = SDL_GetTicks();
-        if (r != rumble_sent_ || (r && now - rumble_renewed_ > 200)) {
-            SDL_RumbleGamepad(gamepad_, std::uint16_t(r >> 16), std::uint16_t(r), r ? 400 : 0);
-            rumble_sent_ = r;
-            rumble_renewed_ = now;
+        std::lock_guard<std::mutex> hold(pads_lock_);
+        for (Gamepad& g : pads_) {
+            const bool target = targets.empty() || std::find(targets.begin(), targets.end(), g.id) != targets.end();
+            const TriggerEffect left = target ? wanted[0] : TriggerEffect{}, right = target ? wanted[1] : TriggerEffect{};
+            if (g.triggers_unsent || !(left == g.triggers_sent[0]) || !(right == g.triggers_sent[1])) {
+                SendTriggers(g.pad, left, right);
+                g.triggers_sent[0] = left;
+                g.triggers_sent[1] = right;
+                g.triggers_unsent = false;
+            }
+            const std::uint32_t r = g.rumble;
+            if (r != g.rumble_sent || (r && now - g.rumble_renewed > 200)) {
+                SDL_RumbleGamepad(g.pad, std::uint16_t(r >> 16), std::uint16_t(r), r ? 400 : 0);
+                g.rumble_sent = r;
+                g.rumble_renewed = now;
+            }
         }
     }
     SDL_Event e;
@@ -1391,11 +1701,13 @@ bool VulkanDisplay::Pump() {
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F12) capture_ = true;
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_TAB) texture_pack_ = true;
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F1) fps_toggle_ = true;
-        if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && gamepad_ &&
-            (e.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_STICK || e.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_STICK) &&
-            SDL_GetGamepadButton(gamepad_, SDL_GAMEPAD_BUTTON_LEFT_STICK) &&
-            SDL_GetGamepadButton(gamepad_, SDL_GAMEPAD_BUTTON_RIGHT_STICK))
-            capture_ = true;
+        if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
+            (e.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_STICK || e.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_STICK)) {
+            SDL_Gamepad* pad = SDL_GetGamepadFromID(e.gbutton.which);
+            if (pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_LEFT_STICK) &&
+                SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_RIGHT_STICK))
+                capture_ = true;
+        }
         if (e.type == SDL_EVENT_MOUSE_MOTION) MouseAt(e.motion.x, e.motion.y);
         if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_UP) {
             MouseAt(e.button.x, e.button.y);
@@ -1422,15 +1734,27 @@ bool VulkanDisplay::Pump() {
             std::lock_guard<std::mutex> hold(mouse_lock_);
             mouse_.held = 0;
         }
-        if (e.type == SDL_EVENT_GAMEPAD_ADDED && !gamepad_) {
-            gamepad_ = SDL_OpenGamepad(e.gdevice.which);
-            triggers_unsent_ = true;
-            if (gamepad_) std::fprintf(stderr, "[window] controller: %s\n", SDL_GetGamepadName(gamepad_));
+        if (e.type == SDL_EVENT_GAMEPAD_ADDED) {
+            std::lock_guard<std::mutex> hold(pads_lock_);
+            if (!FindPad(e.gdevice.which)) {
+                if (SDL_Gamepad* pad = SDL_OpenGamepad(e.gdevice.which)) {
+                    Gamepad g;
+                    g.pad = pad;
+                    g.id = e.gdevice.which;
+                    pads_.push_back(g);
+                    std::fprintf(stderr, "[window] controller %u: %s\n", unsigned(g.id), SDL_GetGamepadName(pad));
+                }
+            }
         }
-        if (e.type == SDL_EVENT_GAMEPAD_REMOVED && gamepad_ && SDL_GetGamepadID(gamepad_) == e.gdevice.which) {
-            std::fprintf(stderr, "[window] controller unplugged\n");
-            SDL_CloseGamepad(gamepad_);
-            gamepad_ = nullptr;
+        if (e.type == SDL_EVENT_GAMEPAD_REMOVED) {
+            std::lock_guard<std::mutex> hold(pads_lock_);
+            for (auto g = pads_.begin(); g != pads_.end(); ++g)
+                if (g->id == e.gdevice.which) {
+                    std::fprintf(stderr, "[window] controller %u unplugged\n", unsigned(g->id));
+                    SDL_CloseGamepad(g->pad);
+                    pads_.erase(g);
+                    break;
+                }
         }
     }
     UpdateCursor();
@@ -1522,8 +1846,23 @@ void VulkanDisplay::UpdateCursor() {
     }
 }
 
-bool VulkanDisplay::Pad(PadState* state) const {
-    if (!gamepad_) return false;
+namespace {
+std::uint8_t FamilyOf(SDL_Gamepad* pad) {
+    switch (SDL_GetGamepadType(pad)) {
+        case SDL_GAMEPAD_TYPE_PS3:
+        case SDL_GAMEPAD_TYPE_PS4:
+        case SDL_GAMEPAD_TYPE_PS5:
+            return Display::kPlayStationController;
+        case SDL_GAMEPAD_TYPE_XBOX360:
+        case SDL_GAMEPAD_TYPE_XBOXONE:
+            return Display::kXboxController;
+        default:
+            return Display::kOtherController;
+    }
+}
+
+/* One controller as a DualShock 2 reads. */
+Display::PadState ReadPad(SDL_Gamepad* pad) {
     // SDL's buttons by position (south is the DualShock's cross) to
     // DualShock 2 inputs.
     static const std::pair<SDL_GamepadButton, int> kButtons[] = {
@@ -1533,12 +1872,12 @@ bool VulkanDisplay::Pad(PadState* state) const {
         {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 10}, {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 11},
         {SDL_GAMEPAD_BUTTON_NORTH, 12}, {SDL_GAMEPAD_BUTTON_EAST, 13}, {SDL_GAMEPAD_BUTTON_SOUTH, 14},
         {SDL_GAMEPAD_BUTTON_WEST, 15}};
-    PadState s;
+    Display::PadState s;
     for (const auto& [button, input] : kButtons)
-        if (SDL_GetGamepadButton(gamepad_, button)) s.buttons |= std::uint16_t(1u << input);
+        if (SDL_GetGamepadButton(pad, button)) s.buttons |= std::uint16_t(1u << input);
     // Triggers (0-32767) are L2 and R2: pressed past a quarter of their travel.
-    const int l2 = SDL_GetGamepadAxis(gamepad_, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
-    const int r2 = SDL_GetGamepadAxis(gamepad_, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
+    const int l2 = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
+    const int r2 = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
     s.l2 = std::uint8_t(std::clamp(l2, 0, 32767) >> 7);
     s.r2 = std::uint8_t(std::clamp(r2, 0, 32767) >> 7);
     if (l2 > 8192) s.buttons |= 1u << 8;
@@ -1548,24 +1887,37 @@ bool VulkanDisplay::Pad(PadState* state) const {
     static const SDL_GamepadAxis kAxes[4] = {SDL_GAMEPAD_AXIS_RIGHTX, SDL_GAMEPAD_AXIS_RIGHTY,
                                              SDL_GAMEPAD_AXIS_LEFTX, SDL_GAMEPAD_AXIS_LEFTY};
     for (int i = 0; i < 4; ++i) {
-        const int v = SDL_GetGamepadAxis(gamepad_, kAxes[i]);
+        const int v = SDL_GetGamepadAxis(pad, kAxes[i]);
         s.sticks[i] = (v > -4096 && v < 4096) ? 0x80 : std::uint8_t((v + 32768) >> 8);
     }
-    switch (SDL_GetGamepadType(gamepad_)) {
-        case SDL_GAMEPAD_TYPE_PS3:
-        case SDL_GAMEPAD_TYPE_PS4:
-        case SDL_GAMEPAD_TYPE_PS5:
-            s.family = kPlayStationController;
-            break;
-        case SDL_GAMEPAD_TYPE_XBOX360:
-        case SDL_GAMEPAD_TYPE_XBOXONE:
-            s.family = kXboxController;
-            break;
-        default:
-            s.family = kOtherController;
-    }
-    *state = s;
+    s.family = FamilyOf(pad);
+    return s;
+}
+}  // namespace
+
+bool VulkanDisplay::Pad(PadState* state) const {
+    std::lock_guard<std::mutex> hold(pads_lock_);
+    if (pads_.empty()) return false;
+    *state = ReadPad(pads_.front().pad);
     return true;
+}
+
+bool VulkanDisplay::PadOf(std::uint32_t id, PadState* state) const {
+    std::lock_guard<std::mutex> hold(pads_lock_);
+    const Gamepad* g = FindPad(id);
+    if (!g) return false;
+    *state = ReadPad(g->pad);
+    return true;
+}
+
+std::vector<Display::ControllerInfo> VulkanDisplay::Controllers() const {
+    std::lock_guard<std::mutex> hold(pads_lock_);
+    std::vector<ControllerInfo> list;
+    for (const Gamepad& g : pads_) {
+        const char* name = SDL_GetGamepadName(g.pad);
+        list.push_back({g.id, name ? name : "Controller", FamilyOf(g.pad)});
+    }
+    return list;
 }
 
 /* A DualSense's effects packet (SDL's HIDAPI PS5 driver takes it as the
@@ -1574,8 +1926,8 @@ bool VulkanDisplay::Pad(PadState* state) const {
    enabled by bits 2 and 3 of the first byte. An effect: its mode, then its
    parameters - 0x05 off; 0x01 resistance (start, force); 0x06 vibration
    (frequency, amplitude, start). */
-void VulkanDisplay::SendTriggers(const TriggerEffect& left, const TriggerEffect& right) {
-    if (!gamepad_ || SDL_GetGamepadType(gamepad_) != SDL_GAMEPAD_TYPE_PS5) return;
+void VulkanDisplay::SendTriggers(SDL_Gamepad* pad, const TriggerEffect& left, const TriggerEffect& right) {
+    if (!pad || SDL_GetGamepadType(pad) != SDL_GAMEPAD_TYPE_PS5) return;
     std::uint8_t packet[47] = {};
     packet[0] = 0x04 | 0x08;
     auto put = [](std::uint8_t* at, const TriggerEffect& t) {
@@ -1592,14 +1944,16 @@ void VulkanDisplay::SendTriggers(const TriggerEffect& left, const TriggerEffect&
     };
     put(packet + 10, right);
     put(packet + 21, left);
-    if (!SDL_SendGamepadEffect(gamepad_, packet, sizeof packet))
+    if (!SDL_SendGamepadEffect(pad, packet, sizeof packet))
         std::fprintf(stderr, "[window] trigger effects: %s\n", SDL_GetError());
 }
 
 void VulkanDisplay::ReleaseController() {
-    if (!gamepad_) return;
-    SendTriggers(TriggerEffect{}, TriggerEffect{});
-    SDL_RumbleGamepad(gamepad_, 0, 0, 0);
+    std::lock_guard<std::mutex> hold(pads_lock_);
+    for (Gamepad& g : pads_) {
+        SendTriggers(g.pad, TriggerEffect{}, TriggerEffect{});
+        SDL_RumbleGamepad(g.pad, 0, 0, 0);
+    }
 }
 
 bool VulkanDisplay::Focused() const {
@@ -1625,6 +1979,7 @@ VulkanDisplay::~VulkanDisplay() {
     if (copy_pool_) vkDestroyCommandPool(device_, copy_pool_, nullptr);
     DestroyPicture();
     DestroyPostImages();
+    DestroySmaa();
     if (fxaa_pipeline_) vkDestroyPipeline(device_, fxaa_pipeline_, nullptr);
     if (downsample_pipeline_) vkDestroyPipeline(device_, downsample_pipeline_, nullptr);
     if (post_layout_) vkDestroyPipelineLayout(device_, post_layout_, nullptr);
@@ -1645,7 +2000,7 @@ VulkanDisplay::~VulkanDisplay() {
     }
     if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
     if (instance_) vkDestroyInstance(instance_, nullptr);
-    if (gamepad_) SDL_CloseGamepad(gamepad_);
+    for (Gamepad& g : pads_) SDL_CloseGamepad(g.pad);
     if (window_) SDL_DestroyWindow(window_);
     SDL_Quit();
 }

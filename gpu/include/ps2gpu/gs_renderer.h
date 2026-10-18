@@ -312,6 +312,10 @@ void SetPipelineCacheDir(const std::string& dir);
    are - a player's first run then makes none in the middle of a race. Keys
    of an older engine are only made in vain. Set before CreateGsRenderer. */
 void SetPipelineHints(const std::uint32_t* keys, std::size_t count);
+/* `inner` on a thread of its own (threaded_renderer.cpp): what only hands
+   work over is queued and made there in order; what answers or reads waits
+   for the queue to empty first. One caller thread. */
+std::unique_ptr<GsRenderer> MakeThreadedGsRenderer(std::unique_ptr<GsRenderer> inner);
 
 /* How often the CPU has waited for the GPU to finish what was submitted, and
    for how long in all: "N submissions, S s waiting". */

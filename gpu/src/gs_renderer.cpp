@@ -63,6 +63,36 @@ struct PackedVertex {
 // found by its offset: whole vertices to 256 bytes.
 static_assert(256 % sizeof(PackedVertex) == 0, "a vertex must divide the ring's alignment");
 
+/* A batch's vertices so far: room handed out a primitive at a time (Grow)
+   and its fields written in place - no vertex built and then copied, nor
+   its padding cleared (the vertex shader reads none of it). A splitscreen
+   race appends ~400,000 a picture: push_back's temporary and copy were a
+   twelfth of the GS thread. */
+class PendingVertices {
+public:
+    std::size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    void clear() { size_ = 0; }
+    PackedVertex* data() { return data_.get(); }
+    PackedVertex& operator[](std::size_t i) { return data_[i]; }
+    PackedVertex* Grow(std::size_t n) {
+        if (size_ + n > capacity_) {
+            const std::size_t capacity = std::max<std::size_t>(capacity_ * 2, std::max<std::size_t>(size_ + n, 4096));
+            std::unique_ptr<PackedVertex[]> data(new PackedVertex[capacity]);
+            if (size_) std::memcpy(data.get(), data_.get(), size_ * sizeof(PackedVertex));
+            data_ = std::move(data);
+            capacity_ = capacity;
+        }
+        PackedVertex* at = data_.get() + size_;
+        size_ += n;
+        return at;
+    }
+
+private:
+    std::unique_ptr<PackedVertex[]> data_;
+    std::size_t size_ = 0, capacity_ = 0;
+};
+
 /* What the fragment shader is told, after the vertex shader's 16 bytes. */
 struct FragmentParams {
     std::uint32_t textured, tfx, tcc, atst, aref, fix_factor, fix, afail, fge, fogcol, pabe;
@@ -304,6 +334,9 @@ VkPipelineColorBlendAttachmentState Blending(std::uint32_t key, bool dual_source
 }
 
 bool SameBatch(const GsDrawState& x, const GsDrawState& y) {
+    // Most primitives come with the very state of the one before (the
+    // bridge's fast path): the same bytes are the same fields, at once.
+    if (std::memcmp(&x, &y, sizeof x) == 0) return true;
     return x.fbp == y.fbp && x.fbw == y.fbw && x.psm == y.psm && x.fbmsk == y.fbmsk && x.scissor_x0 == y.scissor_x0 &&
            x.scissor_y0 == y.scissor_y0 && x.scissor_x1 == y.scissor_x1 && x.scissor_y1 == y.scissor_y1 &&
            x.textured == y.textured && (!x.textured || (x.texture == y.texture && x.tfx == y.tfx &&
@@ -561,7 +594,7 @@ private:
     void DestroyTexture(Texture texture);
     Texture blank_;                 /* bound when nothing is textured */
     GsDrawState state_;
-    std::vector<PackedVertex> pending_;
+    PendingVertices pending_;
     /* Vertex data for what is recorded: appended to chunks of host-visible
        memory, all reusable once the submission that reads them has run. */
     struct VertexChunk {
@@ -2602,13 +2635,24 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
             last_flat_valid_ = true;
         }
     }
+    PackedVertex* out = pending_.Grow(count / 3 * 3);
     for (std::size_t i = 0; i + 2 < count; i += 3) {
-        for (int k = 0; k < 3; ++k) {
+        for (int k = 0; k < 3; ++k, ++out) {
             // Flat shading takes the colour of the triangle's last vertex.
             const GsVertex& c = state.gouraud ? v[i + k] : v[i + 2];
             const GsVertex& p = v[i + k];
-            pending_.push_back({p.x, p.y, c.r, c.g, c.b, c.a, p.s, p.t, p.q, p.z, p.fog, {0, 0, 0},
-                                {range[0], range[1], range[2], range[3]}, {0, 0, 0, 0}});
+            out->x = p.x;
+            out->y = p.y;
+            out->r = c.r;
+            out->g = c.g;
+            out->b = c.b;
+            out->a = c.a;
+            out->s = p.s;
+            out->t = p.t;
+            out->q = p.q;
+            out->z = p.z;
+            out->fog = p.fog;
+            for (int n = 0; n < 4; ++n) out->range[n] = range[n];
         }
     }
 }

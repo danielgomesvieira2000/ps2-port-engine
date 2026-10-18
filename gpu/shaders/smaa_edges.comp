@@ -1,0 +1,16 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// SMAA's first pass: each pixel's edges, left and top (by luma).
+#include "smaa_common.glsl"
+
+layout(set = 0, binding = 0) uniform sampler2D colorTex;
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D edges;
+
+void main() {
+    const ivec2 p = Pixel();
+    if (Outside(p)) return;
+    const vec2 uv = TexCoord(p);
+    vec4 offset[3];
+    SMAAEdgeDetectionVS(uv, offset);
+    imageStore(edges, p, vec4(SMAALumaEdgeDetectionPS(uv, offset, colorTex), 0.0, 0.0));
+}

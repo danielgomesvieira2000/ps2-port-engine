@@ -7,6 +7,7 @@
 #define PS2HOST_IOP_VM_INTERNAL_H
 
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <map>
@@ -141,9 +142,37 @@ struct Vm {
     u32 executing = 0;                           // the instruction being run, for messages
 
     // Memory, by IOP address (any segment; the RAM mirrors every 2 MB).
-    u8* At(u32 address, u32 size);
-    u32 Read(u32 address, u32 size);
-    void Write(u32 address, u32 value, u32 size);
+    // Inline, each size its own copy: the interpreter reads every instruction
+    // through Read, and a call with memcpy's own of a size it did not know
+    // was a tenth of the EE thread's time in gameplay.
+    u8* At(u32 address, u32 size) {
+        const u32 physical = address & 0x1FFFFFFFu;
+        if (physical < 0x00800000u) {                       // RAM and its mirrors
+            const u32 offset = physical & (kRamSize - 1);
+            if (offset + size <= kRamSize) return ram + offset;
+        }
+        return nullptr;
+    }
+    u32 Read(u32 address, u32 size) {
+        const u8* p = At(address, size);
+        if (!p) ReadFault(address);
+        if (size == 4) { u32 value; std::memcpy(&value, p, 4); return value; }
+        if (size == 2) { u16 value; std::memcpy(&value, p, 2); return value; }
+        if (size == 1) return *p;
+        u32 value = 0;
+        std::memcpy(&value, p, size);
+        return value;
+    }
+    void Write(u32 address, u32 value, u32 size) {
+        u8* p = At(address, size);
+        if (!p) WriteFault(address, value);
+        if (size == 4) std::memcpy(p, &value, 4);
+        else if (size == 2) { const u16 half = u16(value); std::memcpy(p, &half, 2); }
+        else if (size == 1) *p = u8(value);
+        else std::memcpy(p, &value, size);
+    }
+    [[noreturn]] void ReadFault(u32 address);
+    [[noreturn]] void WriteFault(u32 address, u32 value);
     std::string String(u32 address, u32 limit = 1024);
     std::string Where();
 

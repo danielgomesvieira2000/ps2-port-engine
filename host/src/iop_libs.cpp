@@ -794,6 +794,12 @@ Outcome SendCmd(Vm& vm, Context& c) {
         std::fprintf(stderr, "[iop] to the EE: command %u,%s\n", unsigned(command), words.c_str());
     }
     QueueIopPacket(std::move(bytes));
+    // From an interrupt handler (sceSifSendCmd in one: Burnout 3's B3ROUTE
+    // sends each capture of the player's engine so, every 256 samples): the
+    // EE's handler runs now, as on the console. Its answer - the processed
+    // sound, DMA'd back - is there for the handler 128 samples on, not one
+    // frame on (the input ring played stale pieces: crackle).
+    if (vm.current == 0 && !(command & 0x80000000u)) ps2host::DeliverIopPacketNow();
     return Ret(c, 1);
 }
 

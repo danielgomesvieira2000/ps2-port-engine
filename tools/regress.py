@@ -56,6 +56,7 @@ def main(argv=None) -> int:
                         help="run with --vu-native (compared with the same CRCs: what the exact VU drew)")
     parser.add_argument("--update", action="store_true", help="record this run's pictures as expected")
     parser.add_argument("--keep", help="keep the pictures in this directory")
+    parser.add_argument("--exe", help="the port's executable to run (default: the one port.py builds)")
     parser.add_argument("--frame-times", type=int, default=0, metavar="N",
                         help="print the wall-clock frame rate every N frames (the run's --frame-times)")
     args = parser.parse_args(argv)
@@ -66,7 +67,7 @@ def main(argv=None) -> int:
     runs = game.path(os.path.join("port", "runs"))
     with open(os.path.join(runs, args.run + ".args"), encoding="utf-8") as handle:
         run_args = handle.read().split()
-    executable = game.path(os.path.join(game.build, "port", "cmake", os.path.basename(
+    executable = args.exe or game.path(os.path.join(game.build, "port", "cmake", os.path.basename(
         os.path.normpath(game.directory)) + ".exe"))
     elf = game.path(os.path.join(game.extracted, game.executable))
     disc = game.path(game.iso) if game.iso else ""

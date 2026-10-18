@@ -138,6 +138,23 @@ PS2RT_VU_INLINE __m128i CleanLanes(__m128i v) {
 #endif
 }
 
+/* Clean for code that runs with the SSE control word's DAZ and FTZ on (a VU
+   run: VuRounding in vu.cpp): the processor takes a denormal operand as a
+   zero of its sign and gives a zero of its sign for a result that would be
+   one - Clean's two lower cases - so of Clean only the exponent of 255 is
+   left to do: the magnitude clamped to the largest finite, the sign kept.
+   For values going into arithmetic, or coming out of it; a denormal stays
+   as it was. */
+PS2RT_VU_INLINE __m128i ClampLanes(__m128i v) {
+#if PS2RT_VU_SSE41
+    const __m128i magnitude = _mm_and_si128(v, _mm_set1_epi32(0x7FFFFFFF));
+    const __m128i sign = _mm_xor_si128(v, magnitude);
+    return _mm_or_si128(sign, _mm_min_epu32(magnitude, _mm_set1_epi32(int(kMax))));
+#else
+    return CleanLanes(v);
+#endif
+}
+
 inline __m128 AsFloats(__m128i v) { return _mm_castsi128_ps(v); }
 inline __m128i AsBits(__m128 v) { return _mm_castps_si128(v); }
 
@@ -151,7 +168,9 @@ PS2RT_VU_INLINE __m128i OrderLanes(__m128i v) {
     return _mm_sub_epi32(_mm_xor_si128(magnitude, negative), negative);
 }
 
-template <int Op, int Known = 0>
+/* `Daz`: the caller runs with DAZ and FTZ on (compiled VU code), so
+   ClampLanes does what CleanLanes would. */
+template <int Op, int Known = 0, bool Daz = false>
 PS2RT_VU_INLINE __m128i LanesSse(__m128i a, __m128i b, __m128i acc) {
     if constexpr (Op == kMax_ || Op == kMini) {
         // MAX takes b where a < b, MINI where b < a; otherwise a - by Order,
@@ -160,16 +179,17 @@ PS2RT_VU_INLINE __m128i LanesSse(__m128i a, __m128i b, __m128i acc) {
                                            : _mm_cmplt_epi32(OrderLanes(b), OrderLanes(a));
         return _mm_or_si128(_mm_andnot_si128(take_b, a), _mm_and_si128(take_b, b));
     }
-    if constexpr ((Known & 1) == 0) a = CleanLanes(a);
-    if constexpr ((Known & 2) == 0) b = CleanLanes(b);
-    if constexpr (Op == kAdd) return CleanLanes(AsBits(_mm_add_ps(AsFloats(a), AsFloats(b))));
-    else if constexpr (Op == kSub) return CleanLanes(AsBits(_mm_sub_ps(AsFloats(a), AsFloats(b))));
-    else if constexpr (Op == kMul) return CleanLanes(AsBits(_mm_mul_ps(AsFloats(a), AsFloats(b))));
+    const auto clean = [](__m128i v) { return Daz ? ClampLanes(v) : CleanLanes(v); };
+    if constexpr ((Known & 1) == 0) a = clean(a);
+    if constexpr ((Known & 2) == 0) b = clean(b);
+    if constexpr (Op == kAdd) return clean(AsBits(_mm_add_ps(AsFloats(a), AsFloats(b))));
+    else if constexpr (Op == kSub) return clean(AsBits(_mm_sub_ps(AsFloats(a), AsFloats(b))));
+    else if constexpr (Op == kMul) return clean(AsBits(_mm_mul_ps(AsFloats(a), AsFloats(b))));
     else if constexpr (Op == kMadd || Op == kMsub) {
-        const __m128i product = CleanLanes(AsBits(_mm_mul_ps(AsFloats(a), AsFloats(b))));
-        const __m128 total = AsFloats((Known & 4) != 0 ? acc : CleanLanes(acc));
-        return CleanLanes(AsBits(Op == kMadd ? _mm_add_ps(total, AsFloats(product))
-                                             : _mm_sub_ps(total, AsFloats(product))));
+        const __m128i product = clean(AsBits(_mm_mul_ps(AsFloats(a), AsFloats(b))));
+        const __m128 total = AsFloats((Known & 4) != 0 ? acc : clean(acc));
+        return clean(AsBits(Op == kMadd ? _mm_add_ps(total, AsFloats(product))
+                                        : _mm_sub_ps(total, AsFloats(product))));
     }
 }
 #endif

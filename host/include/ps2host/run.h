@@ -111,6 +111,11 @@ bool IopReplyPending();
 /* A packet from the IOP to the EE (a module's sceSifSendCmd): queued, and
    delivered as the SIF0 interrupt at the next safe point. */
 void QueueIopPacket(std::vector<u8> packet);
+/* A module's command sent from an IOP interrupt handler (sceSifSendCmd in
+   one): delivered now, with the answers due before it, unless the EE is in
+   an interrupt itself - so the EE's handler for it runs before the IOP goes
+   on, as on the console, where it takes microseconds. */
+void DeliverIopPacketNow();
 /* A host RPC server's: its answer (the RPC end) reaches the EE `ns` later, on
    the host clock (virtual under --virtual-time) - a device's time, such as a
    CD read's. */
@@ -315,10 +320,11 @@ bool WindowVsync();
    so - auto's the window's now. */
 void SetWindowAspect(const std::string& aspect);
 float PictureAspect();
-/* Anti-aliasing (the "antialiasing" setting): "off", the default; "fxaa",
-   the picture's edges smoothed before it is scaled to the window; "ssaa2" or
-   "ssaa4", supersampling - drawn at 2 or 4 times the internal resolution
-   (SupersamplingFactor) and averaged down to the window's size. */
+/* Anti-aliasing (the "antialiasing" setting): "off", the default; "fxaa"
+   or "smaa" (SMAA 1x, gpu/third_party/smaa), the picture's edges smoothed
+   before it is scaled to the window; "ssaa2" or "ssaa4", supersampling -
+   drawn at 2 or 4 times the internal resolution (SupersamplingFactor) and
+   averaged down to the window's size. */
 void SetWindowAntiAliasing(const std::string& mode);
 u32 SupersamplingFactor();
 /* A line after the window's title (a game's tool says what it is doing);
@@ -368,8 +374,42 @@ struct HostPadState {
     u8 l2 = 0, r2 = 0;
     u8 pressure[16] = {};       // each input's pressure (a controller filter's to change; 0xFF pressed)
     ControllerFamily family = ControllerFamily::kOther;     // whose: its buttons' names and marks
+    u8 port = 0;                // the controller port it drives (a controller filter's to tell players apart)
 };
 bool HostPad(HostPadState* state);
+/* The players' devices: the keyboard, each controller plugged in (in the
+   order they were) and each scripted one (--press padN:...), by an id that
+   stays while it is there. HostDevicePad reads one controller as HostPad
+   does (false: gone, or the keyboard). */
+constexpr u32 kKeyboardDevice = 0;
+constexpr u32 kScriptedDevice = 0xFFFF0000u;        // + n: --press padN:BUTTON@FRAME
+struct HostDevice {
+    u32 id = kKeyboardDevice;
+    std::string name;           // "Keyboard", the controller's own name
+    ControllerFamily family = ControllerFamily::kOther;
+};
+std::vector<HostDevice> HostDevices();
+bool HostDevicePad(u32 id, HostPadState* state);
+/* Which devices drive each controller port, 0 and 1 (players 1 and 2). By
+   default port 0 has every device - the keyboard, every controller, every
+   scripted press - and port 1 none: nothing plugged in. SetPortDevices
+   seats a port's players: port 1 then has a controller plugged in. While
+   SetPortsSplit(true) - a game's two players playing - each port is driven
+   by its own devices alone, its rumble theirs, the trigger effects
+   (HostTriggerEffects) port 0's; otherwise (its menus) every device drives
+   both ports, as player 1 - the game's screens for player 2 (its car's
+   choice) answering any. ResetPortDevices: the default again. */
+void SetPortDevices(u32 port, const std::vector<u32>& devices);
+void SetPortsSplit(bool on);
+/* The window's controllers alone (window.cpp; HostDevices adds the rest),
+   one's state, one's motors, and the controllers trigger effects are for
+   (none: every one). */
+std::vector<HostDevice> WindowControllers();
+bool WindowControllerPad(u32 id, HostPadState* state);
+void HostRumbleOf(u32 id, u8 large, u8 small);
+void HostTriggerTargets(const std::vector<u32>& ids);
+void ResetPortDevices();
+bool PortsAssigned();
 /* The mouse over the window (window.cpp), in the picture's terms: x and y
    from 0 to 1 across the game's picture as shown (past them outside it);
    `held` the buttons down (bit 0 left, 1 middle, 2 right), and since the last
@@ -417,7 +457,9 @@ InputDevice LastInputDevice(u64* frame = nullptr);
    each time the pad is read (once a frame, on the EE's thread, at the
    vertical blank): what the mouse means, say. */
 void SetPadHook(u16 (*hook)());
-/* --press: hold `button` (cross, start, up, ...) for 6 frames from `frame`. */
+/* --press: hold `button` (cross, start, up, ...) for 6 frames from `frame` -
+   the player's, on port 0; `padN:button` scripted controller N's (from 1), a
+   device of its own (HostDevices) a game can give a port (SetPortDevices). */
 bool ScriptPress(const std::string& button, u64 from, u64 to, u8 pressure = 0xFF);
 /* --key: hold a key (a Win32 virtual key) from frame `from` to `to`, as if
    the player held it in a window with the focus - a game's own keys
@@ -490,6 +532,11 @@ void SetFastLoadingDefault(bool on);
    scripted runs draw every picture the same with it; --vu-exact turns it
    off again. */
 void SetVuFastDefault(bool on);
+/* Frame pacing (the "frame_pacing" setting: pictures shown evenly spaced,
+   a little more delay) when the player has not chosen: on, unless the game's
+   port defaults it off. */
+void SetFramePacingDefault(bool on);
+bool FramePacingDefault();
 /* The GPU pipelines a game is known to draw with (the keys of a
    gpu_pipelines.txt a run kept beside its settings), made from the start in
    the background - none made in the middle of a player's first race

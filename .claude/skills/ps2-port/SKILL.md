@@ -138,6 +138,12 @@ The goal is every picture on time: **no dropped frame in gameplay**.
   resolution, sound on (`PS2HOST_AUDIO_MUTE=1` to measure in silence), from a
   copy of the executable with its own `pc_settings.ini` (never the player's).
   Run it at least twice: rare late frames vary from run to run.
+- **The GS thread alone, the same every run:** a capture's `replay.bin`
+  through `--gs-replay` with `PS2HOST_REPLAY_GPU=1 PS2HOST_REPLAY_SCALE=n
+  PS2HOST_REPLAY_REPEAT=50` (the stream 50 times more: "ms a pass" - the GS
+  model, the GPU bridge and the renderer's recording), `PS2HOST_REPLAY_SAMPLE=1`
+  under the sampler. Time two builds alternated (A B A B A B): the machine
+  drifts by a few percent between runs, more than many a change.
 - **Where time goes:** `--sample`, `--sample-gs`, `--sample-vif1` (functions
   by thread), `--frame-times N`, `PS2HOST_GPU_PROFILE`, `PS2HOST_GPU_LOG`
   (draws, write-backs, reloads, decodes), `PS2HOST_GPU_WRITE_LOG` (memory

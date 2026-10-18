@@ -9,8 +9,11 @@
 The port is the game's translated functions (src/lifted, from lift.py --emit) on
 the native host (engine/host): guest memory, a dispatch table from guest address
 to translated function, the EE kernel's services. This generates the dispatch
-table, builds games/<name>/port/ with CMake and Ninja under MSVC, and runs the
-result on the executable from the user's own disc, printing how far it got.
+table, builds games/<name>/port/ with CMake and Ninja - with LLVM's clang-cl
+when it is installed (its code is faster: the VU programs about 17%, the GS
+about 20%; the same pictures), else MSVC's own compiler; PS2_COMPILER=msvc
+picks MSVC's - and runs the result on the executable from the user's own disc,
+printing how far it got.
 
 Some code only exists at run time: kept as data and copied out - a kernel
 extension, an overlay - and run where it was copied to. The host records each
@@ -257,31 +260,40 @@ def _visual_studio_tool(*parts) -> str:
 
 
 def _clang_cl() -> str | None:
-    """LLVM's clang-cl, when installed and not declined (PS2_COMPILER=msvc).
-    It builds the same sources with MSVC's headers and libraries; Burnout 3's
-    race measured 33 -> 36-40 pictures a second on an i7-10700F (the GS
-    thread no longer the limit)."""
+    """LLVM's clang-cl, if installed and not turned away (PS2_COMPILER=msvc):
+    on the path, in LLVM's own folder, or the one Visual Studio installs."""
     if os.environ.get("PS2_COMPILER", "").lower() == "msvc":
         return None
-    for root in (os.environ.get("LLVM_ROOT", ""), r"C:\Program Files\LLVM"):
-        path = os.path.join(root, "bin", "clang-cl.exe") if root else ""
-        if path and os.path.exists(path):
-            return path
+    candidates = [shutil.which("clang-cl"),
+                  os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "LLVM", "bin", "clang-cl.exe")]
+    try:
+        vc = os.path.abspath(os.path.join(os.path.dirname(cppcheck.find_vcvars()), "..", ".."))
+        candidates.append(os.path.join(vc, "Tools", "Llvm", "x64", "bin", "clang-cl.exe"))
+    except Exception:
+        pass
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return os.path.abspath(candidate)
     return None
 
 
-def _forget_other_compiler(binary: str, clang: bool) -> None:
-    """A build directory configured for the other compiler (clang-cl or
-    MSVC's cl) is configured again from scratch: CMake keeps the first one."""
+def _forget_other_compiler(binary: str, compiler: str | None) -> None:
+    """A build folder configured with the other compiler: CMake keeps the
+    compiler it found first, so its cache goes (the objects are rebuilt)."""
     cache = os.path.join(binary, "CMakeCache.txt")
     if not os.path.exists(cache):
         return
     text = open(cache, encoding="utf-8", errors="replace").read()
-    found = re.search(r"^CMAKE_CXX_COMPILER:[A-Z]+=(.*)$", text, re.M)
-    if found and (os.path.basename(found.group(1)).lower() == "clang-cl.exe") != clang:
-        os.remove(cache)
-        import shutil
-        shutil.rmtree(os.path.join(binary, "CMakeFiles"), ignore_errors=True)
+    configured = re.search(r"^CMAKE_CXX_COMPILER:[A-Z]+=(.*)$", text, re.M)
+    configured = configured.group(1).strip() if configured else ""
+    clang = "clang-cl" in configured.lower()
+    if clang == (compiler is not None) and (compiler is None or
+                                             os.path.normcase(os.path.abspath(configured)) == os.path.normcase(compiler)):
+        return
+    print("build: %s now (the folder had %s) - configuring again"
+          % (compiler or "MSVC", configured or "another compiler"))
+    os.remove(cache)
+    shutil.rmtree(os.path.join(binary, "CMakeFiles"), ignore_errors=True)
 
 
 def _build_jobs() -> int:
@@ -310,23 +322,24 @@ def build(game, generated: str, sse4: bool = False) -> str:
     """Configure and build the port; returns the executable's path. `sse4`:
     the build for processors without AVX2 (PS2HOST_AVX2=OFF), in a folder of
     its own, copied beside the main build as <name>-sse4.exe - which the main
-    build starts on such a processor (engine/host/src/cpu_check.cpp)."""
+    build starts on such a processor (engine/host/src/cpu_check.cpp). The
+    compiler: clang-cl when installed (_clang_cl), else MSVC's."""
     source = game.path("port")
     binary = game.path(os.path.join(game.build, "port", "cmake-sse4" if sse4 else "cmake"))
     os.makedirs(binary, exist_ok=True)
     cmake = _visual_studio_tool("CMake", "bin", "cmake.exe")
     ninja = _visual_studio_tool("Ninja", "ninja.exe")
     clang = _clang_cl()
-    compilers = ""
-    if clang:
-        compilers = ' -DCMAKE_C_COMPILER="%s" -DCMAKE_CXX_COMPILER="%s"' % (clang, clang)
-    _forget_other_compiler(binary, clang is not None)
+    _forget_other_compiler(binary, clang)
+    compilers = (' -DCMAKE_C_COMPILER="%s" -DCMAKE_CXX_COMPILER="%s"' % ((clang.replace("\\", "/"),) * 2)
+                 if clang else "")
     script = os.path.join(binary, "build.bat")
     with open(script, "w", encoding="utf-8") as handle:
         handle.write('@echo off\ncall "%s" >nul\n' % cppcheck.find_vcvars())
-        handle.write('"%s" -S "%s" -B "%s" -G Ninja -DCMAKE_BUILD_TYPE=Release%s '
-                     '-DCMAKE_MAKE_PROGRAM="%s" -DPS2_GENERATED_DIR="%s" -DPS2HOST_AVX2=%s >nul || exit /b 1\n'
-                     % (cmake, source, binary, compilers, ninja, generated.replace("\\", "/"), "OFF" if sse4 else "ON"))
+        handle.write('"%s" -S "%s" -B "%s" -G Ninja -DCMAKE_BUILD_TYPE=Release '
+                     '-DCMAKE_MAKE_PROGRAM="%s" -DPS2_GENERATED_DIR="%s" -DPS2HOST_AVX2=%s%s >nul || exit /b 1\n'
+                     % (cmake, source, binary, ninja, generated.replace("\\", "/"), "OFF" if sse4 else "ON",
+                        compilers))
         handle.write('"%s" --build "%s" -j %d || exit /b 1\n' % (cmake, binary, _build_jobs()))
     result = subprocess.run(["cmd", "/c", script], capture_output=True, text=True)
     if result.returncode:
@@ -346,7 +359,7 @@ def build(game, generated: str, sse4: bool = False) -> str:
         os.makedirs(os.path.dirname(beside), exist_ok=True)
         shutil.copyfile(executable, beside)
         executable = beside
-    print("built %s" % executable)
+    print("built %s (%s)" % (executable, "clang-cl" if clang else "MSVC"))
     return executable
 
 

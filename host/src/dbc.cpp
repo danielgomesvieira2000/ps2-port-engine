@@ -1,8 +1,10 @@
 /*
  * The IOP's controller manager, dbcman (server 0x80001300), on the host: the
- * devices behind the SDK's libdbc and, above it, libpad2. One DualShock 2 is
- * attached on port 0, driven by the window's game controller (SDL3, any one
- * SDL knows) and by the keyboard while the window has focus.
+ * devices behind the SDK's libdbc and, above it, libpad2. A DualShock 2 is
+ * attached on port 0, driven by every device - the window's game controllers
+ * (SDL3, any SDL knows) and the keyboard while the window has focus - and
+ * none on port 1, until a game gives each port its players' devices
+ * (SetPortDevices): then port 1 has a DualShock 2 too, driven by its own.
  *
  * The protocol, as Burnout 3's copies of libdbc (0x00215F18-0x00216D20) and
  * libpad2 (0x00215620-0x00215EE0) speak it:
@@ -69,9 +71,25 @@ struct Dbc {
 
 // Ports 0 and 1 are the controller ports, 2 and 3 the memory card slots. A
 // socket opens on any of them; what is plugged in shows in its blocks. There is
-// a DualShock 2 on port 0 and nothing else - no second pad, no memory card.
-constexpr u32 kPorts = 4;
-bool Present(u32 port) { return port == 0; }
+// a DualShock 2 on port 0, one on port 1 while it has devices of its own
+// (SetPortDevices), and no memory card.
+constexpr u32 kPorts = 4, kPadPorts = 2;
+bool g_assigned = false;                        // SetPortDevices: each port its devices
+bool g_split = false;                           // SetPortsSplit: ... and they drive them now
+std::vector<u32> g_port_devices[kPadPorts];
+bool Present(u32 port) { return port == 0 || (port == 1 && g_assigned && !g_port_devices[1].empty()); }
+// Whether a port is player 1's, every device's: port 0 - and port 1 too
+// while seated and not split (a game's menus: its screens for player 2 then
+// work from any device).
+bool Split() { return g_assigned && g_split; }
+bool Everyones(u32 port) { return port == 0 || (port == 1 && Present(1) && !g_split); }
+// Whether a device drives a port: split, its seat's; otherwise everyone's.
+bool Drives(u32 port, u32 device) {
+    if (!Split()) return Everyones(port);
+    if (port >= kPadPorts) return false;
+    const auto& d = g_port_devices[port];
+    return std::find(d.begin(), d.end(), device) != d.end();
+}
 
 Dbc& D() {
     static Dbc dbc;
@@ -96,8 +114,10 @@ const std::pair<int, int> kKeys[] = {
     {8, '1'}, {9, '3'}, {10, 'Q'}, {11, 'E'}, {12, 'V'}, {13, 'C'}, {14, 'X'}, {15, 'Z'},
 };
 
-// Scripted presses (--press): (input, first frame, last frame, pressure).
-struct Press { int input; u64 from, to; u8 pressure; };
+// Scripted presses (--press): (input, first frame, last frame, pressure), and
+// the scripted controller pressing it (--press padN:..., N from 1), or 0: the
+// player's own presses, on port 0 whoever drives it.
+struct Press { int input; u64 from, to; u8 pressure; u32 device; };
 std::vector<Press>& Script() {
     static std::vector<Press> presses;
     return presses;
@@ -111,15 +131,37 @@ std::vector<KeyPress>& KeyScript() {
 u64 g_frame = 0;
 
 bool Pressed(int key) { return (WindowFocused() || KeysScripted()) && HostKeyDown(key); }
-u16 g_held = 0;                     // PadButtonsHeld
+u16 g_held = 0;                     // PadButtonsHeld: port 0's
 u16 (*g_pad_hook)() = nullptr;      // SetPadHook
 void (*g_controller_filter)(HostPadState*) = nullptr;     // SetControllerFilter
 u16 (*g_keyboard_mapper)() = nullptr;                       // SetKeyboardMapper
 // LastInputDevice: the device of the last press, and when; what each held.
 InputDevice g_last_device = InputDevice::kNone;
 u64 g_last_input_frame = 0;
-u16 g_keys_before = 0, g_controller_before = 0;
-bool g_sticks_before = false;
+struct Before {                     // each port's, the read before
+    u16 keys = 0, controller = 0;
+    bool sticks = false;
+};
+Before g_before[kPadPorts];
+
+// A scripted controller (--press padN:...) as a controller reads now.
+HostPadState ScriptedPad(u32 n) {
+    HostPadState pad;
+    for (const Press& p : Script())
+        if (p.device == n && g_frame >= p.from && g_frame <= p.to) {
+            pad.buttons |= u16(1u << p.input);
+            if (p.input == 8) pad.l2 = p.pressure;
+            if (p.input == 9) pad.r2 = p.pressure;
+        }
+    return pad;
+}
+std::vector<u32> ScriptedDevices() {
+    std::vector<u32> n;
+    for (const Press& p : Script())
+        if (p.device && std::find(n.begin(), n.end(), p.device) == n.end()) n.push_back(p.device);
+    std::sort(n.begin(), n.end());
+    return n;
+}
 
 // --record-input and --replay-input (RecordInput, ReplayInput): the reports,
 // by the frame each starts at.
@@ -149,66 +191,97 @@ void RecordOrReplay(u8* data) {
     }
 }
 
-void PadData(u8* data) {
+void PadData(u32 port, u8* data) {
     u16 buttons = 0xFFFF;                                   // active low: nothing pressed
     u8 pressure[16] = {};                                   // each input's, the most any source gives
     u16 keys = 0;
-    if (g_keyboard_mapper) {
-        keys = g_keyboard_mapper();
-        for (int i = 0; i < 16; ++i)
-            if (keys & (1u << i)) pressure[i] = 0xFF;
-    } else {
-        for (const auto& [input, key] : kKeys)
-            if (Pressed(key)) keys |= u16(1u << input), pressure[input] = 0xFF;
+    if (Drives(port, kKeyboardDevice)) {
+        if (g_keyboard_mapper) {
+            keys = g_keyboard_mapper();
+            for (int i = 0; i < 16; ++i)
+                if (keys & (1u << i)) pressure[i] = 0xFF;
+        } else {
+            for (const auto& [input, key] : kKeys)
+                if (Pressed(key)) keys |= u16(1u << input), pressure[input] = 0xFF;
+        }
     }
     buttons &= u16(~keys);
     // PS2HOST_SCRIPT_CONTROLLER=1: scripted presses as a controller's (a
     // game's controller filter sees them; L2's and R2's pressure the
     // triggers' travel) - to test a game's own controls in a scripted run.
+    // The player's own presses (--press without padN:) are player 1's.
     static const bool script_controller = std::getenv("PS2HOST_SCRIPT_CONTROLLER") != nullptr;
     HostPadState scripted;
-    for (const Press& p : Script())
-        if (g_frame >= p.from && g_frame <= p.to) {
-            if (script_controller) {
-                scripted.buttons |= u16(1u << p.input);
-                if (p.input == 8) scripted.l2 = p.pressure;
-                if (p.input == 9) scripted.r2 = p.pressure;
-                continue;
+    if (Everyones(port))
+        for (const Press& p : Script())
+            if (!p.device && g_frame >= p.from && g_frame <= p.to) {
+                if (script_controller) {
+                    scripted.buttons |= u16(1u << p.input);
+                    if (p.input == 8) scripted.l2 = p.pressure;
+                    if (p.input == 9) scripted.r2 = p.pressure;
+                    continue;
+                }
+                buttons &= u16(~(1u << p.input));
+                pressure[p.input] = std::max(pressure[p.input], p.pressure);
             }
-            buttons &= u16(~(1u << p.input));
-            pressure[p.input] = std::max(pressure[p.input], p.pressure);
-        }
-    HostPadState pad;
-    bool controller = HostPad(&pad);
-    if (script_controller && !controller) {
-        pad = scripted;
-        controller = true;
+    // The port's controllers, each as the player pressed it, then through a
+    // game's own controls (SetControllerFilter), together: the buttons any
+    // holds, the most pressure, the sticks of the first pushed off centre.
+    std::vector<HostPadState> pads;
+    for (const HostDevice& d : WindowControllers()) {
+        HostPadState pad;
+        if (Drives(port, d.id) && WindowControllerPad(d.id, &pad)) pads.push_back(pad);
     }
-    const u16 controller_held = controller ? pad.buttons : 0;   // as the player pressed them
-    if (controller) {
+    if (script_controller && Everyones(port) && pads.empty()) pads.push_back(scripted);
+    for (u32 n : ScriptedDevices())
+        if (Drives(port, kScriptedDevice + n)) pads.push_back(ScriptedPad(n));
+    const bool controller = !pads.empty();
+    HostPadState pad;
+    u16 controller_held = 0;
+    bool sticks = false;
+    for (std::size_t n = 0; n < pads.size(); ++n) {
+        HostPadState& p = pads[n];
+        p.port = u8(port);
+        controller_held |= p.buttons;
+        for (int i = 0; i < 4; ++i) sticks = sticks || std::abs(int(p.sticks[i]) - 0x80) > 0x50;
         for (int i = 0; i < 16; ++i)
-            if (pad.buttons & (1u << i)) pad.pressure[i] = 0xFF;
-        if (pad.buttons & (1u << 8)) pad.pressure[8] = std::max<u8>(pad.l2, 1);
-        if (pad.buttons & (1u << 9)) pad.pressure[9] = std::max<u8>(pad.r2, 1);
+            if (p.buttons & (1u << i)) p.pressure[i] = 0xFF;
+        if (p.buttons & (1u << 8)) p.pressure[8] = std::max<u8>(p.l2, 1);
+        if (p.buttons & (1u << 9)) p.pressure[9] = std::max<u8>(p.r2, 1);
         // A game's own controls (SetControllerFilter): the controller's alone.
-        if (g_controller_filter) g_controller_filter(&pad);
+        if (g_controller_filter) g_controller_filter(&p);
+        if (n == 0) {
+            pad = p;
+            continue;
+        }
+        pad.buttons |= p.buttons;
+        for (int i = 0; i < 16; ++i) pad.pressure[i] = std::max(pad.pressure[i], p.pressure[i]);
+        pad.l2 = std::max(pad.l2, p.l2);
+        pad.r2 = std::max(pad.r2, p.r2);
+        bool centred = true;
+        for (int i = 0; i < 4; ++i) centred = centred && std::abs(int(pad.sticks[i]) - 0x80) <= 0x10;
+        if (centred) std::copy(std::begin(p.sticks), std::end(p.sticks), std::begin(pad.sticks));
+    }
+    if (controller) {
         for (int i = 0; i < 16; ++i)
             if (pad.buttons & (1u << i)) pressure[i] = std::max(pressure[i], pad.pressure[i]);
         buttons &= u16(~pad.buttons);
     }
     // A key or a controller's button newly down, or a stick pushed well off
     // its centre: that device the player's now.
-    bool sticks = false;
-    if (controller)
-        for (int i = 0; i < 4; ++i) sticks = sticks || std::abs(int(pad.sticks[i]) - 0x80) > 0x50;
-    if (keys & ~g_keys_before) g_last_device = InputDevice::kKeyboard, g_last_input_frame = g_frame;
-    if (controller && ((controller_held & ~g_controller_before) || (sticks && !g_sticks_before)))
+    Before& before = g_before[port < kPadPorts ? port : 0];
+    if (keys & ~before.keys) g_last_device = InputDevice::kKeyboard, g_last_input_frame = g_frame;
+    if (controller && ((controller_held & ~before.controller) || (sticks && !before.sticks)))
         g_last_device = InputDevice::kController, g_last_input_frame = g_frame;
-    g_keys_before = keys;
-    g_controller_before = controller_held;
-    g_sticks_before = sticks;
-    if (g_pad_hook) {
-        const u16 hooked = g_pad_hook();
+    before.keys = keys;
+    before.controller = controller_held;
+    before.sticks = sticks;
+    if (g_pad_hook && Everyones(port)) {
+        // (asked once a frame: both ports' the same)
+        static u64 hook_frame = ~0ull;
+        static u16 hook_buttons = 0;
+        if (hook_frame != g_frame) hook_buttons = g_pad_hook(), hook_frame = g_frame;
+        const u16 hooked = hook_buttons;
         buttons &= u16(~hooked);
         for (int i = 0; i < 16; ++i)
             if (hooked & (1u << i)) pressure[i] = 0xFF;
@@ -218,7 +291,7 @@ void PadData(u8* data) {
         pad = HostPadState{};
         std::fill(std::begin(pressure), std::end(pressure), u8(0));
     }
-    g_held = u16(~buttons);
+    if (port == 0) g_held = u16(~buttons);
     data[0] = u8(buttons);
     data[1] = u8(buttons >> 8);
     // Then, as libpad's DualShock 2 report has them: the sticks (right X, Y,
@@ -231,7 +304,17 @@ void PadData(u8* data) {
     for (u32 i = 2; i < 6; ++i) data[i] = controller ? pad.sticks[i - 2] : 0x80;
     static const int kPressure[12] = {5, 7, 4, 6, 12, 13, 14, 15, 10, 11, 8, 9};
     for (u32 i = 0; i < 12; ++i) data[6 + i] = (buttons >> kPressure[i]) & 1 ? 0 : pressure[kPressure[i]];
-    RecordOrReplay(data);
+    if (port == 0) RecordOrReplay(data);    // (port 0's alone: one player's session)
+}
+
+// A port's motors: its controllers' - every controller's while port 0 has them all.
+void PortRumble(u32 port, u8 large, u8 small) {
+    if (!Split()) {
+        if (port == 0) HostRumble(large, small);
+        return;
+    }
+    for (const HostDevice& d : WindowControllers())
+        if (Drives(port, d.id)) HostRumbleOf(d.id, large, small);
 }
 
 std::vector<u8> Server(u32 procedure, const std::vector<u8>& request) {
@@ -279,7 +362,8 @@ std::vector<u8> Server(u32 procedure, const std::vector<u8>& request) {
                 if (std::getenv("PS2HOST_RUMBLE_LOG"))
                     std::fprintf(stderr, "[pad] motors: large %u small %u (0x%04X)\n", unsigned(large),
                                  unsigned(small), unsigned(value));
-                HostRumble(large, small);
+                const auto socket = d.sockets.find(s32(At(request, 0)));
+                PortRumble(socket != d.sockets.end() ? socket->second.port : 0, large, small);
             } else {
                 char text[128];
                 std::snprintf(text, sizeof text, "DBC: SendData2 command length %u, data length %u (ignored)",
@@ -398,7 +482,7 @@ void PadmanFrame() {
         m.Write(f + 0x71, 0, 1);
         if (!present) continue;
         u8 data[kDataBytes];
-        PadData(data);
+        PadData(p.port, data);
         static const bool pad_log = std::getenv("PS2HOST_PAD_LOG") != nullptr;
         if (pad_log && (data[0] != 0xFF || data[1] != 0xFF))
             std::fprintf(stderr, "[pad] frame %llu port %u area 0x%08X frame# %u buttons %02X%02X\n",
@@ -421,16 +505,88 @@ void PadmanFrame() {
 
 }  // namespace
 
-bool ScriptPress(const std::string& button, u64 from, u64 to, u8 pressure) {
+bool ScriptPress(const std::string& spec, u64 from, u64 to, u8 pressure) {
     static const char* const kNames[16] = {"select", "l3", "r3", "start", "up", "right", "down", "left",
                                            "l2", "r2", "l1", "r1", "triangle", "circle", "cross", "square"};
+    // padN:BUTTON - scripted controller N's (from 1).
+    std::string button = spec;
+    u32 device = 0;
+    if (spec.compare(0, 3, "pad") == 0 && spec.find(':') != std::string::npos) {
+        device = u32(std::strtoul(spec.c_str() + 3, nullptr, 10));
+        if (!device || device > 0xFFFF) return false;
+        button = spec.substr(spec.find(':') + 1);
+    }
     for (int i = 0; i < 16; ++i)
         if (button == kNames[i]) {
-            Script().push_back({i, from, to, pressure});
+            Script().push_back({i, from, to, pressure, device});
             return true;
         }
     return false;
 }
+
+std::vector<HostDevice> HostDevices() {
+    std::vector<HostDevice> list;
+    list.push_back({kKeyboardDevice, "Keyboard", ControllerFamily::kOther});
+    for (const HostDevice& d : WindowControllers()) list.push_back(d);
+    for (u32 n : ScriptedDevices())
+        list.push_back({kScriptedDevice + n, "Scripted controller " + std::to_string(n), ControllerFamily::kOther});
+    return list;
+}
+
+bool HostDevicePad(u32 id, HostPadState* state) {
+    if (id > kScriptedDevice && id <= kScriptedDevice + 0xFFFF) {
+        *state = ScriptedPad(id - kScriptedDevice);
+        return true;
+    }
+    return id != kKeyboardDevice && WindowControllerPad(id, state);
+}
+
+void SplitChanged();
+
+void SetPortDevices(u32 port, const std::vector<u32>& devices) {
+    if (port >= kPadPorts) return;
+    if (!g_assigned) {
+        g_assigned = true;
+        for (auto& d : g_port_devices) d.clear();
+    }
+    const bool was = Split();
+    g_port_devices[port] = devices;
+    if (Split() || was) SplitChanged();
+    std::string text = "players: port " + std::to_string(port) + " has";
+    for (u32 id : devices) text += " " + std::to_string(id);
+    std::fprintf(stderr, "[pad] %s\n", text.c_str());
+}
+
+// The ports split or joined: motors stopped (their controllers change), and
+// the trigger effects follow port 0's controllers while split (the
+// keyboard's id, no controller's, when it has none: none has them).
+void SplitChanged() {
+    for (const HostDevice& d : WindowControllers()) HostRumbleOf(d.id, 0, 0);
+    std::vector<u32> targets;
+    if (Split()) {
+        for (u32 id : g_port_devices[0])
+            if (id != kKeyboardDevice) targets.push_back(id);
+        if (targets.empty()) targets.push_back(kKeyboardDevice);
+    }
+    HostTriggerTargets(targets);
+}
+
+void ResetPortDevices() {
+    if (!g_assigned) return;
+    const bool was = Split();
+    g_assigned = false;
+    for (auto& d : g_port_devices) d.clear();
+    if (was) SplitChanged();
+    std::fprintf(stderr, "[pad] players: every device on port 0 again\n");
+}
+
+void SetPortsSplit(bool on) {
+    const bool was = Split();
+    g_split = on;
+    if (Split() != was) SplitChanged();
+}
+
+bool PortsAssigned() { return g_assigned; }
 
 bool ScriptKey(const std::string& key, u64 from, u64 to) {
     static const std::pair<const char*, int> kNames[] = {
@@ -505,7 +661,7 @@ void DbcFrame() {
             continue;
         }
         u8 data[kDataBytes];
-        PadData(data);
+        PadData(s.port, data);
         m.Write(b + 0, 1, 1);                           // connected
         m.Write(b + 1, 0, 1);
         m.Write(b + 2, kDataBytes, 1);

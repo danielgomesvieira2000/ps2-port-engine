@@ -382,8 +382,8 @@ void Gs::TransferBlock(const u8* data, u32 qwords) {
         u32 n = 0;
         switch (psm) {
             case PSMCT32: case PSMZ32:
-                for (u32 i = 0; i < size; i += 4)
-                    pixels[n++] = u32(bytes[i]) | u32(bytes[i + 1]) << 8 | u32(bytes[i + 2]) << 16 | u32(bytes[i + 3]) << 24;
+                std::memcpy(pixels, bytes, size);       // little-endian words, as the GS takes them
+                n = size / 4;
                 break;
             case PSMCT24: case PSMZ24:
                 // 24-bit pixels run across quadwords: gather bytes.
@@ -393,7 +393,11 @@ void Gs::TransferBlock(const u8* data, u32 qwords) {
                 }
                 break;
             case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S:
-                for (u32 i = 0; i < size; i += 2) pixels[n++] = u32(bytes[i]) | u32(bytes[i + 1]) << 8;
+                for (u32 i = 0; i < size; i += 2) {
+                    std::uint16_t half;
+                    std::memcpy(&half, bytes + i, 2);
+                    pixels[n++] = half;
+                }
                 break;
             case PSMT8: case PSMT8H:
                 for (u32 i = 0; i < size; ++i) pixels[n++] = bytes[i];

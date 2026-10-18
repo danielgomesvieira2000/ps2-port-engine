@@ -116,6 +116,10 @@ if(MSVC)
     target_compile_options(ps2rt PUBLIC /EHsc /bigobj /W3 /wd4100 /wd4189)
     if(PS2HOST_AVX2)
         target_compile_options(ps2rt PUBLIC /arch:AVX2)
+    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        # MSVC takes SSE4.1's intrinsics without a flag; clang-cl needs the
+        # floor named (the one cpu_check.cpp holds the SSE4 build to).
+        target_compile_options(ps2rt PUBLIC /clang:-msse4.1)
     endif()
     target_compile_definitions(ps2rt PUBLIC _CRT_SECURE_NO_WARNINGS)
     target_compile_options(ps2host PRIVATE /Z7)     # symbols for --sample, as the ports'

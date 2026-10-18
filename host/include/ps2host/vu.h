@@ -121,7 +121,7 @@ public:
        VU must leave alone). Returns 0, or 1 when the file cannot be read. */
     static int Bench(const std::string& path, int passes = 5, bool fast = false, bool native = false);
     /* How often each program address was started, for reports. */
-    const std::map<u32, u64>& starts() const { return starts_; }
+    const std::map<u32, u64>& starts() const;
 
     /* For tests: one 128-bit quadword of data memory. */
     u32* Quad(u32 address);
@@ -132,12 +132,24 @@ private:
     u32 data_mask_;                 /* in quadwords */
     u64 pairs_ = 0, kicks_ = 0, compiled_pairs_ = 0, compiled_entries_ = 0, compiled_stale_ = 0,
         compiled_checked_ = 0;
-    std::map<u32, u64> starts_;
+    std::vector<u64> start_counts_;         // runs started, by pair address (starts() as a map)
+    mutable std::map<u32, u64> starts_;
     // Instruction memory's writes so far, and for each compiled program the
     // count when it was last found in memory: unchanged since, it still is
     // (2.3 million entries a race compared 4.4 GB of code otherwise).
     u64 micro_generation_ = 1;
     std::unordered_map<const void*, u64> held_at_;
+    // The compiled program found at each pair address and its block table,
+    // while instruction memory is as it was then (micro_generation_): a run
+    // starts with an index, not three lookups by hash and one by tree.
+    struct Entered {
+        const void* program = nullptr;      // const VuCompiled*
+        const void* table = nullptr;        // const std::vector<VuBlock>*
+        u64 generation = 0;
+        bool fast = false;
+        bool native = false;
+    };
+    std::vector<Entered> entered_;
 
     // Compiled code: the vector registers that may hold fields the model's
     // Clean would change (bit r for VF r) - loaded so, or not known; the FMAC
