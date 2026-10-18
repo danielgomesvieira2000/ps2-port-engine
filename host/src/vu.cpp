@@ -158,11 +158,15 @@ std::unordered_map<std::uint64_t, std::vector<const VuCompiled*>>& Compiled() {
 }
 
 // A program's blocks by pair address (null where none starts), made once.
-const std::vector<VuBlock>& BlockTable(const VuCompiled* program, std::size_t pairs, bool fast) {
+const std::vector<VuBlock>& BlockTable(const VuCompiled* program, std::size_t pairs, bool fast, bool native) {
     // A thread's own (VU1 runs on VIF1's worker, VU0 on the EE's).
-    thread_local std::unordered_map<const VuCompiled*, std::vector<VuBlock>> tables[2];
-    const VuBlock* blocks = fast && program->fast_blocks ? program->fast_blocks : program->blocks;
-    std::vector<VuBlock>& table = tables[blocks == program->blocks ? 0 : 1][program];
+    thread_local std::unordered_map<const VuCompiled*, std::vector<VuBlock>> tables[3];
+    // --vu-fast's blocks where asked for, else the native ones, else exact.
+    const VuBlock* blocks = fast && program->fast_blocks     ? program->fast_blocks
+                          : native && program->native_blocks ? program->native_blocks
+                                                             : program->blocks;
+    std::vector<VuBlock>& table =
+        tables[blocks == program->blocks ? 0 : blocks == program->fast_blocks ? 1 : 2][program];
     if (table.empty()) {
         table.assign(pairs, nullptr);
         for (std::uint32_t i = 0; i < program->block_count; ++i)
@@ -644,7 +648,7 @@ void Vu::SnapshotFrame(u64 frame) {
     if (g_snapshots && frame >= g_snapshot_from.load()) g_snapshotting = true;
 }
 
-int Vu::Bench(const std::string& path, int passes, bool fast) {
+int Vu::Bench(const std::string& path, int passes, bool fast, bool native) {
     std::FILE* in = std::fopen(path.c_str(), "rb");
     if (!in) {
         std::fprintf(stderr, "vu: cannot read %s\n", path.c_str());
@@ -667,6 +671,7 @@ int Vu::Bench(const std::string& path, int passes, bool fast) {
     std::fclose(in);
     Vu vu(1);
     vu.fast = fast;
+    vu.native = native;
     vu.on_kick = [](u64, u64) {};
     vu.on_kick_block = [](const u32*, u32) {};
     // PS2HOST_VU_FIND=x,y,z,w (hex words): the run that leaves that quadword
@@ -872,7 +877,8 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
         Entered* entered = state.pc < micro.size() ? &entered_[state.pc / 8] : nullptr;
         const VuCompiled* program = nullptr;
         const std::vector<VuBlock>* blocks = nullptr;
-        if (entered && entered->generation == micro_generation_ && entered->fast == fast) {
+        if (entered && entered->generation == micro_generation_ && entered->fast == fast &&
+            entered->native == native) {
             program = static_cast<const VuCompiled*>(entered->program);
             blocks = static_cast<const std::vector<VuBlock>*>(entered->table);
         } else {
@@ -895,8 +901,8 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
                 ++compiled_stale_;
                 break;
             }
-            blocks = &BlockTable(program, micro.size() / 8, fast);
-            if (entered) *entered = Entered{program, blocks, micro_generation_, fast};
+            blocks = &BlockTable(program, micro.size() / 8, fast, native);
+            if (entered) *entered = Entered{program, blocks, micro_generation_, fast, native};
         }
         ++compiled_entries_;
         const std::vector<VuBlock>& table = *blocks;

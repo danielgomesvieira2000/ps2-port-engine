@@ -716,6 +716,7 @@ int Run(const Options& options) {
     if (options.vu_interpret) Vu1().use_compiled = Vu0().use_compiled = false;
     Vu1().fast = options.vu_fast || (g_vu_fast_default && !options.vu_exact && SettingOn("vu_fast", true));
     if (Vu1().fast && !options.vu_fast) std::fprintf(stderr, "[host] VU1 fast mode (the game's default; --vu-exact for the exact flags)\n");
+    Vu1().native = Vu0().native = options.vu_native;
     SetUntilFrame(options.until_frame);
     SetFrameTimes(options.frame_times);
     if (options.gpu || options.gpu_shadow) {
@@ -852,7 +853,11 @@ int Main(int argc, char** argv) {
         else if (arg == "--vu-record" && i + 1 < argc) options.vu_record = argv[++i];
         else if (arg == "--vu-interpret") options.vu_interpret = true;
         else if (arg == "--vu-fast") options.vu_fast = true;
-        else if (arg == "--vu-exact") options.vu_exact = true;
+        else if (arg == "--vu-native") options.vu_native = true;
+        else if (arg == "--vu-exact") {
+            options.vu_native = false;
+            options.vu_exact = true;
+        }
         else if (arg == "--memcard" && i + 1 < argc) options.memcard = argv[++i];
         else if (arg == "--setting" && i + 1 < argc) options.settings.push_back(argv[++i]);
         else if (arg == "--audio") options.audio = true;
@@ -931,8 +936,8 @@ int Main(int argc, char** argv) {
             SetSampleFrom(0);
             SampleFrame(0);
         }
-        const int status = Vu::Bench(options.vu_bench, options.sample ? 100 : 5, options.vu_fast);
-        if (options.sample) std::printf("%s", SampleReport().c_str());
+        const int status = Vu::Bench(options.vu_bench, options.sample ? 100 : 5, options.vu_fast, options.vu_native);
+        if (options.sample) std::printf("%s", SampleReport(std::getenv("PS2HOST_SAMPLE_TOP") ? std::atoi(std::getenv("PS2HOST_SAMPLE_TOP")) : 30).c_str());
         return status;
     }
     if (options.elf_path.empty() && options.disc_path.empty()) {

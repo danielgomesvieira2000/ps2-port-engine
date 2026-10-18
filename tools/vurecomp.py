@@ -855,9 +855,11 @@ def generate_files(programs: list, what: str, single: str = None) -> dict:
     """programs: [(unit, [entries], pairs)] -> {file name: C++}. `single`
     names one file for everything (the tests' corpus); otherwise the blocks go
     in vu_blocks_N.cpp and the tables in vu_programs.cpp."""
+    import vunative     # (here: it imports this module)
     files = {}
     chunks = [[]]
     tables = []
+    native_count = native_pairs = 0
     registrations = []
     declarations = []
     for number, (unit, entries, pairs) in enumerate(programs):
@@ -865,6 +867,7 @@ def generate_files(programs: list, what: str, single: str = None) -> dict:
         name = "Vu%dProgram%d" % (unit, number)
         blocks = blocks_of(pairs, entries, mask)
         names = []
+        natives = []
         drops = fast_drops(unit, pairs, mask)
         fast = bool(drops)
         for block in blocks:
@@ -876,6 +879,18 @@ def generate_files(programs: list, what: str, single: str = None) -> dict:
                     chunks.append([])
                 chunks[-1] += code + [""]
                 declarations.append("void %s%s(Vu& v, VuRunState& s, std::uint64_t limit);" % (block_name, variant))
+            code = vunative.emit_native(block_name + "Native", block_name, block, pairs, mask)
+            if code is None:
+                natives.append(block_name)
+                continue
+            native_count += 1
+            native_pairs += len(block)
+            natives.append(block_name + "Native")
+            code = ["#if PS2RT_VU_SSE"] + code + ["#endif"]
+            if single is None and len(chunks[-1]) + len(code) > LINES_PER_FILE and chunks[-1]:
+                chunks.append([])
+            chunks[-1] += code + [""]
+            declarations.append("void %sNative(Vu& v, VuRunState& s, std::uint64_t limit);" % block_name)
         tables.append("const u32 k%sCode[] = {" % name)
         tables.append(code_array(runs_of(pairs)))
         tables.append("};")
@@ -884,17 +899,24 @@ def generate_files(programs: list, what: str, single: str = None) -> dict:
         if fast:
             tables.append("const ps2host::VuBlock k%sFastBlocks[] = {%s};" %
                           (name, ", ".join(n + "Fast" for _, n in names)))
+        tables.append("#if PS2RT_VU_SSE")
+        tables.append("const ps2host::VuBlock k%sNativeBlocks[] = {%s};" % (name, ", ".join(natives)))
+        tables.append("#define k%sNative k%sNativeBlocks" % (name, name))
+        tables.append("#else")
+        tables.append("#define k%sNative nullptr" % name)
+        tables.append("#endif")
         tables.append("")
         for entry in entries:
-            registrations.append("    {%d, 0x%Xu, k%sCode, k%sStarts, k%sBlocks, %du, %s}," %
+            registrations.append("    {%d, 0x%Xu, k%sCode, k%sStarts, k%sBlocks, %du, %s, k%sNative}," %
                                  (unit, entry, name, name, name, len(names),
-                                  "k%sFastBlocks" % name if fast else "nullptr"))
+                                  "k%sFastBlocks" % name if fast else "nullptr", name))
     main = [HEADER % what]
     if single is not None:
         main += chunks[0]
     else:
         main += declarations + [""]
     main += tables
+    main.append("/* Native blocks: %d (%d pairs); the rest run exact. */" % (native_count, native_pairs))
     main.append("const VuCompiled kPrograms[] = {")
     main += registrations or ["    {0, 0, nullptr, nullptr, nullptr, 0},"]
     main.append("};")

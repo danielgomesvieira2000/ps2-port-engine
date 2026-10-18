@@ -203,7 +203,7 @@ void VifStream::Start(std::uint32_t pc) {
         tops = base + (dbf ? offset : 0);
     }
     itop = itops;
-    if (!vu) return;
+    if (!vu || skip_programs) return;
     vu->top = top;
     vu->itop = itop;
     vu->Run(pc);

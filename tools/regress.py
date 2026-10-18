@@ -52,6 +52,8 @@ def main(argv=None) -> int:
     parser.add_argument("--every", type=int, default=200, help="a picture every N frames")
     parser.add_argument("--vu-fast", action="store_true",
                         help="run with --vu-fast (compared with the same CRCs: what the exact VU drew)")
+    parser.add_argument("--vu-native", action="store_true",
+                        help="run with --vu-native (compared with the same CRCs: what the exact VU drew)")
     parser.add_argument("--update", action="store_true", help="record this run's pictures as expected")
     parser.add_argument("--keep", help="keep the pictures in this directory")
     parser.add_argument("--exe", help="the port's executable to run (default: the one port.py builds)")
@@ -82,6 +84,8 @@ def main(argv=None) -> int:
         command.append("--gpu")
     if args.vu_fast:
         command.append("--vu-fast")
+    if args.vu_native:
+        command.append("--vu-native")
     if args.frame_times:
         command += ["--frame-times", str(args.frame_times)]
     started = time.time()

@@ -135,8 +135,9 @@ struct Options {
     bool fast_disc = false;        /* --fast-disc: disc reads without the drive's time (FastDisc) */
     std::string vu_record;         /* --vu-record: the microprograms run, for vurecomp.py */
     bool vu_interpret = false;     /* --vu-interpret: no compiled microprograms */
-    bool vu_exact = false;         /* --vu-exact: VU1's exact flags even where the game defaults to fast */
+    bool vu_exact = false;         /* --vu-exact: VU1's exact flags even where the game defaults to fast (and no native blocks) */
     bool vu_fast = false;          /* --vu-fast: VU1 programs without MAC/STATUS readers skip those flags */
+    bool vu_native = true;         /* compiled VU programs run their native blocks (vunative.py); --vu-exact: not */
     bool gpu = false;              /* draw on the GPU instead of the software GS (gpu_bridge.cpp) */
     bool gpu_shadow = false;       /* draw on the GPU too, and compare (gpu_bridge.cpp) */
     bool gpu_shadow_rtt = false;   /* ...sampling GPU targets as textures */
