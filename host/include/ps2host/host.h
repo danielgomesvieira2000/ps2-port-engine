@@ -127,6 +127,7 @@ struct Options {
     long long sample_from = 0;     /* ...from this frame on (--sample-from) */
     bool sample_gs = false;        /* ...on the GS thread (--sample-gs) */
     bool sample_vif1 = false;      /* ...on VIF1's worker (--sample-vif1) */
+    bool sample_renderer = false;  /* ...on the GPU renderer's thread (--sample-renderer) */
     std::string vu_snapshot;       /* --vu-snapshot FILE FROM COUNT: VU1 runs for --vu-bench */
     long long vu_snapshot_from = 0;
     unsigned vu_snapshot_count = 0;

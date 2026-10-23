@@ -14,6 +14,8 @@
 namespace ps2gpu {
 
 void SetGpuWaitObserver(GpuWaitObserver observer) { g_wait_observer = observer; }
+void (*g_renderer_thread_start)() = nullptr;
+void SetRendererThreadStart(void (*start)()) { g_renderer_thread_start = start; }
 
 namespace {
 /* A GPU's preference: PS2HOST_GPU=<part of its name> (any case: "intel",

@@ -3,6 +3,9 @@
 #include "ps2host/profile.h"
 #include "ps2host/timeline.h"
 #include "ps2host/run.h"
+#if PS2HOST_VULKAN
+#include "ps2gpu/gs_renderer.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -182,7 +185,15 @@ void SetSampleGsThread(bool on) { g_sample_gs = on; }
 bool SampleGsThread() { return g_sample_gs; }
 namespace {
 std::atomic<bool> g_sample_vif1{false};
+std::atomic<bool> g_sample_renderer{false};
 }  // namespace
+void SetSampleRendererThread(bool on) {
+    g_sample_renderer = on;
+#if PS2HOST_VULKAN
+    ps2gpu::SetRendererThreadStart(on ? +[] { timeline::NameThread("GPU renderer"); StartSampler(); } : nullptr);
+#endif
+}
+bool SampleRendererThread() { return g_sample_renderer; }
 void SetSampleVif1Thread(bool on) { g_sample_vif1 = on; }
 bool SampleVif1Thread() { return g_sample_vif1; }
 
@@ -227,7 +238,7 @@ void StartSampler() {
     timeBeginPeriod(1);
     // The guest's call stack too, on the EE's thread only (the others run no
     // guest thread of their own).
-    const bool sample_guest = !SampleGsThread() && !SampleVif1Thread();
+    const bool sample_guest = !SampleGsThread() && !SampleVif1Thread() && !g_sample_renderer;
     // PS2HOST_SAMPLE_US: microseconds between samples (1000 by default, a
     // Sleep each; under that the sampler spins on the clock - a core of its
     // own - for the samples a compiled VU block's lines need).

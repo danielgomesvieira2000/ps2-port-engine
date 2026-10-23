@@ -34,6 +34,9 @@ namespace ps2gpu {
    host's profiler (PS2HOST_PROFILE). On the waiting thread. */
 using GpuWaitObserver = void (*)(const char* why, std::uint64_t from_ns, std::uint64_t to_ns);
 void SetGpuWaitObserver(GpuWaitObserver observer);
+/* Called on the renderer's own thread (a threaded renderer's) as it starts:
+   the host's profiler sampling it (--sample-renderer). */
+void SetRendererThreadStart(void (*start)());
 
 /* A Vulkan instance and device with one graphics queue (Vulkan 1.3: dynamic
    rendering). Opaque; created headless. */

@@ -727,6 +727,7 @@ int Run(const Options& options) {
         SetSampleFrom(u64(options.sample_from));
         if (options.sample_gs) SetSampleGsThread(true);
         else if (options.sample_vif1) SetSampleVif1Thread(true);
+        else if (options.sample_renderer) SetSampleRendererThread(true);
         else StartSampler();
     }
     if (!options.vu_record.empty()) Vu::RecordPrograms(options.vu_record);
@@ -852,6 +853,7 @@ int Main(int argc, char** argv) {
         else if (arg == "--sample") options.sample = true;
         else if (arg == "--sample-gs") options.sample = options.sample_gs = true;
         else if (arg == "--sample-vif1") options.sample = options.sample_vif1 = true;
+        else if (arg == "--sample-renderer") options.sample = options.sample_renderer = true;
         else if (arg == "--vif1-sync") options.vif1_sync = true;
         else if (arg == "--fast-disc") options.fast_disc = true;
         else if (arg == "--check-guesses") options.check_guesses = true;

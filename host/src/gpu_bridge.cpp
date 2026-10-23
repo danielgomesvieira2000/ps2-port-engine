@@ -2308,6 +2308,9 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
         device = bridge.gpu.get();
     }
     ps2gpu::SetPipelineHints(g_pipeline_hints.data(), g_pipeline_hints.size());
+    // The renderer's thread named, for --frame-times' CPU of each thread (the
+    // sampler's own start names it too: --sample-renderer).
+    if (!SampleRendererThread()) ps2gpu::SetRendererThreadStart([] { timeline::NameThread("GPU renderer"); });
     // The pipeline cache beside the PC settings - a player's only: a scripted
     // run's settings are beside its memory card, in %TEMP% (what every
     // game's runs there would share), and it makes every pipeline at once.

@@ -30,6 +30,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <timeapi.h>
+#include <xmmintrin.h>
 #pragma comment(lib, "synchronization.lib")
 
 #include <atomic>
@@ -187,8 +188,22 @@ void Preempt(Thread& woken) {
     GiveWay();
 }
 
+/* The EE's code runs in the VU's rounding throughout (toward zero, denormals
+   flushed), as macro mode would set it for each COP2 instruction (lifted.h:
+   g_macro_switch), with no control-word write for each. The FPU's helpers
+   (eefpu.cpp) truncate to single themselves; their double arithmetic now
+   rounds toward zero too - the same results, but for the rare one whose
+   double rounding to nearest crossed a single's boundary (truncated exactly
+   now). Each fiber has its own control word. */
+void EeRounding() {
+    if (lifted::kMacroNearest) return;
+    _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u);
+    lifted::g_macro_switch = false;
+}
+
 void CALLBACK ThreadMain(void* parameter) {
     Thread& t = *static_cast<Thread*>(parameter);
+    EeRounding();
     try {
         Dispatch(t.context, t.entry);
         t.state = State::Dormant;               // returning from its entry ends a thread
@@ -910,6 +925,7 @@ void RunThreads(const lifted::Context& initial, u32 entry, s64 loop_budget) {
     s.realtime = loop_budget == INT64_MAX && !s.virtual_time;
     if (s.realtime) StartRealTimeThreads();
     s.next_vblank_ns = ClockNs() + kFrameNs;
+    EeRounding();                   // (the interrupt handlers run on this fiber)
     s.host_fiber = ConvertThreadToFiber(nullptr);
     auto main = std::make_unique<Thread>();
     main->id = s.next_thread++;

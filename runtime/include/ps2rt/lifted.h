@@ -141,6 +141,10 @@ void StoreRight(u32 address, u64 value, u32 size);
 void Cop2Slow(Context& c, u32 word);
 /* PS2RT_EE_ROUND_NEAREST: macro mode left rounding to nearest (vu0.cpp). */
 extern const bool kMacroNearest;
+/* Macro mode sets the VU's rounding for each instruction - unless the thread
+   running the EE's code runs in it throughout (ps2host's RunThreads clears
+   this: two control-word writes an instruction were a fifth of its time). */
+extern bool g_macro_switch;
 /* COP2's FMAC operations (ADD, SUB, MUL, MADD, MSUB, MAX, MINI, with their
    broadcast, Q, I and accumulator forms), decoded once and run as often as
    needed - the VU interpreter keeps them per instruction. Cop2 runs them the
@@ -249,8 +253,9 @@ inline __m128i MacroLanes(__m128i a, __m128i b, __m128i acc) { return LanesSse<O
 inline void MacroFmac(Context& c, u32 word, FmacForm f) {
     const u32 fd = (word >> 6) & 0x1F, fs = (word >> 11) & 0x1F, ft = (word >> 16) & 0x1F;
     const u32 dest = (word >> 21) & 0xF;
-    const unsigned saved = _mm_getcsr();
-    if (!kMacroNearest) _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u);
+    const bool switching = g_macro_switch;
+    const unsigned saved = switching ? _mm_getcsr() : 0u;
+    if (switching) _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u);
     const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(c.vf[fs]));
     __m128i b;
     if (f.operand == 6) b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(c.vf[ft]));
@@ -272,7 +277,7 @@ inline void MacroFmac(Context& c, u32 word, FmacForm f) {
     if (to)
         for (int lane = 0; lane < 4; ++lane)
             if (dest & (8u >> lane)) to[lane] = out[lane];
-    if (!kMacroNearest) _mm_setcsr(saved);
+    if (switching) _mm_setcsr(saved);
 }
 #endif
 

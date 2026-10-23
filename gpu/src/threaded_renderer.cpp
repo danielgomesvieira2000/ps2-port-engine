@@ -27,6 +27,8 @@
 
 namespace ps2gpu {
 
+extern void (*g_renderer_thread_start)();     // gpu.cpp (SetRendererThreadStart)
+
 namespace {
 
 /* A chunk of the queue: bytes appended, never zeroed first (a vector's
@@ -458,6 +460,7 @@ private:
     }
 
     void Run() {
+        if (g_renderer_thread_start) g_renderer_thread_start();
         std::unique_lock<std::mutex> hold(lock_);
         for (;;) {
             wake_.wait(hold, [this] { return stop_ || !full_.empty(); });
