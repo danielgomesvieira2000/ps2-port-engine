@@ -32,6 +32,7 @@ Control flow, precisely:
 
 from __future__ import annotations
 
+import re
 import struct
 
 from . import vu0
@@ -606,6 +607,49 @@ def lift_function(image: bytes, base: int, start: int, end: int, chunks=()) -> s
         if "L_%08X:" % target not in text:
             raise Refused("label 0x%08X has no instruction" % target)
     return text + "\n"
+
+
+_COP2 = re.compile(r"^(\s*)lifted::Cop2\(c, ")
+_COP2_MOVE = re.compile(r"^(\s*)lifted::Cop2Move\(c, ")
+
+
+def macro_runs(lines):
+    """Runs of two or more COP2 macro instructions, at one indentation, with
+    only moves to and from the VU's registers (qmtc2, qmfc2, ctc2, cfc2)
+    between and no label: each in a scope that sets the VU's rounding once
+    (lifted::MacroRun), its instructions as lifted::Cop2Run. Nothing else in
+    the run does floating point, nothing jumps into it, and a goto out of it
+    leaves the scope, the EE's rounding put back."""
+    def at(line, pattern, indent):
+        m = pattern.match(line)
+        return m is not None and m.group(1) == indent
+
+    out, i = [], 0
+    while i < len(lines):
+        m = _COP2.match(lines[i]) or _COP2_MOVE.match(lines[i])
+        if not m:
+            out.append(lines[i])
+            i += 1
+            continue
+        indent = m.group(1)
+        j = i
+        while j < len(lines) and (at(lines[j], _COP2, indent) or at(lines[j], _COP2_MOVE, indent)):
+            j += 1
+        macros = [k for k in range(i, j) if at(lines[k], _COP2, indent)]
+        if len(macros) < 2:
+            out.extend(lines[i:j])
+            i = j
+            continue
+        # Moves at the ends stay outside: the run from its first macro to its last.
+        first, last = macros[0], macros[-1]
+        out.extend(lines[i:first])
+        out.append(indent + "{ lifted::MacroRun run;")
+        for k in range(first, last + 1):
+            out.append(lines[k].replace("lifted::Cop2(c, ", "lifted::Cop2Run(c, ", 1))
+        out.append(indent + "}")
+        out.extend(lines[last + 1:j])
+        i = j
+    return out
 
 
 def _transfer(target: int, inside) -> str:

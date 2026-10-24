@@ -122,7 +122,9 @@ def write_chunks(lifted: dict, directory: str, prefix: str, unverified=None,
                     handle.write("/* %s (%s) */\n" % names[address])
                 if address in unverified:
                     handle.write("/* NOT VERIFIED: %s */\n" % unverified[address])
-                handle.write(_annotated(lifted[address], names))
+                # Runs of COP2 macro instructions: the VU's rounding set once each.
+                text = "\n".join(lift.macro_runs(lifted[address].split("\n")))
+                handle.write(_annotated(text, names))
                 handle.write("\n")
         paths.append(path)
     return paths

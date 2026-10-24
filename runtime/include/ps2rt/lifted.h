@@ -246,11 +246,14 @@ constexpr PS2RT_VU_INLINE FmacForm FmacFormOf(u32 word) {
 template <int Op>
 inline __m128i MacroLanes(__m128i a, __m128i b, __m128i acc) { return LanesSse<Op>(a, b, acc); }
 
+/* kRounding: the VU's rounding set here and put back after; a run of them
+   (MacroRun) has it set once, around them all. */
+template <bool kRounding = true>
 inline void MacroFmac(Context& c, u32 word, FmacForm f) {
     const u32 fd = (word >> 6) & 0x1F, fs = (word >> 11) & 0x1F, ft = (word >> 16) & 0x1F;
     const u32 dest = (word >> 21) & 0xF;
-    const unsigned saved = _mm_getcsr();
-    if (!kMacroNearest) _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u);
+    const unsigned saved = kRounding ? _mm_getcsr() : 0u;
+    if (kRounding && !kMacroNearest) _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u);
     const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(c.vf[fs]));
     __m128i b;
     if (f.operand == 6) b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(c.vf[ft]));
@@ -272,8 +275,28 @@ inline void MacroFmac(Context& c, u32 word, FmacForm f) {
     if (to)
         for (int lane = 0; lane < 4; ++lane)
             if (dest & (8u >> lane)) to[lane] = out[lane];
-    if (!kMacroNearest) _mm_setcsr(saved);
+    if (kRounding && !kMacroNearest) _mm_setcsr(saved);
 }
+
+/* A run of COP2 instructions with nothing else between them but moves to
+   and from the VU's registers, and no label: the VU's rounding (round to
+   zero, denormals flushed) set once for the run - the lifter puts each such
+   run in a scope with one (`{ lifted::MacroRun run; ...Cop2Run... }`), a goto
+   out of it putting the EE's back as it leaves. The same results as Cop2's
+   own, each setting it (2-3% of the EE in a race, the switches). */
+struct MacroRun {
+    unsigned saved;
+    MacroRun() : saved(_mm_getcsr()) {
+        if (!kMacroNearest) _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u);
+    }
+    ~MacroRun() {
+        if (!kMacroNearest) _mm_setcsr(saved);
+    }
+    MacroRun(const MacroRun&) = delete;
+    MacroRun& operator=(const MacroRun&) = delete;
+};
+#else
+struct MacroRun {};
 #endif
 
 /* Always inlined, with the decode above: at a lifted call site the word is a
@@ -285,6 +308,19 @@ PS2RT_VU_INLINE void Cop2(Context& c, u32 word) {
     const FmacForm f = FmacFormOf(word);
     if (f.valid) {
         MacroFmac(c, word, f);
+        return;
+    }
+#endif
+    Cop2Slow(c, word);
+}
+
+/* Cop2 inside a MacroRun: the rounding already the VU's (Cop2Slow sets it
+   again for itself, the same). */
+PS2RT_VU_INLINE void Cop2Run(Context& c, u32 word) {
+#if PS2RT_VU_SSE
+    const FmacForm f = FmacFormOf(word);
+    if (f.valid) {
+        MacroFmac<false>(c, word, f);
         return;
     }
 #endif
