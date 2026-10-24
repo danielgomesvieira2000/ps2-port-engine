@@ -312,6 +312,8 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
         if (worst > 0.5f) ++r.near;
         if (worst > r.worst) r.worst = worst, r.worst_segment = jb;
     }
+    if (o.cut_segment >= 0 && r.view >= o.new_view && float(r.unmatched) >= o.new_share * float(r.segments))
+        camera_cut = true;
     if (o.cut_segment >= 0 ? camera_cut : matched && float(r.jumps + r.moved) > o.cut_share * float(matched)) {
         r.cut = true;
         plan.at.clear();

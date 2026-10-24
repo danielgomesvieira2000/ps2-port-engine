@@ -49,6 +49,12 @@ struct ListBlendOptions {
     // turned or moved by more than `jump` of its own length the cut (not its
     // lights' rows: a shot's flash). The rest of it blended whole.
     unsigned view_first = 0, view_end = ~0u;
+    // A cut the view's rows miss: most of the things new (`new_share` of the
+    // segments: another room's or shot's) while the camera's view moved by
+    // `new_view` of a cut or more. Outbreak (played 2026-10-24): two steps
+    // in 22 minutes, a picture between two shots each; a still camera over
+    // a room whose things come and go (a fire's) is no cut.
+    float new_share = 0.5f, new_view = 0.3f;
 };
 
 struct ListBlend {
