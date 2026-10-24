@@ -237,16 +237,20 @@ void Change(int step) {
     if (row.kind == Row::kPage) {
         g_page = row.index;
         g_row = 0;
+        std::fprintf(stderr, "[pc menu] page %s\n", Pages()[std::size_t(g_page)].c_str());
         return;
     }
     if (row.kind == Row::kKeyLink) {
         g_page = kKeyboard;
         g_row = 0;
+        std::fprintf(stderr, "[pc menu] page Keyboard\n");
         return;
     }
     if (row.kind == Row::kKey) {
         g_binding = row.index;
         g_binding_armed = false;
+        std::fprintf(stderr, "[pc menu] keyboard: the key for %s?\n",
+                     bindings::ButtonName(row.index, bindings::Style::kPlayStation));
         return;
     }
     if (row.kind == Row::kOption) {
@@ -265,7 +269,9 @@ void Change(int step) {
     for (int i = 0; i < int(c.values.size()); ++i)
         if (c.values[i] == now) at = i;
     const int count = int(c.values.size());
-    c.set(c.values[std::size_t(((at + step) % count + count) % count)]);
+    const std::string& to = c.values[std::size_t(((at + step) % count + count) % count)];
+    c.set(to);
+    std::fprintf(stderr, "[pc menu] %s: %s\n", c.label, to.c_str());
 }
 
 // Keys and buttons, each acting when it goes down.
