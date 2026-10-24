@@ -105,8 +105,9 @@ float Distance(const std::vector<u32>& a, const Code& ca, const std::vector<u32>
    camera's view, planned apart: PlanCamera). */
 bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, const std::vector<u32>& b,
               const std::vector<Code>& cb, const Segment& s, const ListBlendOptions& o, ListBlendPlan& plan,
-              const std::vector<u32>* moving, u32 skip_lo = 0, u32 skip_hi = 0) {
+              const std::vector<u32>* moving, u32 skip_lo = 0, u32 skip_hi = 0, float* worst = nullptr) {
     const size_t mark = plan.at.size();
+    float most = 0.0f;              // the largest move, as a share of its jump
     const auto skipped = [&](u32 at) { return at >= skip_lo && at < skip_hi; };
     for (u32 j = s.first; j < s.end; ++j) {
         const Code& y = cb[j];
@@ -149,11 +150,13 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
                 plan.to.resize(mark);
                 return false;
             }
+            if (scale[k & 3] > 0.0f) most = std::max(most, std::fabs(fb - fa) / (o.jump * scale[k & 3]));
             plan.at.push_back(y.at + 1 + k);
             plan.from.push_back(fa);
             plan.to.push_back(fb);
         }
     }
+    if (worst) *worst = most;
     return true;
 }
 
@@ -165,7 +168,7 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
    between on and off for a picture: Below Freezing Point's gate at 144. */
 void PlanCamera(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, const std::vector<u32>& b,
                 const std::vector<Code>& cb, const Segment& s, const ListBlendOptions& o, ListBlendPlan& plan,
-                const std::vector<u32>* moving) {
+                const std::vector<u32>* moving, float* worst) {
     u32 lo = 0, hi = 0;
     for (u32 j = s.first; j < s.end; ++j) {
         const Code& y = cb[j];
@@ -185,7 +188,7 @@ void PlanCamera(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, 
         }
         break;
     }
-    PlanPair(a, ca, sa, b, cb, s, o, plan, moving, lo, hi);
+    PlanPair(a, ca, sa, b, cb, s, o, plan, moving, lo, hi, worst);
 }
 
 /* The camera's segment's view (rows `first` to `end` of its first UNPACK of
@@ -194,7 +197,7 @@ void PlanCamera(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, 
    2e7), by which no turn is a jump - a cut from one corner of a room to
    another blended through the walls. */
 bool ViewJumps(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, const std::vector<u32>& b,
-               const std::vector<Code>& cb, const Segment& s, float jump, u32 first, u32 end) {
+               const std::vector<Code>& cb, const Segment& s, float jump, u32 first, u32 end, float* share) {
     for (u32 j = s.first; j < s.end; ++j) {
         const Code& y = cb[j];
         const Code& x = ca[sa + (j - s.first)];
@@ -209,6 +212,8 @@ bool ViewJumps(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, c
                 la += fa * fa;
                 lb += fb * fb;
             }
+            if (plausible && std::max(la, lb) > 1e-6f)
+                *share = std::max(*share, std::sqrt(d / std::max(la, lb)) / jump);
             if (plausible && d > jump * jump * std::max(la, lb) && std::max(la, lb) > 1e-6f) return true;
         }
         return false;
@@ -292,11 +297,20 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
             // still for a step, then on).
             // (Out of its place is no cut: a thing before it came or went -
             // the virus gauge.)
-            camera_cut |= ViewJumps(a.words, ca, sa[best].first, b.words, cb, s, o.jump, o.view_first, o.view_end);
-            PlanCamera(a.words, ca, sa[best].first, b.words, cb, s, o, plan, moving);
+            camera_cut |= ViewJumps(a.words, ca, sa[best].first, b.words, cb, s, o.jump, o.view_first, o.view_end,
+                                    &r.view);
+            float worst = 0.0f;
+            PlanCamera(a.words, ca, sa[best].first, b.words, cb, s, o, plan, moving, &worst);
+            if (worst > r.worst) r.worst = worst, r.worst_segment = jb;
             continue;
         }
-        if (!PlanPair(a.words, ca, sa[best].first, b.words, cb, s, o, plan, moving)) ++r.jumps;
+        float worst = 0.0f;
+        if (!PlanPair(a.words, ca, sa[best].first, b.words, cb, s, o, plan, moving, 0, 0, &worst)) {
+            ++r.jumps;
+            continue;
+        }
+        if (worst > 0.5f) ++r.near;
+        if (worst > r.worst) r.worst = worst, r.worst_segment = jb;
     }
     if (o.cut_segment >= 0 ? camera_cut : matched && float(r.jumps + r.moved) > o.cut_share * float(matched)) {
         r.cut = true;

@@ -60,6 +60,15 @@ struct ListBlend {
     u32 jumps = 0;          // matched but jumping: not blended
     bool cut = false;       // the camera cut: nothing blended
     bool whole = false;     // the lists' codes the same to their end
+    // How near the blend came to its limits (a trace's, to find the moves
+    // that look wrong): the largest move of a blended value, as a share of
+    // the jump that would have stepped its segment (1: it would have), and
+    // whose segment; segments blended with a move above half of it; the
+    // camera's view's largest row move as a share of the cut's (1: a cut).
+    float worst = 0.0f;
+    u32 worst_segment = 0;
+    u32 near = 0;
+    float view = 0.0f;
 };
 
 struct ListBlendPlan {
