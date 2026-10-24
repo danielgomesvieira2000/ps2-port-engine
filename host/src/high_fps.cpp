@@ -137,9 +137,11 @@ double Wanted() {
     // PS2HOST_HIGH_FPS_FROM=<frame>: 60 until then (a scripted run's test:
     // its presses land as at 60, and the same screen at 60 and above is
     // compared at the same times).
+    // (Or the setting high_fps_from: a run's --setting, in its .args.)
     static const unsigned long long from = [] {
         const char* e = std::getenv("PS2HOST_HIGH_FPS_FROM");
-        return e ? std::strtoull(e, nullptr, 10) : 0ull;
+        const std::string set = Setting("high_fps_from", "");
+        return e ? std::strtoull(e, nullptr, 10) : set.empty() ? 0ull : std::strtoull(set.c_str(), nullptr, 10);
     }();
     if (FrameNumber() < from) want = Own();
     return g_cap > 0.0 ? std::min(want, g_cap) : want;
