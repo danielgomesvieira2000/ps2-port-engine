@@ -258,7 +258,9 @@ bool WindowClosed() { return g_closed; }
 void QuitGame() { g_closed = true; }
 
 bool HostKeyDown(int key) {
-    if (ScriptedKeyDown(key)) return true;          // --key
+    // --key: a run with scripted keys sees those alone - not whatever the
+    // person at the PC types meanwhile (read with the window behind).
+    if (KeysScripted()) return ScriptedKeyDown(key);
 #ifdef PS2HOST_VULKAN
     if (g_display) return g_display->KeyDown(Scancode(key));
 #endif
