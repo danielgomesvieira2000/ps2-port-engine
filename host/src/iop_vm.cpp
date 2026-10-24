@@ -42,6 +42,8 @@ constexpr u64 kSlice = 20'000'000;          // instructions a call may run, so a
 // interrupts (alarms, sound, DMA completions) arrive between quanta, as the
 // real IOP takes them whenever they come.
 constexpr u64 kQuantum = 4096;
+// ... unless its interrupts are off, for up to this many more (Execute).
+constexpr u64 kInterruptsOffMax = 1'000'000;
 constexpr u32 kInterruptStack = 0x0000FF00u;    // below the heap, in the kernel's area
 
 std::set<std::string>& RunList() {
@@ -175,7 +177,14 @@ namespace {
 // `limit` instructions have run. Returns what ended it.
 Outcome Execute(Vm& vm, Context& c, u32 stop, u64 limit, bool* stopped) {
     *stopped = false;
-    for (u64 n = 0; n < limit; ++n) {
+    for (u64 n = 0;; ++n) {
+        // A thread with its interrupts off (CpuSuspendIntr) runs on past its
+        // quantum until it turns them on (or blocks): no interrupt or other
+        // thread inside its critical section. Capped, for one never ending it.
+        if (n >= limit) {
+            const Thread* t = vm.in_interrupt ? nullptr : vm.Current();
+            if (!t || !t->interrupts_off || n >= limit + kInterruptsOffMax) break;
+        }
         if (c.pc == stop) {
             *stopped = true;
             return Outcome::Return;
@@ -720,9 +729,15 @@ std::string Report() {
                                   "sleeping", "delayed", "dormant", "serving RPC",
                                   "waiting on a message box"};
     for (auto& [id, t] : vm.threads) {
-        char line[160];
-        std::snprintf(line, sizeof line, "  IOP thread %u: %s, priority %d, entry 0x%08X, at 0x%08X\n",
-                      id, t.ready ? "ready" : waits[int(t.wait)], t.priority, t.entry, t.c.pc);
+        char line[224];
+        int n = std::snprintf(line, sizeof line, "  IOP thread %u: %s, priority %d, entry 0x%08X, at 0x%08X",
+                              id, t.ready ? "ready" : waits[int(t.wait)], t.priority, t.entry, t.c.pc);
+        const auto sema = vm.semaphores.find(t.object);
+        if (!t.ready && t.wait == Wait::Sema && sema != vm.semaphores.end())
+            n += std::snprintf(line + n, sizeof line - n, " (semaphore %u: count %d, %zu queued)", unsigned(t.object),
+                               int(sema->second.count), sema->second.waiting.size());
+        if (t.interrupts_off) n += std::snprintf(line + n, sizeof line - n, ", interrupts off");
+        std::snprintf(line + n, sizeof line - n, "\n");
         out += line;
     }
     return out;

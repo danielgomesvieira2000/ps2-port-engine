@@ -54,6 +54,7 @@ struct Thread {
     u32 object = 0;                 // the semaphore or event flag waited on
     u32 event_bits = 0, event_mode = 0, event_result = 0;
     s32 wakeups = 0;
+    bool interrupts_off = false;    // CpuSuspendIntr/CpuDisableIntr: its quantum runs on (Execute)
     u64 until_us = 0;               // DelayThread
     u32 entry = 0, stack = 0, stack_size = 0;
     RpcRequest serving;             // the RPC request its server function is running

@@ -779,8 +779,34 @@ Outcome Puts(Vm& vm, Context& c) {
 
 // ---------------------------------------------------------------- interrupts
 
+/* A thread's interrupts off until it turns them on again: no interrupt and
+   no other thread between (Execute runs its quantum on). Left out, a
+   quantum's end split RenderWare Audio's critical sections - a stream's
+   flags read, an interrupt's changed, the old ones written back - and its
+   stream threads waited for a wake-up that had come and gone (Burnout 3:
+   the music stopped mid race and a later load waited for it). The state
+   given back is 1 if they were on, 0 if already off, so nested pairs keep
+   them off until the outer one ends. An interrupt handler's are off anyway. */
 Outcome CpuSuspendIntr(Vm& vm, Context& c) {
-    if (const u32 state = A(vm, c, 0)) vm.Write(state, 0, 4);
+    Thread* t = vm.in_interrupt ? nullptr : vm.Current();
+    const bool were_on = t && !t->interrupts_off;
+    if (t) t->interrupts_off = true;
+    if (const u32 state = A(vm, c, 0)) vm.Write(state, were_on ? 1u : 0u, 4);
+    return Ret(c, KE_OK);
+}
+
+Outcome CpuResumeIntr(Vm& vm, Context& c) {
+    if (Thread* t = vm.in_interrupt ? nullptr : vm.Current()) t->interrupts_off = A(vm, c, 0) == 0;
+    return Ret(c, KE_OK);
+}
+
+Outcome CpuDisableIntr(Vm& vm, Context& c) {
+    if (Thread* t = vm.in_interrupt ? nullptr : vm.Current()) t->interrupts_off = true;
+    return Ret(c, KE_OK);
+}
+
+Outcome CpuEnableIntr(Vm& vm, Context& c) {
+    if (Thread* t = vm.in_interrupt ? nullptr : vm.Current()) t->interrupts_off = false;
     return Ret(c, KE_OK);
 }
 
@@ -1220,8 +1246,8 @@ const Map& Table() {
         {{"sysclib", 32}, Strrchr}, {{"sysclib", 34}, Strstr}, {{"sysclib", 36}, Strtol},
         {{"sysclib", 38}, Strtoul}, {{"sysclib", 42}, Vsprintf},
         {{"intrman", 4}, Succeed}, {{"intrman", 5}, Succeed}, {{"intrman", 6}, Succeed},
-        {{"intrman", 7}, Succeed}, {{"intrman", 8}, Succeed}, {{"intrman", 9}, Succeed},
-        {{"intrman", 17}, CpuSuspendIntr}, {{"intrman", 18}, Succeed},
+        {{"intrman", 7}, Succeed}, {{"intrman", 8}, CpuDisableIntr}, {{"intrman", 9}, CpuEnableIntr},
+        {{"intrman", 17}, CpuSuspendIntr}, {{"intrman", 18}, CpuResumeIntr},
         {{"intrman", 23}, QueryIntrContext},
         {{"thbase", 4}, CreateThread}, {{"thbase", 5}, DeleteThread},
         {{"thbase", 6}, StartThread}, {{"thbase", 7}, StartThreadArgs},
