@@ -78,6 +78,11 @@ int GsReplay(const std::string& file, const std::string& out) {
     gs::Gs& g = gs::TheGs();
     std::memcpy(g.memory.data(), data.data() + 5, kMemory);
     const bool gpu = std::getenv("PS2HOST_REPLAY_GPU") != nullptr;
+    // PS2HOST_REPLAY_SAMPLE=renderer: the renderer's own thread sampled
+    // instead (its recording of what the bridge hands it).
+    const char* sample_what = std::getenv("PS2HOST_REPLAY_SAMPLE");
+    const bool sample_renderer = sample_what && std::string(sample_what) == "renderer";
+    if (sample_renderer) SetSampleRendererThread(true);
     if (gpu) {
         std::string error;
         if (!StartGpuRenderer(&error, GpuMode::Primary, false)) {
@@ -97,7 +102,7 @@ int GsReplay(const std::string& file, const std::string& out) {
     // (the decoding on its own), synced at each vertical blank.
     const bool threaded = GsSplit();
     if (threaded) {
-        if (std::getenv("PS2HOST_REPLAY_SAMPLE")) SetSampleGsThread(true);
+        if (sample_what && !sample_renderer) SetSampleGsThread(true);
         StartGsThread();
     }
     std::size_t at = 5 + kMemory;
@@ -110,7 +115,7 @@ int GsReplay(const std::string& file, const std::string& out) {
     const int repeat = std::getenv("PS2HOST_REPLAY_REPEAT") ? std::atoi(std::getenv("PS2HOST_REPLAY_REPEAT")) : 0;
     int pass = 0;
     std::chrono::steady_clock::time_point started;
-    double cpu_started = 0;
+    double cpu_started = 0, renderer_started = 0;
     for (;;) {
     while (at < data.size()) {
         const char kind = char(data[at++]);
@@ -178,12 +183,13 @@ int GsReplay(const std::string& file, const std::string& out) {
     }
     if (pass == 0) {
         if (repeat > 0 && std::getenv("PS2HOST_REPLAY_SAMPLE")) {
-            if (!threaded) StartSampler();      // (split: the GS thread's, started with it)
+            if (!threaded && !sample_renderer) StartSampler();      // (split: the GS thread's, started with it; the renderer's: with it)
             SetSampleFrom(0);
             SampleFrame(0);
         }
         started = std::chrono::steady_clock::now();
         cpu_started = ThreadCpuMs();
+        renderer_started = RendererThreadCpuMs();
     }
     if (pass++ >= repeat) break;
     timing = true;
@@ -198,8 +204,9 @@ int GsReplay(const std::string& file, const std::string& out) {
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
         // The thread's own CPU as well: with a renderer on a thread of its
         // own the passes' time may be that thread's (or the GPU's), not this.
-        std::fprintf(stderr, "gs-replay: %d passes, %.2f ms a pass (%d pictures each), this thread's CPU %.2f ms a pass\n",
-                     repeat, ms / repeat, pictures, (ThreadCpuMs() - cpu_started) / repeat);
+        std::fprintf(stderr, "gs-replay: %d passes, %.2f ms a pass (%d pictures each), this thread's CPU %.2f ms a pass, the renderer's %.2f\n",
+                     repeat, ms / repeat, pictures, (ThreadCpuMs() - cpu_started) / repeat,
+                     (RendererThreadCpuMs() - renderer_started) / repeat);
         if (std::getenv("PS2HOST_REPLAY_SAMPLE"))
             std::printf("%s", SampleReport(std::getenv("PS2HOST_SAMPLE_TOP") ? std::atoi(std::getenv("PS2HOST_SAMPLE_TOP")) : 30).c_str());
     }
