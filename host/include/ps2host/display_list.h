@@ -80,6 +80,7 @@ struct ListBlend {
 struct ListBlendPlan {
     std::vector<u32> at;    // the newer list's words to blend
     std::vector<float> from, to;
+    std::vector<u32> segment;   // each word's segment (the newer list's), in order
     ListBlend stats;
 };
 

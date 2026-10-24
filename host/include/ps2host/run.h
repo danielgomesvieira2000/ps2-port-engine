@@ -183,6 +183,12 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir);
    the GPU draws (--gpu), so there is something to capture. */
 void GpuCaptureBegin(u64 frame, const std::string& passes_dir);
 std::string GpuCaptureScreen(const std::string& dir);
+/* The picture shown now at the PS2's own size (640x448 at most: 1x), each
+   pixel's bytes R, G, B, A - for a port that compares pictures as it runs
+   (SyncGs first). False without the GPU. SavePicture writes such a picture
+   as a BMP. */
+bool GpuShownPicture(std::vector<u32>* pixels, u32* width, u32* height);
+void SavePicture(const std::string& path, const std::vector<u32>& pixels, u32 width, u32 height);
 bool GpuPrimary();
 /* The GPU renderer's internal resolution, now (a GS replay's; a run takes
    the "resolution" setting between frames). */

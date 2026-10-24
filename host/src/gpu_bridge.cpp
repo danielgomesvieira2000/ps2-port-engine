@@ -2460,6 +2460,25 @@ std::string GpuCaptureScreen(const std::string& dir) {
     return text;
 }
 
+bool GpuShownPicture(std::vector<u32>* pixels, u32* width, u32* height) {
+    if (!g_bridge) return false;
+    u32 fbp = 0, fbw = 0, psm = 0;
+    gs::TheGs().Displayed(&fbp, &fbw, &psm);
+    std::vector<u32> all;
+    u32 w = 0, h = 0;
+    if (!g_bridge->renderer->ReadTarget(fbp, fbw, psm, &all, &w, &h)) return false;
+    *width = std::min(w, 640u);
+    *height = std::min(h, 448u);
+    pixels->resize(std::size_t(*width) * *height);
+    for (u32 y = 0; y < *height; ++y)
+        std::copy_n(all.begin() + std::size_t(y) * w, *width, pixels->begin() + std::size_t(y) * *width);
+    return true;
+}
+
+void SavePicture(const std::string& path, const std::vector<u32>& pixels, u32 width, u32 height) {
+    WriteBmp(path, pixels, width, width, height);
+}
+
 void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
     if (!g_bridge) return;
     Bridge& s = *g_bridge;
