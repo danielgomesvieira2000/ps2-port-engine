@@ -178,7 +178,15 @@ def verify_texts(texts: dict, work: str, game, seeds, jobs, cache, abi=False,
         else:
             outcomes[address] = outcome
     if missing:
-        dll, built = build(missing, work)
+        try:
+            dll, built = build(missing, work)
+        except cppcheck.CompilerUnavailable as exc:
+            # Nothing can be checked: every text is emitted marked NOT VERIFIED,
+            # and no verdict is remembered (another machine may have a compiler).
+            print("  verification SKIPPED: %s - nothing is verified" % exc)
+            for address in missing:
+                outcomes[address] = "not verified: no C++ compiler (%s)" % exc
+            return outcomes
         if jobs > 1 and len(built) > 50:
             fresh = verify_parallel(sorted(built), game, seeds, dll, jobs, abi)
         else:
@@ -220,7 +228,7 @@ def equivalent_to_plain(addresses, structured, plain, abi, cache, work) -> list:
     if missing:
         try:
             checked = equivalence.check({a: (plain[a], structured[a], abi) for a in missing}, work)
-        except cppcheck.CompileError as exc:
+        except (cppcheck.CompileError, cppcheck.CompilerUnavailable) as exc:
             # A checker that cannot run has found nothing: say so loudly, remember
             # nothing, and let the forms stand on their verification this time.
             print("  WARNING: the equivalence check did not build, so it was skipped:\n    %s"
