@@ -53,6 +53,12 @@ struct GifDecode {
                 i += 4 * qwords;
                 continue;
             }
+            // PACKED, whole quadwords, no trace wanting each one's source:
+            // a run of them with the tag's descriptors taken once.
+            if (p.pending_count == 0 && p.loops && p.format == 0 && count - i >= 4 && !k.Tracing()) {
+                i = PackedRun(s, k, p, words, count, i);
+                continue;
+            }
             // DMA already supplies complete quadwords. Avoid assembling those
             // through four Word calls; retain that path for fragmented packets.
             // Word's fourth write supplies the diagnostic source address.
@@ -65,6 +71,32 @@ struct GifDecode {
             if (from != Gs::kNoSource) s.dma_source = from + 4 * i;
             Word(s, k, path, words[i++]);
         }
+    }
+
+    /* PACKED quadwords from words[i] on, as Qword would take them, until the
+       tag's loops end or the words do (a whole quadword left at least): each
+       register's descriptor from the tag once, the place in the loop in
+       locals (a quadword's descriptor shifted out of the tag, and the tag's
+       fields read again, each time were most of the decoding). Returns
+       where it stopped. */
+    static u32 PackedRun(GifState& s, Sink& k, GifState::Path& p, const u32* words, u32 count, u32 i) {
+        u32 descriptors[16];
+        const u32 nregs = p.nregs;
+        for (u32 r = 0; r < nregs; ++r) descriptors[r] = u32(p.tag_high >> (4 * r)) & 15;
+        u32 reg = p.reg, loops = p.loops;
+        while (loops && count - i >= 4) {
+            const u64 low = u64(words[i]) | u64(words[i + 1]) << 32;
+            const u64 high = u64(words[i + 2]) | u64(words[i + 3]) << 32;
+            i += 4;
+            Packed(s, k, descriptors[reg], low, high);
+            if (++reg == nregs) {
+                reg = 0;
+                --loops;
+            }
+        }
+        p.reg = reg;
+        p.loops = loops;
+        return i;
     }
 
     static void Word(GifState& s, Sink& k, int path, u32 word) {
