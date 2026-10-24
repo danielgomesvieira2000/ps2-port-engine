@@ -401,6 +401,23 @@ address with a host implementation. It is the mechanism for:
   with the guest address it came from (Mister Mosquito's HUD in a wider
   picture: its vertices tagged where they are made, placed there).
 
+What the ports found they shared is here to use:
+
+* `ps2host/hud.h` - a wider picture's 2D: elements, their anchors (settings
+  and the port's defaults), placing, and the HUD editor (F10). A port finds
+  where its game draws 2D and who drew it; the rest is the engine's.
+* `AddPortOptions` (run.h) - a port's own settings as pages of the PC
+  settings panel (F9), the same table its own menus show.
+* `ps2host/libnet.h` - Sony's libnet client (sceInet*) answered with the
+  PC's sockets: a port gives its wrappers' addresses.
+* `ps2host/logitech.h` - Logitech's wheel and headset modules, nothing
+  attached, at the versions the game's libraries want.
+* `engine/tools/lift_mods.py` - PCSX2 patches (.pnach) as switchable mods:
+  each function a patch changes lifted again with its words, chosen at run
+  time by the port's `ModOn`.
+* `engine/tools/bench.py` - a deterministic benchmark (GS replays, VU
+  snapshots, virtual-time runs) to weigh a change.
+
 Prefer overriding a whole library routine (`sceGsSyncV`, `sceSifCallRpc`) to
 emulating the hardware it touches: the routine's contract is smaller than the
 hardware's, and `names.csv` already identifies many of them. Routines every
