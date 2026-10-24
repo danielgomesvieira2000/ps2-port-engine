@@ -18,6 +18,7 @@
 #include "ps2host/disc.h"
 #include "ps2host/dma.h"
 #include "ps2host/gs.h"
+#include "ps2host/bindings.h"
 #include "ps2host/host.h"
 #include "ps2host/hud.h"
 #include "ps2host/libnet.h"
@@ -1894,7 +1895,39 @@ void LibnetSendsDatagrams() {
     Check(call(client.close, {u32(a), 0}) == 0 && call(client.close, {u32(b), 0}) == 0, "libnet: sockets closed");
 }
 
+// A player's bindings: the settings over the defaults, a binding taking its
+// key from the input that had it, and back to the settings as names.
+void BindingsKeepAndSwap() {
+    namespace b = ps2host::bindings;
+    b::Table defaults{};
+    for (int i = 0; i < b::kInputs; ++i) defaults.physical[i] = 0;
+    defaults.physical[b::kCross] = 'X';
+    defaults.physical[b::kSquare] = 'Z';
+    ps2host::RunSetting(b::SettingKey(b::Device::kKeyboard, "test", b::kCircle), "LEFT SHIFT");
+    ps2host::RunSetting(b::SettingKey(b::Device::kKeyboard, "test", b::kSquare), "NONE");
+    ps2host::RunSetting(b::SettingKey(b::Device::kKeyboard, "test", b::kL1), "NOT A KEY");
+    b::Table t = b::Load(b::Device::kKeyboard, "test", defaults);
+    Check(t.physical[b::kCross] == 'X', "bindings: a default kept");
+    Check(t.physical[b::kCircle] == b::KeyByName("LEFT SHIFT") && t.physical[b::kCircle] != 0,
+          "bindings: a setting's key");
+    Check(t.physical[b::kSquare] == 0, "bindings: NONE");
+    Check(t.physical[b::kL1] == 0, "bindings: a name not known keeps the default");
+    b::Bind(t, b::kCircle, 'X');
+    Check(t.physical[b::kCircle] == 'X' && t.physical[b::kCross] == b::KeyByName("LEFT SHIFT"),
+          "bindings: the key's old input gets the bound one's");
+    b::Save(b::Device::kKeyboard, "test", t);
+    Check(ps2host::Setting(b::SettingKey(b::Device::kKeyboard, "test", b::kCross)) == "LEFT SHIFT" &&
+              ps2host::Setting(b::SettingKey(b::Device::kKeyboard, "test", b::kSelect)) == "NONE",
+          "bindings: saved as names");
+    Check(b::Same(b::Load(b::Device::kKeyboard, "test", defaults), t), "bindings: what was saved loads");
+    Check(std::string(b::ButtonName(b::kCross, b::Style::kXbox)) == "A" &&
+              std::string(b::ButtonName(b::kCross, b::Style::kPlayStation)) == "CROSS" &&
+              b::ButtonByName("TRIANGLE") == b::kTriangle && std::string(b::ButtonName(-1, b::Style::kXbox)) == "NONE",
+          "bindings: the buttons' names");
+}
+
 int main() {
+    BindingsKeepAndSwap();
     HudAnchorsAndPlaces();
     LibnetSendsDatagrams();
     OverlaysRunWhatIsLoaded();
