@@ -209,6 +209,7 @@ public:
         u32 count;
         u64 fogcol;
         bool pabe;
+        u64 generation;     // Apply's count of register writes: the same, no register changed
     };
     std::function<void(const DrawCall&)> on_draw;
     /* --gpu: the GS model draws nothing itself (rasterize false) and a second
@@ -327,6 +328,7 @@ private:
     std::FILE* record_ = nullptr;               // BeginRecord's stream
     Context ctx_[2];
     u64 prim_ = 0, prmode_ = 0, prmodecont_ = 1;
+    u64 register_writes_ = 0;           // Apply's (DrawCall::generation)
     u64 texclut_ = 0, texa_ = 0, fogcol_ = 0, dthe_ = 0, colclamp_ = 1, pabe_ = 0;
     u64 bitbltbuf_ = 0, trxpos_ = 0, trxreg_ = 0, trxdir_ = 3;
     Vertex queue_[3];

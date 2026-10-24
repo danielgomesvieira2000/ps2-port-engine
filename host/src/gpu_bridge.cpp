@@ -1761,13 +1761,24 @@ void OnDraw(const gs::Gs::DrawCall& call) {
         bool draws_colour = false;
         u32 y_offset = 0, t_offset = 0, th = 1;     // Containing's: the target's rows, the texture's
         u64 last_draw = ~0ull;      // g_draws after the last draw of this state
+        u64 generation = ~0ull;     // the GS's register writes then (DrawCall::generation)
     };
     static Fast fast;
-    const u64 regs[12] = {call.prim, c.frame, c.scissor, c.tex0, c.tex1, c.clamp, c.alpha, c.test, c.zbuf,
-                          call.texa, call.fogcol | (u64(call.pabe) << 63), c.miptbp1 ^ (c.miptbp2 * 31)};
+    // No register written since the fast state's (a strip's primitives, most
+    // of a frame's): its registers are these, without gathering and
+    // comparing them each primitive.
+    const bool same_registers = fast.valid && fast.generation == call.generation;
+    u64 regs[12];
+    auto gather = [&] {
+        const u64 now[12] = {call.prim, c.frame, c.scissor, c.tex0, c.tex1, c.clamp, c.alpha, c.test, c.zbuf,
+                             call.texa, call.fogcol | (u64(call.pabe) << 63), c.miptbp1 ^ (c.miptbp2 * 31)};
+        std::memcpy(regs, now, sizeof regs);
+    };
+    if (!same_registers) gather();
     if (s.primary && fast.valid && fast.mutations == g_mutations && fast.context == call.context &&
-        rows <= fast.rows && std::memcmp(regs, fast.regs, sizeof regs) == 0 && !s.Dumping() &&
+        rows <= fast.rows && (same_registers || std::memcmp(regs, fast.regs, sizeof regs) == 0) && !s.Dumping() &&
         (!fast.source || !fast.source->stale)) {
+        fast.generation = call.generation;
         ps2gpu::GsDrawState& st = fast.state;      // (the renderer copies what it keeps)
         st.gouraud = gouraud;
         for (std::size_t i = 0; i < n; ++i) v[i].z = std::min(v[i].z, fast.zmax);
@@ -1791,6 +1802,7 @@ void OnDraw(const gs::Gs::DrawCall& call) {
         if (fast.depth) Drew(s, *fast.depth, x0, x1, y1, y0);
         return;
     }
+    if (same_registers) gather();
     fast.valid = false;
     timed.emplace(Section::GpuBridge);
     ps2gpu::GsDrawState state;
@@ -2097,6 +2109,7 @@ void OnDraw(const gs::Gs::DrawCall& call) {
         }
         if (may) {
             fast.valid = true;
+            fast.generation = call.generation;
             fast.mutations = g_mutations;
             fast.context = call.context;
             std::memcpy(fast.regs, regs, sizeof regs);

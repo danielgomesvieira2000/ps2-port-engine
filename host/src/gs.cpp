@@ -156,6 +156,7 @@ void Gs::PushVertex(const Vertex& v, bool draw) {
 
 /* The registers the GS keeps (every one but those only the decoding reads). */
 void Gs::Apply(u32 address, u64 value) {
+    ++register_writes_;
     switch (address) {
         case 0x00: prim_ = value; queued_ = 0; strip_ = 0; break;
         case 0x06: case 0x07:

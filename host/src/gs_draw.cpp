@@ -305,7 +305,7 @@ void Gs::Draw() {
     else setup_stale_ = true;
     if (on_draw) {
         Finish();                               // the second renderer reads local memory as of now
-        on_draw(DrawCall{Prim(), &Ctx(), texa_, queue_, queued_, fogcol_, (pabe_ & 1) != 0});
+        on_draw(DrawCall{Prim(), &Ctx(), texa_, queue_, queued_, fogcol_, (pabe_ & 1) != 0, register_writes_});
     }
     if (trace) {
         const Context& c = Ctx();
