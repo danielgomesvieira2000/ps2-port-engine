@@ -66,6 +66,17 @@ void Save(Device device, const std::string& context, const Table& table);
    (each key or button does one thing in a context). */
 void Bind(Table& table, int input, int physical);
 
+/* The engine's own keyboard mapping, for a port without its own controls
+   (no SetKeyboardMapper): the context "game" over the engine's keys (X
+   Cross, Z Square, C Circle, V Triangle, Q L1, E R1, 1 L2, 3 R2, the arrows,
+   Enter Start, Backspace Select), rebound in the PC settings panel's
+   Keyboard page. */
+const Table& GameKeys();
+/* `input` bound to the key `vk` there: swapped, saved. */
+void SetGameKey(int input, int vk);
+/* Whether the port maps the keyboard itself (its own controls). */
+bool PortMapsKeyboard();
+
 }  // namespace bindings
 }  // namespace ps2host
 

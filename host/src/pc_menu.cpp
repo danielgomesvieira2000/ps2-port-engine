@@ -7,7 +7,10 @@
  * with the PC settings (settings.h). While it is open the game gets no input.
  *
  * A port's own settings (AddPortOptions) follow as pages, each row opening
- * one: its options, then Back.
+ * one: its options, then Back. A port without controls of its own (no
+ * SetKeyboardMapper) has the Keyboard page: each of the DualShock 2's
+ * inputs and the key that holds it (bindings.h's GameKeys) - Enter, then the
+ * key to bind (Esc leaves it as it was).
  *
  *   Up / Down          choose
  *   Left / Right       change (Enter or Cross too; on a page's row, open it)
@@ -21,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "ps2host/bindings.h"
 #include "ps2host/high_fps.h"
 #include "ps2host/run.h"
 #include "ps2host/settings.h"
@@ -37,7 +41,16 @@ namespace {
 bool g_open = false;
 bool g_releasing = false;                // closed, the game's input held back until the keys are let go
 int g_row = 0;
-int g_page = -1;                          // a port's page open (Pages()' index), or -1: the first
+int g_page = -1;                          // a port's page open (Pages()' index), -1 the first, kKeyboard
+constexpr int kKeyboard = -2;             // the Keyboard page (GameKeys)
+int g_binding = -1;                       // the input a key is awaited for (the Keyboard page), or -1
+bool g_binding_armed = false;             // ...every key let go since it began
+
+/* The Keyboard page's rows, in the order a player thinks of them. */
+constexpr int kKeyRows[] = {bindings::kUp,     bindings::kDown, bindings::kLeft,   bindings::kRight,
+                            bindings::kCross,  bindings::kCircle, bindings::kSquare, bindings::kTriangle,
+                            bindings::kL1,     bindings::kR1,   bindings::kL2,     bindings::kR2,
+                            bindings::kL3,     bindings::kR3,   bindings::kStart,  bindings::kSelect};
 
 std::vector<PortOption>& PortOptions() {
     static std::vector<PortOption> options;
@@ -55,7 +68,7 @@ std::vector<std::string> Pages() {
 /* A row shown: the engine's setting, a page's link, a port's option, or the
    last (Close; Back on a page). */
 struct Row {
-    enum Kind { kChoice, kPage, kOption, kLast } kind;
+    enum Kind { kChoice, kPage, kOption, kKeyLink, kKey, kLast } kind;
     int index;
 };
 
@@ -139,6 +152,9 @@ std::vector<Row> Shown() {
         for (int i : Rows()) rows.push_back({Row::kChoice, i});
         const int pages = int(Pages().size());
         for (int p = 0; p < pages; ++p) rows.push_back({Row::kPage, p});
+        if (!bindings::PortMapsKeyboard()) rows.push_back({Row::kKeyLink, 0});
+    } else if (g_page == kKeyboard) {
+        for (int input : kKeyRows) rows.push_back({Row::kKey, input});
     } else {
         const std::string page = Pages()[std::size_t(g_page)];
         const auto& options = PortOptions();
@@ -154,8 +170,9 @@ std::string Padded(const std::string& label) {
 }
 
 void Draw(bool force = false) {
-    std::vector<std::string> lines = {g_page < 0 ? "PC SETTINGS   (F9 closes)"
-                                                 : "PC SETTINGS > " + Pages()[std::size_t(g_page)] + "   (F9 closes)"};
+    std::vector<std::string> lines = {g_page == kKeyboard ? "PC SETTINGS > Keyboard   (F9 closes)"
+                                      : g_page < 0           ? "PC SETTINGS   (F9 closes)"
+                                      : "PC SETTINGS > " + Pages()[std::size_t(g_page)] + "   (F9 closes)"};
     const std::vector<Row> rows = Shown();
     std::string help;
     for (int r = 0; r < int(rows.size()); ++r) {
@@ -165,6 +182,15 @@ void Draw(bool force = false) {
             text = g_page < 0 ? "Close" : "Back";
         } else if (row.kind == Row::kPage) {
             text = Pages()[std::size_t(row.index)] + "  >";
+        } else if (row.kind == Row::kKeyLink) {
+            text = "Keyboard  >";
+        } else if (row.kind == Row::kKey) {
+            const int vk = bindings::GameKeys().physical[row.index];
+            const char* key = vk ? bindings::KeyName(vk) : nullptr;
+            text = Padded(bindings::ButtonName(row.index, bindings::Style::kPlayStation)) +
+                   (g_binding == row.index ? std::string("< press a key, Esc leaves it >")
+                                           : "< " + std::string(key ? key : "NONE") + " >");
+            if (r == g_row) help = "Enter, then the key for it";
         } else if (row.kind == Row::kOption) {
             const PortOption& o = PortOptions()[std::size_t(row.index)];
             const int now = o.now ? o.now() : 0;
@@ -191,10 +217,10 @@ void Draw(bool force = false) {
 
 /* Back from a page to the first (its row chosen), or the panel closed. */
 void Back() {
-    if (g_page >= 0) {
+    if (g_page >= 0 || g_page == kKeyboard) {
         const int page = g_page;
         g_page = -1;
-        g_row = int(Rows().size()) + page;
+        g_row = page == kKeyboard ? int(Rows().size() + Pages().size()) : int(Rows().size()) + page;
         return;
     }
     g_open = false;
@@ -211,6 +237,16 @@ void Change(int step) {
     if (row.kind == Row::kPage) {
         g_page = row.index;
         g_row = 0;
+        return;
+    }
+    if (row.kind == Row::kKeyLink) {
+        g_page = kKeyboard;
+        g_row = 0;
+        return;
+    }
+    if (row.kind == Row::kKey) {
+        g_binding = row.index;
+        g_binding_armed = false;
         return;
     }
     if (row.kind == Row::kOption) {
@@ -307,11 +343,45 @@ void OpenPcMenu() {
     Draw(true);
 }
 
+/* A key awaited for the Keyboard page's input: the first one down once all
+   were let go, or Esc leaving it as it was. */
+void AwaitKey() {
+    if (!(WindowFocused() || KeysScripted())) return;
+    if (!g_binding_armed) {
+        g_binding_armed = !bindings::AnyKeyDown();
+        return;
+    }
+#ifdef _WIN32
+    if (HostKeyDown(VK_ESCAPE)) {
+        std::fprintf(stderr, "[pc menu] keyboard: %s left as it was\n",
+                     bindings::ButtonName(g_binding, bindings::Style::kPlayStation));
+        g_binding = -1;
+        return;
+    }
+#endif
+    for (int vk : bindings::BindableKeys())
+        if (HostKeyDown(vk)) {
+            bindings::SetGameKey(g_binding, vk);
+            std::fprintf(stderr, "[pc menu] keyboard: %s on %s\n",
+                         bindings::ButtonName(g_binding, bindings::Style::kPlayStation), bindings::KeyName(vk));
+            g_binding = -1;
+            return;
+        }
+}
+
 void UpdatePcMenu() {
     static std::array<bool, kInputs> before{};
     const std::array<bool, kInputs> now = Held();
     const bool was_open = g_open;
     auto went_down = [&](Input i) { return now[i] && !before[i]; };
+    if (g_open && g_binding >= 0 && !went_down(kToggle)) {
+        // The keys are the binding's until it is made (Esc too: not Back).
+        AwaitKey();
+        before = now;
+        Draw();
+        return;
+    }
+    g_binding = -1;
     if (went_down(kToggle)) {
         g_open = !g_open;
         g_row = 0;
