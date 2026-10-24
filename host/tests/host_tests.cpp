@@ -19,6 +19,9 @@
 #include "ps2host/dma.h"
 #include "ps2host/gs.h"
 #include "ps2host/host.h"
+#include "ps2host/hud.h"
+#include "ps2host/libnet.h"
+#include "ps2host/settings.h"
 #include "ps2host/run.h"
 #include "ps2host/ipu.h"
 #include "iop_vm_internal.h"
@@ -1795,7 +1798,105 @@ void OverlaysRunWhatIsLoaded() {
     ps2host::RegisterOverlays(nullptr, 0);
 }
 
+// The HUD's anchors: an element's key, its anchor from a setting or the
+// port's defaults (a key ending in '.' for every cell), and its placing.
+void HudAnchorsAndPlaces() {
+    namespace hud = ps2host::hud;
+    static const std::pair<const char*, hud::Anchor> defaults[] = {
+        {"hud.000010.000020.TL", hud::Anchor::kLeft},
+        {"hud.000010.000030.", hud::Anchor::kStretch},
+    };
+    hud::Game game;
+    game.defaults = defaults;
+    game.default_count = 2;
+    game.width = 512.0f;
+    hud::SetGame(game);
+    hud::ElementId id;
+    id.context = 0x10;
+    id.object = 0x20;
+    hud::CellOf(10.0f, 10.0f, id.cell);
+    Check(id.Key() == "hud.000010.000020.TL", "hud: an element's key names its context, object and cell");
+    Check(hud::AnchorOf(id) == hud::Anchor::kLeft && hud::AnchoringOf(id).given, "hud: a default anchor");
+    hud::ElementId other = id;
+    other.object = 0x30;
+    hud::CellOf(400.0f, 400.0f, other.cell);
+    Check(other.cell[0] == 'B' && other.cell[1] == 'R', "hud: a cell of the game's own picture (512 wide)");
+    Check(hud::AnchorOf(other) == hud::Anchor::kStretch, "hud: a default for the object in every cell");
+    hud::ElementId set = id;
+    set.object = 0x40;
+    ps2host::RunSetting(set.Key(), "right");
+    Check(hud::AnchorOf(set) == hud::Anchor::kRight, "hud: a setting's anchor");
+    set.object = 0x50;
+    Check(hud::AnchorOf(set) == hud::Anchor::kCentre && !hud::AnchoringOf(set).given, "hud: none named: centred");
+    Check(id < other && !(other < id), "hud: the editor's list goes top to bottom");
+    Check(hud::Place(100.0f, 320.0f, 320.0f, 0.75f, hud::Anchor::kCentre) == 155.0f, "hud: centred, brought in");
+    Check(hud::Place(100.0f, 320.0f, 320.0f, 0.75f, hud::Anchor::kLeft) == 75.0f, "hud: anchored left");
+    Check(hud::Place(600.0f, 320.0f, 320.0f, 0.75f, hud::Anchor::kRight) == 610.0f, "hud: anchored right");
+    Check(hud::Place(600.0f, 320.0f, 320.0f, 0.75f, hud::Anchor::kStretch) == 600.0f, "hud: stretched as drawn");
+    Check(hud::PlaceGs(0x8000 - 1600, 0x8000, 4096, 0.75f, hud::Anchor::kCentre) == 0x8000 - 1200,
+          "hud: GS units, rounded");
+    hud::SetGame(hud::Game{});
+}
+
+// libnet answered with the PC's sockets: two datagram sockets on the
+// loopback, one sending to the other, as a game's client wrappers call them
+// (client, buffer, then the arguments in a2, a3, t0..t3, the stack).
+void LibnetSendsDatagrams() {
+    namespace libnet = ps2host::libnet;
+    libnet::Client client;
+    client.create = 0x00510000u;
+    client.open = 0x00510100u;
+    client.close = 0x00510200u;
+    client.recv_from = 0x00510300u;
+    client.send_to = 0x00510400u;
+    libnet::Options options;
+    options.address_env = "PS2HOST_TEST_LAN_IP";
+    options.dump_env = nullptr;
+    _putenv_s("PS2HOST_TEST_LAN_IP", "127.0.0.1");
+    libnet::Register(client, options);
+    ps2host::Memory& m = ps2host::GuestMemory();
+    lifted::Context c{};
+    const auto call = [&](u32 at, std::initializer_list<u32> args) {
+        int i = 0;
+        for (u32 a : args) {
+            if (i < 6) c.r[6 + i] = a;
+            else m.Write(0x00520000u + u32(i - 6) * 4, a, 4);
+            ++i;
+        }
+        c.r[29] = 0x00520000u;
+        ps2host::Dispatch(c, at);
+        return s32(c.r[2]);
+    };
+    const u32 param = 0x00530000u, data = 0x00531000u, got = 0x00532000u, from = 0x00533000u;
+    const u32 kPortA = 39457, kPortB = 39458;
+    const auto create = [&](u32 port) {
+        for (u32 i = 0; i < 0x40; i += 4) m.Write(param + i, 0u, 4);
+        m.Write(param + 4, port, 4);                    // type 0 (datagram), the local port
+        return call(client.create, {param});
+    };
+    const s32 a = create(kPortA), b = create(kPortB);
+    Check(a > 0 && b > 0 && a != b, "libnet: sockets made");
+    Check(call(client.open, {u32(a), 0}) == 0 && call(client.open, {u32(b), 0}) == 0, "libnet: sockets opened");
+    const char hello[] = "hello";
+    for (u32 i = 0; i < 5; ++i) m.Write(data + i, u8(hello[i]), 1);
+    m.Write(from + 4, 0x7F000001u, 4);                  // 127.0.0.1, the EE's order
+    Check(call(client.send_to, {u32(a), data, 5, 0, from, kPortB, 0}) == 5, "libnet: a datagram sent");
+    s32 n = 0;
+    for (int tries = 0; tries < 200 && n <= 0; ++tries) {
+        n = call(client.recv_from, {u32(b), got, 64, 0, from, from + 0x20, 0});
+        if (n <= 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    bool same = n == 5;
+    for (u32 i = 0; same && i < 5; ++i) same = m.Read(got + i, 1) == u8(hello[i]);
+    Check(same, "libnet: the datagram received");
+    Check(m.Read(from + 4, 4) == 0x7F000001u && m.Read(from + 0x20, 4) == kPortA, "libnet: from whom, in the EE's order");
+    Check(call(client.recv_from, {u32(b), got, 64, 0, 0, 0, 0}) == 0, "libnet: nothing more: no wait");
+    Check(call(client.close, {u32(a), 0}) == 0 && call(client.close, {u32(b), 0}) == 0, "libnet: sockets closed");
+}
+
 int main() {
+    HudAnchorsAndPlaces();
+    LibnetSendsDatagrams();
     OverlaysRunWhatIsLoaded();
     MirrorsReachTheSameRam();
     LoadsExtendAsTheEeDoes();

@@ -48,6 +48,8 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/pc_menu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/window.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/settings.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/hud.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/libnet.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/timeline.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gs.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gs_thread.cpp
