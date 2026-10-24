@@ -1,7 +1,9 @@
 # EE kernel services by syscall number ($v1), from the documented platform ABI.
 # A negative number selects the interrupt-context variant of a service.
 # It lists the services met so far; extend it from the ABI documentation when a game
-# calls one that is missing, rather than from memory.
+# calls one that is missing, rather than from memory. 0x4A and 0x4B are numbered as
+# ps2sdk (ee/kernel/include/syscallnr.h), PCSX2 (R5900::bios) and the host's own
+# kernel (host/src/kernel.cpp) number them.
 service,name
 0x07,ExecPS2
 0x0D,SetVTLBRefillHandler
@@ -34,8 +36,8 @@ service,name
 0x42,SignalSema
 0x44,WaitSema
 0x45,PollSema
-0x4A,GetOsdConfigParam
-0x4B,SetOsdConfigParam
+0x4A,SetOsdConfigParam
+0x4B,GetOsdConfigParam
 0x56,Deci2Call_alt
 0x5A,MachineType_or_rfu
 0x5B,GetMemorySize_or_rfu

@@ -97,6 +97,21 @@ class TestNaming(unittest.TestCase):
         self.assertEqual(table[0x42], "SignalSema")
         self.assertEqual(table[-0x77], "iSifSetDma")
 
+    def test_the_osd_config_services_are_numbered_as_the_kernel_numbers_them(self):
+        # ps2sdk's ee/kernel/include/syscallnr.h, PCSX2's R5900::bios and the
+        # host's kernel.cpp: 0x4A sets the configuration, 0x4B reads it.
+        table = naming.syscall_table()
+        self.assertEqual(table[0x4A], "SetOsdConfigParam")
+        self.assertEqual(table[0x4B], "GetOsdConfigParam")
+
+    def test_the_library_names_kernel_stubs_as_the_service_table_does(self):
+        # A stub named in another game must not contradict the service numbers.
+        library = signatures.Library.load()
+        for service, name in naming.syscall_table().items():
+            found = library.name_for(sig([addiu(3, 0, service), SYSCALL, JR_RA, NOP]))
+            if found is not None:
+                self.assertEqual(found, name, "service %#x" % service)
+
     def _database(self, references):
         """Functions at 0x1000-spaced addresses, each referencing the given strings."""
         strings, xrefs, functions = [], [], []
