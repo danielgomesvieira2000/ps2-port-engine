@@ -59,9 +59,16 @@ struct PackedVertex {
     float s, t, q;
     std::uint32_t z;
     std::uint8_t fog, pad[3];
-    float range[4];             // a sprite's S, T at its first and last pixels (gs.vert)
-    float pad2[4];
 };
+// A sprite's S, T at its first and last pixels (gs.vert's `range`), in a
+// stream of its own: only a sprite or a flat quad on a target drawn larger
+// reads it (gs.frag's snap), so every other batch binds one value for all
+// its vertices (stride 0) - the vertex half the size it was with it inside,
+// half the bytes written, copied to the GPU and fetched there.
+struct VertexRange {
+    float range[4];
+};
+constexpr VertexRange kNoRange{{-1e9f, -1e9f, 1e9f, 1e9f}};
 // The vertex ring hands out 256-byte aligned runs, a batch's first vertex
 // found by its offset: whole vertices to 256 bytes.
 static_assert(256 % sizeof(PackedVertex) == 0, "a vertex must divide the ring's alignment");
@@ -93,6 +100,33 @@ public:
 
 private:
     std::unique_ptr<PackedVertex[]> data_;
+    std::size_t size_ = 0, capacity_ = 0;
+};
+
+/* A batch's ranges so far, in step with its vertices - kept only for a
+   batch that can read them (VulkanGsRenderer::RangesWanted). */
+class PendingRanges {
+public:
+    std::size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    void clear() { size_ = 0; }
+    VertexRange* data() { return data_.get(); }
+    VertexRange& operator[](std::size_t i) { return data_[i]; }
+    VertexRange* Grow(std::size_t n) {
+        if (size_ + n > capacity_) {
+            const std::size_t capacity = std::max<std::size_t>(capacity_ * 2, std::max<std::size_t>(size_ + n, 4096));
+            std::unique_ptr<VertexRange[]> data(new VertexRange[capacity]);
+            if (size_) std::memcpy(data.get(), data_.get(), size_ * sizeof(VertexRange));
+            data_ = std::move(data);
+            capacity_ = capacity;
+        }
+        VertexRange* at = data_.get() + size_;
+        size_ += n;
+        return at;
+    }
+
+private:
+    std::unique_ptr<VertexRange[]> data_;
     std::size_t size_ = 0, capacity_ = 0;
 };
 
@@ -697,6 +731,13 @@ private:
     Texture blank_;                 /* bound when nothing is textured */
     GsDrawState state_;
     PendingVertices pending_;
+    PendingRanges ranges_;          // empty, or as many as pending_ (RangesWanted)
+    /* Whether a batch can read its ranges: textured on a target drawn larger,
+       a sprite or a flat quad (DrawTriangles) - at the PS2's own resolution
+       none. */
+    bool RangesWanted(const GsDrawState& s) const {
+        return scale_ > 1 && s.textured && (s.sprite || !s.texture_target);
+    }
     /* Vertex data for what is recorded: appended to chunks of host-visible
        memory, all reusable once the submission that reads them has run. */
     struct VertexChunk {
@@ -765,7 +806,11 @@ private:
         VkRect2D scissor{};
         float size[2] = {-1, -1};
         VkBuffer vertices = VK_NULL_HANDLE;
+        VkBuffer ranges = VK_NULL_HANDLE;   // bound for all the vertices (stride 0), with `vertices`
     } drawn_;
+    // kNoRange, for a batch whose ranges are read but keep nothing in.
+    VkBuffer no_range_ = VK_NULL_HANDLE;
+    VkDeviceMemory no_range_memory_ = VK_NULL_HANDLE;
     // The CLUT for the draws (gs.frag's set 1): a target read as PSMT8H.
     VkDescriptorSetLayout clut_set_layout_ = VK_NULL_HANDLE;
     VkDescriptorSet clut_set_ = VK_NULL_HANDLE;
@@ -2167,17 +2212,18 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     const VkSpecializationMapEntry feature_entry{0, 0, sizeof features};
     VkSpecializationInfo specialisation{1, &feature_entry, sizeof features, &features};
     stages[1].pSpecializationInfo = &specialisation;
-    VkVertexInputBindingDescription binding{0, sizeof(PackedVertex), VK_VERTEX_INPUT_RATE_VERTEX};
+    const VkVertexInputBindingDescription bindings[2] = {{0, sizeof(PackedVertex), VK_VERTEX_INPUT_RATE_VERTEX},
+                                                         {1, sizeof(VertexRange), VK_VERTEX_INPUT_RATE_VERTEX}};
     VkVertexInputAttributeDescription attributes[6] = {
         {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(PackedVertex, x)},
         {1, 0, VK_FORMAT_R8G8B8A8_UNORM, offsetof(PackedVertex, r)},
         {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(PackedVertex, s)},
         {3, 0, VK_FORMAT_R32_UINT, offsetof(PackedVertex, z)},
         {4, 0, VK_FORMAT_R8_UNORM, offsetof(PackedVertex, fog)},
-        {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(PackedVertex, range)}};
+        {5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 0}};
     VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    input.vertexBindingDescriptionCount = 1;
-    input.pVertexBindingDescriptions = &binding;
+    input.vertexBindingDescriptionCount = 2;
+    input.pVertexBindingDescriptions = bindings;
     input.vertexAttributeDescriptionCount = 6;
     input.pVertexAttributeDescriptions = attributes;
     VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -2206,9 +2252,10 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     depth.back = depth.front;
     VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
                                        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
-                                       VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE};
+                                       VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+                                       VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = 6;
+    dynamic.dynamicStateCount = 7;
     dynamic.pDynamicStates = dynamic_states;
     const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
@@ -2903,8 +2950,8 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
                 SpriteSpan& o = sprites_[n];
                 auto widen = [&](int mine, int theirs, float value_mine, float value_theirs) {
                     range[mine] = value_mine;
-                    for (int k = 0; k < 6 && o.vertex + k < pending_.size(); ++k)
-                        pending_[o.vertex + k].range[theirs] = value_theirs;
+                    for (int k = 0; k < 6 && o.vertex + k < ranges_.size(); ++k)
+                        ranges_[o.vertex + k].range[theirs] = value_theirs;
                 };
                 if (same(o.y0, sp.y0) && same(o.y1, sp.y1) && same(o.t0, sp.t0) && same(o.t1, sp.t1)) {
                     if (same(o.x1, sp.x0) && same(o.s1, sp.s0))         // it, then this one to its right
@@ -2955,7 +3002,7 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
             FlatQuadRange(q, state);
             for (int n = 0; n < 4; ++n) range[n] = q.range[n];
             for (int k = 0; k < 3; ++k)
-                for (int n = 0; n < 4; ++n) pending_[q.vertex[0] + k].range[n] = q.range[n];
+                for (int n = 0; n < 4 && q.vertex[0] + k < ranges_.size(); ++n) ranges_[q.vertex[0] + k].range[n] = q.range[n];
             quads_.push_back(q);
             last_flat_valid_ = false;
         } else {
@@ -2965,6 +3012,17 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
             last_flat_.vertex = pending_.size();
             last_flat_valid_ = true;
         }
+    }
+    // The ranges kept in step with the vertices where this batch can read
+    // them (the earlier vertices' given none, should the batch start without).
+    VertexRange* range_out = nullptr;
+    if (RangesWanted(state) || !ranges_.empty()) {
+        const std::size_t behind = pending_.size() - ranges_.size();
+        VertexRange* fill = ranges_.Grow(behind + count / 3 * 3);
+        for (std::size_t i = 0; i < behind; ++i) fill[i] = kNoRange;
+        range_out = fill + behind;
+        for (std::size_t i = 0; i < count / 3 * 3; ++i)
+            for (int n = 0; n < 4; ++n) range_out[i].range[n] = range[n];
     }
     PackedVertex* out = pending_.Grow(count / 3 * 3);
     for (std::size_t i = 0; i + 2 < count; i += 3) {
@@ -2983,7 +3041,6 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
             out->q = p.q;
             out->z = p.z;
             out->fog = p.fog;
-            for (int n = 0; n < 4; ++n) out->range[n] = range[n];
         }
     }
 }
@@ -3036,7 +3093,7 @@ void VulkanGsRenderer::FlatQuadRange(FlatQuad& q, const GsDrawState& state) {
         if (changed)
             for (int t = 0; t < 2; ++t)
                 for (int k = 0; k < 3; ++k)
-                    for (int c = 0; c < 4; ++c) pending_[o.vertex[t] + k].range[c] = o.range[c];
+                    for (int c = 0; c < 4 && o.vertex[t] + k < ranges_.size(); ++c) ranges_[o.vertex[t] + k].range[c] = o.range[c];
     }
     for (int axis = 0; axis < 2; ++axis) {
         q.range[axis] = open_lo[axis] ? q.lo[axis] : std::min(q.lo[axis] + in[axis], 0.5f * (q.lo[axis] + q.hi[axis]));
@@ -3061,10 +3118,37 @@ void VulkanGsRenderer::Flush() {
     void* vertex_data = Vertices(bytes, &vertex_buffer, &vertex_offset);
     if (!vertex_data) {
         pending_.clear();
+        ranges_.clear();
         return;
     }
     std::memcpy(vertex_data, pending_.data(), bytes);
     Image* t = TargetFor(state_);
+    // The ranges (gs.vert): read only on a target drawn larger (gs.frag's
+    // snap) - there the batch's own, or the one that keeps nothing in for
+    // all its vertices (stride 0). Elsewhere nothing reads them: the
+    // vertices' own buffer stands in (stride 0), bound with them once a
+    // chunk of the ring as before.
+    VkBuffer range_buffer = vertex_buffer;      // (stride 0: one for all)
+    VkDeviceSize range_offset = 0;
+    const bool ranges_read = state_.textured && t->scale > 1;
+    const bool own_ranges = ranges_read && !ranges_.empty() && ranges_.size() == pending_.size();
+    if (own_ranges) {
+        const VkDeviceSize range_bytes = ranges_.size() * sizeof(VertexRange);
+        void* range_data = Vertices(range_bytes, &range_buffer, &range_offset);
+        if (!range_data) {
+            pending_.clear();
+            ranges_.clear();
+            return;
+        }
+        std::memcpy(range_data, ranges_.data(), range_bytes);
+    } else if (ranges_read) {
+        if (!no_range_) {
+            void* mapped = nullptr;
+            if (Buffer(sizeof kNoRange, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &no_range_, &no_range_memory_, &mapped))
+                std::memcpy(mapped, &kNoRange, sizeof kNoRange);
+        }
+        range_buffer = no_range_;
+    }
     // A target's own depth buffer is keyed past any ZBP (which has 9 bits).
     // A depth buffer is kDepthRows tall whatever draws with it (a 16-bit
     // target is twice as tall: the same memory), so it is one image.
@@ -3317,13 +3401,27 @@ void VulkanGsRenderer::Flush() {
                 d.size[1] = size[1];
                 vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, 8, size);
             }
-            // The ring's chunk bound once, at its start; the batch by its first vertex.
-            if (d.vertices != vertex_buffer) {
-                d.vertices = vertex_buffer;
-                const VkDeviceSize zero = 0;
-                vkCmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer, &zero);
+            // Without ranges read: the ring's chunk bound once, at its start,
+            // the batch by its first vertex. With them: the batch's vertices
+            // and ranges each where they are (the ranges' stride dynamic).
+            std::uint32_t first = 0;
+            if (!own_ranges) {
+                if (d.vertices != vertex_buffer || d.ranges != range_buffer) {
+                    d.vertices = vertex_buffer;
+                    d.ranges = range_buffer;
+                    const VkBuffer buffers[2] = {vertex_buffer, range_buffer};
+                    const VkDeviceSize offsets[2] = {0, 0};
+                    const VkDeviceSize strides[2] = {sizeof(PackedVertex), 0};
+                    vkCmdBindVertexBuffers2(cmd, 0, 2, buffers, offsets, nullptr, strides);
+                }
+                first = std::uint32_t(vertex_offset / sizeof(PackedVertex));
+            } else {
+                d.vertices = d.ranges = VK_NULL_HANDLE;
+                const VkBuffer buffers[2] = {vertex_buffer, range_buffer};
+                const VkDeviceSize offsets[2] = {vertex_offset, range_offset};
+                const VkDeviceSize strides[2] = {sizeof(PackedVertex), sizeof(VertexRange)};
+                vkCmdBindVertexBuffers2(cmd, 0, 2, buffers, offsets, nullptr, strides);
             }
-            const std::uint32_t first = std::uint32_t(vertex_offset / sizeof(PackedVertex));
             // PABE splits each pass again: blended where As >= 0x80 (the shader's
             // pabe 1), not blended below (pabe 2, the pipeline without blending).
             const bool split = state_.blend && state_.pabe;
@@ -3372,6 +3470,7 @@ void VulkanGsRenderer::Flush() {
         });
     }
     pending_.clear();
+    ranges_.clear();
 }
 
 bool VulkanGsRenderer::ReadDepth(std::uint32_t zbp, std::uint32_t width, std::uint32_t height,
@@ -3573,7 +3672,8 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (decode_pipeline_) vkDestroyPipeline(g_.device, decode_pipeline_, nullptr);
     if (decode_) vkDestroyShaderModule(g_.device, decode_, nullptr);
     for (auto [buffer, memory] : {std::pair{gsmem_, gsmem_memory_}, std::pair{linear_, linear_memory_},
-                                  std::pair{clut_, clut_memory_}, std::pair{tables_, tables_memory_}}) {
+                                  std::pair{clut_, clut_memory_}, std::pair{tables_, tables_memory_},
+                                  std::pair{no_range_, no_range_memory_}}) {
         if (buffer) vkDestroyBuffer(g_.device, buffer, nullptr);
         if (memory) vkFreeMemory(g_.device, memory, nullptr);
     }
