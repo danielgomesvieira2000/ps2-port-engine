@@ -48,6 +48,14 @@ namespace ps2host {
    written, timed - the GS thread's work for a capture's frames (the GS model,
    the GPU bridge, the renderer's recording), the same every run; with
    PS2HOST_REPLAY_SAMPLE=1 sampled too (the sampler's report after). */
+/* The calling thread's CPU time (user and kernel), in milliseconds. */
+double ThreadCpuMs() {
+    FILETIME created, exited, kernel, user;
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return 0;
+    auto ms = [](const FILETIME& t) { return double(u64(t.dwHighDateTime) << 32 | t.dwLowDateTime) / 10000.0; };
+    return ms(kernel) + ms(user);
+}
+
 int GsReplay(const std::string& file, const std::string& out) {
     std::FILE* f = std::fopen(file.c_str(), "rb");
     if (!f) {
@@ -102,6 +110,7 @@ int GsReplay(const std::string& file, const std::string& out) {
     const int repeat = std::getenv("PS2HOST_REPLAY_REPEAT") ? std::atoi(std::getenv("PS2HOST_REPLAY_REPEAT")) : 0;
     int pass = 0;
     std::chrono::steady_clock::time_point started;
+    double cpu_started = 0;
     for (;;) {
     while (at < data.size()) {
         const char kind = char(data[at++]);
@@ -174,6 +183,7 @@ int GsReplay(const std::string& file, const std::string& out) {
             SampleFrame(0);
         }
         started = std::chrono::steady_clock::now();
+        cpu_started = ThreadCpuMs();
     }
     if (pass++ >= repeat) break;
     timing = true;
@@ -186,7 +196,10 @@ int GsReplay(const std::string& file, const std::string& out) {
         // renderer on a thread of its own, its queue).
         if (gpu && g.on_memory) g.on_memory(0, 1, false);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-        std::fprintf(stderr, "gs-replay: %d passes, %.2f ms a pass (%d pictures each)\n", repeat, ms / repeat, pictures);
+        // The thread's own CPU as well: with a renderer on a thread of its
+        // own the passes' time may be that thread's (or the GPU's), not this.
+        std::fprintf(stderr, "gs-replay: %d passes, %.2f ms a pass (%d pictures each), this thread's CPU %.2f ms a pass\n",
+                     repeat, ms / repeat, pictures, (ThreadCpuMs() - cpu_started) / repeat);
         if (std::getenv("PS2HOST_REPLAY_SAMPLE"))
             std::printf("%s", SampleReport(std::getenv("PS2HOST_SAMPLE_TOP") ? std::atoi(std::getenv("PS2HOST_SAMPLE_TOP")) : 30).c_str());
     }
