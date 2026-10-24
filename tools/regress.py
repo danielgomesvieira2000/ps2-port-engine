@@ -55,6 +55,7 @@ def main(argv=None) -> int:
     parser.add_argument("--update", action="store_true", help="record this run's pictures as expected")
     parser.add_argument("--keep", help="keep the pictures in this directory")
     parser.add_argument("--exe", help="the port's executable to run (default: the one port.py builds)")
+    parser.add_argument("--log", metavar="FILE", help="the run's whole log (stderr) to FILE")
     parser.add_argument("--frame-times", type=int, default=0, metavar="N",
                         help="print the wall-clock frame rate every N frames (the run's --frame-times)")
     args = parser.parse_args(argv)
@@ -90,6 +91,9 @@ def main(argv=None) -> int:
     for line in result.stdout.splitlines():
         if line.startswith("time:") or line.startswith("gpu: "):
             print(line)
+    if args.log:
+        with open(args.log, "w", encoding="utf-8") as handle:
+            handle.write(result.stderr)
     for line in result.stderr.splitlines():
         if line.startswith("[frames]"):
             print(line)
