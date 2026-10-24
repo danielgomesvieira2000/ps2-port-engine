@@ -104,7 +104,7 @@ struct VuRunState {
 #else
 #define PS2HOST_VU_BLOCK
 #endif
-using VuBlock = void (PS2HOST_VU_BLOCK*)(Vu& vu, VuRunState& state, std::uint64_t limit);
+using VuBlock = void (PS2HOST_VU_BLOCK*)(Vu& __restrict vu, VuRunState& __restrict state, std::uint64_t limit);
 /* How a block goes on to the next where the generator knows which it is (the
    pair after it, a branch's target): straight into it, as Vu::RunCompiled's
    loop would have called it next - it starts only with as many pairs left

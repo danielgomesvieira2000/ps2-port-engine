@@ -1318,7 +1318,7 @@ def emit_block(name: str, block: list, pairs: dict, mask: int, drops: set = froz
     # dead_flags relies on; the first pair's flags are never left out.
     # `chain`: the program's blocks of the same kind by where they start, for
     # going straight on into the next (leave_to).
-    out = ["PS2HOST_VU_BLOCK void %s(Vu& v, VuRunState& s, std::uint64_t limit) {" % name,
+    out = ["PS2HOST_VU_BLOCK void %s(Vu& __restrict v, VuRunState& __restrict s, std::uint64_t limit) {" % name,
            "    if (s.count + %d > limit) return;" % len(block),
            "    u64 count = s.count, cyc = C::Cycle(v);",
            "    bool stopping = s.stopping;",
@@ -1340,7 +1340,7 @@ def emit_block(name: str, block: list, pairs: dict, mask: int, drops: set = froz
     # The blocks it goes on into, declared before it (they may be in another file).
     called = sorted(set(line.split("PS2HOST_VU_NEXT(")[1].split(")")[0]
                         for line in out if "PS2HOST_VU_NEXT(" in line))
-    return ["PS2HOST_VU_BLOCK void %s(Vu& v, VuRunState& s, std::uint64_t limit);" % c for c in called] + out
+    return ["PS2HOST_VU_BLOCK void %s(Vu& __restrict v, VuRunState& __restrict s, std::uint64_t limit);" % c for c in called] + out
 
 
 def runs_of(pairs: dict) -> list:
@@ -1428,7 +1428,7 @@ def generate_files(programs: list, what: str, single: str = None) -> dict:
                 if single is None and len(chunks[-1]) + len(code) > LINES_PER_FILE and chunks[-1]:
                     chunks.append([])
                 chunks[-1] += code + [""]
-                declarations.append("PS2HOST_VU_BLOCK void %s(Vu& v, VuRunState& s, std::uint64_t limit);" % block_name)
+                declarations.append("PS2HOST_VU_BLOCK void %s(Vu& __restrict v, VuRunState& __restrict s, std::uint64_t limit);" % block_name)
         tables.append("const u32 k%sCode[] = {" % name)
         tables.append(code_array(runs_of(pairs)))
         tables.append("};")
