@@ -205,7 +205,6 @@ void RunFmac(Context& c, const FmacOp& f) {
    PS2RT_EE_ROUND_NEAREST=1 leaves it to nearest, as emu.py's interpreter
    (eefpu.cpp: what verification compares against). */
 extern const bool kMacroNearest = std::getenv("PS2RT_EE_ROUND_NEAREST") != nullptr;
-bool g_macro_switch = !kMacroNearest;
 
 struct MacroRounding {
     unsigned saved = _mm_getcsr();
