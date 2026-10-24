@@ -148,7 +148,7 @@ std::vector<int> Rows() {
    an open page's options. */
 std::vector<Row> Shown() {
     std::vector<Row> rows;
-    if (g_page < 0) {
+    if (g_page == -1) {
         for (int i : Rows()) rows.push_back({Row::kChoice, i});
         const int pages = int(Pages().size());
         for (int p = 0; p < pages; ++p) rows.push_back({Row::kPage, p});
@@ -179,7 +179,7 @@ void Draw(bool force = false) {
         std::string text;
         const Row& row = rows[std::size_t(r)];
         if (row.kind == Row::kLast) {
-            text = g_page < 0 ? "Close" : "Back";
+            text = g_page == -1 ? "Close" : "Back";
         } else if (row.kind == Row::kPage) {
             text = Pages()[std::size_t(row.index)] + "  >";
         } else if (row.kind == Row::kKeyLink) {
