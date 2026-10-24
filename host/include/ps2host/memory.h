@@ -42,6 +42,12 @@ struct MemoryFault {
     bool write;
 };
 
+/* PCSX2's way with an access that hits no memory: a read finds 0 and a write
+   goes nowhere (each said once), instead of a MemoryFault stopping the run -
+   for code written against PCSX2 (a .pnach mod's, which may read through a
+   stale pointer and never notice there). Off by default. */
+void SetUnmappedIgnored(bool on);
+
 class Memory {
 public:
     Memory();
