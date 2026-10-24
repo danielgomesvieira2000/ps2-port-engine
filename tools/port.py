@@ -31,7 +31,12 @@ game's scripted runs (game.json's "pgo_runs", else all of port/runs), the
 counts merged into build/port/pgo.profdata - which every build after it is
 compiled with (--no-pgo: without), the branches laid out and the inlining
 chosen as the game runs: Burnout 3's EE and GS threads 10-12% less CPU in a
-race, the pictures the same. A profile from older code still serves: what
+race, the pictures the same. game.json's "pgo_env" gives a run environment
+variables of its own ({"run": {"NAME": "value"}}, a value's "{game}" the
+game's folder): a texture pack's folder, say, where one is on this PC - a
+path that does not exist leaves the variable out, the run as without it.
+What no run reaches is laid out as cold: train the paths players take
+(modern graphics, high frame rates, a pack). A profile from older code still serves: what
 changed since is compiled as without one. A game whose game.json says
 "lto": true is linked with ThinLTO too (clang-cl; PS2_LTO=on/off overrides):
 the host's functions the game's code calls inlined across files - Burnout
@@ -453,10 +458,18 @@ def pgo(game, generated: str) -> str:
     regress = os.path.join(os.path.dirname(os.path.abspath(__file__)), "regress.py")
     for name in runs:
         gpu = os.path.exists(game.path(os.path.join("port", "runs", name + ".gpu.crc")))
+        run_env = dict(env)
+        for key, value in (_game_json(game).get("pgo_env") or {}).get(name, {}).items():
+            value = value.replace("{game}", os.path.abspath(game.directory))
+            if os.sep in value or "/" in value:
+                if not os.path.exists(value):
+                    print("pgo: %s: %s not here, left out" % (name, value), flush=True)
+                    continue
+            run_env[key] = value
         print("pgo: %s" % name, flush=True)
         # (Its pictures checked as ever: a difference is reported, the counts kept.)
         subprocess.run([sys.executable, regress, "--game", game.directory, name, "--exe", counting]
-                       + (["--gpu"] if gpu else []), env=env)
+                       + (["--gpu"] if gpu else []), env=run_env)
     counts = [os.path.join(raw, f) for f in sorted(os.listdir(raw))
               if f.endswith(".profraw") and os.path.getsize(os.path.join(raw, f))]
     if not counts:
