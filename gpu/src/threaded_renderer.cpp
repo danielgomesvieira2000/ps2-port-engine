@@ -48,6 +48,7 @@ public:
         capacity_ = capacity;
     }
     std::size_t capacity() const { return capacity_; }
+    std::uint8_t* at(std::size_t offset) { return bytes_.get() + offset; }
     void append(const void* data, std::size_t size) {
         if (size_ + size > capacity_) reserve(std::max(capacity_ * 2, size_ + size));
         std::memcpy(bytes_.get() + size_, data, size);
@@ -100,8 +101,8 @@ public:
             }
         }
         if (has_last_ && std::memcmp(&state, &last_, sizeof state) == 0) {
-            Op(kDrawSame, sizeof n + n * sizeof(GsVertex));
-            Put(&n, sizeof n);
+            Same(vertices, n);
+            return;
         } else {
             std::memcpy(&last_, &state, sizeof state);
             has_last_ = true;
@@ -117,11 +118,7 @@ public:
        one field that path changes, is the last one's too. */
     void DrawTrianglesAgain(const GsDrawState& state, const GsVertex* vertices, std::size_t count) override {
         if (!has_last_ || state.gouraud != last_.gouraud) return DrawTriangles(state, vertices, count);
-        const std::uint32_t n = std::uint32_t(count);
-        Op(kDrawSame, sizeof n + n * sizeof(GsVertex));
-        Put(&n, sizeof n);
-        Put(vertices, n * sizeof(GsVertex));
-        End();
+        Same(vertices, std::uint32_t(count));
     }
     void Flush() override { Op(kFlush, 0); End(); }
     void Kick() override {
@@ -388,8 +385,44 @@ public:
     }
 
 private:
+    /* A primitive of the last state: added to the run of them the open
+       chunk ends with when it has as many vertices (3, or a sprite's 6) -
+       one record for the run, and on the renderer's thread one
+       DrawTriangleRun (most of a crash's ~120,000 primitives a picture come
+       in runs of one state: a record and a draw call each were a tenth of
+       the GS thread and two thirds of the renderer's). */
+    void Same(const GsVertex* vertices, std::uint32_t n) {
+        const std::size_t bytes = n * sizeof(GsVertex);
+        if (run_chunk_ == chunks_ && run_end_ == open_.size() && run_vertices_ == n) {
+            std::uint8_t* head = open_.at(run_at_);
+            std::uint32_t size, count;
+            std::memcpy(&size, head + 4, 4);
+            std::memcpy(&count, head + 12, 4);
+            size += std::uint32_t(bytes);
+            ++count;
+            std::memcpy(head + 4, &size, 4);
+            std::memcpy(head + 12, &count, 4);
+            Put(vertices, bytes);
+        } else {
+            run_at_ = open_.size();
+            run_chunk_ = chunks_;
+            run_vertices_ = n;
+            const std::uint32_t head[4] = {kDrawRun, std::uint32_t(8 + bytes), n, 1};
+            Put(head, sizeof head);
+            Put(vertices, bytes);
+        }
+        run_end_ = open_.size();
+        End();
+    }
+    // The run the open chunk ends with: where its record starts, the chunk
+    // it is in (Submit counts them), where it ends, its primitives' size.
+    std::size_t run_at_ = 0, run_end_ = 0;
+    std::uint64_t run_chunk_ = ~0ull;
+    std::uint32_t run_vertices_ = 0;
+    mutable std::uint64_t chunks_ = 0;
+
     enum : std::uint32_t {
-        kDraw, kDrawSame, kFlush, kKick, kUploadTexture, kUseReplacement, kUploadDepth, kUploadTarget,
+        kDrawRun, kDraw, kDrawSame, kFlush, kKick, kUploadTexture, kUseReplacement, kUploadDepth, kUploadTarget,
         kReleaseTexture, kMemoryWrite, kMemoryPatch, kTargetFromMemory, kDepthFromMemory, kTextureFromMemory,
         kClutFromMemory, kClutRows, kReloadKeepsColour, kTargetRowsFromMemory, kDepthRowsFromMemory,
         kTargetToMemory, kDepthToMemory, kChannelShuffle, kRunEffect, kUploadReplacement,
@@ -448,6 +481,7 @@ private:
             }
         }
         open_.clear();
+        ++chunks_;
         if (open_.capacity() < kChunk) open_.reserve(kChunk + 4096);
         wake_.notify_one();
     }
@@ -495,6 +529,13 @@ private:
             const std::uint32_t size = Take<std::uint32_t>(at);
             const std::uint8_t* const next = at + size;
             switch (op) {
+                case kDrawRun: {
+                    const std::uint32_t n = Take<std::uint32_t>(at), count = Take<std::uint32_t>(at);
+                    vertices_.resize(std::size_t(n) * count);
+                    std::memcpy(vertices_.data(), at, vertices_.size() * sizeof(GsVertex));
+                    r.DrawTriangleRun(played_, vertices_.data(), n, count);
+                    break;
+                }
                 case kDraw:
                 case kDrawSame: {
                     if (op == kDraw) std::memcpy(&played_, at, sizeof played_), at += sizeof played_;

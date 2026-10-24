@@ -278,6 +278,14 @@ public:
     virtual void DrawTrianglesAgain(const GsDrawState& state, const GsVertex* vertices, std::size_t count) {
         DrawTriangles(state, vertices, count);
     }
+    /* `prims` primitives of `per` vertices each (3, or a sprite's 6), one
+       after another in one state: as DrawTriangles for each, in order - a
+       renderer may take them at once where nothing it does looks at them a
+       primitive at a time. */
+    virtual void DrawTriangleRun(const GsDrawState& state, const GsVertex* vertices, std::size_t per,
+                                 std::size_t prims) {
+        for (std::size_t i = 0; i < prims; ++i) DrawTriangles(state, vertices + i * per, per);
+    }
     /* Runs what has been drawn. */
     virtual void Flush() = 0;
     /* Hands what has been recorded to the GPU without waiting for it (once a

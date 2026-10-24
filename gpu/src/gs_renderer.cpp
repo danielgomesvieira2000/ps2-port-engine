@@ -476,6 +476,11 @@ public:
         return targets_.count(Key{fbp, fbw, psm}) != 0;
     }
     void DrawTriangles(const GsDrawState& state, const GsVertex* vertices, std::size_t count) override;
+    void DrawTriangleRun(const GsDrawState& state, const GsVertex* vertices, std::size_t per,
+                         std::size_t prims) override;
+    /* The batch's vertices (and ranges, where it keeps them) for `count`
+       vertices, three a triangle, each with `range`. */
+    void Append(const GsDrawState& state, const GsVertex* v, std::size_t count, const float* range);
     void Flush() override;
     void Kick() override {
         Flush();
@@ -3013,6 +3018,34 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
             last_flat_valid_ = true;
         }
     }
+    Append(state, v, count, range);
+}
+
+/* A run of primitives in one state (the bridge's fast path, handed over as
+   one): appended at once where none of what DrawTriangles does a primitive
+   at a time applies - a target sampled as it is drawn, a blend in the
+   shader, an alpha test in two passes, a sprite's or flat quad's range on a
+   target drawn larger. Else each as DrawTriangles. */
+void VulkanGsRenderer::DrawTriangleRun(const GsDrawState& state, const GsVertex* v, std::size_t per,
+                                       std::size_t prims) {
+    const bool feedback = state.textured && state.texture_target && state.tex_fbp == state.fbp &&
+                          state.tex_fbw == state.fbw;
+    const bool depth_written = state.depth && state.depth_write;
+    const bool two_pass = state.alpha_test && state.atst != 1 &&
+                          (((state.afail == 1 || state.afail == 2) && depth_written) || state.afail == 3);
+    if (per < 3 || per % 3 || feedback || ShaderBlend(state) || two_pass || state.sprite ||
+        (scale_ > 1 && state.textured && !state.texture_target)) {
+        for (std::size_t i = 0; i < prims; ++i) DrawTriangles(state, v + i * per, per);
+        return;
+    }
+    RecordShuffle();
+    if (!SameBatch(state, state_)) Flush();
+    state_ = state;
+    last_flat_valid_ = false;
+    Append(state, v, per * prims, kNoRange.range);
+}
+
+void VulkanGsRenderer::Append(const GsDrawState& state, const GsVertex* v, std::size_t count, const float* range) {
     // The ranges kept in step with the vertices where this batch can read
     // them (the earlier vertices' given none, should the batch start without).
     VertexRange* range_out = nullptr;
