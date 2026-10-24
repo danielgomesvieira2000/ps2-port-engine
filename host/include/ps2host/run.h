@@ -407,6 +407,18 @@ std::vector<PcSetting> PcSettings();
 void StepPcSetting(int index, int step);
 /* The panel opened from a game's own menu (a port's PC SETTINGS entry). */
 void OpenPcMenu();
+/* A port's own settings, in the panel too: a page for each `page` named,
+   after the engine's rows, opened to its options - the same table a port's
+   own PC SETTINGS pages show (Burnout 3's GRAPHICS, MODS...), so either
+   place changes them. `now` is the value's index among `values` (as shown,
+   in capitals), `set` makes another the setting. Added once, at start. */
+struct PortOption {
+    std::string page, name, help;
+    std::vector<std::string> values;
+    int (*now)() = nullptr;
+    void (*set)(int) = nullptr;
+};
+void AddPortOptions(const std::vector<PortOption>& options);
 /* A port's EXIT GAME: the run ends as when the window is closed. */
 void QuitGame();
 /* A port's look at the 2D on its way to the GS (VIF1 DIRECT, PATH2): each

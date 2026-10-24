@@ -6,12 +6,18 @@
  * settings the host itself applies, changed while the game runs and saved
  * with the PC settings (settings.h). While it is open the game gets no input.
  *
+ * A port's own settings (AddPortOptions) follow as pages, each row opening
+ * one: its options, then Back.
+ *
  *   Up / Down          choose
- *   Left / Right       change (Enter or Cross too)
- *   F9, Esc, Circle    close
+ *   Left / Right       change (Enter or Cross too; on a page's row, open it)
+ *   Esc, Circle        back from a page; close
+ *   F9                 close
  */
 
+#include <algorithm>
 #include <array>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -31,6 +37,27 @@ namespace {
 bool g_open = false;
 bool g_releasing = false;                // closed, the game's input held back until the keys are let go
 int g_row = 0;
+int g_page = -1;                          // a port's page open (Pages()' index), or -1: the first
+
+std::vector<PortOption>& PortOptions() {
+    static std::vector<PortOption> options;
+    return options;
+}
+
+/* The ports' pages, in the order first named. */
+std::vector<std::string> Pages() {
+    std::vector<std::string> pages;
+    for (const PortOption& o : PortOptions())
+        if (std::find(pages.begin(), pages.end(), o.page) == pages.end()) pages.push_back(o.page);
+    return pages;
+}
+
+/* A row shown: the engine's setting, a page's link, a port's option, or the
+   last (Close; Back on a page). */
+struct Row {
+    enum Kind { kChoice, kPage, kOption, kLast } kind;
+    int index;
+};
 
 struct Choice {
     const char* label;
@@ -89,7 +116,7 @@ const std::vector<Choice>& Choices() {
     return choices;
 }
 
-// The rows shown: a texture pack's only when one is loaded; then Close.
+// The engine's rows shown: a texture pack's only when one is loaded.
 std::vector<int> Rows() {
     std::vector<int> rows;
     const auto& c = Choices();
@@ -101,19 +128,51 @@ std::vector<int> Rows() {
         if (label == "Frame rate " && HighFpsOwnRate() != 60.0) continue;
         if (label != "Texture pack" || texture_pack::Count()) rows.push_back(i);
     }
-    rows.push_back(-1);
     return rows;
 }
 
+/* What the panel shows now: the first page's rows and the ports' pages, or
+   an open page's options. */
+std::vector<Row> Shown() {
+    std::vector<Row> rows;
+    if (g_page < 0) {
+        for (int i : Rows()) rows.push_back({Row::kChoice, i});
+        const int pages = int(Pages().size());
+        for (int p = 0; p < pages; ++p) rows.push_back({Row::kPage, p});
+    } else {
+        const std::string page = Pages()[std::size_t(g_page)];
+        const auto& options = PortOptions();
+        for (int i = 0; i < int(options.size()); ++i)
+            if (options[std::size_t(i)].page == page) rows.push_back({Row::kOption, i});
+    }
+    rows.push_back({Row::kLast, -1});
+    return rows;
+}
+
+std::string Padded(const std::string& label) {
+    return label + std::string(std::size_t(20) - std::min<std::size_t>(19, label.size()), ' ');
+}
+
 void Draw(bool force = false) {
-    std::vector<std::string> lines = {"PC SETTINGS   (F9 closes)"};
-    const std::vector<int> rows = Rows();
+    std::vector<std::string> lines = {g_page < 0 ? "PC SETTINGS   (F9 closes)"
+                                                 : "PC SETTINGS > " + Pages()[std::size_t(g_page)] + "   (F9 closes)"};
+    const std::vector<Row> rows = Shown();
+    std::string help;
     for (int r = 0; r < int(rows.size()); ++r) {
         std::string text;
-        if (rows[r] < 0) {
-            text = "Close";
+        const Row& row = rows[std::size_t(r)];
+        if (row.kind == Row::kLast) {
+            text = g_page < 0 ? "Close" : "Back";
+        } else if (row.kind == Row::kPage) {
+            text = Pages()[std::size_t(row.index)] + "  >";
+        } else if (row.kind == Row::kOption) {
+            const PortOption& o = PortOptions()[std::size_t(row.index)];
+            const int now = o.now ? o.now() : 0;
+            const std::string shown = now >= 0 && now < int(o.values.size()) ? o.values[std::size_t(now)] : "?";
+            text = Padded(o.name) + "< " + shown + " >";
+            if (r == g_row) help = o.help;
         } else {
-            const Choice& c = Choices()[rows[r]];
+            const Choice& c = Choices()[std::size_t(row.index)];
             const std::string now = c.get();
             std::string shown = now;
             for (std::size_t i = 0; i < c.values.size(); ++i)
@@ -124,21 +183,47 @@ void Draw(bool force = false) {
         lines.push_back((r == g_row ? "> " : "  ") + text);
     }
     lines.push_back("");
-    lines.push_back("Up/Down choose, Left/Right change");
+    lines.push_back(help.empty() ? "Up/Down choose, Left/Right change" : help);
     static std::vector<std::string> shown;
     if (force || lines != shown) SetWindowOverlay(lines);     // drawn again only when it changes
     shown = lines;
 }
 
-void Change(int step) {
-    const std::vector<int> rows = Rows();
-    const int which = rows[std::size_t(g_row)];
-    if (which < 0) {
-        g_open = false;
-        SetWindowOverlay({});
+/* Back from a page to the first (its row chosen), or the panel closed. */
+void Back() {
+    if (g_page >= 0) {
+        const int page = g_page;
+        g_page = -1;
+        g_row = int(Rows().size()) + page;
         return;
     }
-    const Choice& c = Choices()[which];
+    g_open = false;
+    SetWindowOverlay({});
+}
+
+void Change(int step) {
+    const std::vector<Row> rows = Shown();
+    const Row row = rows[std::size_t((std::min)(g_row, int(rows.size()) - 1))];
+    if (row.kind == Row::kLast) {
+        Back();
+        return;
+    }
+    if (row.kind == Row::kPage) {
+        g_page = row.index;
+        g_row = 0;
+        return;
+    }
+    if (row.kind == Row::kOption) {
+        const PortOption& o = PortOptions()[std::size_t(row.index)];
+        const int count = int(o.values.size());
+        if (!o.now || !o.set || count == 0) return;
+        o.set(((o.now() + step) % count + count) % count);
+        const int now = o.now();
+        std::fprintf(stderr, "[pc menu] %s: %s %s\n", o.page.c_str(), o.name.c_str(),
+                     now >= 0 && now < count ? o.values[std::size_t(now)].c_str() : "?");
+        return;
+    }
+    const Choice& c = Choices()[std::size_t(row.index)];
     const std::string now = c.get();
     int at = 0;
     for (int i = 0; i < int(c.values.size()); ++i)
@@ -152,7 +237,7 @@ enum Input { kToggle, kUp, kDown, kLeft, kRight, kAccept, kBack, kInputs };
 
 std::array<bool, kInputs> Held() {
     std::array<bool, kInputs> held{};
-    const bool focused = WindowFocused();
+    const bool focused = WindowFocused() || KeysScripted();     // a scripted run's keys (--key) in the background too
 #ifdef _WIN32
     auto key = [&](int vk) { return focused && HostKeyDown(vk); };
     held[kToggle] = key(VK_F9);
@@ -180,10 +265,13 @@ std::array<bool, kInputs> Held() {
 
 }  // namespace
 
+void AddPortOptions(const std::vector<PortOption>& options) {
+    PortOptions().insert(PortOptions().end(), options.begin(), options.end());
+}
+
 std::vector<PcSetting> PcSettings() {
     std::vector<PcSetting> settings;
     for (int i : Rows()) {
-        if (i < 0) continue;
         const Choice& c = Choices()[std::size_t(i)];
         const std::string now = c.get();
         std::string value = now;
@@ -197,7 +285,6 @@ std::vector<PcSetting> PcSettings() {
 void StepPcSetting(int index, int step) {
     int n = 0;
     for (int i : Rows()) {
-        if (i < 0) continue;
         if (n++ != index) continue;
         const Choice& c = Choices()[std::size_t(i)];
         const std::string now = c.get();
@@ -216,6 +303,7 @@ void OpenPcMenu() {
     if (g_open) return;
     g_open = true;
     g_row = 0;
+    g_page = -1;
     Draw(true);
 }
 
@@ -224,19 +312,23 @@ void UpdatePcMenu() {
     const std::array<bool, kInputs> now = Held();
     const bool was_open = g_open;
     auto went_down = [&](Input i) { return now[i] && !before[i]; };
-    if (went_down(kToggle) || (g_open && went_down(kBack))) {
+    if (went_down(kToggle)) {
         g_open = !g_open;
         g_row = 0;
+        g_page = -1;
         if (!g_open) SetWindowOverlay({});
         else Draw(true);
+    } else if (g_open && went_down(kBack)) {
+        Back();
     } else if (g_open) {
-        const int rows = int(Rows().size());
+        const int rows = int(Shown().size());
         if (went_down(kUp)) g_row = (g_row + rows - 1) % rows;
         if (went_down(kDown)) g_row = (g_row + 1) % rows;
         if (went_down(kLeft)) Change(-1);
         if (went_down(kRight) || went_down(kAccept)) Change(+1);
     }
     before = now;
+    if (g_open != was_open) std::fprintf(stderr, "[pc menu] %s\n", g_open ? "open" : "closed");
     if (!g_open && was_open) g_releasing = true;
     if (g_releasing) {
         bool any = false;
