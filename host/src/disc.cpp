@@ -1,6 +1,8 @@
 #include "ps2host/disc.h"
 
+#include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -64,7 +66,11 @@ const u8 kSync[12] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
 
 u8 ToBcd(u32 v) { return u8((v / 10) << 4 | (v % 10)); }
 
+void (*g_on_open)() = nullptr;
+
 }  // namespace
+
+void Disc::OnOpen(void (*hook)()) { g_on_open = hook; }
 
 bool Disc::Open(const std::string& path) {
     if (file_) std::fclose(file_);
@@ -80,6 +86,12 @@ bool Disc::Open(const std::string& path) {
     _fseeki64(file_, 0, SEEK_END);
     size_ = u64(_ftelli64(file_));
     DetectFormat();
+    files_.clear();
+    patched_.clear();
+    opening_ = true;                    // (AddFile then only keeps the file)
+    if (g_on_open) g_on_open();
+    opening_ = false;
+    ApplyFiles();
     return true;
 }
 
@@ -87,6 +99,8 @@ void Disc::Use(std::vector<u8> image) {
     memory_ = std::move(image);
     size_ = memory_.size();
     DetectFormat();
+    files_.clear();
+    patched_.clear();
 }
 
 // A raw image: every sector starts with the sync pattern, and sector 16 - the
@@ -116,6 +130,29 @@ bool Disc::ReadBytes(u64 offset, u64 length, u8* out) {
 }
 
 bool Disc::Read(u32 lsn, u32 count, u8* out) {
+    if (patched_.empty() && files_.empty()) return BaseRead(lsn, count, out);
+    // The overlay's sectors one at a time, a run of the image's own at once.
+    for (u32 i = 0; i < count;) {
+        u8* dst = out + std::size_t(i) * kSectorSize;
+        if (SectorAt(lsn + i, dst)) {
+            ++i;
+            continue;
+        }
+        u32 run = 1;
+        while (i + run < count) {
+            const u32 next = lsn + i + run;
+            bool overlaid = next >= sectors_;
+            for (const auto& p : patched_) overlaid = overlaid || p.first == next;
+            if (overlaid) break;
+            ++run;
+        }
+        if (!BaseRead(lsn + i, run, dst)) return false;
+        i += run;
+    }
+    return true;
+}
+
+bool Disc::BaseRead(u32 lsn, u32 count, u8* out) {
     if (u64(lsn) + count > sectors_) return false;
     if (!data_offset_) return ReadBytes(u64(lsn) * kSectorSize, u64(count) * kSectorSize, out);
     // Raw: read the whole run at once, then keep each sector's data.
@@ -228,6 +265,188 @@ std::string Disc::BootPath() {
         return colon == std::string::npos ? value : value.substr(colon + 1);
     }
     return "";
+}
+
+// ---------------------------------------------------------------- the overlay (AddFile)
+
+namespace {
+
+void PutBoth32(u8* p, u32 v) {              // ISO 9660's both-endian word
+    p[0] = u8(v); p[1] = u8(v >> 8); p[2] = u8(v >> 16); p[3] = u8(v >> 24);
+    p[4] = u8(v >> 24); p[5] = u8(v >> 16); p[6] = u8(v >> 8); p[7] = u8(v);
+}
+
+// A directory record: a file ("NAME.EXT;1") or a directory (flags 2).
+std::vector<u8> Record(const std::string& name, u32 lsn, u32 size, bool directory) {
+    const std::size_t length = (33 + name.size() + 1) & ~std::size_t(1);
+    std::vector<u8> r(length, 0);
+    r[0] = u8(length);
+    PutBoth32(&r[2], lsn);
+    PutBoth32(&r[10], size);
+    const u8 date[7] = {104, 9, 7, 12, 0, 0, 0};        // 2004-09-07 12:00
+    std::memcpy(&r[18], date, 7);
+    r[25] = directory ? 2 : 0;
+    r[28] = 1;                                          // volume sequence number 1, both-endian
+    r[31] = 1;
+    r[32] = u8(name.size());
+    std::memcpy(&r[33], name.data(), name.size());
+    return r;
+}
+
+}  // namespace
+
+void Disc::AddFile(const std::string& path, std::vector<u8> data) {
+    std::string key = path;
+    for (char& ch : key) if (ch == '\\') ch = '/';
+    key = Upper(key);
+    auto same = std::find_if(files_.begin(), files_.end(), [&](const Overlaid& f) { return f.path == key; });
+    if (same != files_.end()) same->data = std::move(data);
+    else files_.push_back(Overlaid{key, std::move(data)});
+    if (IsOpen() && !opening_) ApplyFiles();
+}
+
+bool Disc::SectorAt(u32 lsn, u8* out) {
+    for (const auto& p : patched_)
+        if (p.first == lsn) {
+            std::memcpy(out, p.second.data(), kSectorSize);
+            return true;
+        }
+    for (const Overlaid& f : files_)
+        if (f.sectors && lsn >= f.lsn && lsn < f.lsn + f.sectors) {
+            std::memset(out, 0, kSectorSize);
+            const std::size_t from = std::size_t(lsn - f.lsn) * kSectorSize;
+            if (from < f.data.size())
+                std::memcpy(out, f.data.data() + from, std::min<std::size_t>(kSectorSize, f.data.size() - from));
+            return true;
+        }
+    return false;
+}
+
+u8* Disc::Patch(u32 lsn) {
+    for (auto& p : patched_)
+        if (p.first == lsn) return p.second.data();
+    std::vector<u8> sector(kSectorSize, 0);
+    if (!SectorAt(lsn, sector.data()) && lsn < sectors_) BaseRead(lsn, 1, sector.data());
+    patched_.emplace_back(lsn, std::move(sector));
+    return patched_.back().second.data();
+}
+
+void Disc::ApplyFiles() {
+    patched_.clear();
+    for (Overlaid& f : files_) f.sectors = 0;
+    if (files_.empty() || !IsOpen()) return;
+    next_virtual_ = (sectors_ + 0xFFF) & ~0xFFFu;      // past the image, a round number
+    for (Overlaid& f : files_)
+        if (!PlaceFile(f)) std::fprintf(stderr, "[disc] %s: not laid over the disc\n", f.path.c_str());
+}
+
+/* One file of the overlay: its directories found (or made) from the root,
+   its data placed past the image, then its record changed (a file of the
+   disc's) or added. */
+bool Disc::PlaceFile(Overlaid& file) {
+    std::vector<std::string> parts;
+    for (std::size_t at = 0; at <= file.path.size();) {
+        std::size_t end = file.path.find('/', at);
+        if (end == std::string::npos) end = file.path.size();
+        if (end > at) parts.push_back(file.path.substr(at, end - at));
+        at = end + 1;
+    }
+    if (parts.empty() || file.data.size() > 0xFFFFFFFFull) return false;
+    // A directory, and where its own record is: (sector, offset) - the
+    // root's in the volume descriptor.
+    struct Dir {
+        u32 lsn = 0, size = 0;
+        u32 record_lsn = 0, record_at = 0;
+    };
+    std::vector<u8> sector(kSectorSize);
+    if (!Read(16, 1, sector.data()) || sector[0] != 1 || std::memcmp(&sector[1], "CD001", 5) != 0) return false;
+    Dir dir{Le32(&sector[156 + 2]), Le32(&sector[156 + 10]), 16, 156};
+    // A record of `d` by name: its sector and offset.
+    auto find = [&](const Dir& d, const std::string& name, u32* at_lsn, u32* at) {
+        const u32 sectors = (d.size + kSectorSize - 1) / kSectorSize;
+        for (u32 s = 0; s < sectors; ++s) {
+            if (!Read(d.lsn + s, 1, sector.data())) return false;
+            for (u32 o = 0; o < kSectorSize;) {
+                const u8 length = sector[o];
+                if (length == 0 || o + length > kSectorSize) break;
+                const u8 n = sector[o + 32];
+                const std::string got(reinterpret_cast<const char*>(&sector[o + 33]), n);
+                if ((n > 1 || (n == 1 && got[0] > 1)) && Bare(got) == Bare(name)) {
+                    *at_lsn = d.lsn + s;
+                    *at = o;
+                    return true;
+                }
+                o += length;
+            }
+        }
+        return false;
+    };
+    // A record added to `d`: in its last sector, or - that one full - the
+    // directory moved past the image's end with a sector more.
+    auto append = [&](Dir& d, const std::vector<u8>& record) {
+        const u32 sectors = (d.size + kSectorSize - 1) / kSectorSize;
+        u8* tail = Patch(d.lsn + sectors - 1);
+        u32 used = 0;
+        while (used < kSectorSize && tail[used] != 0) used += tail[used];
+        if (used + record.size() <= kSectorSize) {
+            std::memcpy(tail + used, record.data(), record.size());
+            return;
+        }
+        const u32 moved = next_virtual_;
+        next_virtual_ += sectors + 1;
+        for (u32 s = 0; s < sectors; ++s) {
+            std::vector<u8> copy(kSectorSize);
+            Read(d.lsn + s, 1, copy.data());
+            std::memcpy(Patch(moved + s), copy.data(), kSectorSize);
+        }
+        u8* fresh = Patch(moved + sectors);
+        std::memset(fresh, 0, kSectorSize);
+        std::memcpy(fresh, record.data(), record.size());
+        d.lsn = moved;
+        d.size = (sectors + 1) * kSectorSize;
+        // Its own "." record, and its record in its parent (or the volume's).
+        u8* self = Patch(moved);
+        PutBoth32(self + 2, d.lsn);
+        PutBoth32(self + 10, d.size);
+        u8* parent = Patch(d.record_lsn);
+        PutBoth32(parent + d.record_at + 2, d.lsn);
+        PutBoth32(parent + d.record_at + 10, d.size);
+    };
+    for (std::size_t i = 0; i + 1 < parts.size(); ++i) {
+        u32 at_lsn = 0, at = 0;
+        if (find(dir, parts[i], &at_lsn, &at)) {
+            Read(at_lsn, 1, sector.data());
+            if (!(sector[at + 25] & 2)) return false;           // a file of that name
+            dir = Dir{Le32(&sector[at + 2]), Le32(&sector[at + 10]), at_lsn, at};
+            continue;
+        }
+        // A new directory: "." and "..", then its record in this one.
+        const u32 made = next_virtual_++;
+        u8* first = Patch(made);
+        std::memset(first, 0, kSectorSize);
+        const std::vector<u8> self = Record(std::string(1, char(0)), made, kSectorSize, true);
+        const std::vector<u8> up = Record(std::string(1, char(1)), dir.lsn, dir.size, true);
+        std::memcpy(first, self.data(), self.size());
+        std::memcpy(first + self.size(), up.data(), up.size());
+        append(dir, Record(parts[i], made, kSectorSize, true));
+        if (!find(dir, parts[i], &at_lsn, &at)) return false;
+        dir = Dir{made, kSectorSize, at_lsn, at};
+    }
+    // The file's data past the image's end.
+    const u32 size = u32(file.data.size());
+    file.lsn = next_virtual_;
+    file.sectors = std::max<u32>(1, (size + kSectorSize - 1) / kSectorSize);
+    next_virtual_ += file.sectors;
+    u32 at_lsn = 0, at = 0;
+    const std::string& name = parts.back();
+    if (find(dir, name, &at_lsn, &at)) {
+        u8* record = Patch(at_lsn);
+        PutBoth32(record + at + 2, file.lsn);
+        PutBoth32(record + at + 10, size);
+        return true;
+    }
+    append(dir, Record(name.find(';') == std::string::npos ? name + ";1" : name, file.lsn, size, false));
+    return true;
 }
 
 Disc& GuestDisc() {

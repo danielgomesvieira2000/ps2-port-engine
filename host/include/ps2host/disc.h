@@ -13,6 +13,7 @@
 
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "ps2rt/types.h"
@@ -57,9 +58,35 @@ public:
        the disc ("\\SLUS_210.50;1"); "" when the image has none (not a PS2 disc). */
     std::string BootPath();
 
+    /* A file laid over the disc's (a port's own, made from the disc's files):
+       the disc's file of that path replaced, or one added to its directory
+       (made if need be) - case does not matter. The game sees it through the
+       directory sectors it reads, changed here, and its data in sectors past
+       the image's end; the image itself is never written. Kept until the
+       next Open. */
+    void AddFile(const std::string& path, std::vector<u8> data);
+    /* Called as a disc opens, before anything is read from it: a port's
+       chance to AddFile (reading the disc's own files for them). */
+    static void OnOpen(void (*hook)());
+
 private:
     void DetectFormat();
     bool ReadBytes(u64 offset, u64 length, u8* out);
+    bool BaseRead(u32 lsn, u32 count, u8* out);
+    // The overlay (AddFile): sectors changed or made, and the files' data.
+    struct Overlaid {
+        std::string path;
+        std::vector<u8> data;
+        u32 lsn = 0, sectors = 0;
+    };
+    void ApplyFiles();
+    bool PlaceFile(Overlaid& file);
+    bool SectorAt(u32 lsn, u8* out);
+    u8* Patch(u32 lsn);
+    std::vector<Overlaid> files_;
+    std::vector<std::pair<u32, std::vector<u8>>> patched_;     // (lsn, 2048 bytes), few
+    u32 next_virtual_ = 0;
+    bool opening_ = false;
 
     std::FILE* file_ = nullptr;
     std::vector<u8> memory_;

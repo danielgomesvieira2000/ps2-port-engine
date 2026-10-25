@@ -162,6 +162,22 @@ void DiscFindsFilesByPath() {
     Check(disc.ReadPattern(21, 1, 2, big.data()) && big[3] == 2 && std::memcmp(&big[12], "hello", 5) == 0,
           "an .iso's 2340-byte read has a made header");
     Check(!cd.Read(24, 1, sector), "reading past a raw image's end");
+
+    // Files laid over the disc: one replaced, one added to a directory, one
+    // in a directory of its own - the image untouched.
+    std::vector<u8> long_one(kSectorSize + 7, 0x5A);
+    disc.AddFile("FILE.BIN", long_one);
+    disc.AddFile("dir/added.dat", {'n', 'e', 'w'});
+    disc.AddFile("NEW/DEEP/MADE.BIN", {'m', 'a', 'd', 'e'});
+    std::vector<u8> got;
+    Check(disc.ReadFile("/FILE.BIN;1", &got) && got == long_one, "a file replaced, past a sector");
+    Check(disc.ReadFile("/DIR/ADDED.DAT", &got) && got == std::vector<u8>{'n', 'e', 'w'}, "a file added");
+    Check(disc.ReadFile("/dir/inner.dat", &got) && got.size() == 3, "the directory's own file still there");
+    Check(disc.ReadFile("/new/deep/made.bin", &got) && got == std::vector<u8>{'m', 'a', 'd', 'e'},
+          "a file in directories made for it");
+    Check(disc.Read(21, 1, sector) && std::memcmp(sector, "hello", 5) == 0, "the image's own sectors unchanged");
+    disc.Use(image);
+    Check(!disc.Find("/dir/added.dat", &file), "a new image has no overlay");
 }
 
 void BiosIsReadOnly() {
