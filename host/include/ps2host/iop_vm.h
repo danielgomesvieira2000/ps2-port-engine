@@ -75,6 +75,12 @@ void SetPcmInputVolume(std::uint32_t core, std::uint32_t percent);
 /* For the report: one line per IOP thread. */
 std::string Report();
 
+/* Threads waiting on a semaphore at `pc` (where its WaitSema returns to) for
+   at least `us` microseconds, woken as if it had been signalled: for a wait
+   in a loop that checks its condition again on waking, a lost wake-up's
+   way out. The number woken. */
+int WakeLongWaiters(std::uint32_t pc, std::uint64_t us);
+
 /* The SPU2's interrupts as the IOP's code set them up and they fired, the
    last of them (IRQA set, interrupts on or off, an interrupt and the handler
    it went to), a line each - for a stream that stopped asking for data. */

@@ -166,6 +166,7 @@ bool Vm::Block(Context& c, Wait why, u32 object) {
     t->ready = false;
     t->wait = why;
     t->object = object;
+    t->blocked_us = NowUs();
     return true;
 }
 
@@ -707,6 +708,24 @@ void Command(u32 command, const std::vector<u8>& packet) {
     std::memcpy(vm.ram + vm.command_buffer, packet.data(), packet.size() < 0x100 ? packet.size() : 0x100);
     vm.Call(found->second.first, {vm.command_buffer, found->second.second});
     Run();
+}
+
+int WakeLongWaiters(u32 pc, u64 us) {
+    Vm& vm = TheVm();
+    const u64 now = vm.NowUs();
+    int woken = 0;
+    for (auto& [id, t] : vm.threads) {
+        if (t.ready || t.wait != Wait::Sema || t.c.pc != pc || now - t.blocked_us < us) continue;
+        auto sema = vm.semaphores.find(t.object);
+        if (sema != vm.semaphores.end()) {
+            auto& waiting = sema->second.waiting;
+            waiting.erase(std::remove(waiting.begin(), waiting.end(), id), waiting.end());
+        }
+        t.c.r[2] = 0;                       // KE_OK: as if signalled
+        vm.MakeReady(t);
+        ++woken;
+    }
+    return woken;
 }
 
 std::string Report() {
