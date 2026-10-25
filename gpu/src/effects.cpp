@@ -181,8 +181,13 @@ GsEffects::Set& GsEffects::SetFor(std::uint32_t w, std::uint32_t h, VkCommandBuf
     if (set.made) return set;
     set.made = true;
     MakeScratch(set.full, w, h, cmd);
-    MakeScratch(set.half_a, (w + 1) / 2, (h + 1) / 2, cmd);
-    MakeScratch(set.half_b, (w + 1) / 2, (h + 1) / 2, cmd);
+    // The occlusion at half the view's pixels, a third from 4x up: about
+    // the PS2's own count or more - it is soft, and at 4x it was the
+    // effects' dearest (2 ms of 4.5 on an RTX 4070 laptop).
+    set.ao_div = w >= 4u * 640u ? 3u : 2u;
+    const std::uint32_t d = set.ao_div;
+    MakeScratch(set.half_a, (w + d - 1) / d, (h + d - 1) / d, cmd);
+    MakeScratch(set.half_b, (w + d - 1) / d, (h + d - 1) / d, cmd);
     std::uint32_t lw = w, lh = h;
     for (int i = 0; i < kBloomLevels && lw >= 8 && lh >= 8; ++i) {
         lw = (lw + 1) / 2;
@@ -285,6 +290,7 @@ void GsEffects::Record(VkCommandBuffer cmd, const GsEffect& e, const Target& t) 
             const std::uint32_t hw = set.half_a.w, hh = set.half_a.h;
             push.size[0] = std::int32_t(hw);
             push.size[1] = std::int32_t(hh);
+            push.size[3] = std::int32_t(set.ao_div);       // (its passes: the occlusion's divisor)
             Dispatch(cmd, kAo, Descriptors(t, set.half_a.view, nullptr, nullptr), push, hw, hh);
             Barrier(cmd);
             Dispatch(cmd, kAoBlurX, Descriptors(t, set.half_b.view, set.half_a.view, nullptr), push, hw, hh);

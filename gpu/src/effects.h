@@ -49,7 +49,8 @@ private:
     };
     /* A view's scratch images, by its size in image pixels. */
     struct Set {
-        Scratch full, half_a, half_b;
+        Scratch full, half_a, half_b;      // half_*: the occlusion's, 1/ao_div of the view
+        std::uint32_t ao_div = 2;
         std::vector<Scratch> down, up;      // the glow's chain
         bool made = false;
     };

@@ -23,7 +23,8 @@ layout(set = 0, binding = 5) uniform sampler2D src_b;
 
 layout(push_constant) uniform Params {
     ivec4 rect;         // the view in the target's image pixels: x0, y0, x1, y1 (exclusive)
-    ivec4 size;         // the image written: width, height; the frame's count; the target's scale
+    ivec4 size;         // the image written: width, height; the frame's count; the target's scale (the
+                        // occlusion's passes: its divisor, 2 or 3)
     float p[22];
 } pc;
 
@@ -102,18 +103,19 @@ void main() {
     // the depth around it (the nearer side of each pair: no normal across an
     // edge). p4 radius, p5 strength, p6 the distance it fades out by.
     if (any(greaterThanEqual(at, pc.size.xy))) return;
-    const vec2 half_lo = vec2(pc.rect.xy) * 0.5;
-    const vec2 pixel = (vec2(at) + half_lo) * 2.0 + 1.0;   // the target pixel it stands for
+    const float div = float(max(pc.size.w, 2));
+    const vec2 pixel = vec2(pc.rect.xy) + (vec2(at) + 0.5) * div;   // the target pixel it stands for
     const float z = DepthAt(pixel);
     if (z > pc.p[6]) {
         imageStore(dst, at, vec4(1.0, z, 0.0, 0.0));
         return;
     }
     const vec3 c = ViewPos(pixel, z);
-    const vec3 dx0 = ViewPos(pixel + vec2(2, 0), DepthAt(pixel + vec2(2, 0))) - c;
-    const vec3 dx1 = c - ViewPos(pixel - vec2(2, 0), DepthAt(pixel - vec2(2, 0)));
-    const vec3 dy0 = ViewPos(pixel + vec2(0, 2), DepthAt(pixel + vec2(0, 2))) - c;
-    const vec3 dy1 = c - ViewPos(pixel - vec2(0, 2), DepthAt(pixel - vec2(0, 2)));
+    const vec2 sx = vec2(div, 0.0), sy = vec2(0.0, div);
+    const vec3 dx0 = ViewPos(pixel + sx, DepthAt(pixel + sx)) - c;
+    const vec3 dx1 = c - ViewPos(pixel - sx, DepthAt(pixel - sx));
+    const vec3 dy0 = ViewPos(pixel + sy, DepthAt(pixel + sy)) - c;
+    const vec3 dy1 = c - ViewPos(pixel - sy, DepthAt(pixel - sy));
     const vec3 ddx = abs(dx0.z) < abs(dx1.z) ? dx0 : dx1;
     const vec3 ddy = abs(dy0.z) < abs(dy1.z) ? dy0 : dy1;
     vec3 n = normalize(cross(ddy, ddx));
@@ -230,7 +232,7 @@ void main() {
     const ivec2 q = pc.rect.xy + at;
     if (any(greaterThanEqual(q, pc.rect.zw))) return;
     const float z = DepthAt(vec2(q) + 0.5);
-    const vec2 h = (vec2(at) + 0.5) * 0.5 - 0.5;
+    const vec2 h = (vec2(at) + 0.5) / float(max(pc.size.w, 2)) - 0.5;
     const ivec2 h0 = ivec2(floor(h));
     const vec2 f = h - vec2(h0);
     const ivec2 hmax = textureSize(src_a, 0) - 1;
