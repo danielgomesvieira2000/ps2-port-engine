@@ -318,7 +318,11 @@ def _forget_other_compiler(binary: str, compiler: str | None) -> None:
 def _build_jobs() -> int:
     """Compilers at once: by the memory there is, not the processors - a
     file of compiled VU code takes the compiler 2 GB and more, and a build
-    from nothing with Ninja's default (processors + 2) ran out of it on 16 GB."""
+    from nothing with Ninja's default (processors + 2) ran out of it on 16 GB -
+    and by what is free as it starts (an instrumented PGO build ran out with
+    other programs holding 11 GB of 16). PS2_BUILD_JOBS=n: n, whatever."""
+    if os.environ.get("PS2_BUILD_JOBS", "").isdigit():
+        return max(1, int(os.environ["PS2_BUILD_JOBS"]))
     jobs = os.cpu_count() or 4
     if sys.platform == "win32":
         import ctypes
@@ -333,7 +337,8 @@ def _build_jobs() -> int:
         status = MemoryStatus()
         status.length = ctypes.sizeof(MemoryStatus)
         if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
-            jobs = min(jobs, int(status.total_physical / (2.5 * 2 ** 30)))
+            jobs = min(jobs, int(status.total_physical / (2.5 * 2 ** 30)),
+                       int((status.free_physical + 2 ** 30) / (2.5 * 2 ** 30)))
     return max(1, jobs)
 
 
