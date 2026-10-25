@@ -57,9 +57,35 @@ public:
        the disc ("\\SLUS_210.50;1"); "" when the image has none (not a PS2 disc). */
     std::string BootPath();
 
+    /* Files of a folder on the PC laid over the disc's (a mod's own files): a
+       path in the folder replaces the disc's file of that path, or is added to
+       its directory (made if need be) - case does not matter. The game sees
+       them through the directory sectors it reads, changed here, and their
+       data in sectors past the disc's end. Taken when the disc is opened (or
+       now, if it is); the image itself is never written. */
+    void AddFiles(const std::string& folder);
+    /* Called as the disc opens, before the overlay is laid (the settings are
+       all read by then): a port's chance to AddFiles by them. */
+    static void OnOpen(void (*hook)());
+
 private:
     void DetectFormat();
     bool ReadBytes(u64 offset, u64 length, u8* out);
+    // The overlay (AddFiles): sectors changed or made, and files' extents.
+    struct Extra {
+        u32 lsn = 0, sectors = 0, size = 0;
+        std::string path;
+    };
+    void ApplyFiles();
+    bool BaseRead(u32 lsn, u32 count, u8* out);
+    bool SectorAt(u32 lsn, u8* out);
+    u8* Patch(u32 lsn);
+    bool AddFile(const std::string& relative, const std::string& host_path, u32 size);
+    std::vector<std::string> folders_;
+    std::vector<std::pair<u32, std::vector<u8>>> patched_;     // (lsn, 2048 bytes), few
+    std::vector<Extra> extras_;
+    u32 next_virtual_ = 0;
+    bool opening_ = false;
 
     std::FILE* file_ = nullptr;
     std::vector<u8> memory_;
