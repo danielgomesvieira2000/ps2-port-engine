@@ -897,6 +897,16 @@ int Main(int argc, char** argv) {
         else if (arg == "--vu-exact") options.vu_exact = true;
         else if (arg == "--memcard" && i + 1 < argc) options.memcard = argv[++i];
         else if (arg == "--setting" && i + 1 < argc) options.settings.push_back(argv[++i]);
+        else if (arg == "--setting-at" && i + 1 < argc) {
+            // --setting-at KEY=VALUE@FRAME: changed mid-run (settings.h).
+            const std::string spec = argv[++i];
+            const std::size_t equals = spec.find('='), at = spec.rfind('@');
+            if (equals == std::string::npos || at == std::string::npos || at < equals)
+                std::fprintf(stderr, "--setting-at %s: KEY=VALUE@FRAME\n", spec.c_str());
+            else
+                ScheduleSetting(spec.substr(0, equals), spec.substr(equals + 1, at - equals - 1),
+                                std::stoull(spec.substr(at + 1)));
+        }
         else if (arg == "--audio") options.audio = true;
         else if (arg == "--audio-wav" && i + 1 < argc) options.audio_wav = argv[++i];
         else if (arg == "--press" && i + 1 < argc) {

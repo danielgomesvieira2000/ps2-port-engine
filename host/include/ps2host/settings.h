@@ -8,6 +8,7 @@
 #ifndef PS2HOST_SETTINGS_H
 #define PS2HOST_SETTINGS_H
 
+#include <cstdint>
 #include <string>
 
 namespace ps2host {
@@ -26,6 +27,11 @@ void SetSetting(const std::string& key, const std::string& value);
 void SetSettingOn(const std::string& key, bool on);
 /* Sets one for this run only (--setting): the file is not written. */
 void RunSetting(const std::string& key, const std::string& value);
+/* --setting-at KEY=VALUE@FRAME: a scripted run's setting changed at a frame
+   (a mod turned on or off mid-race), as RunSetting; applied as that frame's
+   blank is delivered (ApplyScheduledSettings). */
+void ScheduleSetting(const std::string& key, const std::string& value, std::uint64_t frame);
+void ApplyScheduledSettings(std::uint64_t frame);
 
 }  // namespace ps2host
 

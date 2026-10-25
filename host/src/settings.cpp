@@ -10,6 +10,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <vector>
 
 namespace ps2host {
 
@@ -77,6 +78,25 @@ void SetSettingOn(const std::string& key, bool on) { SetSetting(key, on ? "on" :
 void RunSetting(const std::string& key, const std::string& value) {
     std::lock_guard<std::mutex> hold(g_lock);
     g_values[key] = value;
+}
+
+namespace {
+struct Scheduled {
+    std::string key, value;
+    std::uint64_t frame;
+};
+std::vector<Scheduled> g_scheduled;
+}  // namespace
+
+void ScheduleSetting(const std::string& key, const std::string& value, std::uint64_t frame) {
+    std::lock_guard<std::mutex> hold(g_lock);
+    g_scheduled.push_back({key, value, frame});
+}
+
+void ApplyScheduledSettings(std::uint64_t frame) {
+    std::lock_guard<std::mutex> hold(g_lock);
+    for (const Scheduled& s : g_scheduled)
+        if (s.frame == frame) g_values[s.key] = s.value;
 }
 
 }  // namespace ps2host

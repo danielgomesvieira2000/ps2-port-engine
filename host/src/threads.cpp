@@ -50,6 +50,7 @@
 #include "ps2host/iop_vm.h"
 #include "ps2host/memory.h"
 #include "ps2host/run.h"
+#include "ps2host/settings.h"
 #include "ps2host/profile.h"
 
 namespace ps2host {
@@ -298,6 +299,7 @@ bool g_paced = false;                   // SetPaced
 bool DeliverFrame() {
     Scheduler& s = S();
     ++s.frames;
+    ApplyScheduledSettings(s.frames);
     if (g_paced && s.virtual_time) {
         // No sooner than the display's next blank (NTSC's 59.94 a second): the
         // run stays exact, only slowed to where it can be played.
