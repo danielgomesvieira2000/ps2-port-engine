@@ -342,6 +342,7 @@ class Mods:
         self.warnings = []
         self.exits = {}                     # where lifted code calls or jumps out to -> from where
         self._images = {}
+        self.ram_image = Image(self.ram, ())
 
     @staticmethod
     def spans(f):
@@ -418,6 +419,60 @@ class Mods:
                 span |= found[0]
         return sorted(first | {m for m in range(len(self.mods)) if span & self.written[m]})
 
+
+    def frame_size(self, image, start: int) -> int:
+        """The stack a function takes (its `addiu $sp, $sp, -N` among its
+        first instructions), 0 for none."""
+        for a in range(start, start + 48, 4):
+            ins = decode(image.word(a), a)
+            if ins.mnemonic in ("addiu", "daddiu") and ins.rs == 29 and ins.rt == 29 and ins.raw & 0x8000:
+                return 0x10000 - (ins.raw & 0xFFFF)
+        return 0
+
+    def callers(self):
+        """Each of the game's functions, to the functions calling it (jal)."""
+        if not hasattr(self, "_callers"):
+            self._callers = {}
+            for f in self.functions.values():
+                for s, e in self.spans(f):
+                    for a in range(s, e, 4):
+                        w = struct.unpack_from("<I", self.ram, a)[0]
+                        if w >> 26 == 3:
+                            target = (w & 0x03FFFFFF) << 2
+                            self._callers.setdefault(target, set()).add(f["addr"])
+        return self._callers
+
+    def reads_above(self, m: int, start: int) -> int:
+        """How far above the frame of the function at `start` the mod's code
+        run in it reads the stack (its callers' frames: their saved $ra and
+        registers, which a structured translation never stores) - 0 none.
+        The mod's code there: what the function reaches with the mod on, and
+        the mod's functions it calls that take no frame of their own."""
+        image = self.image([m])
+        frame = self.frame_size(image, start)
+        mine = self.written[m]
+        found = follow(image, start, self.stops() - {start})
+        if not found:
+            return 0
+        addresses = set(found[0])
+        for target in found[1]:
+            if target in self.entries and m in self.entries[target] and not self.frame_size(image, target):
+                more = follow(image, target, self.stops() - {target})
+                if more:
+                    addresses |= more[0]
+        most = 0
+        for a in addresses:
+            if a not in mine:
+                continue
+            ins = decode(image.word(a), a)
+            if ins.rs == 29 and ins.mnemonic in ("lw", "ld", "lq", "lwu", "lb", "lbu", "lh", "lhu"):
+                offset = ins.raw & 0xFFFF
+                # (within a caller's frame or two: past that, a frame this
+                # tool did not see being made)
+                if not offset & 0x8000 and frame <= offset < frame + 0x400:
+                    most = max(most, offset - frame + 1)
+        return most
+
     def lift(self, start, which):
         """The function at `start` with the mods `which` on, lifted, or None."""
         image = self.image(which)
@@ -493,6 +548,31 @@ def generate(game_dir: str, mods, code=(), name: str = "its mods' spec", shards:
         which = state.touching(start)
         if which:
             touched[start] = which
+    # A mod's code that reads its callers' frames (their saved $ra, say, to
+    # know where it is called from): those callers translated as plainly as
+    # the mod's own (every register stored where the code stores it) while
+    # it is on - up the calls as far as it reads.
+    for start, which in list(touched.items()):
+        if start not in state.functions:
+            continue
+        for m in which:
+            above = state.reads_above(m, start)
+            level, reach = {start}, above
+            for _depth in range(3):
+                if reach <= 0:
+                    break
+                nxt = set()
+                for f in level:
+                    for caller in state.callers().get(f, ()):
+                        touched.setdefault(caller, [])
+                        if m not in touched[caller]:
+                            touched[caller] = sorted(set(touched[caller]) | {m})
+                            state.warnings.append("0x%08X kept plain for %s (its code reads 0x%X above 0x%08X's frame)"
+                                                  % (caller, state.keys[m], above, start))
+                        nxt.add(caller)
+                reach -= min((state.frame_size(state.ram_image, c) for c in nxt), default=reach) if nxt else reach
+                level = nxt
+
     # Functions whose words add to $ra: their callers carry on where they return.
     for start, which in touched.items():
         image = state.image(which)
