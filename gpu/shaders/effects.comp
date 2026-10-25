@@ -143,6 +143,26 @@ void main() {
     }
     const float r6 = radius * radius * radius * radius * radius * radius;
     float ao = max(0.0, 1.0 - sum * pc.p[5] * 5.0 / (r6 * float(kSamples)));
+    // A second, wider scale (p17 metres, p16 its strength; 0 none): the broad
+    // shade at a wall's foot, under an awning, between parked cars - what the
+    // close disc is too small to see. Fewer samples: it is soft by nature.
+    if (pc.p[16] > 0.0 && pc.p[17] > radius) {
+        const float wide = pc.p[17];
+        const float wide_screen = min(wide / (pc.p[3] * z) * 0.5 * float(pc.rect.w - pc.rect.y), 320.0);
+        const int kWide = 8;
+        float wsum = 0.0;
+        for (int i = 0; i < kWide; ++i) {
+            const float alpha = (float(i) + 0.5) / float(kWide);
+            const float angle = alpha * 3.0 * 6.2831853 + spin + 1.3;
+            const vec2 sp = pixel + vec2(cos(angle), sin(angle)) * alpha * wide_screen;
+            const vec3 v = ViewPos(sp, DepthAt(sp)) - c;
+            const float vv = dot(v, v);
+            const float f = max(wide * wide - vv, 0.0);
+            wsum += f * max((dot(v, n) - 0.004 * z) / (vv + 0.01 * wide * wide), 0.0);
+        }
+        const float w4 = wide * wide * wide * wide;
+        ao *= max(0.0, 1.0 - wsum * pc.p[16] * 2.5 / (w4 * float(kWide)));
+    }
     // Faded out with distance, and slightly by the slope's own darkening.
     ao = mix(ao, 1.0, smoothstep(pc.p[6] * 0.6, pc.p[6], z));
     // Sun shadows (p10 their strength): from the pixel towards the sun (p7-9,
@@ -158,7 +178,7 @@ void main() {
     const vec3 sun = vec3(pc.p[7], pc.p[8], pc.p[9]);
     const float lit = dot(n, sun);
     if (pc.p[10] > 0.0 && lit > 0.0 && on_car < 0.99) {
-        const int kSteps = 14;
+        const int kSteps = 20;
         const vec3 start = c + n * (0.02 + 0.002 * z);
         float shade = 0.0;
         float t = 0.06;
@@ -266,7 +286,8 @@ void main() {
         imageStore(dst, at, vec4(here.rgb, -1.0));        // (unblurred: the copy leaves it)
         return;
     }
-    const int kTaps = 12;
+    // (taps by the streak's length: a long one in steps of about 3 pixels)
+    const int kTaps = clamp(int(len / 3.0), 8, 20);
     const float jitter = Noise(pixel) - 0.5;
     vec3 sum = here.rgb;
     float weight = 1.0;
@@ -424,11 +445,29 @@ void main() {
     // grade: a filmic shoulder for the bright end (p12: how much), contrast
     // around the middle grey (p13), saturation (p14), a vignette (p15),
     // warmth (p16: red up and blue down, a share).
+    // p17: sharpening (contrast-adaptive, AMD's CAS) first, 0-1 - then the
+    // result goes to dst (the effect copies it back): the neighbours read
+    // must be the picture's own.
     const ivec2 q = pc.rect.xy + at;
     if (any(greaterThanEqual(q, pc.rect.zw))) return;
     const vec4 c = imageLoad(target, q);
     const float white = pc.p[9] > 0.0 ? 1.0 / pc.p[9] : 1.0;       // p9: the picture's white (its 1.0)
     vec3 col = c.rgb * white;
+    const bool sharpen = pc.p[17] > 0.0;
+    if (sharpen) {
+        #define T(dx, dy) min(texelFetch(target_tex, clamp(q + ivec2(dx, dy), pc.rect.xy, pc.rect.zw - 1), 0).rgb * white, vec3(1.0))
+        const vec3 n = T(0, -1), w = T(-1, 0), e = T(1, 0), s = T(0, 1);
+        #undef T
+        const vec3 mid = min(col, vec3(1.0));
+        const vec3 lo = min(mid, min(min(n, s), min(w, e)));
+        const vec3 hi = max(mid, max(max(n, s), max(w, e)));
+        // The amount from how much room the neighbourhood leaves (none at an
+        // edge already at its ends: no halo), the lobe from the strength.
+        const vec3 amount = sqrt(clamp(min(lo, 1.0 - hi) / max(hi, vec3(1e-4)), 0.0, 1.0));
+        const vec3 lobe = amount * (-1.0 / mix(8.0, 5.0, clamp(pc.p[17], 0.0, 1.0)));
+        const vec3 sharp = (mid + lobe * (n + w + e + s)) / (1.0 + 4.0 * lobe);
+        col = max(col - mid + sharp, 0.0);                          // (above white kept as it was)
+    }
     const vec2 uv = (vec2(at) + 0.5) / vec2(pc.rect.zw - pc.rect.xy);
 #if PASS == PASS_BLOOM_APPLY
     col += texture(src_a, uv).rgb * pc.p[1];
@@ -448,6 +487,7 @@ void main() {
     col *= vec3(1.0 + pc.p[16], 1.0, 1.0 - pc.p[16]);
     const vec2 d = (uv - 0.5) * vec2(1.0, float(pc.rect.w - pc.rect.y) / float(pc.rect.z - pc.rect.x));
     col *= 1.0 - pc.p[15] * smoothstep(0.25, 0.75, dot(d, d) * 2.2);
-    imageStore(target, q, vec4(clamp(col / white, 0.0, 1.0), c.a));
+    if (sharpen) imageStore(dst, at, vec4(clamp(col / white, 0.0, 1.0), c.a));
+    else imageStore(target, q, vec4(clamp(col / white, 0.0, 1.0), c.a));
 #endif
 }

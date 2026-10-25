@@ -328,11 +328,24 @@ void GsEffects::Record(VkCommandBuffer cmd, const GsEffect& e, const Target& t) 
             push.size[0] = std::int32_t(w);
             push.size[1] = std::int32_t(h);
             const VkImageView top = n > 1 ? set.up[0].view : set.down[0].view;
-            Dispatch(cmd, kBloomApply, Descriptors(t, nullptr, top, nullptr), push, w, h);
+            // (sharpening, p17: into the scratch, then copied back)
+            const bool sharpen = push.p[17] > 0.0f;
+            Dispatch(cmd, kBloomApply, Descriptors(t, sharpen ? set.full.view : nullptr, top, nullptr), push, w, h);
+            if (sharpen) {
+                Barrier(cmd);
+                Dispatch(cmd, kCopy, Descriptors(t, nullptr, set.full.view, nullptr), push, w, h);
+            }
             break;
         }
         case GsEffectId::kGrade:
-            Dispatch(cmd, kGrade, Descriptors(t, nullptr, nullptr, nullptr), push, w, h);
+            if (push.p[17] > 0.0f) {
+                Set& set = SetFor(w, h, cmd);
+                Dispatch(cmd, kGrade, Descriptors(t, set.full.view, nullptr, nullptr), push, w, h);
+                Barrier(cmd);
+                Dispatch(cmd, kCopy, Descriptors(t, nullptr, set.full.view, nullptr), push, w, h);
+            } else {
+                Dispatch(cmd, kGrade, Descriptors(t, nullptr, nullptr, nullptr), push, w, h);
+            }
             break;
         case GsEffectId::kDepthOfField: {
             if (!t.depth_view) return;
