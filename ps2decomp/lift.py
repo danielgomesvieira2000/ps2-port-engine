@@ -659,9 +659,6 @@ def _transfer(target: int, inside) -> str:
 
 
 def _dispatch(targets) -> str:
-    # A jump to where the function was called from is its return - code that
-    # keeps $ra in another register and leaves through it (`move $a0, $ra`
-    # ... `jr $a0`) - not a transfer into the middle of its caller.
     cases = " ".join("case 0x%08Xu: goto L_%08X;" % (a, a) for a in targets)
-    return ("switch (jump) { %s default: if (jump == entry_ra) return; "
-            "lifted::TailCall(c, jump, entry_ra, entry_sp); return; }" % cases)
+    return ("switch (jump) { %s default: lifted::TailCall(c, jump, entry_ra, entry_sp); "
+            "return; }" % cases)

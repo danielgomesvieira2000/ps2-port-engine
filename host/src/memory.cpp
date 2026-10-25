@@ -1,10 +1,7 @@
 #include "ps2host/memory.h"
 
-#include <atomic>
 #include <cstdio>
 #include <cstring>
-#include <mutex>
-#include <unordered_set>
 
 #include "ps2host/run.h"
 #include "ps2host/vu.h"
@@ -95,23 +92,6 @@ bool Vif1Sees(u32 a, bool write) {
 }
 }  // namespace
 
-namespace {
-std::atomic<bool> g_unmapped_ignored{false};
-
-/* An access no memory takes, while they are ignored (SetUnmappedIgnored):
-   said the first time at each address's page. */
-void Ignored(u32 address, bool write) {
-    static std::mutex lock;
-    static std::unordered_set<u32> pages;
-    std::lock_guard<std::mutex> hold(lock);
-    if (pages.size() < 64 && pages.insert(address >> 12).second)
-        std::fprintf(stderr, "[memory] a %s at 0x%08X, outside guest memory: %s (as PCSX2 does)\n",
-                     write ? "write" : "read", unsigned(address), write ? "dropped" : "0");
-}
-}  // namespace
-
-void SetUnmappedIgnored(bool on) { g_unmapped_ignored = on; }
-
 u64 Memory::Read(u32 address, u32 size) {
     address = Physical(address);
     // GIF_STAT, while VIF1's worker has work: what it will read once the
@@ -123,11 +103,7 @@ u64 Memory::Read(u32 address, u32 size) {
         JoinVif1("read", address);
     }
     u8* bytes = Translate(address, size);
-    if (!bytes) {
-        if (!g_unmapped_ignored) throw MemoryFault{address, false};
-        Ignored(address, false);
-        return 0;
-    }
+    if (!bytes) throw MemoryFault{address, false};
     u64 value = 0;
     std::memcpy(&value, bytes, size);        // the EE and the host are both little-endian
     const int index = HookIndex(address & ~3u);
@@ -169,11 +145,7 @@ void Memory::Write(u32 address, u64 value, u32 size) {
         for (u32 w : watched_)
             if (w >= address && w < address + size) Watched(address, value, size);
     u8* bytes = Translate(address, size);
-    if (!bytes) {
-        if (!g_unmapped_ignored) throw MemoryFault{address, true};
-        Ignored(address, true);
-        return;
-    }
+    if (!bytes) throw MemoryFault{address, true};
     if (address >= kBiosBase && address - kBiosBase < kBiosSize) return;   // ROM
     std::memcpy(bytes, &value, size);
     // A write wider than a word reaches each register word it covers, in order.

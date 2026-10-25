@@ -414,20 +414,7 @@ What the ports found they shared is here to use:
   attached, at the versions the game's libraries want.
 * `engine/tools/lift_mods.py` - PCSX2 patches (.pnach) as switchable mods:
   each function a patch changes lifted again with its words, chosen at run
-  time by the port's `ModOn`. A mod with code of its own (caves of
-  thousands of words) needs no list of its functions: they are followed
-  from its hooks, calls, pointers and switch tables, and its words come out
-  as `kModWrites` for the port to write while it is on (`words_of_pnach(...,
-  places=True)`). The build says what it could not resolve ("a call to X:
-  no function there") and which callers it keeps plain because the mod reads
-  their stack frames. `ModdedFunction(address, original)` is for a port's
-  own override of a function a mod also changes. While a mod written
-  against PCSX2 is on, `SetUnmappedIgnored(true)` (memory.h) gives it
-  PCSX2's reads of nothing as 0.
-* `Disc::AddFiles(folder)` (disc.h) - a mod's own files over the disc
-  image without changing it: replaced files and new directories, through
-  the directory sectors the game reads. `Disc::OnOpen` lets a port add them
-  by its settings, which are all read by then.
+  time by the port's `ModOn`.
 * `engine/tools/bench.py` - a deterministic benchmark (GS replays, VU
   snapshots, virtual-time runs) to weigh a change.
 
