@@ -207,6 +207,7 @@ enum class GsEffectId : std::uint32_t {
     kGrade = 4,         /* tone and colour */
     kSceneDepth = 5,    /* the scene's depth saved, for soft particles drawn after (tag bit 2) */
     kDepthOfField = 6,  /* a camera's depth of field, focused on the view's middle */
+    kReflections = 7,   /* screen-space reflections on what faces up, from the depth */
 };
 struct GsEffect {
     GsEffectId id = GsEffectId::kTint;

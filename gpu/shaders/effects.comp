@@ -20,6 +20,7 @@ layout(set = 0, binding = 2) uniform sampler2D target_tex;   // the target, filt
 layout(set = 0, binding = 3) uniform sampler2D depth_tex;    // nearest
 layout(set = 0, binding = 4) uniform sampler2D src_a;        // filtered
 layout(set = 0, binding = 5) uniform sampler2D src_b;
+layout(set = 0, binding = 6) uniform usampler2D stencil_tex;  // the depth buffer's stencil (bit 2: paint)
 
 layout(push_constant) uniform Params {
     ivec4 rect;         // the view in the target's image pixels: x0, y0, x1, y1 (exclusive)
@@ -41,6 +42,8 @@ layout(push_constant) uniform Params {
 #define PASS_GRADE 10
 #define PASS_SCENE_DEPTH 11
 #define PASS_DOF 12
+#define PASS_SSR 13
+#define PASS_SSR_APPLY 14
 
 const float kTwoTo32 = 4294967296.0;
 
@@ -494,5 +497,139 @@ void main() {
     const vec3 stored = clamp(col / white + (StillNoise(vec2(q)) - 0.5) / 255.0, 0.0, 1.0);
     if (sharpen) imageStore(dst, at, vec4(stored, c.a));
     else imageStore(target, q, vec4(stored, c.a));
+#elif PASS == PASS_SSR
+    // Screen-space reflections on the cars' paint, at the occlusion's
+    // resolution (dst: the reflected colour in rgb, its weight in a). The
+    // paint is where the stencil's bit 2 is set (the renderer marks the
+    // paint's reflection pass, the game's tag). From each such pixel the
+    // view's ray reflected about the surface's normal - from the depth over
+    // a wider footprint (p13 target pixels: the low-polygon bodies' facets
+    // smoothed) - and marched through the depth buffer until it passes
+    // behind what is drawn there: that pixel's colour is what it reflects.
+    // Where it finds nothing, the game's own reflection (its sphere map)
+    // stays. p6 the farthest paint, p10 the ray's longest (metres), p11 the
+    // strength, p12 Fresnel's base (face on).
+    if (any(greaterThanEqual(at, pc.size.xy))) return;
+    const float div = float(max(pc.size.w, 2));
+    const vec2 pixel = vec2(pc.rect.xy) + (vec2(at) + 0.5) * div;
+    const ivec2 ip = clamp(ivec2(pixel), pc.rect.xy, pc.rect.zw - 1);
+    if ((texelFetch(stencil_tex, ip, 0).r & 2u) == 0u) {
+        imageStore(dst, at, vec4(0.0));
+        return;
+    }
+    const float z = DepthAt(pixel);
+    if (z > pc.p[6]) {
+        imageStore(dst, at, vec4(0.0));
+        return;
+    }
+    const vec3 c = ViewPos(pixel, z);
+    const float foot = max(pc.p[13], 1.0);
+    const vec2 sx = vec2(foot, 0.0), sy = vec2(0.0, foot);
+    const vec3 dx0 = ViewPos(pixel + sx, DepthAt(pixel + sx)) - c;
+    const vec3 dx1 = c - ViewPos(pixel - sx, DepthAt(pixel - sx));
+    const vec3 dy0 = ViewPos(pixel + sy, DepthAt(pixel + sy)) - c;
+    const vec3 dy1 = c - ViewPos(pixel - sy, DepthAt(pixel - sy));
+    const vec3 ddx = abs(dx0.z) < abs(dx1.z) ? dx0 : dx1;
+    const vec3 ddy = abs(dy0.z) < abs(dy1.z) ? dy0 : dy1;
+    vec3 n = normalize(cross(ddy, ddx));
+    if (dot(n, c) > 0.0) n = -n;
+    const vec3 view = normalize(c);
+    const vec3 r = reflect(view, n);
+    const float facing = clamp(dot(-view, n), 0.0, 1.0);
+    const float fresnel = pc.p[12] + (1.0 - pc.p[12]) * pow(1.0 - facing, 5.0);
+    if (pc.p[14] > 2.5) {       // (a test: the normal, and the ray's way)
+        imageStore(dst, at, vec4(n * 0.5 + 0.5, 1.0));
+        return;
+    }
+    // (a ray back towards the camera finds nothing it can see)
+    const float away = smoothstep(0.0, 0.2, r.z);
+    if (away <= 0.0) {
+        imageStore(dst, at, vec4(0.0));
+        return;
+    }
+    const int kSteps = 24;
+    const float longest = pc.p[10];
+    const float jitter = StillNoise(vec2(at));
+    float last_t = 0.0;
+    float hit_t = -1.0;
+    for (int i = 1; i <= kSteps; ++i) {
+        // (steps growing with the distance: what is near the car finely)
+        const float f = (float(i) - 0.5 + jitter) / float(kSteps);
+        const float t = 0.15 + longest * f * f;
+        const vec3 q = c + r * t;
+        if (q.z < 0.2) break;
+        const vec2 qp = ToPixel(q);
+        if (any(lessThan(qp, vec2(pc.rect.xy))) || any(greaterThanEqual(qp, vec2(pc.rect.zw)))) break;
+        // (not the paint itself: a ray still over its own body)
+        const ivec2 qi = ivec2(qp);
+        const float scene = DepthAt(qp);
+        const float behind = q.z - scene;
+        if (behind > 0.0 && behind < max(0.3, 0.06 * q.z + (t - last_t))) {
+            float lo = last_t, hi = t;
+            for (int k = 0; k < 5; ++k) {
+                const float mid = 0.5 * (lo + hi);
+                const vec3 m = c + r * mid;
+                if (m.z - DepthAt(ToPixel(m)) > 0.0) hi = mid;
+                else lo = mid;
+            }
+            hit_t = hi;
+            break;
+        }
+        last_t = t;
+    }
+    if (hit_t < 0.0) {
+        imageStore(dst, at, vec4(0.0));
+        return;
+    }
+    const vec2 hp = ToPixel(c + r * hit_t);
+    // Faded towards the view's edges (the picture ends there, not the world)
+    // and with the ray's length.
+    const vec2 lo = vec2(pc.rect.xy), hi = vec2(pc.rect.zw);
+    const vec2 edge = min(hp - lo, hi - hp) / (hi - lo);
+    const float edges = smoothstep(0.0, 0.08, min(edge.x, edge.y));
+    const float reach = 1.0 - smoothstep(0.6 * longest, longest, hit_t);
+    const float far_fade = 1.0 - smoothstep(pc.p[6] * 0.6, pc.p[6], z);
+    const vec3 col = texture(target_tex, hp / vec2(TargetSize())).rgb;
+    imageStore(dst, at, vec4(col, away * fresnel * edges * reach * far_fade * pc.p[11]));
+
+#elif PASS == PASS_SSR_APPLY
+    // The reflections (src_a, at the occlusion's resolution) over the paint
+    // (the stencil's bit 2, at the full resolution): a soft 3x3 of them -
+    // lacquer's slight blur, and no blocks - each by its weight.
+    const ivec2 q = pc.rect.xy + at;
+    if (any(greaterThanEqual(q, pc.rect.zw))) return;
+    // (p14 1: the paint's mask shown, magenta; 2: the weight, red; 3: the
+    // normal - tests)
+    if (pc.p[14] > 1.5) {
+        const vec2 uv0 = (vec2(at) + 0.5) / float(max(pc.size.w, 2)) / vec2(textureSize(src_a, 0));
+        const vec4 t0 = texture(src_a, uv0);
+        const vec4 c0 = imageLoad(target, q);
+        if ((texelFetch(stencil_tex, q, 0).r & 2u) != 0u)
+            imageStore(target, q, vec4(pc.p[14] > 2.5 ? t0.rgb : vec3(min(t0.a * 4.0, 1.0), 0.0, 0.0), c0.a));
+        return;
+    }
+    if (pc.p[14] > 0.5) {
+        const vec4 c0 = imageLoad(target, q);
+        if ((texelFetch(stencil_tex, q, 0).r & 2u) != 0u) imageStore(target, q, vec4(0.5, 0.0, 0.5, c0.a));
+        return;
+    }
+    if ((texelFetch(stencil_tex, q, 0).r & 2u) == 0u) return;
+    const vec2 size = vec2(textureSize(src_a, 0));
+    const float div = float(max(pc.size.w, 2));
+    const vec2 uv = (vec2(at) + 0.5) / div / size;
+    vec4 sum = vec4(0.0);
+    float wsum = 0.0;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) {
+            const float k = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0);
+            const vec4 t = texture(src_a, uv + vec2(x, y) / size);
+            sum += vec4(t.rgb * t.a, t.a) * k;
+            wsum += k;
+        }
+    const float w = clamp(sum.a / wsum, 0.0, 1.0);
+    if (w <= 0.001) return;
+    const vec3 refl = sum.rgb / max(sum.a, 1e-4);
+    const vec4 c = imageLoad(target, q);
+    imageStore(target, q, vec4(mix(c.rgb, refl, w), c.a));
 #endif
 }

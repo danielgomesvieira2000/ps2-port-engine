@@ -18,6 +18,8 @@
 #include "effects_10.h"
 #include "effects_11.h"
 #include "effects_12.h"
+#include "effects_13.h"
+#include "effects_14.h"
 
 namespace ps2gpu {
 
@@ -36,6 +38,7 @@ constexpr int kBloomLevels = 6;
 GsEffects::~GsEffects() {
     Forget();
     DestroyScratch(dummy_);
+    DestroyScratch(dummy_mask_);
     DestroyScratch(scene_);
     for (int i = 0; i < kPasses; ++i) {
         if (pipelines_[i]) vkDestroyPipeline(g_.device, pipelines_[i], nullptr);
@@ -49,15 +52,15 @@ GsEffects::~GsEffects() {
 }
 
 bool GsEffects::Init(VkPipelineCache cache) {
-    VkDescriptorSetLayoutBinding b[6] = {};
-    for (std::uint32_t i = 0; i < 6; ++i) {
+    VkDescriptorSetLayoutBinding b[7] = {};
+    for (std::uint32_t i = 0; i < 7; ++i) {
         b[i].binding = i;
         b[i].descriptorCount = 1;
         b[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dl.bindingCount = 6;
+    dl.bindingCount = 7;
     dl.pBindings = b;
     if (vkCreateDescriptorSetLayout(g_.device, &dl, nullptr, &layout_) != VK_SUCCESS) return false;
     const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push)};
@@ -74,7 +77,8 @@ bool GsEffects::Init(VkPipelineCache cache) {
         {spirv_effects_6, sizeof spirv_effects_6}, {spirv_effects_7, sizeof spirv_effects_7},
         {spirv_effects_8, sizeof spirv_effects_8}, {spirv_effects_9, sizeof spirv_effects_9},
         {spirv_effects_10, sizeof spirv_effects_10}, {spirv_effects_11, sizeof spirv_effects_11},
-        {spirv_effects_12, sizeof spirv_effects_12},
+        {spirv_effects_12, sizeof spirv_effects_12}, {spirv_effects_13, sizeof spirv_effects_13},
+        {spirv_effects_14, sizeof spirv_effects_14},
     };
     for (int i = 0; i < kPasses; ++i) {
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -90,7 +94,7 @@ bool GsEffects::Init(VkPipelineCache cache) {
         if (vkCreateComputePipelines(g_.device, cache, 1, &cpi, nullptr, &pipelines_[i]) != VK_SUCCESS) return false;
     }
     const VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * 1024},
-                                           {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 * 1024}};
+                                           {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 * 1024}};
     VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dp.maxSets = 1024;
     dp.poolSizeCount = 2;
@@ -108,18 +112,19 @@ bool GsEffects::Init(VkPipelineCache cache) {
     return true;
 }
 
-bool GsEffects::MakeScratch(Scratch& s, std::uint32_t w, std::uint32_t h, VkCommandBuffer cmd) {
+bool GsEffects::MakeScratch(Scratch& s, std::uint32_t w, std::uint32_t h, VkCommandBuffer cmd, VkFormat format) {
     s.w = std::max(1u, w);
     s.h = std::max(1u, h);
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D;
-    ici.format = kScratchFormat;
+    ici.format = format;
     ici.extent = {s.w, s.h, 1};
     ici.mipLevels = 1;
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.usage = format == kScratchFormat ? VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                                         : VK_IMAGE_USAGE_SAMPLED_BIT;
     if (vkCreateImage(g_.device, &ici, nullptr, &s.image) != VK_SUCCESS) return false;
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(g_.device, s.image, &req);
@@ -131,7 +136,7 @@ bool GsEffects::MakeScratch(Scratch& s, std::uint32_t w, std::uint32_t h, VkComm
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vci.image = s.image;
     vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vci.format = kScratchFormat;
+    vci.format = format;
     vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     if (vkCreateImageView(g_.device, &vci, nullptr, &s.view) != VK_SUCCESS) return false;
     // GENERAL from the start, for good: written and read by the passes alike.
@@ -205,7 +210,8 @@ VkDescriptorSet GsEffects::Descriptors(const Target& t, VkImageView dst, VkImage
     if (!a) a = dummy_.view;
     if (!b) b = dummy_.view;
     const VkImageView depth = t.depth_view ? t.depth_view : dummy_.view;
-    const std::array<VkImageView, 5> key{t.view, dst, depth, a, b};
+    const VkImageView mask = t.stencil_view ? t.stencil_view : dummy_mask_.view;
+    const std::array<VkImageView, 6> key{t.view, dst, depth, a, b, mask};
     if (auto found = descriptors_.find(key); found != descriptors_.end()) return found->second;
     if (descriptors_.size() >= 1000) {          // (images come and go with the scale alone)
         descriptors_.clear();
@@ -217,7 +223,7 @@ VkDescriptorSet GsEffects::Descriptors(const Target& t, VkImageView dst, VkImage
     ai.pSetLayouts = &layout_;
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (vkAllocateDescriptorSets(g_.device, &ai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
-    const VkDescriptorImageInfo info[6] = {
+    const VkDescriptorImageInfo info[7] = {
         {VK_NULL_HANDLE, t.view, VK_IMAGE_LAYOUT_GENERAL},
         {VK_NULL_HANDLE, dst, VK_IMAGE_LAYOUT_GENERAL},
         {linear_, t.view, VK_IMAGE_LAYOUT_GENERAL},
@@ -225,9 +231,11 @@ VkDescriptorSet GsEffects::Descriptors(const Target& t, VkImageView dst, VkImage
          t.depth_view ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL},
         {linear_, a, VK_IMAGE_LAYOUT_GENERAL},
         {linear_, b, VK_IMAGE_LAYOUT_GENERAL},
+        {nearest_, mask,
+         t.stencil_view ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL},
     };
-    VkWriteDescriptorSet writes[6] = {};
-    for (std::uint32_t i = 0; i < 6; ++i) {
+    VkWriteDescriptorSet writes[7] = {};
+    for (std::uint32_t i = 0; i < 7; ++i) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = set;
         writes[i].dstBinding = i;
@@ -235,7 +243,7 @@ VkDescriptorSet GsEffects::Descriptors(const Target& t, VkImageView dst, VkImage
         writes[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[i].pImageInfo = &info[i];
     }
-    vkUpdateDescriptorSets(g_.device, 6, writes, 0, nullptr);
+    vkUpdateDescriptorSets(g_.device, 7, writes, 0, nullptr);
     descriptors_.emplace(key, set);
     return set;
 }
@@ -260,7 +268,10 @@ void GsEffects::Dispatch(VkCommandBuffer cmd, Pass pass, VkDescriptorSet set, co
 void GsEffects::Record(VkCommandBuffer cmd, const GsEffect& e, const Target& t) {
     if (!ready_ || !t.view) return;
     if (!dummy_.image) MakeScratch(dummy_, 1, 1, cmd);
-    ++frame_;
+    if (!dummy_mask_.image) MakeScratch(dummy_mask_, 1, 1, cmd, VK_FORMAT_R8_UINT);
+    // (each effect a frame - the noise turned for each - but the reflections:
+    // turned on, they would change the blur's and the occlusion's noise)
+    if (e.id != GsEffectId::kReflections) ++frame_;
     const std::uint32_t k = t.scale;
     const std::uint32_t x0 = std::min(std::uint32_t(std::max(e.x0, 0)) * k, t.pw);
     const std::uint32_t y0 = std::min(std::uint32_t(std::max(e.y0, 0)) * k, t.ph);
@@ -359,6 +370,21 @@ void GsEffects::Record(VkCommandBuffer cmd, const GsEffect& e, const Target& t) 
             Dispatch(cmd, kDof, Descriptors(t, set.full.view, nullptr, nullptr), push, w, h);
             Barrier(cmd);
             Dispatch(cmd, kCopy, Descriptors(t, nullptr, set.full.view, nullptr), push, w, h);
+            break;
+        }
+        case GsEffectId::kReflections: {
+            if (!t.depth_view) return;
+            Set& set = SetFor(w, h, cmd);
+            Barrier(cmd);       // (the occlusion's images, used just before)
+            const std::uint32_t hw = set.half_a.w, hh = set.half_a.h;
+            push.size[0] = std::int32_t(hw);
+            push.size[1] = std::int32_t(hh);
+            push.size[3] = std::int32_t(set.ao_div);
+            Dispatch(cmd, kSsr, Descriptors(t, set.half_a.view, nullptr, nullptr), push, hw, hh);
+            Barrier(cmd);
+            push.size[0] = std::int32_t(w);
+            push.size[1] = std::int32_t(h);
+            Dispatch(cmd, kSsrApply, Descriptors(t, nullptr, set.half_a.view, nullptr), push, w, h);
             break;
         }
         case GsEffectId::kSceneDepth:

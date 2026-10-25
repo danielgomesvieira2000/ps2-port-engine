@@ -189,6 +189,7 @@ struct Image {
     VkDescriptorSet sampled = VK_NULL_HANDLE;   /* a target read by the DATE setup pass */
     VkDescriptorSet storage = VK_NULL_HANDLE;   /* a target as the swizzle's storage image */
     VkImageView depth_view = VK_NULL_HANDLE;    /* a depth buffer's depth alone, to sample */
+    VkImageView stencil_view = VK_NULL_HANDLE;  /* ...and its stencil alone (bit 2: a car's paint) */
     VkDescriptorSet depth_sampled = VK_NULL_HANDLE;     /* ...for the swizzle */
 };
 
@@ -581,6 +582,8 @@ private:
        size, kept (one image resized in turn - the race alternates targets of
        several sizes - waited for the GPU each time: 32 s of a race script). */
     std::map<std::pair<std::uint32_t, std::uint32_t>, Image> feedbacks_;
+    /* A game has tagged its paint to be marked in the stencil (tag bit 3). */
+    bool paint_mask_ = false;
     Image* feedback_ = nullptr;     /* the one the batch being recorded copies into */
     /* A batch that samples its own target reads one copy, made as it begins;
        the GS reads each primitive's texels as the ones before it left them.
@@ -1077,6 +1080,8 @@ bool VulkanGsRenderer::MakeImage(Image& t, std::uint32_t width, std::uint32_t he
     if (format == kDepthFormat && (usage & VK_IMAGE_USAGE_SAMPLED_BIT)) {
         vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
         if (vkCreateImageView(g_.device, &vci, nullptr, &t.depth_view) != VK_SUCCESS) return false;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(g_.device, &vci, nullptr, &t.stencil_view) != VK_SUCCESS) return false;
     }
     return true;
 }
@@ -1086,6 +1091,10 @@ void VulkanGsRenderer::DestroyImage(Image& t) {
     if (t.view) vkDestroyImageView(g_.device, t.view, nullptr);
     if (t.words) vkDestroyImageView(g_.device, t.words, nullptr);
     if (t.depth_view) vkDestroyImageView(g_.device, t.depth_view, nullptr);
+    if (t.stencil_view) {
+        effects_.ForgetView(t.stencil_view);
+        vkDestroyImageView(g_.device, t.stencil_view, nullptr);
+    }
     if (t.image) vkDestroyImage(g_.device, t.image, nullptr);
     if (t.memory) FreeImageMemory(t.memory, t.offset, t.piece_class, t.memory_type);
     t = Image{};
@@ -1906,6 +1915,7 @@ void VulkanGsRenderer::RunEffect(const GsEffect& e) {
             Transition(cmd, *d, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
             view.depth_view = d->depth_view;
+            view.stencil_view = d->stencil_view;
         }
         if (t.layout == VK_IMAGE_LAYOUT_GENERAL) {
             ++g_barriers;
@@ -2258,9 +2268,11 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
                                        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
                                        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
-                                       VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
+                                       VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE, VK_DYNAMIC_STATE_STENCIL_OP,
+                                       VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                                       VK_DYNAMIC_STATE_STENCIL_REFERENCE};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = 7;
+    dynamic.dynamicStateCount = 11;
     dynamic.pDynamicStates = dynamic_states;
     const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
@@ -3395,10 +3407,36 @@ void VulkanGsRenderer::Flush() {
                                                     VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
             if (drawn_.recording != g_.recording_id()) drawn_ = DrawState{g_.recording_id()};
             DrawState& d = drawn_;
-            const int depth_test = state_.depth ? 1 : 0, stencil_test = state_.date ? 1 : 0;
+            // The stencil: the destination alpha test (bit 1, the setup
+            // pass's), else - once a game tags paint to be marked (tag bit 3,
+            // its effects' screen-space reflections) - bit 2 set where the
+            // paint is drawn and cleared where anything else is, so it holds
+            // the paint left on top.
+            if (state_.tag & 8u) paint_mask_ = true;
+            const int stencil_test = state_.date ? 1 : paint_mask_ ? ((state_.tag & 1u) ? 2 : 3) : 0;
+            const int depth_test = state_.depth ? 1 : 0;
             const int compare = int(state_.ztst & 3);
             if (d.depth_test != depth_test) vkCmdSetDepthTestEnable(cmd, VkBool32(d.depth_test = depth_test));
-            if (d.stencil_test != stencil_test) vkCmdSetStencilTestEnable(cmd, VkBool32(d.stencil_test = stencil_test));
+            if (d.stencil_test != stencil_test) {
+                d.stencil_test = stencil_test;
+                vkCmdSetStencilTestEnable(cmd, VkBool32(stencil_test != 0));
+                const VkStencilFaceFlags both = VK_STENCIL_FACE_FRONT_AND_BACK;
+                if (stencil_test == 1) {
+                    vkCmdSetStencilOp(cmd, both, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP,
+                                      VK_COMPARE_OP_EQUAL);
+                    vkCmdSetStencilCompareMask(cmd, both, 1);
+                    vkCmdSetStencilWriteMask(cmd, both, 0);
+                    vkCmdSetStencilReference(cmd, both, 1);
+                } else {
+                    // (off too: a pipeline's dynamic state is set before it draws)
+                    vkCmdSetStencilOp(cmd, both, VK_STENCIL_OP_KEEP,
+                                      stencil_test >= 2 ? VK_STENCIL_OP_REPLACE : VK_STENCIL_OP_KEEP,
+                                      VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS);
+                    vkCmdSetStencilCompareMask(cmd, both, 0);
+                    vkCmdSetStencilWriteMask(cmd, both, stencil_test >= 2 ? 2 : 0);
+                    vkCmdSetStencilReference(cmd, both, stencil_test == 2 ? 2 : 0);
+                }
+            }
             if (d.compare != compare) vkCmdSetDepthCompareOp(cmd, kCompare[d.compare = compare]);
             if (d.sets[0] != set || d.sets[1] != clut_set_) {
                 d.sets[0] = set;

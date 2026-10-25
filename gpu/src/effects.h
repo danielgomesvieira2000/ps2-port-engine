@@ -29,6 +29,7 @@ public:
         VkImageView view = VK_NULL_HANDLE;
         std::uint32_t pw = 0, ph = 0, scale = 1;
         VkImageView depth_view = VK_NULL_HANDLE;
+        VkImageView stencil_view = VK_NULL_HANDLE;    // the depth buffer's stencil (bit 2: paint)
     };
     void Record(VkCommandBuffer cmd, const GsEffect& effect, const Target& target);
     /* Drops every scratch image and descriptor set (the device idle: a new
@@ -55,7 +56,7 @@ private:
         bool made = false;
     };
     enum Pass { kTint, kAo, kAoBlurX, kAoBlurY, kAoApply, kBlur, kCopy, kBloomDown, kBloomUp, kBloomApply, kGrade,
-                kSceneDepth, kDof, kPasses };
+                kSceneDepth, kDof, kSsr, kSsrApply, kPasses };
     struct Push {
         std::int32_t rect[4];
         std::int32_t size[4];
@@ -63,7 +64,8 @@ private:
     };
     static_assert(sizeof(Push) <= 128, "push constants");
 
-    bool MakeScratch(Scratch& s, std::uint32_t w, std::uint32_t h, VkCommandBuffer cmd);
+    bool MakeScratch(Scratch& s, std::uint32_t w, std::uint32_t h, VkCommandBuffer cmd,
+                     VkFormat format = VK_FORMAT_R16G16B16A16_SFLOAT);
     void DestroyScratch(Scratch& s);
     Set& SetFor(std::uint32_t w, std::uint32_t h, VkCommandBuffer cmd);
     VkDescriptorSet Descriptors(const Target& t, VkImageView dst, VkImageView a, VkImageView b);
@@ -80,9 +82,10 @@ private:
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     VkSampler linear_ = VK_NULL_HANDLE, nearest_ = VK_NULL_HANDLE;
     Scratch dummy_;                         // what a pass does not use is bound to
+    Scratch dummy_mask_;                    // ...the stencil's binding, without one (R8_UINT)
     Scratch scene_;                         // the scene's depth (SceneDepth)
     std::map<std::uint64_t, Set> sets_;     // by w << 32 | h
-    std::map<std::array<VkImageView, 5>, VkDescriptorSet> descriptors_;
+    std::map<std::array<VkImageView, 6>, VkDescriptorSet> descriptors_;
     std::uint32_t frame_ = 0;
 };
 
