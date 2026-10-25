@@ -68,7 +68,7 @@ RAM_SIZE = 32 << 20
 # A combination of more of a function's mods than this is not lifted: each
 # alone, each pair, and all of them are (mods that share a function are
 # rarely all on at once; a combination left out runs the nearest smaller).
-FULL_COMBINATIONS = 4
+FULL_COMBINATIONS = 6
 
 
 def words_of_pnach(path: str, section: str | None = None, places: bool = False):
