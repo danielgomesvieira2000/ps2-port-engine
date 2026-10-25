@@ -399,6 +399,18 @@ void main() {
             const vec2 r = coordinate.xy / coordinate.z * vec2(TextureSize());
             t = SampleModern(uv, dFdx(r), dFdy(r), int((p.bilinear >> 2) & 7u),
                              float(1u << ((p.blend_ops >> 22) & 7u)));
+        } else if (((p.blend_ops >> 19) & 1u) != 0u) {
+            // A car's paint reflecting its sphere map (the Fresnel tag, below):
+            // a map drawn each frame, no mipmaps - where it is minified, four
+            // taps over the pixel's footprint, as a mip would: no shimmer on
+            // a distant or a curved body.
+            const vec2 dx = dFdx(uv), dy = dFdy(uv);
+            if (max(length(dx), length(dy)) > 1.5) {
+                const vec2 a = 0.25 * (dx + dy), b = 0.25 * (dx - dy);
+                t = floor((Sample(uv + a) + Sample(uv + b) + Sample(uv - b) + Sample(uv - a)) * 0.25 + 0.5);
+            } else {
+                t = Sample(uv);
+            }
         } else {
             t = Sample(uv);
         }
