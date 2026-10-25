@@ -387,7 +387,7 @@ void main() {
     // Depth of field (dst, then copied back): focused at p6 metres (0: on
     // what the middle of the view shows), each pixel's circle of confusion
     // from how far its distance is from the focus's (p4 the aperture, p5 the
-    // largest circle as a share of the height); gathered from a disc of 16
+    // largest circle as a share of the height); gathered from a disc of 24
     // taps, each taking part as far as its own circle reaches this pixel (a
     // sharp thing in focus keeps out of the blur behind it).
     const ivec2 q = pc.rect.xy + at;
@@ -418,8 +418,8 @@ void main() {
     vec3 sum = here.rgb;
     float weight = 1.0;
     const float spin = StillNoise(pixel) * 6.2831853;
-    for (int i = 0; i < 16; ++i) {
-        const float r = sqrt((float(i) + 0.5) / 16.0);
+    for (int i = 0; i < 24; ++i) {
+        const float r = sqrt((float(i) + 0.5) / 24.0);
         const float a = float(i) * 2.39996323 + spin;          // the golden angle
         const vec2 o = vec2(cos(a), sin(a)) * r * coc;
         const vec2 sp = clamp(pixel + o, vec2(pc.rect.xy) + 0.5, vec2(pc.rect.zw) - 0.5);
