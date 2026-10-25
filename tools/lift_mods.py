@@ -27,7 +27,8 @@ boot, 1 every frame, 2 both, 3 once as it is turned on): such a mod's words
 are also memory - its own code's data, tables, state, the game's data it
 changes - and go to `kModWrites` for the port to write while the mod is on
 (and to put back once it is off). `words_of_pnach(path, section, places=True)`
-reads them so.
+reads them so. A spec may give a word place 9: lifted, never written (code
+of a mod's where another keeps data at run time).
 
 A mod's own code need not be named: from the functions its words change, and
 from the pointers to its code it writes, its code is followed - its calls,
@@ -341,6 +342,7 @@ class Mods:
         self.entries = {}                   # a mod's function's address -> the mods it belongs to
         self.warnings = []
         self.exits = {}                     # where lifted code calls or jumps out to -> from where
+        self.entry_why = {}                 # a mod's function -> how it was found
         self._images = {}
         self.ram_image = Image(self.ram, ())
 
@@ -382,6 +384,7 @@ class Mods:
                     continue
                 if start not in self.functions:
                     self.entries.setdefault(start, set()).add(m)
+                    self.entry_why.setdefault(start, why)
                 _seen, calls, built = found
                 for a in _seen:
                     if a in mine:
@@ -634,10 +637,12 @@ def generate(game_dir: str, mods, code=(), name: str = "its mods' spec", shards:
             state.warnings.append("a call to 0x%08X (from 0x%08X): no function there" % (target, where))
 
     # The mods' words as memory, for the port to write while each is on.
+    # (place 9: a spec's word to lift but never write - code of a mod's
+    # where another keeps data at run time)
     writes = []
     for index, (_key, words) in enumerate(mods):
         for w in words:
-            if len(w) > 3:
+            if len(w) > 3 and w[3] != 9:
                 writes.append("    {0x%08Xu, 0x%08Xu, %d, %d, %d}," % (w[0], w[1], w[2], w[3], index))
     first = header + declarations + [""] + choosers
     first.append("struct ModWrite { u32 address, value; u8 size, place; u16 mod; };")
