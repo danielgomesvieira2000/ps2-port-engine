@@ -464,7 +464,12 @@ void main() {
         const float r2 = min(dot(st, st), 0.85);
         const float facing = 1.0 - sqrt(1.0 - r2);
         const float fresnel = 0.04 + 0.96 * facing * facing * facing;
-        c.rgb = min(c.rgb * (0.7 + 3.0 * fresnel), vec3(255.0));
+        // The brightest of what it reflects - the sun and the sky's brightest,
+        // near the picture's white (128: the 3D is drawn at half intensity) -
+        // over white, as a lacquer's highlight: the glow takes them up.
+        const float lum = dot(c.rgb, vec3(0.299, 0.587, 0.114));
+        const float glint = 1.0 + 1.1 * smoothstep(96.0, 128.0, lum);
+        c.rgb = min(c.rgb * (0.7 + 3.0 * fresnel) * glint, vec3(255.0));
     }
 
 #ifndef SHADER_BLEND
