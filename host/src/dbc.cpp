@@ -232,7 +232,7 @@ void PadData(u32 port, u8* data) {
     HostPadState scripted;
     if (Everyones(port))
         for (const Press& p : Script())
-            if (!p.device && g_frame >= p.from && g_frame <= p.to) {
+            if (!p.device && p.input < 16 && g_frame >= p.from && g_frame <= p.to) {
                 if (script_controller) {
                     scripted.buttons |= u16(1u << p.input);
                     if (p.input == 8) scripted.l2 = p.pressure;
@@ -320,6 +320,11 @@ void PadData(u32 port, u8* data) {
     // scripted press's its own. (Sticks read as 0 are pushed fully up and
     // left: with them there, the frontend saw input held and never a press.)
     for (u32 i = 2; i < 6; ++i) data[i] = controller ? pad.sticks[i - 2] : 0x80;
+    // Scripted sticks (--press rs_left@...): pushed fully that way.
+    if (Everyones(port))
+        for (const Press& p : Script())
+            if (!p.device && p.input >= 16 && g_frame >= p.from && g_frame <= p.to)
+                data[2 + (p.input - 16) / 2] = (p.input & 1) ? 0x00 : 0xFF;
     static const int kPressure[12] = {5, 7, 4, 6, 12, 13, 14, 15, 10, 11, 8, 9};
     for (u32 i = 0; i < 12; ++i) data[6 + i] = (buttons >> kPressure[i]) & 1 ? 0 : pressure[kPressure[i]];
     // SetPadHold: the report as it last was while the game will not step,
@@ -563,6 +568,14 @@ bool ScriptPress(const std::string& spec, u64 from, u64 to, u8 pressure) {
     for (int i = 0; i < 16; ++i)
         if (button == kNames[i]) {
             Script().push_back({i, from, to, pressure, device});
+            return true;
+        }
+    // The sticks pushed fully one way: rs_left..ls_down (inputs 16-23).
+    static const char* const kSticks[8] = {"rs_right", "rs_left", "rs_down", "rs_up",
+                                           "ls_right", "ls_left", "ls_down", "ls_up"};
+    for (int i = 0; i < 8; ++i)
+        if (button == kSticks[i] && !device) {
+            Script().push_back({16 + i, from, to, pressure, device});
             return true;
         }
     return false;
