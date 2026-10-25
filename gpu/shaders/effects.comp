@@ -489,7 +489,10 @@ void main() {
     col *= vec3(1.0 + pc.p[16], 1.0, 1.0 - pc.p[16]);
     const vec2 d = (uv - 0.5) * vec2(1.0, float(pc.rect.w - pc.rect.y) / float(pc.rect.z - pc.rect.x));
     col *= 1.0 - pc.p[15] * smoothstep(0.25, 0.75, dot(d, d) * 2.2);
-    if (sharpen) imageStore(dst, at, vec4(clamp(col / white, 0.0, 1.0), c.a));
-    else imageStore(target, q, vec4(clamp(col / white, 0.0, 1.0), c.a));
+    // Dithered by under half a step of the 8 bits it is stored in (the same
+    // each frame): no bands in the sky's and the glow's gradients.
+    const vec3 stored = clamp(col / white + (StillNoise(vec2(q)) - 0.5) / 255.0, 0.0, 1.0);
+    if (sharpen) imageStore(dst, at, vec4(stored, c.a));
+    else imageStore(target, q, vec4(stored, c.a));
 #endif
 }
