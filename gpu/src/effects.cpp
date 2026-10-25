@@ -376,15 +376,18 @@ void GsEffects::Record(VkCommandBuffer cmd, const GsEffect& e, const Target& t) 
             if (!t.depth_view) return;
             Set& set = SetFor(w, h, cmd);
             Barrier(cmd);       // (the occlusion's images, used just before)
-            const std::uint32_t hw = set.half_a.w, hh = set.half_a.h;
-            push.size[0] = std::int32_t(hw);
-            push.size[1] = std::int32_t(hh);
-            push.size[3] = std::int32_t(set.ao_div);
-            Dispatch(cmd, kSsr, Descriptors(t, set.half_a.view, nullptr, nullptr), push, hw, hh);
+            push.p[15] = float(k);      // (the target's scale: the normal's footprint)
+            // p16: traced at the full resolution (HIGH), else the occlusion's (LOW)
+            const bool full = push.p[16] > 0.0f;
+            const Scratch& into = full ? set.full : set.half_a;
+            push.size[0] = std::int32_t(into.w);
+            push.size[1] = std::int32_t(into.h);
+            push.size[3] = full ? 1 : std::int32_t(set.ao_div);
+            Dispatch(cmd, kSsr, Descriptors(t, into.view, nullptr, nullptr), push, into.w, into.h);
             Barrier(cmd);
             push.size[0] = std::int32_t(w);
             push.size[1] = std::int32_t(h);
-            Dispatch(cmd, kSsrApply, Descriptors(t, nullptr, set.half_a.view, nullptr), push, w, h);
+            Dispatch(cmd, kSsrApply, Descriptors(t, nullptr, into.view, nullptr), push, w, h);
             break;
         }
         case GsEffectId::kSceneDepth:

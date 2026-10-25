@@ -498,19 +498,20 @@ void main() {
     if (sharpen) imageStore(dst, at, vec4(stored, c.a));
     else imageStore(target, q, vec4(stored, c.a));
 #elif PASS == PASS_SSR
-    // Screen-space reflections on the cars' paint, at the occlusion's
-    // resolution (dst: the reflected colour in rgb, its weight in a). The
+    // Screen-space reflections on the cars' paint (dst: the reflected
+    // colour in rgb, its weight in a; only the paint's pixels traced), at the
+    // full resolution (size.w 1: HIGH, sharp) or the occlusion's (LOW). The
     // paint is where the stencil's bit 2 is set (the renderer marks the
     // paint's reflection pass, the game's tag). From each such pixel the
     // view's ray reflected about the surface's normal - from the depth over
-    // a wider footprint (p13 target pixels: the low-polygon bodies' facets
-    // smoothed) - and marched through the depth buffer until it passes
+    // a wider footprint (p13 pixels at the PS2's resolution, times p15 the
+    // target's scale: the low-polygon bodies' facets smoothed) - and marched through the depth buffer until it passes
     // behind what is drawn there: that pixel's colour is what it reflects.
     // Where it finds nothing, the game's own reflection (its sphere map)
     // stays. p6 the farthest paint, p10 the ray's longest (metres), p11 the
     // strength, p12 Fresnel's base (face on).
     if (any(greaterThanEqual(at, pc.size.xy))) return;
-    const float div = float(max(pc.size.w, 2));
+    const float div = float(max(pc.size.w, 1));
     const vec2 pixel = vec2(pc.rect.xy) + (vec2(at) + 0.5) * div;
     const ivec2 ip = clamp(ivec2(pixel), pc.rect.xy, pc.rect.zw - 1);
     if ((texelFetch(stencil_tex, ip, 0).r & 2u) == 0u) {
@@ -523,7 +524,7 @@ void main() {
         return;
     }
     const vec3 c = ViewPos(pixel, z);
-    const float foot = max(pc.p[13], 1.0);
+    const float foot = max(pc.p[13] * max(pc.p[15], 1.0), 1.0);
     const vec2 sx = vec2(foot, 0.0), sy = vec2(0.0, foot);
     const vec3 dx0 = ViewPos(pixel + sx, DepthAt(pixel + sx)) - c;
     const vec3 dx1 = c - ViewPos(pixel - sx, DepthAt(pixel - sx));
@@ -547,7 +548,7 @@ void main() {
         imageStore(dst, at, vec4(0.0));
         return;
     }
-    const int kSteps = 24;
+    const int kSteps = div > 1.0 ? 24 : 40;
     const float longest = pc.p[10];
     const float jitter = StillNoise(vec2(at));
     float last_t = 0.0;
@@ -566,7 +567,7 @@ void main() {
         const float behind = q.z - scene;
         if (behind > 0.0 && behind < max(0.3, 0.06 * q.z + (t - last_t))) {
             float lo = last_t, hi = t;
-            for (int k = 0; k < 5; ++k) {
+            for (int k = 0; k < 7; ++k) {
                 const float mid = 0.5 * (lo + hi);
                 const vec3 m = c + r * mid;
                 if (m.z - DepthAt(ToPixel(m)) > 0.0) hi = mid;
@@ -593,16 +594,15 @@ void main() {
     imageStore(dst, at, vec4(col, away * fresnel * edges * reach * far_fade * pc.p[11]));
 
 #elif PASS == PASS_SSR_APPLY
-    // The reflections (src_a, at the occlusion's resolution) over the paint
-    // (the stencil's bit 2, at the full resolution): a soft 3x3 of them -
-    // lacquer's slight blur, and no blocks - each by its weight.
+    // The reflections (src_a, at the full resolution) over the paint (the
+    // stencil's bit 2): a 3x3 of them, the paint's own pixels only - the
+    // trace's grain smoothed, lacquer's slight blur - each by its weight.
     const ivec2 q = pc.rect.xy + at;
     if (any(greaterThanEqual(q, pc.rect.zw))) return;
     // (p14 1: the paint's mask shown, magenta; 2: the weight, red; 3: the
     // normal - tests)
     if (pc.p[14] > 1.5) {
-        const vec2 uv0 = (vec2(at) + 0.5) / float(max(pc.size.w, 2)) / vec2(textureSize(src_a, 0));
-        const vec4 t0 = texture(src_a, uv0);
+        const vec4 t0 = texelFetch(src_a, at / max(pc.size.w, 1), 0);
         const vec4 c0 = imageLoad(target, q);
         if ((texelFetch(stencil_tex, q, 0).r & 2u) != 0u)
             imageStore(target, q, vec4(pc.p[14] > 2.5 ? t0.rgb : vec3(min(t0.a * 4.0, 1.0), 0.0, 0.0), c0.a));
@@ -614,18 +614,33 @@ void main() {
         return;
     }
     if ((texelFetch(stencil_tex, q, 0).r & 2u) == 0u) return;
-    const vec2 size = vec2(textureSize(src_a, 0));
-    const float div = float(max(pc.size.w, 2));
-    const vec2 uv = (vec2(at) + 0.5) / div / size;
     vec4 sum = vec4(0.0);
     float wsum = 0.0;
-    for (int y = -1; y <= 1; ++y)
-        for (int x = -1; x <= 1; ++x) {
-            const float k = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0);
-            const vec4 t = texture(src_a, uv + vec2(x, y) / size);
-            sum += vec4(t.rgb * t.a, t.a) * k;
-            wsum += k;
-        }
+    const float div = float(max(pc.size.w, 1));
+    if (div > 1.0) {
+        // (LOW: the occlusion's resolution, filtered up)
+        const vec2 size = vec2(textureSize(src_a, 0));
+        const vec2 uv = (vec2(at) + 0.5) / div / size;
+        for (int y = -1; y <= 1; ++y)
+            for (int x = -1; x <= 1; ++x) {
+                const float k = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0);
+                const vec4 t = texture(src_a, uv + vec2(x, y) / size);
+                sum += vec4(t.rgb * t.a, t.a) * k;
+                wsum += k;
+            }
+    } else {
+        const ivec2 last = ivec2(textureSize(src_a, 0)) - 1;
+        for (int y = -1; y <= 1; ++y)
+            for (int x = -1; x <= 1; ++x) {
+                const ivec2 o = q + ivec2(x, y);
+                if ((texelFetch(stencil_tex, clamp(o, pc.rect.xy, pc.rect.zw - 1), 0).r & 2u) == 0u) continue;
+                const float k = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0);
+                const vec4 t = texelFetch(src_a, clamp(at + ivec2(x, y), ivec2(0), last), 0);
+                sum += vec4(t.rgb * t.a, t.a) * k;
+                wsum += k;
+            }
+    }
+    if (wsum <= 0.0) return;
     const float w = clamp(sum.a / wsum, 0.0, 1.0);
     if (w <= 0.001) return;
     const vec3 refl = sum.rgb / max(sum.a, 1e-4);
