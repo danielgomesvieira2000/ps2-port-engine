@@ -116,6 +116,20 @@ public:
        hash of every run's registers and memory after (what a change to the
        VU must leave alone). Returns 0, or 1 when the file cannot be read. */
     static int Bench(const std::string& path, int passes = 5, bool fast = false);
+    /* PS2HOST_VU_DEPS with --vu-bench: how far the snapshot's runs depend on
+       each other (vu_deps in the plan) - for each run, what it reads that an
+       earlier run left (data memory by the interpreter's accesses below,
+       registers and flags by running it again with each changed), then the
+       longest chain of runs, by pairs, against all of them: the most that
+       running VU1 programs side by side could win. Returns 0, or 1. */
+    static int Dependencies(const std::string& path);
+    /* Told each data-memory access a program makes (the interpreter's): the
+       quadword and its fields as dest bits (x 8 .. w 1). Null: none. */
+    struct Accesses {
+        virtual void Read(u32 quad, u32 lanes) = 0;
+        virtual void Write(u32 quad, u32 lanes) = 0;
+    };
+    Accesses* accesses = nullptr;
     /* How often each program address was started, for reports. */
     const std::map<u32, u64>& starts() const;
 
