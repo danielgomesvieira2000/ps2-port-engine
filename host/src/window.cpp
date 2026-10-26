@@ -12,9 +12,12 @@
 #define NOMINMAX
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <functional>
@@ -194,6 +197,44 @@ std::string& GameTitleText() {
 void SetGameTitle(const std::string& title) { GameTitleText() = title; }
 const std::string& GameTitle() { return GameTitleText(); }
 
+/* PS2HOST_REFRESH_LOG=1: every 600 pictures shown, the screen's refreshes
+   they went to (each the first of its blanks after the picture was handed
+   over, RefreshTiming's): pictures handed over in a refresh that already had
+   one (a picture dropped, or shown a refresh late), refreshes none was handed
+   over in (the one before shown twice - at the screen's own rate, a
+   stutter), and the nearest a picture came to a blank (near one, a wake-up's
+   error decides which refresh it goes to). */
+void NoteRefreshes(std::uint64_t shown_ns) {
+    static const bool on = std::getenv("PS2HOST_REFRESH_LOG") != nullptr;
+    if (!on) return;
+    double period = 0;
+    u64 anchor = 0;
+    if (!WindowRefreshTiming(&period, &anchor)) return;
+    static double last_blank = 0;               // the blank the last picture went to
+    static unsigned shown = 0, doubled = 0, missed = 0;
+    static double nearest = 1e18;
+    const double since = double(shown_ns) - double(anchor);
+    const double into = since - std::floor(since / period) * period;
+    const double blank = double(shown_ns) + (period - into);
+    nearest = std::min(nearest, std::min(into, period - into));
+    if (last_blank > 0) {
+        const long long apart = std::llround((blank - last_blank) / period);
+        if (apart <= 0) ++doubled;
+        else missed += unsigned(apart - 1);
+    }
+    last_blank = blank;
+    if (++shown < 600) return;
+    double locked_period = 0;
+    u64 locked_anchor = 0;
+    std::fprintf(stderr,
+                 "[refresh] 600 pictures on a %.4f ms refresh: %u to a refresh that had one, %u refreshes without "
+                 "one; nearest a blank %.2f ms; blanks %s\n",
+                 period / 1e6, doubled, missed, nearest / 1e6,
+                 RefreshLocked(&locked_period, &locked_anchor) ? "locked to the screen's" : "by the processor's clock");
+    shown = doubled = missed = 0;
+    nearest = 1e18;
+}
+
 bool OpenWindow(const wchar_t* title, int width, int height) {
 #ifdef PS2HOST_VULKAN
     std::string narrow;
@@ -229,6 +270,7 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
                 last_shown = shown_ns;
             }
         });
+        if (std::getenv("PS2HOST_REFRESH_LOG")) g_display->SetShownObserver(NoteRefreshes);
         if (SettingOn("vsync")) g_display->SetVsync(true);
         g_display->SetAspect(SettingAspect());
         g_display->SetAntiAliasing(DisplayAntiAliasing(Setting("antialiasing", "off")));
@@ -671,6 +713,18 @@ float WindowRefreshRate() {
     if (g_display) return g_display->RefreshRate();
 #endif
     return 0.0f;
+}
+
+bool WindowRefreshTiming(double* period_ns, u64* blank_ns) {
+#ifdef PS2HOST_VULKAN
+    std::uint64_t blank = 0;
+    if (g_display && g_display->RefreshTiming(period_ns, &blank)) {
+        *blank_ns = blank;
+        return true;
+    }
+#endif
+    (void)period_ns, (void)blank_ns;
+    return false;
 }
 
 ps2gpu::Display* WindowDisplay() {

@@ -52,6 +52,7 @@
 #include "ps2host/run.h"
 #include "ps2host/settings.h"
 #include "ps2host/profile.h"
+#include "ps2host/refresh_lock.h"
 
 namespace ps2host {
 
@@ -470,6 +471,61 @@ bool SpareCores() {
     return spare.load(std::memory_order_relaxed);
 }
 
+// The timer locked to the screen's refresh (refresh_lock.h): the timer
+// thread's; what RefreshLocked tells other threads, published as it steps.
+refresh_lock::Lock g_refresh_lock;
+std::atomic<bool> g_refresh_locked{false};
+std::atomic<double> g_locked_period{0.0};
+std::atomic<u64> g_locked_anchor{0};
+
+/* Whether the lock is wanted: PS2HOST_REFRESH_LOCK=0/1, else the
+   "refresh_lock" setting (on by default) unless VRR's on (its refresh
+   follows the pictures). Looked at every few hundred blanks. */
+bool RefreshLockWanted() {
+    static const char* env = std::getenv("PS2HOST_REFRESH_LOCK");
+    if (env) return env[0] == '1';
+    static unsigned looks = 0;
+    static bool wanted = true;
+    if (looks++ % 256 == 0) wanted = SettingOn("refresh_lock", true) && !SettingOn("vrr");
+    return wanted;
+}
+
+/* The step to the blank after `next`: the game's own (`nominal`), or, locked,
+   a whole number of the screen's refreshes, nudged onto its blanks. */
+std::chrono::steady_clock::duration LockedStep(std::chrono::steady_clock::duration nominal,
+                                               std::chrono::steady_clock::time_point next) {
+    double period = 0;
+    u64 anchor = 0;
+    const bool valid = RefreshLockWanted() && WindowRefreshTiming(&period, &anchor);
+    const double nominal_ns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(nominal).count());
+    const u64 next_ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(next.time_since_epoch()).count());
+    const unsigned changes = g_refresh_lock.changes();
+    const double step = g_refresh_lock.Step(nominal_ns, next_ns, valid, period, anchor);
+    const bool locked = g_refresh_lock.state() == refresh_lock::Lock::State::kLocked;
+    if (locked) {
+        g_locked_period.store(g_refresh_lock.period(), std::memory_order_relaxed);
+        g_locked_anchor.store(g_refresh_lock.anchor(), std::memory_order_relaxed);
+    }
+    g_refresh_locked.store(locked, std::memory_order_relaxed);
+    if (g_refresh_lock.changes() != changes) {
+        using State = refresh_lock::Lock::State;
+        switch (g_refresh_lock.state()) {
+            case State::kOff: std::fprintf(stderr, "[refresh] the blanks by the processor's clock\n"); break;
+            case State::kPulling:
+                std::fprintf(stderr, "[refresh] the blanks pulling in to the screen's: %d of its %.4f ms refreshes each\n",
+                             g_refresh_lock.refreshes(), period / 1e6);
+                break;
+            case State::kLocked: std::fprintf(stderr, "[refresh] the blanks locked to the screen's\n"); break;
+            case State::kGaveUp:
+                std::fprintf(stderr, "[refresh] the screen's refresh follows the pictures (VRR?): the blanks by the "
+                                     "processor's clock\n");
+                break;
+        }
+    }
+    return std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::nanoseconds(std::llround(step)));
+}
+
 void VblankTimer() {
     using clock = std::chrono::steady_clock;
     const auto period = std::chrono::microseconds(16683);      // NTSC, 59.94 Hz
@@ -535,10 +591,14 @@ void VblankTimer() {
             unsigned factor = g_fast_forward.load(std::memory_order_relaxed);
             if (S().frames < g_fast_until.load(std::memory_order_relaxed)) factor = std::max(factor, g_fast_until_factor.load(std::memory_order_relaxed));
             const s64 own = g_blank_period_ns.load(std::memory_order_relaxed);
-            next += factor > 1 ? period / factor
-                    : own > 0  ? std::chrono::duration_cast<clock::duration>(std::chrono::nanoseconds(own))
-                               : period;
-            if (clock::now() >= next + period) next = clock::now() + period;   // a stall: start again from now
+            next += LockedStep(factor > 1 ? clock::duration(period / factor)
+                               : own > 0  ? std::chrono::duration_cast<clock::duration>(std::chrono::nanoseconds(own))
+                                          : clock::duration(period),
+                               next);
+            if (clock::now() >= next + period) {        // a stall: start again from now
+                next = clock::now() + period;
+                g_refresh_lock.Pull();
+            }
             if (g_hitch_blanks && !s.vblank_due.load())
                 g_blank_due_ns.store(ClockNs(), std::memory_order_relaxed);
             if (s.vblank_due.exchange(true)) {
@@ -1368,6 +1428,13 @@ bool RunIopBetweenSteps() {
 }
 
 bool BlankDue() { return S().vblank_due.load(std::memory_order_relaxed); }
+bool RefreshLocked(double* period_ns, u64* blank_ns) {
+    if (!g_refresh_locked.load(std::memory_order_relaxed)) return false;
+    *period_ns = g_locked_period.load(std::memory_order_relaxed);
+    *blank_ns = g_locked_anchor.load(std::memory_order_relaxed);
+    return *period_ns > 0;
+}
+
 u64 LastVblankNs() { return g_last_vblank_ns.load(std::memory_order_relaxed); }
 
 void FastThread() {

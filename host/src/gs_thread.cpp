@@ -47,6 +47,7 @@
 #include "gs_decode.h"
 #include "ps2host/timeline.h"
 #include "ps2host/profile.h"
+#include "ps2host/refresh_lock.h"
 #include "ps2host/run.h"
 
 namespace ps2host {
@@ -587,7 +588,19 @@ u64 FrameDue(u64 frame) {
     // 3.6 periods), the oldest waiting was dropped unshown, 3 a second.
     const u64 most = std::min<u64>(25'000'000, 2 * BlankPeriodNs() - 1'000'000);
     keep = std::min<u64>(std::max<u64>(keep + 500'000, std::min<u64>(6'000'000, most)), most);
-    const u64 due = std::max(now, ended + keep);
+    u64 due = std::max(now, ended + keep);
+    // The blanks locked to the screen's (RefreshLocked): a picture on time
+    // handed over in the middle of a refresh, then shown at the next one
+    // whichever way a wake-up errs - at a refresh's very end it was now that
+    // one, now the next (a picture shown twice, then one dropped). Never more
+    // than `most` behind its blank.
+    double refresh = 0;
+    u64 screen_blank = 0;
+    if (due > now && RefreshLocked(&refresh, &screen_blank)) {
+        u64 middle = due + u64(refresh_lock::ToMiddle(double(due) - double(screen_blank), refresh));
+        if (middle - ended > most) middle -= u64(refresh);      // (the middle before)
+        due = std::max(now, middle);
+    }
     // Its blank to its time to be shown: the host's share of what a press
     // takes to reach the screen (the display's refresh and compositor after).
     if (timeline::On()) timeline::Instant("due after its blank (us)", timeline::Now(), (due - ended) / 1000);

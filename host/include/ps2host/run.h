@@ -368,6 +368,15 @@ bool WindowFullscreen();
 /* The refresh rate of the screen the window is on, in Hz (0 when not known,
    or no window). */
 float WindowRefreshRate();
+/* The screen's refresh as measured (Display::RefreshTiming): its period and
+   the time of one of its blanks, steady clock ns. False when not known. */
+bool WindowRefreshTiming(double* period_ns, u64* blank_ns);
+/* The vertical blank timer locked to the screen's refresh (refresh_lock.h):
+   the screen's period and one of its blanks while it is - false when not
+   (off, pulling in, given up, or the rates not whole multiples). The
+   "refresh_lock" setting (on by default; off with VRR) or
+   PS2HOST_REFRESH_LOCK=0/1. */
+bool RefreshLocked(double* period_ns, u64* blank_ns);
 /* Fullscreen at the screen's own refresh (Display::SetKeepRefresh; the
    window opens so when the "frame_rate" setting is "display"), not one 60
    divides evenly. */

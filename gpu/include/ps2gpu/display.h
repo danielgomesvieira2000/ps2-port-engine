@@ -77,6 +77,15 @@ public:
     /* The refresh rate of the screen the window is on, in its present mode
        (fullscreen's own, EvenMode's), in Hz: 0 when not known. */
     virtual float RefreshRate() const { return 0.0f; }
+    /* The screen's refresh as measured (a thread waiting on each of its
+       vertical blanks, their times fitted to a line: vblank_fit.h): the
+       period, and the time of one of its blanks on the steady clock, in
+       nanoseconds. False when not known: not yet, no such screen found, or
+       blanks too uneven to say. */
+    virtual bool RefreshTiming(double* period_ns, std::uint64_t* blank_ns) const {
+        (void)period_ns, (void)blank_ns;
+        return false;
+    }
 
     /* The window's height in the screen's pixels (0 when not known). */
     virtual std::uint32_t PixelHeight() const { return 0; }
@@ -201,6 +210,10 @@ public:
        it was), or dropped unshown (shown_ns 0) - on the presenting thread. */
     using PresentObserver = std::function<void(std::uint64_t due_ns, std::uint64_t shown_ns, bool dropped)>;
     virtual void SetPresentObserver(PresentObserver observer) { (void)observer; }
+    /* Told the time of every present, paced or not (on the presenting
+       thread; set before the first). */
+    using ShownObserver = std::function<void(std::uint64_t shown_ns)>;
+    virtual void SetShownObserver(ShownObserver observer) { (void)observer; }
 
     /* The GPU and driver, for the report. */
     virtual std::string Describe() const = 0;

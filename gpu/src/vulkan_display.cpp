@@ -11,6 +11,7 @@
  */
 
 #include "ps2gpu/display.h"
+#include "ps2gpu/vblank_fit.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -30,6 +31,9 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <dxgi.h>
+#undef small            // rpcndr.h's, through the COM headers; SetRumble names a parameter so
+#pragma comment(lib, "dxgi.lib")
 #endif
 #include <atomic>
 #include <cctype>
@@ -40,6 +44,7 @@
 #include <cstring>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -48,6 +53,85 @@
 namespace ps2gpu {
 
 namespace {
+
+/* The screen's vertical blanks (RefreshTiming): a thread waits on each of
+   the window's screen's (DXGI's WaitForVBlank) and puts its time into the
+   fit. Shared with the thread, which the display leaves to end by itself (a
+   wait on a screen gone to sleep may not come back soon). */
+struct VblankWatch {
+    std::mutex lock;
+    VblankFit fit;
+    std::atomic<bool> stop{false};
+    std::atomic<float> nominal_hz{0.0f};        // the mode's refresh (Pump's)
+};
+
+std::uint64_t SteadyNs() {
+    return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+#ifdef _WIN32
+/* The DXGI output that shows `monitor`, on whichever adapter (a laptop's
+   built-in screen is the integrated GPU's); null if none. */
+IDXGIOutput* FindOutput(HMONITOR monitor) {
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) return nullptr;
+    IDXGIOutput* found = nullptr;
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT a = 0; !found && factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; ++a) {
+        IDXGIOutput* output = nullptr;
+        for (UINT o = 0; !found && adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; ++o) {
+            DXGI_OUTPUT_DESC desc;
+            if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == monitor) found = output;
+            else output->Release();
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    return found;
+}
+
+void WatchVblanks(std::shared_ptr<VblankWatch> watch, HWND window) {
+    // Woken at each blank, to note its time: the sooner it runs, the closer.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    IDXGIOutput* output = nullptr;
+    HMONITOR on = nullptr;
+    unsigned looks = 0, quick = 0;
+    std::uint64_t before = 0;
+    while (!watch->stop.load(std::memory_order_relaxed)) {
+        // The window's screen, looked at again now and then (moved to another).
+        if (looks++ % 256 == 0 || !output) {
+            const HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+            if (monitor != on || !output) {
+                if (output) output->Release();
+                output = FindOutput(monitor);
+                on = monitor;
+                std::lock_guard<std::mutex> hold(watch->lock);
+                watch->fit.Reset();
+            }
+        }
+        if (!output || FAILED(output->WaitForVBlank())) {
+            if (output) output->Release();
+            output = nullptr;
+            Sleep(250);
+            continue;
+        }
+        const std::uint64_t now = SteadyNs();
+        // A wait that does not wait (a screen asleep): not a blank, and no spin.
+        if (now - before < 1'000'000) {
+            if (++quick > 8) Sleep(50);
+            before = now;
+            continue;
+        }
+        quick = 0;
+        before = now;
+        const float hz = watch->nominal_hz.load(std::memory_order_relaxed);
+        std::lock_guard<std::mutex> hold(watch->lock);
+        watch->fit.Add(now, hz > 1.0f ? 1e9 / double(hz) : 0.0);
+    }
+    if (output) output->Release();
+}
+#endif
 
 class VulkanDisplay final : public Display {
 public:
@@ -125,6 +209,8 @@ public:
     void SetVrr(bool on) override;
     bool Vrr() const override { return vrr_; }
     float RefreshRate() const override { return refresh_hz_.load(std::memory_order_relaxed); }
+    bool RefreshTiming(double* period_ns, std::uint64_t* blank_ns) const override;
+    std::shared_ptr<VblankWatch> vblank_watch_;     // RefreshTiming's (null: no such thread)
     void SetKeepRefresh(bool keep) override {
         if (keep_refresh_ == keep) return;
         keep_refresh_ = keep;
@@ -222,6 +308,11 @@ public:
         std::lock_guard<std::mutex> hold(paced_lock_);
         observer_ = std::move(observer);
     }
+    void SetShownObserver(ShownObserver observer) override {
+        std::lock_guard<std::mutex> hold(pacing_lock_);
+        shown_observer_ = std::move(observer);
+    }
+    ShownObserver shown_observer_;          // SetShownObserver (under pacing_lock_)
 private:
     PresentObserver observer_;              // SetPresentObserver (under paced_lock_)
     // The mouse (TakeMouse), from the window's events; the picture's place in
@@ -549,7 +640,26 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     cmd_ = cmds_[0];
     acquired_ = acquireds_[0];
     fence_ = fences_[0];
+#ifdef _WIN32
+    // The screen's blanks, measured (RefreshTiming).
+    if (HWND hwnd = static_cast<HWND>(
+            SDL_GetPointerProperty(SDL_GetWindowProperties(window_), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr))) {
+        vblank_watch_ = std::make_shared<VblankWatch>();
+        std::thread(WatchVblanks, vblank_watch_, hwnd).detach();
+    }
+#endif
     return CreateSwapchain();
+}
+
+bool VulkanDisplay::RefreshTiming(double* period_ns, std::uint64_t* blank_ns) const {
+    if (!vblank_watch_) return false;
+    std::lock_guard<std::mutex> hold(vblank_watch_->lock);
+    const VblankFit& fit = vblank_watch_->fit;
+    // (Blanks no longer coming - the thread lost its screen: not known.)
+    if (!fit.Valid() || SteadyNs() > fit.Last() + 250'000'000) return false;
+    *period_ns = fit.Period();
+    *blank_ns = fit.Anchor();
+    return true;
 }
 
 bool VulkanDisplay::CreateSwapchain() {
@@ -1599,6 +1709,9 @@ bool VulkanDisplay::Submit(std::uint32_t index) {
         last_present_ = now;
         // The FPS counter's: presents counted over half a second at a time.
         if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) ++fps_presents_;
+        if (shown_observer_ && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR))
+            shown_observer_(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              now.time_since_epoch()).count()));
         const double counted = std::chrono::duration<double>(now - fps_since_).count();
         if (counted >= 0.5) {
             fps_.store(fps_since_.time_since_epoch().count() ? fps_presents_ / counted : 0.0);
@@ -1704,6 +1817,7 @@ bool VulkanDisplay::Pump() {
         const SDL_DisplayID id = SDL_GetDisplayForWindow(window_);
         const SDL_DisplayMode* mode = id ? SDL_GetCurrentDisplayMode(id) : nullptr;
         refresh_hz_.store(mode ? mode->refresh_rate : 0.0f, std::memory_order_relaxed);
+        if (vblank_watch_) vblank_watch_->nominal_hz.store(mode ? mode->refresh_rate : 0.0f, std::memory_order_relaxed);
     }
     // Each controller's: the triggers' effects as last set, when they change
     // (off on one SetTriggerTargets leaves out), and the motors as the game
@@ -2033,6 +2147,7 @@ bool VulkanDisplay::KeyDown(int scancode) const {
 }
 
 VulkanDisplay::~VulkanDisplay() {
+    if (vblank_watch_) vblank_watch_->stop = true;      // (its thread ends at its next blank)
     {
         std::lock_guard<std::mutex> hold(paced_lock_);
         stop_ = true;

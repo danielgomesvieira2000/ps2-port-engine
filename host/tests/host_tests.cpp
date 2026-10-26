@@ -38,7 +38,9 @@
 
 #if PS2HOST_VULKAN
 #include "ps2gpu/gs_renderer.h"
+#include "ps2gpu/vblank_fit.h"
 #endif
+#include "ps2host/refresh_lock.h"
 
 /* vu_corpus.cpp (vurecomp.py --corpus, as the build goes): the random programs, compiled. */
 const ps2host::VuCompiled* VuGeneratedPrograms(std::size_t* count);
@@ -1913,6 +1915,87 @@ void LibnetSendsDatagrams() {
 
 // A player's bindings: the settings over the defaults, a binding taking its
 // key from the input that had it, and back to the settings as names.
+/* The timer locked to a screen (refresh_lock.h): the multiples, pulling in
+   to a 60 Hz screen from 59.94 and holding there, and giving up on a screen
+   whose refresh follows the pictures (VRR). */
+void BlanksLockToTheScreen() {
+    namespace rl = ps2host::refresh_lock;
+    Check(rl::Refreshes(16683000, 16666667) == 1 && rl::Refreshes(16683000, 8333333) == 2 &&
+              rl::Refreshes(16683000, 4166667) == 4 && rl::Refreshes(6944444, 6944000) == 1,
+          "refresh lock: whole multiples within half a percent");
+    Check(rl::Refreshes(8341500, 6944444) == 0 && rl::Refreshes(16683000, 6944444) == 0 &&
+              rl::Refreshes(16683000, 16000000) == 0,
+          "refresh lock: none where the rates do not divide");
+    Check(std::fabs(rl::Phase(16666667 + 1000, 16666667) - 1000) < 1 &&
+              std::fabs(rl::Phase(-1000, 16666667) + 1000) < 1,
+          "refresh lock: the phase, either side of a blank");
+    Check(std::fabs(rl::ToMiddle(1000, 10000) - 4000) < 1 && std::fabs(rl::ToMiddle(6000, 10000) - 9000) < 1,
+          "refresh lock: the next middle of a refresh");
+
+    // A 60 Hz screen whose blanks are 5 ms off the timer's, the game's 59.94.
+    const double screen = 1e9 / 60.0;
+    const std::uint64_t anchor = 5'000'000;
+    rl::Lock lock;
+    double next = 1e9;
+    double steps = 0;
+    int counted = 0;
+    for (int blank = 0; blank < 60 * 30; ++blank) {
+        const double step = lock.Step(16683000, std::uint64_t(next), true, screen, anchor);
+        next += step;
+        if (blank >= 60 * 20) steps += step, ++counted;
+    }
+    Check(lock.state() == rl::Lock::State::kLocked, "refresh lock: locked to a 60 Hz screen");
+    Check(std::fabs(rl::Phase(next - double(anchor), screen)) < 20'000,
+          "refresh lock: the blanks on the screen's (within 20 us)");
+    Check(std::fabs(steps / counted - screen) < 1.0, "refresh lock: a blank the screen's period");
+
+    // Knocked off (a stall): in again.
+    lock.Pull();
+    next += 4'000'000;
+    for (int blank = 0; blank < 60 * 10; ++blank) next += lock.Step(16683000, std::uint64_t(next), true, screen, anchor);
+    Check(lock.state() == rl::Lock::State::kLocked && std::fabs(rl::Phase(next - double(anchor), screen)) < 20'000,
+          "refresh lock: back on after a stall");
+
+    // A screen that is not known, or a rate that does not divide: the game's own.
+    Check(lock.Step(16683000, std::uint64_t(next), false, screen, anchor) == 16683000 &&
+              lock.state() == rl::Lock::State::kOff,
+          "refresh lock: off when the screen is not known");
+
+    // A VRR screen: its blank 7 ms after each of the timer's, whatever the timer does.
+    rl::Lock follower;
+    next = 1e9;
+    for (int blank = 0; blank < 144 * 15; ++blank) {
+        const double step = follower.Step(6944444, std::uint64_t(next), true, 6944444, std::uint64_t(next) + 7'000'000);
+        next += step;
+    }
+    Check(follower.state() == rl::Lock::State::kGaveUp, "refresh lock: gives up on a screen that follows");
+    Check(follower.Step(6944444, std::uint64_t(next), true, 6944444, std::uint64_t(next) + 7'000'000) == 6944444,
+          "refresh lock: given up, the game's own blank");
+
+#if PS2HOST_VULKAN
+    // The blanks as a thread sees them: 144 Hz on a clock 40 ppm off, each
+    // seen up to 0.1 ms late, every 37th missed, one 3 ms late.
+    ps2gpu::VblankFit fit;
+    const double period = 1e9 / 144.0 * (1.0 + 40e-6);
+    const double start = 5e9 + 123456;
+    unsigned seed = 12345;
+    for (int n = 0; n < 600; ++n) {
+        if (n % 37 == 36) continue;
+        seed = seed * 1103515245u + 12345u;
+        double late = double((seed >> 16) % 100000);
+        if (n == 300) late = 3'000'000;
+        fit.Add(std::uint64_t(start + period * n + late), 1e9 / 144.0);
+    }
+    Check(fit.Valid(), "vblank fit: valid");
+    Check(std::fabs(fit.Period() - period) < 200.0, "vblank fit: the period (within 0.2 us)");
+    Check(std::fabs(rl::Phase(double(fit.Anchor()) - start, period) - 50'000) < 40'000,
+          "vblank fit: a blank's time (within its wake-ups' lateness)");
+    // The screen's mode changed (60 Hz): again, and right.
+    for (int n = 0; n < 200; ++n) fit.Add(std::uint64_t(start + 1e10 + n * (1e9 / 60.0)), 1e9 / 60.0);
+    Check(fit.Valid() && std::fabs(fit.Period() - 1e9 / 60.0) < 50.0, "vblank fit: a new mode's period");
+#endif
+}
+
 void BindingsKeepAndSwap() {
     namespace b = ps2host::bindings;
     b::Table defaults{};
@@ -1943,6 +2026,7 @@ void BindingsKeepAndSwap() {
 }
 
 int main() {
+    BlanksLockToTheScreen();
     BindingsKeepAndSwap();
     HudAnchorsAndPlaces();
     LibnetSendsDatagrams();
