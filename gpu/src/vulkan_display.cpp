@@ -6,7 +6,8 @@
  * which is cleared to black first. One frame is in flight: the fence is waited
  * before the staging buffer is written again. The swapchain presents in
  * MAILBOX mode where the driver has it (never blocking the emulation thread),
- * else IMMEDIATE, else FIFO, and is recreated when the window changes size.
+ * else IMMEDIATE, else FIFO (IMMEDIATE first on a VRR screen: SetVrr), and is
+ * recreated when the window changes size.
  */
 
 #include "ps2gpu/display.h"
@@ -121,6 +122,8 @@ public:
         return std::uint32_t(h > 0 ? h : 0);
     }
     bool Vsync() const override { return vsync_; }
+    void SetVrr(bool on) override;
+    bool Vrr() const override { return vrr_; }
     float RefreshRate() const override { return refresh_hz_.load(std::memory_order_relaxed); }
     void SetKeepRefresh(bool keep) override {
         if (keep_refresh_ == keep) return;
@@ -275,6 +278,7 @@ private:
     VkFence fence_ = VK_NULL_HANDLE;
     VkPresentModeKHR mode_ = VK_PRESENT_MODE_FIFO_KHR;
     std::atomic<bool> vsync_{false};        // FIFO when set (SetVsync)
+    std::atomic<bool> vrr_{false};          // IMMEDIATE before MAILBOX when set (SetVrr)
 
     VkBuffer staging_ = VK_NULL_HANDLE;
     VkDeviceMemory staging_memory_ = VK_NULL_HANDLE;
@@ -574,9 +578,24 @@ bool VulkanDisplay::CreateSwapchain() {
     std::vector<VkPresentModeKHR> modes(n);
     vkGetPhysicalDeviceSurfacePresentModesKHR(gpu_, surface_, &n, modes.data());
     mode_ = VK_PRESENT_MODE_FIFO_KHR;            // every device has it
+    // The last of these the driver has: MAILBOX first (no tearing on a
+    // fixed refresh), IMMEDIATE first on a VRR screen (SetVrr).
     if (!vsync_)
-        for (VkPresentModeKHR m : {VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR})
+        for (VkPresentModeKHR m : vrr_ ? std::initializer_list<VkPresentModeKHR>{VK_PRESENT_MODE_MAILBOX_KHR,
+                                                                                VK_PRESENT_MODE_IMMEDIATE_KHR}
+                                       : std::initializer_list<VkPresentModeKHR>{VK_PRESENT_MODE_IMMEDIATE_KHR,
+                                                                                VK_PRESENT_MODE_MAILBOX_KHR})
             if (std::find(modes.begin(), modes.end(), m) != modes.end()) mode_ = m;
+    // (In a player's log when it changes: what a VRR screen was given.)
+    static VkPresentModeKHR logged = VK_PRESENT_MODE_MAX_ENUM_KHR;
+    if (mode_ != logged) {
+        logged = mode_;
+        std::fprintf(stderr, "[display] presenting %s (vsync %s, vrr %s)\n",
+                     mode_ == VK_PRESENT_MODE_FIFO_KHR      ? "FIFO"
+                     : mode_ == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX"
+                                                            : "IMMEDIATE",
+                     vsync_ ? "on" : "off", vrr_ ? "on" : "off");
+    }
 
     VkSwapchainCreateInfoKHR sci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     sci.surface = surface_;
@@ -1610,6 +1629,12 @@ void VulkanDisplay::SetVsync(bool on) {
     if (vsync_ == on) return;
     vsync_ = on;
     stale_ = true;                              // the swapchain again, with the other mode
+}
+
+void VulkanDisplay::SetVrr(bool on) {
+    if (vrr_ == on) return;
+    vrr_ = on;
+    if (!vsync_) stale_ = true;                 // (vertical sync's FIFO either way)
 }
 
 /* The display mode fullscreen takes: the desktop's resolution at a refresh

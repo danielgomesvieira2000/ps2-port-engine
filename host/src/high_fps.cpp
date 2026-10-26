@@ -132,7 +132,11 @@ double Own() { return 60.0 * g_game.steps_per_blank; }
 double Wanted() {
     static const char* env = std::getenv("PS2HOST_FRAME_RATE");
     const std::string rate = env ? std::string(env) : Setting("frame_rate", g_game.default_rate);
-    const double hz = rate == "display" ? double(WindowRefreshRate()) : std::atof(rate.c_str());
+    double hz = rate == "display" ? double(WindowRefreshRate()) : std::atof(rate.c_str());
+    // On a VRR screen (WindowVrr), DISPLAY 3% under its refresh (139 on 144,
+    // 160 on 165): at the very top of its range a picture a little early
+    // waits for the next refresh as with a fixed one, and the queue behind it.
+    if (rate == "display" && WindowVrr()) hz = std::floor(hz * 0.97);
     double want = hz >= 1.5 * Own() ? std::min(hz, 240.0) : Own();
     // PS2HOST_HIGH_FPS_FROM=<frame>: 60 until then (a scripted run's test:
     // its presses land as at 60, and the same screen at 60 and above is

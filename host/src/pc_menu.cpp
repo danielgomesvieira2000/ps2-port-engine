@@ -125,6 +125,12 @@ const std::vector<Choice>& Choices() {
              SetSettingOn("texture_pack", v == "on");
          },
          "TEXTURES", {"ON", "OFF"}, "The texture pack's textures, or the game's own."},
+        // VRR: last, so a game's own menu that shows the first few rows
+        // (Mister Mosquito's) keeps the ones it had.
+        {"VRR", {"off", "on"}, {"Off", "On"},
+         [] { return OnOff(WindowVrr()); },
+         [](const std::string& v) { SetWindowVrr(v == "on"); },
+         "VRR", {"OFF", "ON"}, "A G-Sync or FreeSync screen: its refresh follows the pictures."},
     };
     return choices;
 }

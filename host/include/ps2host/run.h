@@ -380,6 +380,13 @@ u64 LatePictures();
    delay. */
 void SetWindowVsync(bool on);
 bool WindowVsync();
+/* A variable refresh screen (G-Sync, FreeSync: the "vrr" setting, off by
+   default): pictures at once without vertical sync (IMMEDIATE, not
+   MAILBOX), fullscreen at the screen's own refresh, and a high frame rate's
+   DISPLAY a little under it (high_fps.cpp) - VRR's range, not its ceiling.
+   Off, all is as on a fixed refresh. */
+void SetWindowVrr(bool on);
+bool WindowVrr();
 /* The picture's shape (the "aspect" setting: "4:3", "16:9" or "auto", the
    window's own), shown so; and as width over height, for a game to draw it
    so - auto's the window's now. */

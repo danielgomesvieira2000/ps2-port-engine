@@ -204,7 +204,8 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
     g_display = ps2gpu::CreateVulkanDisplay(narrow.c_str(), width, height, &error);
     if (g_display) {
         Note("window", "window: Vulkan on " + g_display->Describe());
-        g_display->SetKeepRefresh(Setting("frame_rate", "60") == "display");
+        g_display->SetVrr(SettingOn("vrr"));
+        g_display->SetKeepRefresh(Setting("frame_rate", "60") == "display" || SettingOn("vrr"));
         if (SettingOn("fullscreen")) g_display->SetFullscreen(true);
         ApplyCursorArt();
         g_display->SetPresentObserver([](std::uint64_t due_ns, std::uint64_t shown_ns, bool dropped) {
@@ -645,10 +646,23 @@ bool WindowFullscreen() {
 
 void SetWindowKeepRefresh(bool keep) {
 #ifdef PS2HOST_VULKAN
-    if (g_display) g_display->SetKeepRefresh(keep);
+    // (On a VRR screen, always: its own refresh is the most it can follow.)
+    if (g_display) g_display->SetKeepRefresh(keep || SettingOn("vrr"));
 #endif
     (void)keep;
 }
+
+void SetWindowVrr(bool on) {
+    SetSettingOn("vrr", on);
+#ifdef PS2HOST_VULKAN
+    if (g_display) {
+        g_display->SetVrr(on);
+        g_display->SetKeepRefresh(on || Setting("frame_rate", "60") == "display");
+    }
+#endif
+}
+
+bool WindowVrr() { return SettingOn("vrr"); }
 
 std::uint64_t LatePictures() { return g_late_pictures.load(std::memory_order_relaxed); }
 

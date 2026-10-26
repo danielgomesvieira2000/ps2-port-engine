@@ -68,6 +68,11 @@ public:
        all there is). */
     virtual void SetVsync(bool on) { (void)on; }
     virtual bool Vsync() const { return false; }
+    /* A variable refresh screen (G-Sync, FreeSync): without vertical sync,
+       each picture goes at once (IMMEDIATE, never MAILBOX - which shows at
+       the screen's highest refresh and drops pictures, uneven under VRR). */
+    virtual void SetVrr(bool on) { (void)on; }
+    virtual bool Vrr() const { return false; }
 
     /* The refresh rate of the screen the window is on, in its present mode
        (fullscreen's own, EvenMode's), in Hz: 0 when not known. */
