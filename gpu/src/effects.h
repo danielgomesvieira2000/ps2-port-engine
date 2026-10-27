@@ -56,7 +56,7 @@ private:
         bool made = false;
     };
     enum Pass { kTint, kAo, kAoBlurX, kAoBlurY, kAoApply, kBlur, kCopy, kBloomDown, kBloomUp, kBloomApply, kGrade,
-                kSceneDepth, kDof, kSsr, kSsrApply, kPasses };
+                kSceneDepth, kDof, kSsr, kSsrApply, kAoDepth, kPasses };
     struct Push {
         std::int32_t rect[4];
         std::int32_t size[4];

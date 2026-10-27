@@ -20,6 +20,7 @@
 #include "effects_12.h"
 #include "effects_13.h"
 #include "effects_14.h"
+#include "effects_15.h"
 
 namespace ps2gpu {
 
@@ -78,7 +79,7 @@ bool GsEffects::Init(VkPipelineCache cache) {
         {spirv_effects_8, sizeof spirv_effects_8}, {spirv_effects_9, sizeof spirv_effects_9},
         {spirv_effects_10, sizeof spirv_effects_10}, {spirv_effects_11, sizeof spirv_effects_11},
         {spirv_effects_12, sizeof spirv_effects_12}, {spirv_effects_13, sizeof spirv_effects_13},
-        {spirv_effects_14, sizeof spirv_effects_14},
+        {spirv_effects_14, sizeof spirv_effects_14}, {spirv_effects_15, sizeof spirv_effects_15},
     };
     for (int i = 0; i < kPasses; ++i) {
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -302,7 +303,13 @@ void GsEffects::Record(VkCommandBuffer cmd, const GsEffect& e, const Target& t) 
             push.size[0] = std::int32_t(hw);
             push.size[1] = std::int32_t(hh);
             push.size[3] = std::int32_t(set.ao_div);       // (its passes: the occlusion's divisor)
-            Dispatch(cmd, kAo, Descriptors(t, set.half_a.view, nullptr, nullptr), push, hw, hh);
+            // Its distances first, one a pixel of its own (half_b), read by
+            // its samples: the full depth buffer's scattered reads were a
+            // fifth of its time at 3x (0.9 ms a picture -> 0.75 in the
+            // explosion; the rest its own arithmetic, the sun's 0.17).
+            Dispatch(cmd, kAoDepth, Descriptors(t, set.half_b.view, nullptr, nullptr), push, hw, hh);
+            Barrier(cmd);
+            Dispatch(cmd, kAo, Descriptors(t, set.half_a.view, set.half_b.view, nullptr), push, hw, hh);
             Barrier(cmd);
             Dispatch(cmd, kAoBlurX, Descriptors(t, set.half_b.view, set.half_a.view, nullptr), push, hw, hh);
             Barrier(cmd);

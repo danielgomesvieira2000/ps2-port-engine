@@ -113,7 +113,7 @@ add_custom_command(OUTPUT ${out}
     COMMENT "glslang gs.frag (blending in the shader)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # The PC's effects (effects.cpp): effects.comp once for each pass.
-foreach(pass RANGE 0 14)
+foreach(pass RANGE 0 15)
     set(out ${PS2GPU_SHADER_DIR}/effects_${pass}.h)
     add_custom_command(OUTPUT ${out}
         COMMAND glslang-standalone -V --target-env vulkan1.3 -DPASS=${pass} --vn spirv_effects_${pass}
