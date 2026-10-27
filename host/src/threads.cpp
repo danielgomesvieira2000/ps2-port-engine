@@ -531,7 +531,20 @@ void VblankTimer() {
     const auto period = std::chrono::microseconds(16683);      // NTSC, 59.94 Hz
     const auto margin = std::chrono::microseconds(700);    // the precise sleep's (SleepUntil), then a spin
     auto next = clock::now() + period;
+    u64 period_seen = BlankPeriodNs();
     while (!StopRequested() && !g_timer_stop) {
+        // The blanks quicker from now (a high frame rate taken up): the one
+        // waited for a period of the new rate after the last, not the old
+        // rate's - a picture each blank, the first after the change shown
+        // a whole old period after the one before (28 ms at 60 to 144).
+        if (const u64 period_now = BlankPeriodNs(); period_now != period_seen) {
+            if (period_now < period_seen && g_last_vblank_ns.load(std::memory_order_relaxed)) {
+                const clock::time_point sooner{std::chrono::duration_cast<clock::duration>(std::chrono::nanoseconds(
+                    g_last_vblank_ns.load(std::memory_order_relaxed) + period_now))};
+                next = std::min(next, std::max(sooner, clock::now()));
+            }
+            period_seen = period_now;
+        }
         // Sleep to the next vertical blank, or to an EE timer's interrupt if that
         // comes first.
         Scheduler& s = S();

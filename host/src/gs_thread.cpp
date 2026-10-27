@@ -572,6 +572,14 @@ u64 FrameDue(u64 frame) {
     // than a period and a half behind - a frame later than that goes at once.
     static u64 delays[120] = {};
     static int next = 0;
+    // The blanks' rate changed: the delays at the old forgotten (the frame
+    // across the change came a period late; kept, every picture after it
+    // waited that long, the most, for two seconds).
+    static u64 period = 0;
+    if (BlankPeriodNs() != period) {
+        period = BlankPeriodNs();
+        std::fill(std::begin(delays), std::end(delays), u64(0));
+    }
     const u64 ended = FrameEndedNs(frame);
     const u64 now = SteadyNowNs();
     if (!ended || now < ended) return now;
