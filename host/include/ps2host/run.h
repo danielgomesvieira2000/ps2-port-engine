@@ -377,6 +377,10 @@ bool WindowRefreshTiming(double* period_ns, u64* blank_ns);
    "refresh_lock" setting (on by default; off with VRR) or
    PS2HOST_REFRESH_LOCK=0/1. */
 bool RefreshLocked(double* period_ns, u64* blank_ns);
+/* The locked blanks' lead (refresh_lock.h): each this long before one of the
+   screen's, the picture it makes then done just before a refresh. The
+   window's (NoteGpuDone), from when the GPU finished each picture; 0 none. */
+void SetRefreshLead(u64 ns);
 /* Fullscreen at the screen's own refresh (Display::SetKeepRefresh; the
    window opens so when the "frame_rate" setting is "display"), not one 60
    divides evenly. */

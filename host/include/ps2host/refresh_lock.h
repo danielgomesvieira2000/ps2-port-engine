@@ -15,6 +15,12 @@
  * and it them: a lock still pulling in after ten seconds, or one whose
  * nudges add up (more than a millisecond in ten seconds once in place),
  * gives up until the screen's period changes. The VRR setting turns it off.
+ *
+ * Each blank a `lead` before the screen's (Step's): the picture a blank
+ * makes is done on the GPU some time after it; on the screen's blank, it
+ * waited out nearly a whole refresh for the next - the lead (the host's
+ * longest such time and a margin, as the screen's refreshes go) has it done
+ * just before one, shown at once. The lead taken up at the slew's pace.
  */
 #pragma once
 
@@ -59,12 +65,14 @@ public:
     static constexpr double kSlewShare = 0.004;         // of a refresh, the most a blank is nudged
     static constexpr double kPullNs = 10e9;             // pulling in for longer: given up
     static constexpr double kWindowNs = 10e9;           // once locked, nudges summed over this...
-    static constexpr double kDriftNs = 1e6;             // ...more than this: given up
+    static constexpr double kDriftNs = 1e6;             // ...more than this beyond the error closed: given up
 
     /* The step to the blank after `next` (steady clock ns), the game's own
        being `nominal` ns; the screen's refresh `period` ns with a blank at
-       `anchor` (valid false: not known). */
-    double Step(double nominal, std::uint64_t next, bool valid, double period, std::uint64_t anchor) {
+       `anchor` (valid false: not known); each blank wanted `lead` ns before
+       one of the screen's (0 to a period). */
+    double Step(double nominal, std::uint64_t next, bool valid, double period, std::uint64_t anchor,
+                double lead = 0) {
         const int k = valid ? Refreshes(nominal, period) : 0;
         if (state_ == State::kGaveUp) {
             if (k && std::fabs(period - gave_up_period_) < 0.01 * period) return nominal;
@@ -78,10 +86,18 @@ public:
             k_ = k;
             Pull();
         }
-        // The blank after this step, unnudged: after the screen's nearest by e.
-        const double target = double(next) + double(k) * period;
-        const double e = Phase(target - double(anchor), period);
         const double slew = kSlewShare * period;
+        // The lead followed a slew at a time once locked - the phase's error
+        // stays a few hundredths of a refresh (never pulling in again), and
+        // what it adds is no drift (the nudges' sum less it).
+        const double wanted = Phase(lead, period);
+        const double moved = state_ == State::kLocked ? std::clamp(Phase(wanted - lead_, period), -slew, slew) : 0.0;
+        lead_ += moved;
+        window_sum_ -= moved;
+        // The blank after this step, unnudged: after the screen's nearest (less
+        // the lead) by e.
+        const double target = double(next) + double(k) * period;
+        const double e = Phase(target + lead_ - double(anchor), period);
         const double nudge = std::clamp(e * kGain, -slew, slew);
         elapsed_ += nominal;
         if (state_ == State::kPulling) {
@@ -89,6 +105,7 @@ public:
                 Change(State::kLocked);
                 window_from_ = elapsed_;
                 window_sum_ = 0;
+                window_e_ = e - nudge;
             } else if (elapsed_ > kPullNs) {
                 GiveUp(period);
                 return nominal;
@@ -96,14 +113,17 @@ public:
         } else if (std::fabs(e) > period / 8) {
             Pull();                             // knocked off (a stall): in again
         } else {
+            // Drift: nudges beyond the error they closed (and the lead taken
+            // up) - a screen that follows the blanks, its error never closing.
             window_sum_ += nudge;
-            if (std::fabs(window_sum_) > kDriftNs) {
+            if (std::fabs(window_sum_ - (window_e_ - (e - nudge))) > kDriftNs) {
                 GiveUp(period);
                 return nominal;
             }
             if (elapsed_ - window_from_ > kWindowNs) {
                 window_from_ = elapsed_;
                 window_sum_ = 0;
+                window_e_ = e - nudge;
             }
         }
         period_ = period;
@@ -137,6 +157,8 @@ private:
     State state_ = State::kOff;
     int k_ = 0;
     double elapsed_ = 0, window_from_ = 0, window_sum_ = 0, gave_up_period_ = 0, period_ = 0;
+    double lead_ = 0;                   // the lead as far as taken up
+    double window_e_ = 0;               // the error expected after the window's first nudge
     std::uint64_t anchor_ = 0;
     unsigned changes_ = 0;
 };

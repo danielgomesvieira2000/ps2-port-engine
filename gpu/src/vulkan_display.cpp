@@ -313,7 +313,26 @@ public:
         shown_observer_ = std::move(observer);
     }
     ShownObserver shown_observer_;          // SetShownObserver (under pacing_lock_)
+    void SetGpuDoneObserver(GpuDoneObserver observer) override;
+    void SetPresentTag(std::uint64_t tag) override { present_tag_.store(tag); }
 private:
+    /* SetGpuDoneObserver's: after each tagged present an empty submit with
+       a fence of its own - signalled once all before it on the queue is
+       done - waited for by a thread that notes the time. Its fences its own
+       (a present's are reset by the next present). */
+    struct DoneWatch {
+        std::mutex lock;
+        std::condition_variable wake;
+        std::vector<std::pair<VkFence, std::uint64_t>> waiting;     // (fence, tag), oldest first
+        std::vector<VkFence> spare;
+        bool stop = false;
+        GpuDoneObserver observer;
+        std::thread thread;
+    };
+    std::unique_ptr<DoneWatch> done_watch_;
+    std::atomic<std::uint64_t> present_tag_{0};     // SetPresentTag's, taken by the next Submit
+    void WatchDone();
+    void StopDoneWatch();
     PresentObserver observer_;              // SetPresentObserver (under paced_lock_)
     // The mouse (TakeMouse), from the window's events; the picture's place in
     // the window, in pixels, as the last present put it.
@@ -1722,6 +1741,34 @@ bool VulkanDisplay::Submit(std::uint32_t index) {
         std::lock_guard<std::mutex> hold(g_queue_lock);
         if (!Check(vkQueueSubmit(queue_, 1, &submit, fence_), "vkQueueSubmit")) return false;
         r = vkQueuePresentKHR(queue_, &present);
+        // The GPU done with it: an empty submit's fence (after the copy, and
+        // all drawn before on this queue), for SetGpuDoneObserver.
+        const std::uint64_t tag = present_tag_.exchange(0);
+        if (done_watch_ && tag) {
+            VkFence watch = VK_NULL_HANDLE;
+            bool room = false;
+            {
+                std::lock_guard<std::mutex> hold(done_watch_->lock);
+                if (!done_watch_->spare.empty()) {
+                    watch = done_watch_->spare.back();
+                    done_watch_->spare.pop_back();
+                }
+                room = done_watch_->waiting.size() < 16;
+            }
+            if (!watch && room) {
+                VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+                vkCreateFence(device_, &fci, nullptr, &watch);
+            }
+            if (watch) {
+                if (vkQueueSubmit(queue_, 0, nullptr, watch) == VK_SUCCESS) {
+                    std::lock_guard<std::mutex> hold(done_watch_->lock);
+                    done_watch_->waiting.emplace_back(watch, tag);
+                    done_watch_->wake.notify_one();
+                } else {
+                    vkDestroyFence(device_, watch, nullptr);
+                }
+            }
+        }
     }
     {
         const auto now = std::chrono::steady_clock::now();
@@ -2202,6 +2249,54 @@ bool VulkanDisplay::KeyDown(int scancode) const {
     return keys && scancode >= 0 && scancode < n && keys[scancode];
 }
 
+void VulkanDisplay::SetGpuDoneObserver(GpuDoneObserver observer) {
+    if (done_watch_ || !observer) return;
+    done_watch_ = std::make_unique<DoneWatch>();
+    done_watch_->observer = std::move(observer);
+    done_watch_->thread = std::thread([this] { WatchDone(); });
+}
+
+void VulkanDisplay::WatchDone() {
+    DoneWatch& w = *done_watch_;
+    while (true) {
+        std::pair<VkFence, std::uint64_t> next;
+        {
+            std::unique_lock<std::mutex> hold(w.lock);
+            w.wake.wait(hold, [&] { return w.stop || !w.waiting.empty(); });
+            if (w.waiting.empty()) return;
+            next = w.waiting.front();
+        }
+        // (A tenth of a second at a time: stopped meanwhile, it goes.)
+        VkResult r = VK_TIMEOUT;
+        while ((r = vkWaitForFences(device_, 1, &next.first, VK_TRUE, 100'000'000)) == VK_TIMEOUT) {
+            std::lock_guard<std::mutex> hold(w.lock);
+            if (w.stop) return;
+        }
+        const std::uint64_t done = std::uint64_t(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        vkResetFences(device_, 1, &next.first);
+        {
+            std::lock_guard<std::mutex> hold(w.lock);
+            w.waiting.erase(w.waiting.begin());
+            w.spare.push_back(next.first);
+        }
+        if (r == VK_SUCCESS) w.observer(next.second, done);
+    }
+}
+
+void VulkanDisplay::StopDoneWatch() {
+    if (!done_watch_) return;
+    {
+        std::lock_guard<std::mutex> hold(done_watch_->lock);
+        done_watch_->stop = true;
+    }
+    done_watch_->wake.notify_all();
+    if (done_watch_->thread.joinable()) done_watch_->thread.join();
+    for (auto& [fence, tag] : done_watch_->waiting) vkDestroyFence(device_, fence, nullptr);
+    for (VkFence fence : done_watch_->spare) vkDestroyFence(device_, fence, nullptr);
+    done_watch_.reset();
+}
+
 VulkanDisplay::~VulkanDisplay() {
     if (vblank_watch_) vblank_watch_->stop = true;      // (its thread ends at its next blank)
     {
@@ -2212,6 +2307,7 @@ VulkanDisplay::~VulkanDisplay() {
     if (present_thread_.joinable()) present_thread_.join();
     shared_.reset();
     if (device_) vkDeviceWaitIdle(device_);
+    StopDoneWatch();
     DestroyPaced();
     if (copy_pool_) vkDestroyCommandPool(device_, copy_pool_, nullptr);
     DestroyPicture();

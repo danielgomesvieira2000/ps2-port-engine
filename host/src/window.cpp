@@ -235,6 +235,64 @@ void NoteRefreshes(std::uint64_t shown_ns) {
     nearest = 1e18;
 }
 
+/* Each picture's GPU work done (Display::SetGpuDoneObserver), `tag` its
+   blank: the lead the locked blanks keep (SetRefreshLead) - the longest
+   blank-to-done of the last two seconds, a millisecond and a tenth more,
+   as the screen's refreshes go (a 9 ms picture at 144: 3 ms - done before
+   the second refresh after its blank, never on one). Every picture then
+   waits that long, the longest's time and the margin: taken only where that
+   is a millisecond under what they wait with the blanks on the screen's
+   (each to the refresh after it is done) - a 60 Hz screen's pictures done
+   3 ms after their blank: 6 ms against 16.7. At 144 a 3x picture's 5.5 ms,
+   now and then 8.5, is quicker on the refresh after: none. Not with frame pacing
+   (FrameDue times its pictures: a lead would only move them); nor with
+   PS2HOST_REFRESH_LEAD=0. With
+   PS2HOST_REFRESH_LOG, each 600 pictures: blank to shown (the screen's next
+   refresh after done), what a press waits for beyond the game. */
+void NoteGpuDone(std::uint64_t tag, std::uint64_t done_ns) {
+    if (done_ns <= tag) return;
+    double period = 0;
+    u64 anchor = 0;
+    if (!WindowRefreshTiming(&period, &anchor) || !(period > 0)) return;
+    const u64 lag = done_ns - tag;
+    struct Seen { u64 at, lag; };
+    static std::vector<Seen> seen;              // the last two seconds'
+    seen.push_back({done_ns, lag});
+    std::size_t old = 0;
+    while (old < seen.size() && seen[old].at + 2'000'000'000ull < done_ns) ++old;
+    seen.erase(seen.begin(), seen.begin() + std::ptrdiff_t(old));
+    u64 most = 0;
+    double unled = 0;                           // waited on average with the blanks on the screen's
+    for (const Seen& s : seen) {
+        most = std::max(most, s.lag);
+        unled += std::ceil(double(s.lag) / period) * period;
+    }
+    unled /= double(seen.size());
+    const double led = double(most) * 1.1 + 1e6;   // waited by every picture with the lead
+    static bool leading = false;
+    leading = leading ? led < unled : led < unled - 1e6;
+    const double lead = leading ? std::fmod(led, period) : 0.0;
+    static const char* forced = std::getenv("PS2HOST_REFRESH_LEAD");     // (=0: none, to compare)
+    const bool wanted = !(forced && forced[0] == '0') && !SettingOn("frame_pacing", FramePacingDefault());
+    SetRefreshLead(wanted ? u64(lead) : 0);
+    static const bool log = std::getenv("PS2HOST_REFRESH_LOG") != nullptr;
+    if (!log) return;
+    const double since = double(done_ns) - double(anchor);
+    const double shown = double(done_ns) + (period - (since - std::floor(since / period) * period));
+    static double sum = 0, longest = 0, lag_sum = 0;
+    static unsigned n = 0;
+    sum += shown - double(tag);
+    longest = std::max(longest, shown - double(tag));
+    lag_sum += double(lag);
+    if (++n < 600) return;
+    std::fprintf(stderr,
+                 "[latency] 600 pictures: blank to shown %.2f ms (longest %.2f), blank to done on the GPU %.2f ms; "
+                 "the blanks' lead %.2f ms\n",
+                 sum / n / 1e6, longest / 1e6, lag_sum / n / 1e6, lead / 1e6);
+    sum = longest = lag_sum = 0;
+    n = 0;
+}
+
 bool OpenWindow(const wchar_t* title, int width, int height) {
 #ifdef PS2HOST_VULKAN
     std::string narrow;
@@ -272,6 +330,7 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
             }
         });
         if (std::getenv("PS2HOST_REFRESH_LOG")) g_display->SetShownObserver(NoteRefreshes);
+        g_display->SetGpuDoneObserver(NoteGpuDone);
         if (SettingOn("vsync")) g_display->SetVsync(true);
         g_display->SetAspect(SettingAspect());
         g_display->SetAntiAliasing(DisplayAntiAliasing(Setting("antialiasing", "off")));

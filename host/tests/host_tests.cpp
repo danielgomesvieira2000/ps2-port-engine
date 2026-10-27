@@ -1961,6 +1961,29 @@ void BlanksLockToTheScreen() {
               lock.state() == rl::Lock::State::kOff,
           "refresh lock: off when the screen is not known");
 
+    // A lead: each blank 3 ms before one of the screen's (a picture done
+    // 2 ms after its blank, shown at once), then 9 ms at 144 (as the
+    // refreshes go: 2.06 ms) - taken up at the slew's pace, locked all along.
+    rl::Lock leading;
+    next = 1e9;
+    for (int blank = 0; blank < 60 * 20; ++blank)
+        next += leading.Step(16683000, std::uint64_t(next), true, screen, anchor, 3'000'000);
+    Check(leading.state() == rl::Lock::State::kLocked &&
+              std::fabs(rl::Phase(next + 3'000'000 - double(anchor), screen)) < 20'000,
+          "refresh lock: the blanks a lead before the screen's (within 20 us)");
+    rl::Lock fast;
+    const double screen144 = 1e9 / 144.0;
+    next = 1e9;
+    for (int blank = 0; blank < 144 * 10; ++blank)
+        next += fast.Step(6944444, std::uint64_t(next), true, screen144, anchor);
+    bool held = fast.state() == rl::Lock::State::kLocked;
+    for (int blank = 0; blank < 144 * 10; ++blank) {
+        next += fast.Step(6944444, std::uint64_t(next), true, screen144, anchor, 9'000'000);
+        held = held && fast.state() == rl::Lock::State::kLocked;
+    }
+    Check(held && std::fabs(rl::Phase(next + 9'000'000 - double(anchor), screen144)) < 20'000,
+          "refresh lock: a new lead taken up, locked throughout");
+
     // A VRR screen: its blank 7 ms after each of the timer's, whatever the timer does.
     rl::Lock follower;
     next = 1e9;

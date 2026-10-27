@@ -477,6 +477,7 @@ refresh_lock::Lock g_refresh_lock;
 std::atomic<bool> g_refresh_locked{false};
 std::atomic<double> g_locked_period{0.0};
 std::atomic<u64> g_locked_anchor{0};
+std::atomic<u64> g_refresh_lead{0};             // SetRefreshLead
 
 /* Whether the lock is wanted: PS2HOST_REFRESH_LOCK=0/1, else the
    "refresh_lock" setting (on by default) unless VRR's on (its refresh
@@ -500,7 +501,8 @@ std::chrono::steady_clock::duration LockedStep(std::chrono::steady_clock::durati
     const double nominal_ns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(nominal).count());
     const u64 next_ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(next.time_since_epoch()).count());
     const unsigned changes = g_refresh_lock.changes();
-    const double step = g_refresh_lock.Step(nominal_ns, next_ns, valid, period, anchor);
+    const double step = g_refresh_lock.Step(nominal_ns, next_ns, valid, period, anchor,
+                                            double(g_refresh_lead.load(std::memory_order_relaxed)));
     const bool locked = g_refresh_lock.state() == refresh_lock::Lock::State::kLocked;
     if (locked) {
         g_locked_period.store(g_refresh_lock.period(), std::memory_order_relaxed);
@@ -1449,6 +1451,8 @@ bool RefreshLocked(double* period_ns, u64* blank_ns) {
 }
 
 u64 LastVblankNs() { return g_last_vblank_ns.load(std::memory_order_relaxed); }
+
+void SetRefreshLead(u64 ns) { g_refresh_lead.store(ns, std::memory_order_relaxed); }
 
 void FastThread() {
     THREAD_POWER_THROTTLING_STATE throttling{};

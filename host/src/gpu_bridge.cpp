@@ -2448,6 +2448,8 @@ void PresentWaiting() {
     g_present_waits = false;
     if (ps2gpu::Display* display = WindowDisplay()) {
         const bool pace = !VirtualClock() && SettingOn("frame_pacing", FramePacingDefault());    // (PC SETTINGS)
+        // (Its blank, for the GPU's done time: the locked blanks' lead, NoteGpuDone.)
+        if (!pace && !VirtualClock()) display->SetPresentTag(FrameEndedNs(g_present_frame));
         PresentGpuPicture(*display, pace ? FrameDue(g_present_frame) : 0);
     }
 }

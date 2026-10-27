@@ -222,6 +222,15 @@ public:
        thread; set before the first). */
     using ShownObserver = std::function<void(std::uint64_t shown_ns)>;
     virtual void SetShownObserver(ShownObserver observer) { (void)observer; }
+    /* Told when each picture's GPU work was done - all drawn before its
+       present, and the present's own copy: from then the screen's next
+       refresh can show it - with the tag SetPresentTag gave it (the host:
+       its blank), on a thread of the display's own. A present untagged (0)
+       is not told. Set before the first. */
+    using GpuDoneObserver = std::function<void(std::uint64_t tag, std::uint64_t done_ns)>;
+    virtual void SetGpuDoneObserver(GpuDoneObserver observer) { (void)observer; }
+    /* The tag of the next present (PresentImage, on the thread that makes it). */
+    virtual void SetPresentTag(std::uint64_t tag) { (void)tag; }
 
     /* The GPU and driver, for the report. */
     virtual std::string Describe() const = 0;
