@@ -396,6 +396,11 @@ bool WindowVsync();
    Off, all is as on a fixed refresh. */
 void SetWindowVrr(bool on);
 bool WindowVrr();
+/* The GPU's clocks kept up (the "gpu_boost" setting, on by default:
+   Display::SetGpuBoost - NVIDIA's low-latency boost): no slow first frames
+   at a new scene after a light one; off saves a laptop's battery. */
+void SetWindowGpuBoost(bool on);
+bool WindowGpuBoost();
 /* The picture's shape (the "aspect" setting: "4:3", "16:9" or "auto", the
    window's own), shown so; and as width over height, for a game to draw it
    so - auto's the window's now. */

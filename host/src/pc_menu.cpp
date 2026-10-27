@@ -131,6 +131,10 @@ const std::vector<Choice>& Choices() {
          [] { return OnOff(WindowVrr()); },
          [](const std::string& v) { SetWindowVrr(v == "on"); },
          "VRR", {"OFF", "ON"}, "A G-Sync or FreeSync screen: its refresh follows the pictures."},
+        {"GPU boost", {"on", "off"}, {"On", "Off"},
+         [] { return OnOff(WindowGpuBoost()); },
+         [](const std::string& v) { SetWindowGpuBoost(v == "on"); },
+         "GPU BOOST", {"ON", "OFF"}, "The GPU's clocks kept up: no hitch at a new scene. Off saves battery."},
     };
     return choices;
 }

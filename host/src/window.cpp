@@ -707,6 +707,15 @@ void SetWindowVrr(bool on) {
 
 bool WindowVrr() { return SettingOn("vrr"); }
 
+void SetWindowGpuBoost(bool on) {
+    SetSettingOn("gpu_boost", on);
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetGpuBoost(on);
+#endif
+}
+
+bool WindowGpuBoost() { return SettingOn("gpu_boost", true); }
+
 std::uint64_t LatePictures() { return g_late_pictures.load(std::memory_order_relaxed); }
 
 float WindowRefreshRate() {
