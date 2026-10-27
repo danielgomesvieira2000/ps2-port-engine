@@ -222,6 +222,9 @@ public:
     Pacing TakePacing() override;
     bool Focused() const override;
     bool KeyDown(int scancode) const override;
+    bool Minimized() const override {
+        return window_ && (SDL_GetWindowFlags(window_) & SDL_WINDOW_MINIMIZED) != 0;
+    }
     bool Pad(PadState* state) const override;
     std::string Describe() const override { return describe_; }
     Gpu* SharedGpu() override;

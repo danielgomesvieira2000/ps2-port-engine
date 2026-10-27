@@ -136,6 +136,8 @@ public:
        scancode (SDL_SCANCODE_*), which names keys by position. */
     virtual bool Focused() const = 0;
     virtual bool KeyDown(int scancode) const = 0;
+    /* Whether the window is minimised (nothing of it shown). */
+    virtual bool Minimized() const { return false; }
 
     /* The first game controller, as a DualShock 2 reads: false when none is
        plugged in. */

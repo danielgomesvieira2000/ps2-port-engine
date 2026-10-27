@@ -161,6 +161,9 @@ double Wanted() {
         return e ? std::strtoull(e, nullptr, 10) : set.empty() ? 0ull : std::strtoull(set.c_str(), nullptr, 10);
     }();
     if (FrameNumber() < from) want = Own();
+    // Minimised: pictures nobody sees - the game's own rate (at 144 a race
+    // took 2 cores, at 60 0.7), back up when the window is.
+    if (WindowMinimized()) want = Own();
     return g_cap > 0.0 ? std::min(want, g_cap) : want;
 }
 

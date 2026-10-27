@@ -355,6 +355,13 @@ bool WindowFocused() {
     return g_window && GetForegroundWindow() == g_window;
 }
 
+bool WindowMinimized() {
+#ifdef PS2HOST_VULKAN
+    if (g_display) return g_display->Minimized();
+#endif
+    return g_window && IsIconic(g_window);
+}
+
 bool WindowClosed() { return g_closed; }
 
 // A game's own EXIT GAME: as if the window had been closed.
