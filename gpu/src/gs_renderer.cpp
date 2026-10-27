@@ -3214,9 +3214,11 @@ void VulkanGsRenderer::Flush() {
     }
     // The shader addresses and filters texels itself (texelFetch), as the GS
     // does - but a texture pack's replacement in REPEAT or CLAMP, which the
-    // GPU filters (ReplacementSampler).
+    // GPU filters (ReplacementSampler), and MODERN filtering's levels (tag
+    // bit 1: gs.frag's Bilinear, linear within a level, its texelFetch the same).
     const int sampler = (texture->replaced & 0x100u) && state_.wms < 2 && state_.wmt < 2
-                            ? ReplacementSampler(state_) : 3;
+                            ? ReplacementSampler(state_)
+                            : (state_.tag & 2u) ? 7 : 3;
     VkDescriptorSet set = SetFor(*texture, sampler);
     // Render to texture: the target itself, or a copy when it is also drawn into.
     Image* source = nullptr;

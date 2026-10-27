@@ -322,6 +322,53 @@ vec4 ReplacedSample(vec2 r, vec2 dx, vec2 dy) {
    texels; `most` the taps at most (the player's anisotropy; 1: trilinear,
    the level the footprint's as it is - finer would shimmer, nothing to
    calm it). */
+// Level n bilinear at uv (level 0's texels) for SampleModern, by the GPU's
+// sampler (binding 0 linear for it: gs_renderer.cpp's Flush) - one fetch,
+// where Sample's GS-exact sixteenths are a gather and their arithmetic: the
+// difference was MODERN's cost (a 3x explosion 7.35 ms a picture against
+// 6.8 as the game filters; 6.9 so). The level's texels only, never its
+// neighbour's in the image: CLAMP held to its outer texels' middles, REPEAT
+// across its edge two fetches there (each held so) mixed - small levels are
+// mostly edge. By hand still for a region's modes, texels that are not the
+// image's as they are (TEXA) and a target drawn larger: the same for the
+// whole draw. Its weights the GS's sixteenths (the position held to them,
+// and a 1024th on: the sampler's 8-bit weights then take exactly those) and
+// its values truncated: a texel of alpha 0 beside an opaque one is 0 a
+// sixteenth away, as Sample has it - finer weights gave such pixels an alpha
+// of 1, past an alpha test that hides a whole polygon.
+vec4 Bilinear(vec2 uv, int n) {
+    if (p.wms > 1u || p.wmt > 1u || p.tex_format != 0u || Scale() != 1u || ImageSize().x < TextureSize().x)
+        return Sample(uv, n, true);
+    const vec2 size = vec2(max(TextureSize() >> n, ivec2(1)));
+    vec2 q = floor((uv / float(1 << n) - 0.5) * 16.0 + kEdge * 16.0) / 16.0 + (0.5 + 1.0 / 1024.0);
+    // Across REPEAT's edge: the last texel's middle (a) and the first's (b),
+    // w of the way from a to b; within it, a alone.
+    vec2 a, b, w = vec2(0.0);
+    for (int i = 0; i < 2; ++i) {
+        float x = q[i];
+        if ((i == 0 ? p.wms : p.wmt) == 0u) {
+            x -= floor(x / size[i]) * size[i];
+            a[i] = x;
+            b[i] = 0.5;
+            if (x < 0.5) { a[i] = size[i] - 0.5; w[i] = floor((x + 0.5) * 16.0) / 16.0; }
+            else if (x > size[i] - 0.5) { a[i] = size[i] - 0.5; w[i] = floor((x - (size[i] - 0.5)) * 16.0) / 16.0; }
+        } else {
+            a[i] = b[i] = clamp(x, 0.5, size[i] - 0.5);
+        }
+    }
+    int offset = 0;
+    for (int i = 0; i < n; ++i) offset += max(TextureSize().y >> i, 1);
+    const vec2 at = vec2(0.0, float(offset)), image = vec2(ImageSize());
+    vec4 c = textureLod(texture_image, (a + at) / image, 0.0);
+    if (w.x > 0.0) c = mix(c, textureLod(texture_image, (vec2(b.x, a.y) + at) / image, 0.0), w.x);
+    if (w.y > 0.0) {
+        vec4 d = textureLod(texture_image, (vec2(a.x, b.y) + at) / image, 0.0);
+        if (w.x > 0.0) d = mix(d, textureLod(texture_image, (b + at) / image, 0.0), w.x);
+        c = mix(c, d, w.y);
+    }
+    return floor(c * 255.0 + 1.0 / 64.0);
+}
+
 vec4 SampleModern(vec2 uv, vec2 dx, vec2 dy, int mxl, float most) {
     const float lx = length(dx), ly = length(dy);
     const float major = max(lx, ly), minor = max(min(lx, ly), 1e-4);
@@ -334,8 +381,8 @@ vec4 SampleModern(vec2 uv, vec2 dx, vec2 dy, int mxl, float most) {
     vec4 sum = vec4(0.0);
     for (int i = 0; i < int(taps); ++i) {
         const vec2 at = uv + axis * ((float(i) + 0.5) / taps - 0.5);
-        vec4 c = Sample(at, n, true);
-        if (n < mxl && f > 0.0) c = mix(c, Sample(at, n + 1, true), f);
+        vec4 c = Bilinear(at, n);
+        if (n < mxl && f > 0.0) c = mix(c, Bilinear(at, n + 1), f);
         sum += c;
     }
     return floor(sum / taps + 0.5);
