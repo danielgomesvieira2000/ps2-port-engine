@@ -652,8 +652,9 @@ void SetGpuPipelineHints(const u32* keys, std::size_t count);
    sphere map, its blend's share by a Fresnel term. One texture at a time. */
 void SetGpuDrawTag(u32 tbp, u32 tag);
 /* Mipmapped textures filtered as a modern GPU filters them - the level from
-   the footprint on screen (finer at an internal resolution), trilinear,
-   anisotropic - not by the GS's depth-based level (GsDrawState::tag bit 1). */
+   the footprint on screen (finer at an internal resolution), trilinear - not
+   by the GS's depth-based level (GsDrawState::tag bit 1). Anisotropic taps
+   are SetGpuTextureFilter's (4), the player's choice: they cost. */
 void SetGpuModernTextures(bool on);
 /* The texture filtering a player chose, over the game's own (TEX1) on its
    3D draws - not on sprites (the HUD, text, a picture's copies and effects,

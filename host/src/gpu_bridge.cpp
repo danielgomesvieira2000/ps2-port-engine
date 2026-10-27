@@ -1835,7 +1835,10 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     state.gouraud = gouraud;
     state.textured = (call.prim >> 4) & 1;
     if (state.textured && Bits(c.tex0, 0, 14) == g_tag_tbp.load(std::memory_order_relaxed)) state.tag = g_tag_bits;
-    if (state.textured && g_modern_textures.load(std::memory_order_relaxed)) state.tag |= 2u | 3u << 8;  // (8 taps)
+    // (One tap: trilinear. Eight anisotropic taps cost the explosion at 3x
+    // 30% of its picture's time - 9.3 ms against 7.2, 7.5 with one -
+    // for a road a little crisper far ahead: ANISOTROPIC, the player's.)
+    if (state.textured && g_modern_textures.load(std::memory_order_relaxed)) state.tag |= 2u;
     // A soft particle: a game's particle texture, blended and depth tested,
     // drawn after its view's effects (the scene's depth saved then).
     if (g_after_effects && state.textured && ((call.prim >> 6) & 1) && Bits(c.test, 16, 1)) {
