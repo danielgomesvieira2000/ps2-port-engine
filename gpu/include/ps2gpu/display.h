@@ -79,6 +79,8 @@ public:
        tenth of the memory's speed - late pictures at every change of scene.
        On by default; off saves power on a laptop's battery. */
     virtual void SetGpuBoost(bool on) { (void)on; }
+    /* Whether the boost is on now: wanted, and the driver took it. */
+    virtual bool GpuBoosted() const { return false; }
 
     /* The refresh rate of the screen the window is on, in its present mode
        (fullscreen's own, EvenMode's), in Hz: 0 when not known. */

@@ -401,6 +401,8 @@ bool WindowVrr();
    at a new scene after a light one; off saves a laptop's battery. */
 void SetWindowGpuBoost(bool on);
 bool WindowGpuBoost();
+/* Whether the boost is on now (wanted, and the driver took it). */
+bool WindowGpuBoosted();
 /* The picture's shape (the "aspect" setting: "4:3", "16:9" or "auto", the
    window's own), shown so; and as width over height, for a game to draw it
    so - auto's the window's now. */

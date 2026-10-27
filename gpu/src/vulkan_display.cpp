@@ -377,6 +377,8 @@ private:
     PFN_vkSetLatencySleepModeNV set_sleep_mode_ = nullptr;
     void ApplyBoost();
     void SetGpuBoost(bool on) override;
+    bool GpuBoosted() const override { return boosted_.load(std::memory_order_relaxed); }
+    std::atomic<bool> boosted_{false};      // ApplyBoost's: the driver took the boost
 
     VkBuffer staging_ = VK_NULL_HANDLE;
     VkDeviceMemory staging_memory_ = VK_NULL_HANDLE;
@@ -1782,6 +1784,7 @@ void VulkanDisplay::ApplyBoost() {
     mode.lowLatencyBoost = boost_ ? VK_TRUE : VK_FALSE;
     mode.minimumIntervalUs = 0;
     const VkResult r = set_sleep_mode_(device_, swapchain_, &mode);
+    boosted_ = boost_ && r == VK_SUCCESS;
     static int said = -1;
     if (said != int(boost_.load())) {
         said = int(boost_.load());

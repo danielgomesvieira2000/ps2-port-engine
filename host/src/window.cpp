@@ -716,6 +716,13 @@ void SetWindowGpuBoost(bool on) {
 
 bool WindowGpuBoost() { return SettingOn("gpu_boost", true); }
 
+bool WindowGpuBoosted() {
+#ifdef PS2HOST_VULKAN
+    if (g_display) return g_display->GpuBoosted();
+#endif
+    return false;
+}
+
 std::uint64_t LatePictures() { return g_late_pictures.load(std::memory_order_relaxed); }
 
 float WindowRefreshRate() {

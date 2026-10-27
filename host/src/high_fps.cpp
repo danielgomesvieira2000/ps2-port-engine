@@ -101,8 +101,8 @@ double g_cap = 0.0;
 int g_sampled = 0;                      // frames since the last look
 
 /* Into a rate above the game's own, the rate rises to it in eighths
-   (PS2HOST_HIGH_FPS_RAMP ms for all eight at the least, 600 by default; 0:
-   at once; Rise): a laptop's GPU
+   (PS2HOST_HIGH_FPS_RAMP ms for all eight at the least, 600 by default -
+   0, at once, where the GPU's boost keeps its clocks up; Rise): a laptop's GPU
    idles clocked down through the loading and the 60-a-second screens
    before a race (an RTX 4070 Laptop at 600-900 MHz, its memory at 810),
    and at once at 144 it took half a second to clock up, the race's first
@@ -115,9 +115,14 @@ bool g_rise_new = false;                // a rise begun: Rise starts its steps
 double RiseMs() {
     static const double ms = [] {
         const char* e = std::getenv("PS2HOST_HIGH_FPS_RAMP");
-        return e ? std::max(0.0, std::atof(e)) : 600.0;
+        return e ? std::max(0.0, std::atof(e)) : -1.0;
     }();
-    return VirtualClock() ? 0.0 : ms;   // (a GPU's clocks are real time's: a scripted run's pictures as ever)
+    if (VirtualClock()) return 0.0;     // (a GPU's clocks are real time's: a scripted run's pictures as ever)
+    if (ms >= 0.0) return ms;
+    // The GPU's clocks kept up (WindowGpuBoosted: NVIDIA's boost): no rise -
+    // the rate at once (race start at 144: none late either way, the rate
+    // there 0.75 s sooner).
+    return WindowGpuBoosted() ? 0.0 : 600.0;
 }
 int g_looks = 0;                        // looks since the rate changed
 u64 g_late_seen = 0;                    // LatePictures at the last look
