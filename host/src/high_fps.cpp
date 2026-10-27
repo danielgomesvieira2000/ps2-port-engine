@@ -129,7 +129,8 @@ u64 g_late_seen = 0;                    // LatePictures at the last look
 
 /* FRAME RATE, as pictures a second (60: none above the game's own):
    PS2HOST_FRAME_RATE, else the setting - 120, or "display", the screen's
-   refresh (up to 240; 60 where it is not known or below 90). */
+   refresh (up to 240; 60 where it is not known or below 90) - never above
+   the screen's refresh. */
 /* The game's own picture rate: 60 for a game that steps each blank, 30 for
    one that steps every second one. */
 double Own() { return 60.0 * g_game.steps_per_blank; }
@@ -142,6 +143,13 @@ double Wanted() {
     // 160 on 165): at the very top of its range a picture a little early
     // waits for the next refresh as with a fixed one, and the queue behind it.
     if (rate == "display" && WindowVrr()) hz = std::floor(hz * 0.97);
+    // Never above the screen's refresh: a picture more than it shows is drawn
+    // and thrown away (MAILBOX keeps the newest), its input no newer - the
+    // game steps at its own rate. 120 on a 60 Hz screen (a fullscreen mode
+    // 60 divides) was twice the work for nothing - at 3x the GS thread full,
+    // pictures 70 ms behind. (A rate within 2% of it is its.)
+    const double screen = double(WindowRefreshRate());
+    if (screen > 0.0 && hz > screen * 1.02) hz = WindowVrr() ? std::floor(screen * 0.97) : screen;
     double want = hz >= 1.5 * Own() ? std::min(hz, 240.0) : Own();
     // PS2HOST_HIGH_FPS_FROM=<frame>: 60 until then (a scripted run's test:
     // its presses land as at 60, and the same screen at 60 and above is
