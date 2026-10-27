@@ -607,8 +607,18 @@ void Trace(float t) {
         const float* b = v.now.data() + camera.position;
         const float* placed = (v.placing ? v.placed.data() : v.now.data()) + camera.position;
         const float d[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
-        const float dot = camera.direction >= 0 ? Dot3(v.last.data() + camera.direction, v.now.data() + camera.direction)
-                                                : 1.0f;
+        // The cosine of the way it looks turned in the step (a quaternion's:
+        // its rotation's angle, q and -q one; the 3 values' else).
+        float dot = 1.0f;
+        if (camera.direction >= 0 && camera.quaternion) {
+            const float* la = v.last.data() + camera.direction;
+            const float* na = v.now.data() + camera.direction;
+            const float lengths = std::sqrt((Dot3(la, la) + la[3] * la[3]) * (Dot3(na, na) + na[3] * na[3]));
+            const float half = lengths > 1e-6f ? std::min(1.0f, std::fabs(Dot3(la, na) + la[3] * na[3]) / lengths) : 1.0f;
+            dot = 2.0f * half * half - 1.0f;       // cos(2 acos(half))
+        } else if (camera.direction >= 0) {
+            dot = Dot3(v.last.data() + camera.direction, v.now.data() + camera.direction);
+        }
         std::fprintf(f, ",%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.5f", a[0], a[1], a[2], b[0], b[1], b[2],
                      placed[0], placed[1], placed[2], std::sqrt(Dot3(d, d)), dot);
     }

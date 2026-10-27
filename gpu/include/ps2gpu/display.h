@@ -73,6 +73,12 @@ public:
        the screen's highest refresh and drops pictures, uneven under VRR). */
     virtual void SetVrr(bool on) { (void)on; }
     virtual bool Vrr() const { return false; }
+    /* The GPU's clocks kept up while a game is light (NVIDIA's low-latency
+       boost, VK_NV_low_latency2, where the driver has it): from a loading
+       screen's idle clocks, a scene's first frames took half a second at a
+       tenth of the memory's speed - late pictures at every change of scene.
+       On by default; off saves power on a laptop's battery. */
+    virtual void SetGpuBoost(bool on) { (void)on; }
 
     /* The refresh rate of the screen the window is on, in its present mode
        (fullscreen's own, EvenMode's), in Hz: 0 when not known. */

@@ -370,6 +370,13 @@ private:
     VkPresentModeKHR mode_ = VK_PRESENT_MODE_FIFO_KHR;
     std::atomic<bool> vsync_{false};        // FIFO when set (SetVsync)
     std::atomic<bool> vrr_{false};          // IMMEDIATE before MAILBOX when set (SetVrr)
+    // SetGpuBoost: VK_NV_low_latency2 enabled on the device (the driver has
+    // it), the boost wanted, and its call (the loader's, by name).
+    bool low_latency_ = false;
+    std::atomic<bool> boost_{true};
+    PFN_vkSetLatencySleepModeNV set_sleep_mode_ = nullptr;
+    void ApplyBoost();
+    void SetGpuBoost(bool on) override;
 
     VkBuffer staging_ = VK_NULL_HANDLE;
     VkDeviceMemory staging_memory_ = VK_NULL_HANDLE;
@@ -595,7 +602,19 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     qci.queueFamilyIndex = family_;
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
-    const char* device_extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    const char* device_extensions[2] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, nullptr};
+    std::uint32_t device_extension_count = 1;
+    {
+        // NVIDIA's low latency (its boost: SetGpuBoost), where the driver has it.
+        std::uint32_t count = 0;
+        vkEnumerateDeviceExtensionProperties(gpu_, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> offered(count);
+        vkEnumerateDeviceExtensionProperties(gpu_, nullptr, &count, offered.data());
+        for (const VkExtensionProperties& e : offered)
+            if (std::strcmp(e.extensionName, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) == 0) low_latency_ = true;
+        if (const char* env = std::getenv("PS2HOST_GPU_BOOST"); env && env[0] == '0') low_latency_ = false;
+        if (low_latency_) device_extensions[device_extension_count++] = VK_NV_LOW_LATENCY_2_EXTENSION_NAME;
+    }
     // What the GS renderer needs, for when it draws on this device
     // (SharedGpu): dynamic rendering, and dual-source blending if there is any.
     VkPhysicalDeviceFeatures supported;
@@ -613,9 +632,14 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     dci.pNext = &features;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1;
+    dci.enabledExtensionCount = device_extension_count;
     dci.ppEnabledExtensionNames = device_extensions;
     if (!Check(vkCreateDevice(gpu_, &dci, nullptr, &device_), "vkCreateDevice")) return false;
+    if (low_latency_) {
+        set_sleep_mode_ = reinterpret_cast<PFN_vkSetLatencySleepModeNV>(
+            vkGetDeviceProcAddr(device_, "vkSetLatencySleepModeNV"));
+        low_latency_ = set_sleep_mode_ != nullptr;
+    }
     // Device functions stay the loader's: see gpu.cpp.
     vkGetDeviceQueue(device_, family_, 0, &queue_);
 
@@ -722,10 +746,14 @@ bool VulkanDisplay::CreateSwapchain() {
     sci.presentMode = mode_;
     sci.clipped = VK_TRUE;
     sci.oldSwapchain = swapchain_;
+    VkSwapchainLatencyCreateInfoNV latency{VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV};
+    latency.latencyModeEnable = VK_TRUE;
+    if (low_latency_) sci.pNext = &latency;
     VkSwapchainKHR created = VK_NULL_HANDLE;
     if (!Check(vkCreateSwapchainKHR(device_, &sci, nullptr, &created), "vkCreateSwapchainKHR")) return false;
     DestroySwapchain();
     swapchain_ = created;
+    ApplyBoost();
     vkGetSwapchainImagesKHR(device_, swapchain_, &n, nullptr);
     images_.resize(n);
     vkGetSwapchainImagesKHR(device_, swapchain_, &n, images_.data());
@@ -1742,6 +1770,31 @@ void VulkanDisplay::SetVsync(bool on) {
     if (vsync_ == on) return;
     vsync_ = on;
     stale_ = true;                              // the swapchain again, with the other mode
+}
+
+/* The boost as wanted, on the swapchain (made again with each). Low latency
+   mode itself on with it - the boost asks for it - but its waits
+   (vkLatencySleepNV) never made: the pictures go as before. */
+void VulkanDisplay::ApplyBoost() {
+    if (!low_latency_ || !swapchain_) return;
+    VkLatencySleepModeInfoNV mode{VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV};
+    mode.lowLatencyMode = boost_ ? VK_TRUE : VK_FALSE;
+    mode.lowLatencyBoost = boost_ ? VK_TRUE : VK_FALSE;
+    mode.minimumIntervalUs = 0;
+    const VkResult r = set_sleep_mode_(device_, swapchain_, &mode);
+    static int said = -1;
+    if (said != int(boost_.load())) {
+        said = int(boost_.load());
+        std::fprintf(stderr, "[display] the GPU's low-latency boost %s%s\n", boost_ ? "on" : "off",
+                     r == VK_SUCCESS ? "" : " (the driver refused)");
+    }
+}
+
+void VulkanDisplay::SetGpuBoost(bool on) {
+    if (boost_ == on) return;
+    boost_ = on;
+    std::lock_guard<std::mutex> hold(present_lock_);
+    ApplyBoost();
 }
 
 void VulkanDisplay::SetVrr(bool on) {

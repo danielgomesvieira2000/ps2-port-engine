@@ -246,6 +246,7 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
     if (g_display) {
         Note("window", "window: Vulkan on " + g_display->Describe());
         g_display->SetVrr(SettingOn("vrr"));
+        g_display->SetGpuBoost(SettingOn("gpu_boost", true));      // (the GPU's clocks kept up)
         g_display->SetKeepRefresh(Setting("frame_rate", "60") == "display" || SettingOn("vrr"));
         if (SettingOn("fullscreen")) g_display->SetFullscreen(true);
         ApplyCursorArt();
