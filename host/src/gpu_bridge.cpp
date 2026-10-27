@@ -858,6 +858,19 @@ u64 Hash(const unsigned char* data, std::size_t size) {
 
 bool GpuHolds(const Bridge& b, u32 begin, u32 end);
 
+/* A texture of the top byte of each 32-bit word (PSMT8H) or a nibble of it
+   (PSMT4HL, PSMT4HH) over a 24-bit image (PSMCT24, PSMZ24): the image's
+   drawing writes the word's other 24 bits only (the GS's; and its
+   write-backs keep the top byte, swizzle.comp) - nothing the texture reads.
+   Burnout 3's explosions keep an 8-bit image in the depth buffer's top
+   bytes and draw over the depth as they sample it: each primitive had the
+   depth written back and the texture decoded again (at 3x, the GPU a third
+   of a picture's time behind). */
+bool HighBitsOf24(u32 texture_psm, u32 image_psm) {
+    return (texture_psm == gs::PSMT8H || texture_psm == gs::PSMT4HL || texture_psm == gs::PSMT4HH) &&
+           (image_psm == gs::PSMCT24 || image_psm == gs::PSMZ24);
+}
+
 bool Palettized(u32 psm) {
     return psm == gs::PSMT8 || psm == gs::PSMT4 || psm == gs::PSMT8H || psm == gs::PSMT4HL || psm == gs::PSMT4HH;
 }
@@ -1015,7 +1028,9 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
         t.owned_seen = b.owned.size();
     }
     for (const Owned* o : t.over)
-        if (o->drawn_serial > t.decoded_serial && o->begin < t.end && t.begin < o->drawn_end) t.valid = false;
+        if (o->drawn_serial > t.decoded_serial && o->begin < t.end && t.begin < o->drawn_end &&
+            !HighBitsOf24(psm, o->psm))
+            t.valid = false;
     // A texture pack (texture_pack.h), for textures from memory - not ones the
     // GPU drew, as PCSX2 replaces none of those. Turned on or off (Tab):
     // every texture comes back once, replaced or as the game has it.
@@ -1032,7 +1047,8 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
     bool gpu_holds_now = false;
     auto gpu_decode = [&] {
         for (auto& [okey, o] : b.owned)
-            if (o.gpu_newer && o.dirty_begin < t.end && t.begin < o.dirty_end) WriteBack(b, o);
+            if (o.gpu_newer && o.dirty_begin < t.end && t.begin < o.dirty_end && !HighBitsOf24(psm, o.psm))
+                WriteBack(b, o);
         Coherent(b, t.begin, t.end, true);
         ps2gpu::GsTextureDecode d;
         d.tbp = tbp;
