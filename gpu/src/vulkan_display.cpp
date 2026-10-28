@@ -2099,6 +2099,11 @@ void VulkanDisplay::MouseAt(float x, float y) {
    otherwise the system's - hidden in fullscreen. */
 void VulkanDisplay::UpdateCursor() {
     if (!window_) return;
+#ifdef __ANDROID__
+    // A phone: no pointer to draw (a tap is the click) - and SDL's cursors
+    // call into Java, which the game's fibers must never do.
+    return;
+#endif
     const bool want = cursor_wanted_.load();
     std::uint32_t size = std::uint32_t(float(shown_h_.load()) / 20.0f + 0.5f);
     size = std::clamp<std::uint32_t>(size, 20, 128);
@@ -2218,12 +2223,30 @@ namespace {
 std::mutex g_touch_lock;
 Display::PadState g_touch;          // SetTouchPad's
 bool g_touch_shown = false;         // ShowTouchPad's
+// A tap shorter than a frame read as a press all the same: each button held
+// at least this long from when it went down.
+constexpr std::uint64_t kTapHoldNs = 60000000;
+std::uint64_t g_touch_down[16] = {};
+
+Display::PadState TouchPadNow() {
+    Display::PadState s = g_touch;
+    const std::uint64_t now = SDL_GetTicksNS();
+    for (int b = 0; b < 16; ++b)
+        if (g_touch_down[b] && now - g_touch_down[b] < kTapHoldNs) s.buttons |= std::uint16_t(1u << b);
+    if (s.buttons & (1u << 8)) s.l2 = 255;
+    if (s.buttons & (1u << 9)) s.r2 = 255;
+    return s;
+}
 }  // namespace
 
 }  // namespace
 
 void SetTouchPad(const Display::PadState& state) {
     std::lock_guard<std::mutex> hold(g_touch_lock);
+    const std::uint16_t went_down = std::uint16_t(state.buttons & ~g_touch.buttons);
+    const std::uint64_t now = SDL_GetTicksNS();
+    for (int b = 0; b < 16; ++b)
+        if (went_down & (1u << b)) g_touch_down[b] = now;
     g_touch = state;
     g_touch.family = Display::kPlayStationController;
 }
@@ -2251,7 +2274,7 @@ bool VulkanDisplay::Pad(PadState* state) const {
     }
     std::lock_guard<std::mutex> hold(g_touch_lock);
     if (!g_touch_shown) return false;
-    *state = g_touch;
+    *state = TouchPadNow();
     return true;
 }
 
@@ -2259,7 +2282,7 @@ bool VulkanDisplay::PadOf(std::uint32_t id, PadState* state) const {
     if (id == kTouchPadId) {
         std::lock_guard<std::mutex> hold(g_touch_lock);
         if (!g_touch_shown) return false;
-        *state = g_touch;
+        *state = TouchPadNow();
         return true;
     }
     std::lock_guard<std::mutex> hold(pads_lock_);

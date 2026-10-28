@@ -20,7 +20,10 @@
 #define PS2RT_VU_INLINE inline __attribute__((always_inline))
 #endif
 
-#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+/* Arm (AArch64): the same SSE code as NEON's, through sse2neon (the host's
+   CMakeLists puts its header behind the x86 headers' names) - all four lanes
+   at once, as on the PC, rather than the model's lane at a time. */
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2) || defined(__aarch64__)
 #include <emmintrin.h>
 #define PS2RT_VU_SSE 1
 #else
@@ -28,8 +31,8 @@
 #endif
 /* SSE4.1 (pminud): every x86-64 processor a Vulkan port runs on has it; MSVC
    takes its intrinsics without /arch, and other compilers say so with
-   __SSE4_1__. */
-#if PS2RT_VU_SSE && (defined(__SSE4_1__) || defined(_M_X64))
+   __SSE4_1__ (NEON has its min of unsigned lanes). */
+#if PS2RT_VU_SSE && (defined(__SSE4_1__) || defined(_M_X64) || defined(__aarch64__))
 #include <smmintrin.h>
 #define PS2RT_VU_SSE41 1
 #else
@@ -39,6 +42,26 @@
 
 
 namespace lifted {
+
+/* The host's floating-point control - SSE's MXCSR, Arm's FPCR - and the
+   VU's arithmetic in it: rounded toward zero, denormals taken and given as
+   zeros (DAZ and FTZ; Arm's FZ, both). Arm's directly: sse2neon's
+   _mm_setcsr sets only the rounding (no flush), a register write each. */
+#if defined(__aarch64__)
+PS2RT_VU_INLINE unsigned FpuControl() {
+    unsigned long value;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(value));
+    return unsigned(value);
+}
+PS2RT_VU_INLINE void SetFpuControl(unsigned value) {
+    __asm__ volatile("msr fpcr, %0" : : "r"(static_cast<unsigned long>(value)));
+}
+PS2RT_VU_INLINE unsigned VuFpuControl(unsigned saved) { return (saved & ~(3u << 22)) | (3u << 22) | (1u << 24); }
+#elif PS2RT_VU_SSE
+PS2RT_VU_INLINE unsigned FpuControl() { return _mm_getcsr(); }
+PS2RT_VU_INLINE void SetFpuControl(unsigned value) { _mm_setcsr(value); }
+PS2RT_VU_INLINE unsigned VuFpuControl(unsigned saved) { return (saved & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u; }
+#endif
 
 inline constexpr u32 kSign = 0x80000000u;
 inline constexpr u32 kMax = 0x7F7FFFFFu;

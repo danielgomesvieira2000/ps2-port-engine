@@ -26,5 +26,8 @@ void DeleteFiber(void* fiber);
    most `ms` milliseconds (or until woken): true. */
 bool WaitOnAddress(volatile void* address, void* compare, std::size_t size, unsigned ms);
 void WakeByAddressAll(void* address);
+/* fn(arg) on the thread's own stack while a fiber runs: Android's Java (JNI,
+   which SDL calls) takes any other stack for an overflow and aborts. */
+void OnThreadStack(void (*fn)(void*), void* arg);
 
 #endif

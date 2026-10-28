@@ -21,7 +21,7 @@
 #include <algorithm>
 #include <cstring>
 #include <emmintrin.h>
-#if defined(__SSE4_1__) || defined(__AVX2__)
+#if defined(__SSE4_1__) || defined(__AVX2__) || defined(__aarch64__)
 #include <smmintrin.h>
 #endif
 #include <cstdint>
@@ -286,7 +286,7 @@ void StoreRun(u8* bytes, const PageTable& t, u32 bp, u32 bw, u32 x, u32 y, const
         const u32 page = Page(bp, page_bw, px / t.width, page_y);
         const u32 in_page = std::min(count - i, t.width - px % t.width);
         u32 k = 0, wx = px % t.width;
-#if defined(__SSE4_1__) || defined(__AVX2__)
+#if defined(__SSE4_1__) || defined(__AVX2__) || defined(__aarch64__)
         if constexpr (Psm == PSMCT16) {
             // Sixteen at a time where they lie so (PageTable::pairs16): the
             // values packed to halfwords, each eight interleaved with the

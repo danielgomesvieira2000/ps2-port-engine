@@ -252,8 +252,8 @@ template <bool kRounding = true>
 inline void MacroFmac(Context& c, u32 word, FmacForm f) {
     const u32 fd = (word >> 6) & 0x1F, fs = (word >> 11) & 0x1F, ft = (word >> 16) & 0x1F;
     const u32 dest = (word >> 21) & 0xF;
-    const unsigned saved = kRounding ? _mm_getcsr() : 0u;
-    if (kRounding && !kMacroNearest) _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u);
+    const unsigned saved = kRounding ? FpuControl() : 0u;
+    if (kRounding && !kMacroNearest) SetFpuControl(VuFpuControl(saved));
     const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(c.vf[fs]));
     __m128i b;
     if (f.operand == 6) b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(c.vf[ft]));
@@ -275,7 +275,7 @@ inline void MacroFmac(Context& c, u32 word, FmacForm f) {
     if (to)
         for (int lane = 0; lane < 4; ++lane)
             if (dest & (8u >> lane)) to[lane] = out[lane];
-    if (kRounding && !kMacroNearest) _mm_setcsr(saved);
+    if (kRounding && !kMacroNearest) SetFpuControl(saved);
 }
 
 /* A run of COP2 instructions with nothing else between them but moves to
@@ -286,11 +286,11 @@ inline void MacroFmac(Context& c, u32 word, FmacForm f) {
    own, each setting it (2-3% of the EE in a race, the switches). */
 struct MacroRun {
     unsigned saved;
-    MacroRun() : saved(_mm_getcsr()) {
-        if (!kMacroNearest) _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u);
+    MacroRun() : saved(FpuControl()) {
+        if (!kMacroNearest) SetFpuControl(VuFpuControl(saved));
     }
     ~MacroRun() {
-        if (!kMacroNearest) _mm_setcsr(saved);
+        if (!kMacroNearest) SetFpuControl(saved);
     }
     MacroRun(const MacroRun&) = delete;
     MacroRun& operator=(const MacroRun&) = delete;

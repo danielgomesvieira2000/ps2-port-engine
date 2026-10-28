@@ -101,6 +101,8 @@ struct VuRunState {
    which keeps its few values itself. */
 #if defined(__clang__) && defined(__x86_64__)
 #define PS2HOST_VU_BLOCK __attribute__((preserve_none, no_stack_protector))
+#elif defined(__clang__) && defined(__aarch64__)
+#define PS2HOST_VU_BLOCK __attribute__((no_stack_protector))
 #else
 #define PS2HOST_VU_BLOCK
 #endif
@@ -111,7 +113,7 @@ using VuBlock = void (PS2HOST_VU_BLOCK*)(Vu& __restrict vu, VuRunState& __restri
    as it has, and returns to that loop otherwise. 2.5 frames of a race's VU1
    work entered 700,000 blocks, each through the loop and a call it could
    not foresee. Without clang the loop calls it. */
-#if defined(__clang__) && defined(__x86_64__)
+#if defined(__clang__) && (defined(__x86_64__) || defined(__aarch64__))
 #define PS2HOST_VU_NEXT(block) [[clang::musttail]] return block(v, s, limit)
 #else
 #define PS2HOST_VU_NEXT(block) return
@@ -603,8 +605,13 @@ struct VuCore {
         const __m128 x = _mm_mul_ps(
             _mm_castsi128_ps(lifted::CleanLanes(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs])))),
             _mm_set1_ps(kScaleF[Shift]));
+#if defined(__aarch64__)
+        // NEON's conversion saturates both ways itself.
+        const __m128i value = _mm_cvttps_epi32(x);
+#else
         const __m128i over = _mm_castps_si128(_mm_cmpge_ps(x, _mm_set1_ps(2147483648.0f)));
         const __m128i value = _mm_xor_si128(_mm_cvttps_epi32(x), over);
+#endif
         __m128i* to = reinterpret_cast<__m128i*>(v.regs.vf[ft]);
         if constexpr (Dest == 15) _mm_storeu_si128(to, value);
         else _mm_storeu_si128(to, Blend(LaneMask(Dest), value, _mm_loadu_si128(to)));

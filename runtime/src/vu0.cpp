@@ -207,9 +207,9 @@ void RunFmac(Context& c, const FmacOp& f) {
 extern const bool kMacroNearest = std::getenv("PS2RT_EE_ROUND_NEAREST") != nullptr;
 
 struct MacroRounding {
-    unsigned saved = _mm_getcsr();
-    MacroRounding() { if (!kMacroNearest) _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u); }
-    ~MacroRounding() { if (!kMacroNearest) _mm_setcsr(saved); }
+    unsigned saved = FpuControl();
+    MacroRounding() { if (!kMacroNearest) SetFpuControl(VuFpuControl(saved)); }
+    ~MacroRounding() { if (!kMacroNearest) SetFpuControl(saved); }
 };
 
 void Cop2Slow(Context& c, u32 word) {

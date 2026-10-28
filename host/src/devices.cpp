@@ -614,6 +614,7 @@ void FrameDone(u64 frame) {
     FrameTimes(frame);
     MusicBlank();
     timeline::Frame(frame);
+    HeavyThreadsFrame();                // a phone's: the frame's work told to the system
     SampleFrame(frame);
     Vu::SnapshotFrame(frame);
     // Time passes: unmasked, PATH3 sends what it still holds (in turn with

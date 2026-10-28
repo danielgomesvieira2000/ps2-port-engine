@@ -208,6 +208,36 @@ if(NOT MSVC)
     endif()
     if(ANDROID)
         target_link_libraries(ps2host PUBLIC android log)
+        # The game a shared library (SDL's activity loads it): its symbols
+        # hidden but for what Java looks up (SDL_main, the JNI natives - which
+        # say so themselves), so the game's calls to its own functions and its
+        # globals' reads are direct rather than through the PLT and the GOT;
+        # no stack canaries in the translated code's every frame.
+        target_compile_options(ps2rt PUBLIC -fvisibility=hidden -fvisibility-inlines-hidden -fno-plt
+                               -fno-stack-protector)
+        # ThinLTO here too (the NDK's clang and lld): the host's functions
+        # the game's code calls inlined across files.
+        option(PS2HOST_ANDROID_LTO "ThinLTO in the Android build" ON)
+        set(PS2HOST_LTO_JOBS "all" CACHE STRING "ThinLTO's code generators at once in the link")
+        set(PS2HOST_PGO "" CACHE STRING "Profile-guided build: the .profdata to build with")
+        if(PS2HOST_ANDROID_LTO)
+            target_compile_options(ps2rt PUBLIC -flto=thin)
+            target_link_options(ps2rt PUBLIC -flto=thin -Wl,--thinlto-jobs=${PS2HOST_LTO_JOBS})
+        endif()
+        # PS2HOST_PGO: "generate" - a build that counts what runs (written
+        # beside the settings: main.cpp) - or the .profdata merged from such
+        # runs (engine/tools/android.py's pgo, on the emulator: the same
+        # sources, the same counts as a phone's).
+        if(PS2HOST_PGO STREQUAL "generate")
+            target_compile_options(ps2rt PUBLIC -fprofile-instr-generate)
+            target_link_options(ps2rt PUBLIC -fprofile-instr-generate)
+            target_compile_definitions(ps2rt PUBLIC PS2HOST_PGO_GENERATE=1)
+        elseif(PS2HOST_PGO)
+            file(TIMESTAMP ${PS2HOST_PGO} pgo_time "%Y%m%d%H%M%S")
+            target_compile_definitions(ps2rt PUBLIC PS2HOST_PGO_TIME=${pgo_time})
+            target_compile_options(ps2rt PUBLIC "-fprofile-instr-use=${PS2HOST_PGO}" -Wno-profile-instr-unprofiled
+                                   -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+        endif()
     endif()
 endif()
 

@@ -364,6 +364,9 @@ void PresentFrame();
 /* The window's events alone (PresentFrame without the picture, which the GS
    thread presents): false once it has been closed. */
 bool PumpWindow();
+/* The GPU's start pipelines made before the game runs, behind a loading
+   screen when that takes a while (a first start on a device). */
+void WaitForGpuPipelines();
 /* Fullscreen on or off (saved as the "fullscreen" setting, settings.h, which
    the window opens with); and whether it is. */
 void SetWindowFullscreen(bool on);
@@ -470,6 +473,15 @@ void SetTouchControls(bool shown);
    False with no reading in the last half second (no phone, no sensor, the
    app in the background). */
 bool Tilt(float* degrees);
+/* A phone's heavy threads (platform.cpp; timeline::NameThread notes each by
+   its name): on the big cores, and the busiest one's work each frame told
+   to the system (HeavyThreadsFrame, once a frame) to clock for it. Nothing
+   elsewhere. PS2HOST_PIN=0, PS2HOST_ADPF=0: either off. */
+void NoteHeavyThread(const char* name);
+void HeavyThreadsFrame();
+/* "CPU EE 80%  GS 61%  VU1 93%  GPU 40%": each heavy thread's share of a
+   core since the last call (the overlay's FPS + CPU); "" off a phone. */
+std::string HeavyThreadLoad();
 /* A port's look at the 2D on its way to the GS (VIF1 DIRECT, PATH2): each
    block of words, `from` the guest address of the first, before the GS takes
    it. A copy - the guest's packets stay as the game wrote them - on the EE

@@ -471,6 +471,11 @@ void SleepUntil(std::chrono::steady_clock::time_point when) {
 bool SpareCores() {
     static const char* forced = std::getenv("PS2HOST_SPIN");
     if (forced) return forced[0] == '1';
+#ifdef __ANDROID__
+    // A phone: Linux's high-resolution sleep is close enough, and a core
+    // kept spinning is heat - what slows a phone's cores down in a race.
+    return false;
+#endif
     static std::atomic<int> looks{0};
     static std::atomic<bool> spare{true};
     if (looks.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {

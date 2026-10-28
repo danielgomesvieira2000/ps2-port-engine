@@ -17,6 +17,7 @@ import android.content.pm.ApplicationInfo;
 import android.content.res.Configuration;
 import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
@@ -72,6 +73,14 @@ public class PortActivity extends SDLActivity {
         return new String[] {"--android-home", dir.getAbsolutePath()};
     }
 
+    private WifiManager.MulticastLock lanLock;
+
+    @Override
+    protected void onDestroy() {
+        if (lanLock != null && lanLock.isHeld()) lanLock.release();
+        super.onDestroy();
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -84,6 +93,18 @@ public class PortActivity extends SDLActivity {
         touch.setShown(shown);
         nativeTouchShown(shown);
         tellKeyboard(getResources().getConfiguration());
+        // LAN play: the Wi-Fi's broadcasts let in (a lobby found by a UDP
+        // broadcast; many phones' Wi-Fi drops them otherwise).
+        try {
+            WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+            if (wifi != null) {
+                lanLock = wifi.createMulticastLock("ps2port-lan");
+                lanLock.setReferenceCounted(false);
+                lanLock.acquire();
+            }
+        } catch (RuntimeException e) {
+            Log.w(TAG, "no multicast lock: " + e);
+        }
         touch.setListener(new TouchControls.Listener() {
             @Override public void onPad(int buttons, int lx, int ly, int rx, int ry) {
                 nativeTouchPad(buttons, lx, ly, rx, ry);

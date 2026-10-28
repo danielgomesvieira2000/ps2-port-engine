@@ -5,6 +5,7 @@
  */
 
 #include "ps2host/timeline.h"
+#include "ps2host/run.h"          // NoteHeavyThread
 
 #include <algorithm>
 #include <atomic>
@@ -181,6 +182,7 @@ std::string ThreadCpu() {
 }
 
 void NameThread(const char* name) {
+    ps2host::NoteHeavyThread(name);
 #ifdef _WIN32
     {
         wchar_t wide[64] = {};

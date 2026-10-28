@@ -10,6 +10,7 @@
  */
 
 #include <cctype>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
@@ -47,6 +48,7 @@ extern const ps2host::OverlayEntry kGuestOverlays[];
 extern const std::size_t kGuestOverlayCount;
 #ifdef PS2HOST_PGO_GENERATE
 extern "C" int __llvm_profile_write_file(void);   // PS2HOST_PGO=generate (LLVM's profile runtime)
+extern "C" void __llvm_profile_set_filename(const char*);
 #endif
 
 /* The game's host implementations of guest functions (its port's overrides.cpp). */
@@ -291,12 +293,22 @@ extern "C" JNIEXPORT void JNICALL Java_org_ps2port_PortActivity_nativeTouchShown
 
 int main(int argc, char** argv) {
     AttachTerminal();
+#ifndef _WIN32
+    // A send to a peer that went away (a LAN player leaving) an error, not
+    // the end of the process.
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
     std::vector<std::string> play;
     std::vector<char*> play_argv;
 #ifdef __ANDROID__
     if (argc == 3 && std::string(argv[1]) == "--android-home") {
 #ifdef PS2HOST_GAME_EXECUTABLE
         play = AndroidPlayArguments(argv[0], argv[2]);
+#endif
+#ifdef PS2HOST_PGO_GENERATE
+        // The counts beside the settings, a file a run (android.py pgo pulls them).
+        static const std::string counts = std::string(argv[2]) + "/pgo-%p.profraw";
+        __llvm_profile_set_filename(counts.c_str());
 #endif
         if (play.empty()) return 0;
         for (std::string& arg : play) play_argv.push_back(arg.data());

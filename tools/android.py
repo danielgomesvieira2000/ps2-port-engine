@@ -109,17 +109,33 @@ def target_name(game) -> str:
     return os.path.basename(os.path.normpath(game.directory))
 
 
+def android_package(game, settings: dict = None) -> str:
+    """The app's id: game.json's android_package, else io.github.ps2port.<target>."""
+    settings = port._game_json(game) if settings is None else settings
+    return settings.get("android_package") or "io.github.ps2port." + re.sub(r"[^a-z0-9_]", "", target_name(game).lower())
+
+
 def pc_build(game) -> str:
     return game.path(os.path.join(game.build, "port", "cmake"))
 
 
-def build_library(game, generated: str, abi: str, t) -> str:
-    """lib<target>.so for one ABI; returns its path."""
+def pgo_profile(game) -> str:
+    """The Android build's profile (android.py pgo), where one was made."""
+    return game.path(os.path.join(game.build, "port", "android-pgo.profdata"))
+
+
+def build_library(game, generated: str, abi: str, t, pgo: str = "") -> str:
+    """lib<target>.so for one ABI; returns its path. `pgo`: "generate" (a
+    counting build, a folder of its own), else the profile of android.py pgo
+    when there is one."""
     host_glslang = os.path.join(pc_build(game), "_deps", "glslang-build", "StandAlone",
                                 "glslang.exe" if os.name == "nt" else "glslang")
     if not os.path.isfile(host_glslang):
         raise SystemExit("android: the PC build first (port.py build): its glslang compiles the shaders")
-    binary = game.path(os.path.join(game.build, "port", "android-" + {"arm64-v8a": "arm64"}.get(abi, abi)))
+    binary = game.path(os.path.join(game.build, "port", "android-" + {"arm64-v8a": "arm64"}.get(abi, abi)
+                                    + ("-pgo-generate" if pgo == "generate" else "")))
+    if not pgo and os.path.isfile(pgo_profile(game)):
+        pgo = os.path.abspath(pgo_profile(game))
     os.makedirs(binary, exist_ok=True)
     cmake = port._visual_studio_tool("CMake", "bin", "cmake.exe") if os.name == "nt" else "cmake"
     ninja = port._visual_studio_tool("Ninja", "ninja.exe") if os.name == "nt" else "ninja"
@@ -129,7 +145,8 @@ def build_library(game, generated: str, abi: str, t) -> str:
          "-DCMAKE_TOOLCHAIN_FILE=" + slash(os.path.join(t["ndk"], "build", "cmake", "android.toolchain.cmake")),
          "-DANDROID_ABI=" + abi, "-DANDROID_PLATFORM=android-%d" % MIN_SDK,
          "-DCMAKE_BUILD_TYPE=Release", "-DPS2_GENERATED_DIR=" + slash(generated),
-         "-DPS2HOST_AVX2=OFF", "-DPS2_HOST_GLSLANG=" + slash(host_glslang)])
+         "-DPS2HOST_AVX2=OFF", "-DPS2_HOST_GLSLANG=" + slash(host_glslang),
+         "-DPS2HOST_LTO_JOBS=%d" % port._build_jobs(), "-DPS2HOST_PGO=" + slash(pgo)])
     run([cmake, "--build", binary, "--target", target_name(game), "-j", str(port._build_jobs())])
     library = os.path.join(binary, "lib%s.so" % target_name(game))
     if not os.path.isfile(library):
@@ -151,7 +168,7 @@ def version_code(version: str) -> int:
 def manifest(game, settings: dict) -> str:
     title = settings.get("title") or settings.get("name") or target_name(game)
     label = settings.get("android_label") or title
-    package = settings.get("android_package") or "io.github.ps2port." + re.sub(r"[^a-z0-9_]", "", target_name(game).lower())
+    package = android_package(game, settings)
     escape = lambda s: s.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
     return """<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -286,16 +303,72 @@ def apk(game, libraries: dict, t) -> str:
     return out
 
 
+PGO_RUNS = ("race", "crash")        # the scripted runs (port/runs) the profile is made from
+
+
+def pgo(game, generated: str, t) -> str:
+    """The profile-guided build's profile, made on the emulator: a counting
+    x86_64 build installed, the scripted runs played with it (its args.txt),
+    the counts pulled and merged (the NDK's llvm-profdata) into
+    build/port/android-pgo.profdata, which the builds after use. The same
+    sources for every processor, so the emulator's counts are a phone's.
+    Needs the emulator (or a device) on adb."""
+    import time
+    library = build_library(game, generated, "x86_64", t, pgo="generate")
+    package = apk(game, {"x86_64": library}, t)
+    adb = t["adb"]
+    env = dict(os.environ, MSYS_NO_PATHCONV="1")
+    run([adb, "install", "-r", package], env=env)
+    app = android_package(game)
+    home = "/storage/emulated/0/Android/data/%s/files" % app
+    raw = game.path(os.path.join(game.build, "port", "android-pgo"))
+    shutil.rmtree(raw, ignore_errors=True)
+    os.makedirs(raw)
+    for name in PGO_RUNS:
+        args = open(game.path(os.path.join("port", "runs", name + ".args"))).read().strip()
+        listed = os.path.join(raw, "args.txt")
+        with open(listed, "w", newline=chr(10)) as f:
+            f.write(args + " --no-memcard" + chr(10))
+        subprocess.run([adb, "shell", "am", "force-stop", app], env=env)
+        subprocess.run([adb, "shell", "rm", "-f", home + "/" + target_name(game) + ".log", home + "/pgo-*.profraw"], env=env)
+        run([adb, "push", listed, home + "/args.txt"], env=env)
+        run([adb, "shell", "am", "start", "-n", app + "/org.ps2port.PortActivity"], env=env)
+        print("pgo: %s on the device" % name, flush=True)
+        began = time.time()
+        while time.time() - began < 3 * 3600:
+            time.sleep(20)
+            alive = subprocess.run([adb, "shell", "pidof", app], capture_output=True, text=True, env=env).stdout.strip()
+            if not alive:
+                break
+        listing = subprocess.run([adb, "shell", "ls", home], capture_output=True, text=True, env=env).stdout.split()
+        for f in listing:
+            if f.startswith("pgo-") and f.endswith(".profraw"):
+                run([adb, "pull", home + "/" + f, os.path.join(raw, name + "-" + f)], env=env)
+        subprocess.run([adb, "shell", "rm", "-f", home + "/args.txt"], env=env)
+        print("pgo: %s done in %.0f s" % (name, time.time() - began), flush=True)
+    counts = [os.path.join(raw, f) for f in sorted(os.listdir(raw)) if f.endswith(".profraw")]
+    if not counts:
+        raise SystemExit("pgo: no counts came back from the device")
+    merge = newest(os.path.join(t["ndk"], "toolchains", "llvm", "prebuilt", "*", "bin",
+                                "llvm-profdata" + (".exe" if os.name == "nt" else "")), "llvm-profdata")
+    run([merge, "merge", "-o", pgo_profile(game)] + counts)
+    print("pgo: %s from %d runs" % (pgo_profile(game), len(counts)))
+    return pgo_profile(game)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     game_config.add_argument(parser)
-    parser.add_argument("action", nargs="?", default="apk", choices=("build", "apk", "install"))
+    parser.add_argument("action", nargs="?", default="apk", choices=("build", "apk", "install", "pgo"))
     parser.add_argument("--abi", default="arm64-v8a",
                         help="ABIs, by commas: arm64-v8a (phones), x86_64 (the emulator)")
     args = parser.parse_args(argv)
     game = game_config.from_args(args)
     t = tools()
     generated = port.generate(game)
+    if args.action == "pgo":
+        pgo(game, generated, t)
+        return 0
     libraries = {abi: build_library(game, generated, abi, t) for abi in args.abi.split(",")}
     if args.action == "build":
         return 0

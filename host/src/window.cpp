@@ -9,8 +9,9 @@
  */
 
 #include "ps2host/platform.h"
+#include "stb_easy_font.h"      // the overlay's text where there is no GDI; the loading screen's
 #ifndef _WIN32
-#include "stb_easy_font.h"      // the overlay's text where there is no GDI
+#include "fiber.h"              // OnThreadStack
 #endif
 
 #include <algorithm>
@@ -21,6 +22,7 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <thread>
 #include <functional>
 #include <vector>
 
@@ -34,6 +36,7 @@
 #include <SDL3/SDL_scancode.h>
 
 #include "ps2gpu/display.h"
+#include "ps2gpu/gs_renderer.h"     // PipelineWarmProgress
 #endif
 
 namespace ps2host {
@@ -576,10 +579,24 @@ void KeepFullscreenSetting() {
 #endif
 }
 
+#ifdef PS2HOST_VULKAN
+/* The display's events (SDL's, which on Android call into Java) on the
+   thread's own stack, not an EE fiber's. */
+static bool PumpDisplay() {
+#ifdef _WIN32
+    return g_display->Pump();
+#else
+    bool open = true;
+    OnThreadStack([](void* p) { *static_cast<bool*>(p) = g_display->Pump(); }, &open);
+    return open;
+#endif
+}
+#endif
+
 bool PumpWindow() {
 #ifdef PS2HOST_VULKAN
     if (g_display) {
-        if (!g_display->Pump()) g_closed = true;
+        if (!PumpDisplay()) g_closed = true;
         KeepFullscreenSetting();
         if (g_display->TakeCapture()) RequestCapture();
         UpdatePcMenu();                     // F9: the PC settings panel (pc_menu.cpp)
@@ -729,6 +746,12 @@ void RefreshOverlay() {
         if (fps > 0) std::snprintf(text, sizeof text, "FPS %.1f", fps);
         else std::snprintf(text, sizeof text, "FPS --");
         lines.push_back(text);
+        // "fps_detail" (a phone's PERFORMANCE OVERLAY at FPS + CPU): which
+        // part is busy - the one near 100% the limit.
+        if (SettingOn("fps_detail", false)) {
+            const std::string load = HeavyThreadLoad();
+            if (!load.empty()) lines.push_back(load);
+        }
     }
 #endif
     static std::vector<std::string> shown;
@@ -869,10 +892,79 @@ ps2gpu::Display* WindowDisplay() {
 #endif
 }
 
+#ifdef PS2HOST_VULKAN
+namespace {
+
+/* `text` into a 640 x 448 picture (R in the low byte), centred on `y`,
+   stb_easy_font's strokes `scale` times. */
+void PictureText(std::vector<u32>& picture, const char* text, int y, int scale, u32 colour) {
+    std::vector<float> quads(4 * 1024 * 4);
+    unsigned char unused[4] = {255, 255, 255, 255};
+    const int n = stb_easy_font_print(0, 0, const_cast<char*>(text), unused, quads.data(),
+                                      int(quads.size() * sizeof(float)));
+    const int x0 = (640 - stb_easy_font_width(const_cast<char*>(text)) * scale) / 2;
+    for (int q = 0; q < n; ++q) {
+        const float* v = &quads[std::size_t(q) * 16];
+        const int left = x0 + int(v[0] * scale), top = y + int(v[1] * scale);
+        const int right = x0 + int(v[8] * scale), bottom = y + int(v[9] * scale);
+        for (int py = std::max(0, top); py < std::min(448, bottom); ++py)
+            for (int px = std::max(0, left); px < std::min(640, right); ++px) picture[std::size_t(py) * 640 + px] = colour;
+    }
+}
+
+}  // namespace
+#endif
+
+/* A first start on a device (or after a new driver): the GPU's pipelines
+   compiled before the game starts, a loading screen saying so meanwhile -
+   a phone's driver takes seconds to a minute, which would otherwise be a
+   black screen and then stutter. A start whose pipelines come from the
+   cache is through before anything is shown. */
+void WaitForGpuPipelines() {
+#ifdef PS2HOST_VULKAN
+    if (!g_display) return;
+    const auto began = std::chrono::steady_clock::now();
+    std::size_t made = 0, total = 0;
+    bool shown = false;
+    // PS2HOST_LOADING_HOLD=ms: the screen shown at once and kept that long (to see it).
+    const char* hold_env = std::getenv("PS2HOST_LOADING_HOLD");
+    const auto hold = std::chrono::milliseconds(hold_env ? std::atoi(hold_env) : 0);
+    while (ps2gpu::PipelineWarmProgress(&made, &total) || std::chrono::steady_clock::now() - began < hold) {
+        const auto now = std::chrono::steady_clock::now();
+        if (hold_env || now - began >= std::chrono::milliseconds(300)) {
+            shown = true;
+            std::vector<u32> picture(640 * 448, 0xFF201410u);         // a dark blue
+            PictureText(picture, "PREPARING GRAPHICS", 150, 4, 0xFFFFFFFFu);
+            PictureText(picture, "first start on this device only", 200, 2, 0xFFC0C0C0u);
+            // The bar: made of total.
+            const int bar_x = 120, bar_w = 400, bar_y = 250, bar_h = 14;
+            const int filled = total ? int(std::int64_t(bar_w) * std::int64_t(made) / std::int64_t(total)) : 0;
+            for (int y = bar_y; y < bar_y + bar_h; ++y)
+                for (int x = bar_x; x < bar_x + bar_w; ++x) {
+                    const bool edge = y == bar_y || y == bar_y + bar_h - 1 || x == bar_x || x == bar_x + bar_w - 1;
+                    picture[std::size_t(y) * 640 + x] = edge ? 0xFFC0C0C0u : x - bar_x < filled ? 0xFF3C8CFFu : 0xFF302018u;
+                }
+            char count[64];
+            std::snprintf(count, sizeof count, "%zu of %zu", made, total);
+            PictureText(picture, count, 280, 2, 0xFFC0C0C0u);
+            if (!g_display->Present(picture.data(), 640, 448)) break;
+        }
+        if (!g_display->Pump()) {
+            g_closed = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(shown ? 30 : 5));
+    }
+    if (shown)
+        std::fprintf(stderr, "[window] first start: %zu GPU pipelines made in %.1f s behind the loading screen\n", total,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count());
+#endif
+}
+
 void PresentFrame() {
 #ifdef PS2HOST_VULKAN
     if (g_display) {
-        if (!g_display->Pump()) {
+        if (!PumpDisplay()) {
             g_closed = true;
             return;
         }

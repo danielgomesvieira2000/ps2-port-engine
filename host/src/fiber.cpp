@@ -25,8 +25,12 @@ struct Fiber {
 };
 
 thread_local Fiber* t_current = nullptr;
+thread_local Fiber* t_thread = nullptr;     // the thread's own (ConvertThreadToFiber)
 
 }  // namespace
+
+/* fn(arg) with the stack pointer `sp`, back on the caller's stack after. */
+extern "C" void ps2_call_on_stack(void* sp, void (*fn)(void*), void* arg);
 
 /* Saves the registers a call keeps on the stack it runs on, its stack
    pointer to *save, and goes on with the stack `load` (a switch's, or a new
@@ -75,7 +79,20 @@ __asm__(
     "    mov x0, x20\n"
     "    blr x19\n"
     "    brk #0\n"                  // (a fiber's routine never returns)
-    ".size ps2_fiber_start, .-ps2_fiber_start\n");
+    ".size ps2_fiber_start, .-ps2_fiber_start\n"
+    ".globl ps2_call_on_stack\n"
+    ".type ps2_call_on_stack, %function\n"
+    ".p2align 4\n"
+    "ps2_call_on_stack:\n"          // x0 the stack, x1 the routine, x2 its parameter
+    "    stp x29, x30, [sp, #-16]!\n"
+    "    mov x29, sp\n"             // (kept by the call)
+    "    mov sp, x0\n"
+    "    mov x0, x2\n"
+    "    blr x1\n"
+    "    mov sp, x29\n"
+    "    ldp x29, x30, [sp], #16\n"
+    "    ret\n"
+    ".size ps2_call_on_stack, .-ps2_call_on_stack\n");
 constexpr std::size_t kFrame = 160;
 #elif defined(__x86_64__)
 __asm__(
@@ -107,14 +124,39 @@ __asm__(
     "    movq %r13, %rdi\n"
     "    callq *%r12\n"
     "    ud2\n"
-    ".size ps2_fiber_start, .-ps2_fiber_start\n");
+    ".size ps2_fiber_start, .-ps2_fiber_start\n"
+    ".globl ps2_call_on_stack\n"
+    ".type ps2_call_on_stack, @function\n"
+    ".p2align 4\n"
+    "ps2_call_on_stack:\n"          // rdi the stack, rsi the routine, rdx its parameter
+    "    pushq %rbp\n"
+    "    movq %rsp, %rbp\n"         // (kept by the call)
+    "    movq %rdi, %rsp\n"
+    "    movq %rdx, %rdi\n"
+    "    callq *%rsi\n"
+    "    movq %rbp, %rsp\n"
+    "    popq %rbp\n"
+    "    ret\n"
+    ".size ps2_call_on_stack, .-ps2_call_on_stack\n");
 #else
 #error "fiber.cpp: no context switch for this processor"
 #endif
 
 void* ConvertThreadToFiber(void*) {
-    t_current = new Fiber();
+    t_current = t_thread = new Fiber();
     return t_current;
+}
+
+void OnThreadStack(void (*fn)(void*), void* arg) {
+    if (!t_thread || t_current == t_thread) {
+        fn(arg);
+        return;
+    }
+    // Below where the thread's own stack was left when it switched to the
+    // fibers (a red zone's worth spared), 16-aligned.
+    auto sp = reinterpret_cast<std::uintptr_t>(t_thread->sp) - 512;
+    sp &= ~std::uintptr_t(15);
+    ps2_call_on_stack(reinterpret_cast<void*>(sp), fn, arg);
 }
 
 void* CreateFiber(std::size_t stack_size, void (*start)(void*), void* parameter) {

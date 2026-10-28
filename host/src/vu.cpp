@@ -931,9 +931,9 @@ namespace {
    after it gave corners twelve times too long - huge smoke puffs lit with
    wrapped colours (the race's white-outs and stretched textures). */
 struct VuRounding {
-    unsigned saved = _mm_getcsr();
-    VuRounding() { _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u); }
-    ~VuRounding() { _mm_setcsr(saved); }
+    unsigned saved = lifted::FpuControl();
+    VuRounding() { lifted::SetFpuControl(lifted::VuFpuControl(saved)); }
+    ~VuRounding() { lifted::SetFpuControl(saved); }
 };
 }  // namespace
 

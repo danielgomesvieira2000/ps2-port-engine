@@ -6,7 +6,7 @@
 
 #include <cmath>
 #include <cstring>
-#if defined(__SSE2__) || defined(_M_X64)
+#if defined(__SSE2__) || defined(_M_X64) || defined(__aarch64__)
 #include <emmintrin.h>
 #endif
 
@@ -143,7 +143,7 @@ u64 LanesOf(int op, u64 a, u64 b) {
 
 }  // namespace
 
-#if defined(__SSE2__) || defined(_M_X64)
+#if defined(__SSE2__) || defined(_M_X64) || defined(__aarch64__)
 /* The same lanes in SSE2 for the operations it has exactly (signed compares,
    halfword max and min, wrapping and unsigned-saturating adds); `done` false
    for the rest. LanesAreScalar (host tests) compares the two. */
@@ -177,7 +177,7 @@ void LanesScalar(int op, u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
 }
 
 void Lanes(int op, u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi) {
-#if defined(__SSE2__) || defined(_M_X64)
+#if defined(__SSE2__) || defined(_M_X64) || defined(__aarch64__)
     if (LanesSse2(op, lo, hi, alo, ahi, blo, bhi)) return;
 #endif
     LanesScalar(op, lo, hi, alo, ahi, blo, bhi);
@@ -211,7 +211,7 @@ void ShiftLanesScalar(u64& lo, u64& hi, u64 blo, u64 bhi, u32 width, u32 kind, u
    same shifts, eight or four lanes at once; a movie's decoder makes them by
    the million (Resident Evil Outbreak's Sofdec). */
 void ShiftLanes(u64& lo, u64& hi, u64 blo, u64 bhi, u32 width, u32 kind, u32 amount) {
-#if defined(__SSE2__) || defined(_M_X64)
+#if defined(__SSE2__) || defined(_M_X64) || defined(__aarch64__)
     if ((width == 16 || width == 32) && kind <= 2) {
         const __m128i x = _mm_set_epi64x(s64(bhi), s64(blo));
         const __m128i n = _mm_cvtsi32_si128(int(amount & (width - 1)));
@@ -244,7 +244,7 @@ void InterleaveScalar(u64& lo, u64& hi, u64 a, u64 b, u32 width) {
 
 /* PEXTLB, PEXTLH, PEXTLW: SSE2's unpack does the same (b's lanes even). */
 void Interleave(u64& lo, u64& hi, u64 a, u64 b, u32 width) {
-#if defined(__SSE2__) || defined(_M_X64)
+#if defined(__SSE2__) || defined(_M_X64) || defined(__aarch64__)
     if (width == 8 || width == 16 || width == 32) {
         const __m128i x = _mm_cvtsi64_si128(s64(b)), y = _mm_cvtsi64_si128(s64(a));
         const __m128i r = width == 8 ? _mm_unpacklo_epi8(x, y) : width == 16 ? _mm_unpacklo_epi16(x, y)

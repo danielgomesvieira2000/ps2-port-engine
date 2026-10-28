@@ -398,6 +398,9 @@ void SetPipelineCacheDir(const std::string& dir);
    are - a player's first run then makes none in the middle of a race. Keys
    of an older engine are only made in vain. Set before CreateGsRenderer. */
 void SetPipelineHints(const std::uint32_t* keys, std::size_t count);
+/* The start's pipelines (the last runs', the hints) being made: true while
+   some are still to come, with how many are made of how many. */
+bool PipelineWarmProgress(std::size_t* made, std::size_t* total);
 /* `inner` on a thread of its own (threaded_renderer.cpp): what only hands
    work over is queued and made there in order; what answers or reads waits
    for the queue to empty first. One caller thread. */

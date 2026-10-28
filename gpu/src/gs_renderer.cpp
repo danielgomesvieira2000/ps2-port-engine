@@ -703,7 +703,7 @@ private:
        with the whole shader (the same pictures) - none made in the middle of
        a frame. Scripted runs (no pipeline cache) make them at once. */
     bool async_pipelines_ = false;
-    std::thread pipeline_worker_;
+    std::vector<std::thread> pipeline_workers_;
     std::mutex pipeline_lock_;
     std::condition_variable pipeline_wake_;
     std::deque<std::uint32_t> pipeline_queue_;
@@ -2035,6 +2035,8 @@ void VulkanGsRenderer::DropImages() {
 namespace {
 std::string g_pipeline_cache_dir;       // SetPipelineCacheDir
 std::vector<std::uint32_t> g_pipeline_hints;    // SetPipelineHints
+// WarmPipelines' progress (PipelineWarmProgress): asked, and made by the workers.
+std::atomic<std::size_t> g_warm_total{0}, g_warm_made{0};
 std::string CacheFile(const char* name) { return g_pipeline_cache_dir + "/" + name; }
 }  // namespace
 
@@ -2080,27 +2082,37 @@ void VulkanGsRenderer::WarmPipelines() {
     if (keys.empty()) return;
     warm_began_ = std::chrono::steady_clock::now();
     warm_left_ = keys.size();
+    g_warm_made = 0;
+    g_warm_total = keys.size();
     for (std::uint32_t key : keys) AskWorker(key, false);
 }
 
 /* A pipeline for the worker to make: a player's draw first (`soon`), the
    start's list after. */
 void VulkanGsRenderer::AskWorker(std::uint32_t key, bool soon) {
-    if (!pipeline_worker_.joinable())
-        pipeline_worker_ = std::thread([this] {
-            std::unique_lock<std::mutex> hold(pipeline_lock_);
-            for (;;) {
-                pipeline_wake_.wait(hold, [this] { return pipeline_stop_ || !pipeline_queue_.empty(); });
-                if (pipeline_stop_) return;
-                const std::uint32_t next = pipeline_queue_.front();
-                pipeline_queue_.pop_front();
-                hold.unlock();
-                const VkPipeline made = MakePipeline(next);
-                hold.lock();
-                pipelines_made_.emplace_back(next, made);
-                pipelines_ready_.store(true, std::memory_order_release);
-            }
-        });
+    // Several workers: a first start (no cache: a driver compiling each
+    // shader - a phone's tens of milliseconds and more) made in a fraction
+    // of the time, the processors otherwise idle while it waits.
+    if (pipeline_workers_.empty()) {
+        const unsigned processors = std::max(1u, std::thread::hardware_concurrency());
+        const unsigned workers = std::clamp(processors / 2, 1u, 4u);
+        for (unsigned i = 0; i < workers; ++i)
+            pipeline_workers_.emplace_back([this] {
+                std::unique_lock<std::mutex> hold(pipeline_lock_);
+                for (;;) {
+                    pipeline_wake_.wait(hold, [this] { return pipeline_stop_ || !pipeline_queue_.empty(); });
+                    if (pipeline_stop_) return;
+                    const std::uint32_t next = pipeline_queue_.front();
+                    pipeline_queue_.pop_front();
+                    hold.unlock();
+                    const VkPipeline made = MakePipeline(next);
+                    hold.lock();
+                    pipelines_made_.emplace_back(next, made);
+                    pipelines_ready_.store(true, std::memory_order_release);
+                    g_warm_made.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
+    }
     {
         std::lock_guard<std::mutex> hold(pipeline_lock_);
         if (soon) pipeline_queue_.push_front(key);
@@ -3680,13 +3692,13 @@ bool VulkanGsRenderer::ReadTarget(std::uint32_t fbp, std::uint32_t fbw, std::uin
 }
 
 VulkanGsRenderer::~VulkanGsRenderer() {
-    if (pipeline_worker_.joinable()) {
+    if (!pipeline_workers_.empty()) {
         {
             std::lock_guard<std::mutex> hold(pipeline_lock_);
             pipeline_stop_ = true;
         }
-        pipeline_wake_.notify_one();
-        pipeline_worker_.join();
+        pipeline_wake_.notify_all();
+        for (std::thread& worker : pipeline_workers_) worker.join();
     }
     for (const auto& [key, pipeline] : pipelines_made_)
         if (pipeline) pipelines_.emplace(key, pipeline);
@@ -3831,6 +3843,13 @@ std::string SubmitStats() {
 
 void SetPipelineCacheDir(const std::string& dir) { g_pipeline_cache_dir = dir; }
 void SetPipelineHints(const std::uint32_t* keys, std::size_t count) { g_pipeline_hints.assign(keys, keys + count); }
+
+bool PipelineWarmProgress(std::size_t* made, std::size_t* total) {
+    const std::size_t all = g_warm_total.load(), done = std::min(all, g_warm_made.load());
+    if (made) *made = done;
+    if (total) *total = all;
+    return done < all;
+}
 
 std::unique_ptr<GsRenderer> CreateGsRenderer(Gpu& gpu, std::string* error) {
     auto renderer = std::make_unique<VulkanGsRenderer>(static_cast<VulkanGpu&>(gpu));
