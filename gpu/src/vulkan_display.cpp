@@ -536,6 +536,12 @@ bool VulkanDisplay::Check(VkResult result, const char* what) {
 }
 
 bool VulkanDisplay::Init(const char* title, int width, int height) {
+#ifdef __ANDROID__
+    // A phone's game: on its side either way, the Back button the game's
+    // (Escape's: KeyDown), not the system's (which would end it).
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         error_ = std::string("SDL_Init: ") + SDL_GetError();
         return false;
@@ -549,8 +555,14 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
         std::fprintf(stderr, "[window] no game controllers: %s\n", SDL_GetError());
     } else {
         int joysticks = 0, gamepads = 0;
-        // Wireless controllers can take a moment to be found.
-        for (int waited = 0; waited < 1000 && joysticks == 0; waited += 50) {
+        // Wireless controllers can take a moment to be found. (Android: no
+        // wait - a phone often has none, and one connected is taken as it comes.)
+#ifdef __ANDROID__
+        constexpr int kControllerWait = 0;
+#else
+        constexpr int kControllerWait = 1000;
+#endif
+        for (int waited = 0; waited < kControllerWait && joysticks == 0; waited += 50) {
             SDL_PumpEvents();
             SDL_free(SDL_GetJoysticks(&joysticks));
             if (joysticks == 0) SDL_Delay(50);
@@ -560,7 +572,12 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
                      gamepads);
     }
     if (!Check(volkInitialize(), "volkInitialize (is there a Vulkan driver?)")) return false;
+#ifdef __ANDROID__
+    // The whole screen, its bars hidden.
+    window_ = SDL_CreateWindow(title, width, height, SDL_WINDOW_VULKAN | SDL_WINDOW_FULLSCREEN);
+#else
     window_ = SDL_CreateWindow(title, width, height, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+#endif
     if (!window_) {
         error_ = std::string("SDL_CreateWindow: ") + SDL_GetError();
         return false;
@@ -717,6 +734,18 @@ bool VulkanDisplay::CreateSwapchain() {
     SDL_GetWindowSizeInPixels(window_, &w, &h);
     extent_ = caps.currentExtent.width != 0xFFFFFFFFu ? caps.currentExtent
               : VkExtent2D{std::uint32_t(w), std::uint32_t(h)};
+    // A screen turned from its natural way (a phone on its side): the
+    // surface's size is the natural way's. The pictures are drawn as the
+    // window stands (no pre-transform: the compositor turns them), so the
+    // swapchain's images take the window's way round.
+    VkSurfaceTransformFlagBitsKHR transform = caps.currentTransform;
+    if (transform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)) {
+        std::swap(extent_.width, extent_.height);
+    }
+    if (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+        transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    else
+        std::swap(extent_.width, extent_.height);    // (the turn can only be the app's: as it was)
     if (extent_.width == 0 || extent_.height == 0) return true;      // minimised: nothing to show
     if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
         error_ = "the swapchain cannot be a transfer destination";
@@ -765,7 +794,7 @@ bool VulkanDisplay::CreateSwapchain() {
     sci.imageArrayLayers = 1;
     sci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    sci.preTransform = caps.currentTransform;
+    sci.preTransform = transform;
     sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     sci.presentMode = mode_;
     sci.clipped = VK_TRUE;
@@ -1639,12 +1668,14 @@ bool SpareCores() {
     static std::atomic<int> looks{0};
     static std::atomic<bool> spare{true};
     if (looks.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
-        DWORD_PTR process = 0, system = 0;
         int cores = int(std::thread::hardware_concurrency());
+#ifdef _WIN32
+        DWORD_PTR process = 0, system = 0;
         if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) && process) {
             cores = 0;
             for (DWORD_PTR m = process; m; m &= m - 1) ++cores;
         }
+#endif
         spare.store(cores >= 4, std::memory_order_relaxed);
     }
     return spare.load(std::memory_order_relaxed);
@@ -2161,14 +2192,49 @@ Display::PadState ReadPad(SDL_Gamepad* pad) {
 }
 }  // namespace
 
+namespace {
+std::mutex g_touch_lock;
+Display::PadState g_touch;          // SetTouchPad's
+bool g_touch_shown = false;         // ShowTouchPad's
+}  // namespace
+
+}  // namespace
+
+void SetTouchPad(const Display::PadState& state) {
+    std::lock_guard<std::mutex> hold(g_touch_lock);
+    g_touch = state;
+    g_touch.family = Display::kPlayStationController;
+}
+
+void ShowTouchPad(bool shown) {
+    std::lock_guard<std::mutex> hold(g_touch_lock);
+    g_touch_shown = shown;
+    if (!shown) g_touch = Display::PadState{};
+}
+
+namespace {
+
 bool VulkanDisplay::Pad(PadState* state) const {
-    std::lock_guard<std::mutex> hold(pads_lock_);
-    if (pads_.empty()) return false;
-    *state = ReadPad(pads_.front().pad);
+    {
+        std::lock_guard<std::mutex> hold(pads_lock_);
+        if (!pads_.empty()) {
+            *state = ReadPad(pads_.front().pad);
+            return true;
+        }
+    }
+    std::lock_guard<std::mutex> hold(g_touch_lock);
+    if (!g_touch_shown) return false;
+    *state = g_touch;
     return true;
 }
 
 bool VulkanDisplay::PadOf(std::uint32_t id, PadState* state) const {
+    if (id == kTouchPadId) {
+        std::lock_guard<std::mutex> hold(g_touch_lock);
+        if (!g_touch_shown) return false;
+        *state = g_touch;
+        return true;
+    }
     std::lock_guard<std::mutex> hold(pads_lock_);
     const Gamepad* g = FindPad(id);
     if (!g) return false;
@@ -2177,12 +2243,16 @@ bool VulkanDisplay::PadOf(std::uint32_t id, PadState* state) const {
 }
 
 std::vector<Display::ControllerInfo> VulkanDisplay::Controllers() const {
-    std::lock_guard<std::mutex> hold(pads_lock_);
     std::vector<ControllerInfo> list;
-    for (const Gamepad& g : pads_) {
-        const char* name = SDL_GetGamepadName(g.pad);
-        list.push_back({g.id, name ? name : "Controller", FamilyOf(g.pad)});
+    {
+        std::lock_guard<std::mutex> hold(pads_lock_);
+        for (const Gamepad& g : pads_) {
+            const char* name = SDL_GetGamepadName(g.pad);
+            list.push_back({g.id, name ? name : "Controller", FamilyOf(g.pad)});
+        }
     }
+    std::lock_guard<std::mutex> hold(g_touch_lock);
+    if (g_touch_shown) list.push_back({kTouchPadId, "Touch screen", kPlayStationController});
     return list;
 }
 
@@ -2249,6 +2319,9 @@ bool VulkanDisplay::Focused() const {
 bool VulkanDisplay::KeyDown(int scancode) const {
     int n = 0;
     const bool* keys = SDL_GetKeyboardState(&n);
+#ifdef __ANDROID__
+    if (scancode == SDL_SCANCODE_ESCAPE && keys && SDL_SCANCODE_AC_BACK < n && keys[SDL_SCANCODE_AC_BACK]) return true;
+#endif
     return keys && scancode >= 0 && scancode < n && keys[scancode];
 }
 

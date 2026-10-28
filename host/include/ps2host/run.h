@@ -301,6 +301,9 @@ u64 LastVblankNs();
    processor, not to park it on an efficiency core) and to run it above
    normal priority. */
 void FastThread();
+/* The calling thread's priority: Windows' levels, Linux's nice values. */
+enum class HostPriority : u8 { kBelowNormal, kAboveNormal, kHighest, kTimeCritical };
+void SetHostPriority(HostPriority priority);
 bool Vif1Async();
 bool OnVif1Worker();
 bool Vif1Busy();

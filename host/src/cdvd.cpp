@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "ps2host/platform.h"
 #include "ps2host/disc.h"
 #include "ps2host/host.h"
 #include "ps2host/memory.h"

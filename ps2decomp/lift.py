@@ -581,10 +581,10 @@ def lift_function(image: bytes, base: int, start: int, end: int, chunks=()) -> s
             if m.endswith("l") and m not in ("bltzal", "bgezal"):
                 body = ["if (%s) { %s %s }" % (condition, slot_text, taken)]
             elif m in ("bltzal", "bgezal"):
-                body = ["{ bool t = %s;" % condition, slot_text, linking,
+                body = ["{ bool t; t = %s;" % condition, slot_text, linking,
                         "if (t) lifted::Call(c, 0x%08Xu); }" % ins.target]
             else:
-                body = ["{ bool t = %s;" % condition, slot_text, "if (t) %s }" % taken]
+                body = ["{ bool t; t = %s;" % condition, slot_text, "if (t) %s }" % taken]
         lines.append("    " + " ".join(part for part in body if part))
         skip.add(address + 4)
         if address + 4 in labels:

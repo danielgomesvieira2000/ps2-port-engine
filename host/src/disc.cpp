@@ -1,3 +1,8 @@
+#include "ps2host/platform.h"
+#ifndef _WIN32
+#include <cstdlib>
+#include <unistd.h>
+#endif
 #include "ps2host/disc.h"
 
 #include <algorithm>
@@ -81,6 +86,15 @@ bool Disc::Open(const std::string& path) {
         image = CueImage(path);
         if (image.empty()) return false;
     }
+#ifndef _WIN32
+    // "fd:N": a descriptor already open (Android's document picker's), read
+    // through a copy of it - the image's own path is not the app's to open.
+    if (image.compare(0, 3, "fd:") == 0) {
+        const int fd = dup(std::atoi(image.c_str() + 3));
+        file_ = fd >= 0 ? fdopen(fd, "rb") : nullptr;
+        if (!file_ && fd >= 0) close(fd);
+    } else
+#endif
     file_ = std::fopen(image.c_str(), "rb");
     if (!file_) return false;
     _fseeki64(file_, 0, SEEK_END);

@@ -28,10 +28,13 @@
 #include <thread>
 #include <vector>
 
+namespace ps2host {
+
+#ifdef _WIN32
+}  // namespace ps2host
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-
 namespace ps2host {
 namespace {
 
@@ -302,6 +305,15 @@ bool PresenceRunning() { return TheDiscord().Running(); }
 void PresenceSet(const PresenceActivity& activity) { TheDiscord().Set(&activity); }
 void PresenceClear() { TheDiscord().Set(nullptr); }
 bool PresenceConnected() { return TheDiscord().Connected(); }
+#else
+// (Not on Windows: no Discord app's pipe to speak to - nothing.)
+void PresenceStart(const std::string&) {}
+void PresenceStop() {}
+bool PresenceRunning() { return false; }
+void PresenceSet(const PresenceActivity&) {}
+void PresenceClear() {}
+bool PresenceConnected() { return false; }
+#endif
 
 long long PresenceNow() {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())

@@ -35,9 +35,7 @@
  * profile FF FF FF FF 00.
  */
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "ps2host/platform.h"      // the keys' names
 
 #include <algorithm>
 #include <cctype>

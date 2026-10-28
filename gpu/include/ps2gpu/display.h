@@ -246,6 +246,14 @@ public:
    no Vulkan device or window to be had. */
 std::unique_ptr<Display> CreateVulkanDisplay(const char* title, int width, int height, std::string* error);
 
+/* On-screen controls (a touch screen's: Android's activity draws them, over
+   the picture) as one more controller, a DualShock 2's: its state as they
+   hold it, and whether they are shown - listed among the controllers
+   (Controllers, id kTouchPadId, PlayStation marks) only then. */
+constexpr std::uint32_t kTouchPadId = 0x7F000001u;
+void SetTouchPad(const Display::PadState& state);
+void ShowTouchPad(bool shown);
+
 }  // namespace ps2gpu
 
 #endif  /* PS2GPU_DISPLAY_H */

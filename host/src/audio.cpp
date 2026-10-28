@@ -23,8 +23,12 @@
  * PS2HOST_AUDIO_MUTE=1: played (the device measured) but silent.
  * PS2HOST_AUDIO_LATENCY_MS=n: the ring's target, 20 to 250 ms.
  * PS2HOST_AUDIO_WAVEOUT=1: the wave device even where WASAPI would open.
+ *
+ * Elsewhere (Android), SDL's audio stream: AAudio's low-latency output, its
+ * callback taking the ring's samples as WASAPI's event does.
  */
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -33,6 +37,9 @@
 #include <audioclient.h>
 #include <mmdeviceapi.h>
 #undef small            // rpcndr.h's, through the COM headers; run.h names a parameter so
+#else
+#include <SDL3/SDL.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -49,8 +56,10 @@
 #include "ps2host/run.h"
 #include "ps2host/timeline.h"
 
+#ifdef _WIN32
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "ole32.lib")
+#endif
 
 namespace ps2host {
 
@@ -233,6 +242,7 @@ void LogStats(Device& d) {
                  s.stretch_min.exchange(1), s.stretch_max.exchange(1));
 }
 
+#ifdef _WIN32
 // ---------------------------------------------------------------- WASAPI
 
 // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, without ksuser.lib.
@@ -379,6 +389,46 @@ void RunWaveOut(Device& d) {
     waveOutClose(out);
     CloseHandle(event);
 }
+#else
+// ---------------------------------------------------------------- SDL
+
+void RunSdl(Device& d) {
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        std::fprintf(stderr, "[audio] no audio: %s\n", SDL_GetError());
+        d.opened.store(-1);
+        return;
+    }
+    SDL_AudioSpec spec{SDL_AUDIO_F32, 2, kRate};
+    // The device's own period: as small as it takes (AAudio's low-latency path).
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "256");
+    SDL_AudioStream* stream = SDL_OpenAudioDeviceStream(
+        SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec,
+        [](void* user, SDL_AudioStream* stream, int additional, int) {
+            Device& d = *static_cast<Device*>(user);
+            thread_local std::vector<float> scratch;
+            const unsigned frames = unsigned(additional) / 8;
+            if (frames == 0) return;
+            scratch.resize(frames * 2);
+            d.Render(scratch.data(), frames);
+            SDL_PutAudioStreamData(stream, scratch.data(), int(frames * 8));
+        },
+        &d);
+    if (!stream) {
+        std::fprintf(stderr, "[audio] no audio device: %s\n", SDL_GetError());
+        d.opened.store(-1);
+        return;
+    }
+    int frames = 0;
+    SDL_AudioSpec device_spec{};
+    SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(stream), &device_spec, &frames);
+    std::fprintf(stderr, "[audio] playing (SDL %s, %d frames a period at %d Hz, %u ms target)\n",
+                 SDL_GetCurrentAudioDriver(), frames, device_spec.freq, d.target_frames * 1000 / kRate);
+    SDL_ResumeAudioStreamDevice(stream);
+    d.opened.store(1);
+    while (!d.stop) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    SDL_DestroyAudioStream(stream);
+}
+#endif
 
 }  // namespace
 
@@ -393,8 +443,13 @@ bool OpenAudio() {
     const bool wave_only = std::getenv("PS2HOST_AUDIO_WAVEOUT") != nullptr;
     d.thread = std::thread([&d, wave_only] {
         timeline::NameThread("audio");
+#ifdef _WIN32
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         if (wave_only || !RunWasapi(d)) RunWaveOut(d);
+#else
+        (void)wave_only;
+        RunSdl(d);
+#endif
     });
     // Until the thread says whether a device opened.
     while (d.opened.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));

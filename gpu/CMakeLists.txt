@@ -38,7 +38,14 @@ set(VULKAN_HEADERS_INSTALL_DIR "${vulkan_headers_SOURCE_DIR}" CACHE PATH "" FORC
 FetchContent_MakeAvailable(volk sdl3)
 
 # Shaders: GLSL compiled to SPIR-V at build time by glslang, from its release
-# like the others, and embedded as arrays (glslang --vn).
+# like the others, and embedded as arrays (glslang --vn). A build for another
+# machine (Android's) runs the PC's: PS2_HOST_GLSLANG, the glslang a PC build
+# made (engine/tools/port.py's android passes it).
+set(PS2_HOST_GLSLANG "" CACHE FILEPATH "glslang to run at build time (a cross build's: the PC's)")
+if(PS2_HOST_GLSLANG)
+    set(GLSLANG ${PS2_HOST_GLSLANG})
+else()
+    set(GLSLANG glslang-standalone)
 FetchContent_Declare(glslang
     GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
     GIT_TAG vulkan-sdk-1.4.363.0
@@ -50,6 +57,7 @@ set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(glslang)
+endif()
 
 set(PS2GPU_SHADER_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${PS2GPU_SHADER_DIR})
@@ -59,12 +67,12 @@ foreach(shader gs.vert gs.frag date.vert date.frag swizzle.comp decode.comp dept
     string(REPLACE "." "_" name ${shader})
     set(out ${PS2GPU_SHADER_DIR}/${name}.h)
     add_custom_command(OUTPUT ${out}
-        COMMAND glslang-standalone -V --target-env vulkan1.3 --vn spirv_${name}
+        COMMAND ${GLSLANG} -V --target-env vulkan1.3 --vn spirv_${name}
                 -I${CMAKE_CURRENT_LIST_DIR}/third_party/smaa
                 -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader}
         DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
                 ${CMAKE_CURRENT_LIST_DIR}/shaders/smaa_common.glsl ${CMAKE_CURRENT_LIST_DIR}/third_party/smaa/SMAA.glsl
-                glslang-standalone
+                ${GLSLANG}
         COMMENT "glslang ${shader}")
     list(APPEND PS2GPU_SHADER_HEADERS ${out})
 endforeach()
@@ -72,53 +80,53 @@ endforeach()
 # dual-source blending.
 set(out ${PS2GPU_SHADER_DIR}/gs_frag_single.h)
 add_custom_command(OUTPUT ${out}
-    COMMAND glslang-standalone -V --target-env vulkan1.3 -DSINGLE_OUTPUT --vn spirv_gs_frag_single
+    COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DSINGLE_OUTPUT --vn spirv_gs_frag_single
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag
-    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag glslang-standalone
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag ${GLSLANG}
     COMMENT "glslang gs.frag (single output)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # The swizzle straight to and from a colour target (a storage image).
 set(out ${PS2GPU_SHADER_DIR}/swizzle_image_comp.h)
 add_custom_command(OUTPUT ${out}
-    COMMAND glslang-standalone -V --target-env vulkan1.3 -DIMAGE --vn spirv_swizzle_image_comp
+    COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DIMAGE --vn spirv_swizzle_image_comp
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp
     DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
-            glslang-standalone
+            ${GLSLANG}
     COMMENT "glslang swizzle.comp (a target's image)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # The texture decode straight into a texture's image (a storage image).
 set(out ${PS2GPU_SHADER_DIR}/decode_image_comp.h)
 add_custom_command(OUTPUT ${out}
-    COMMAND glslang-standalone -V --target-env vulkan1.3 -DTO_IMAGE --vn spirv_decode_image_comp
+    COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DTO_IMAGE --vn spirv_decode_image_comp
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/decode.comp
     DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/decode.comp ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
-            glslang-standalone
+            ${GLSLANG}
     COMMENT "glslang decode.comp (into a texture's image)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # ...and from a depth buffer, sampled.
 set(out ${PS2GPU_SHADER_DIR}/swizzle_depth_comp.h)
 add_custom_command(OUTPUT ${out}
-    COMMAND glslang-standalone -V --target-env vulkan1.3 -DDEPTH_IMAGE --vn spirv_swizzle_depth_comp
+    COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DDEPTH_IMAGE --vn spirv_swizzle_depth_comp
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp
     DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
-            glslang-standalone
+            ${GLSLANG}
     COMMENT "glslang swizzle.comp (a depth buffer)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # ...and blending in the shader, from a copy of the target (a factor over 1).
 set(out ${PS2GPU_SHADER_DIR}/gs_frag_blend.h)
 add_custom_command(OUTPUT ${out}
-    COMMAND glslang-standalone -V --target-env vulkan1.3 -DSHADER_BLEND --vn spirv_gs_frag_blend
+    COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DSHADER_BLEND --vn spirv_gs_frag_blend
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag
-    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag glslang-standalone
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag ${GLSLANG}
     COMMENT "glslang gs.frag (blending in the shader)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # The PC's effects (effects.cpp): effects.comp once for each pass.
 foreach(pass RANGE 0 15)
     set(out ${PS2GPU_SHADER_DIR}/effects_${pass}.h)
     add_custom_command(OUTPUT ${out}
-        COMMAND glslang-standalone -V --target-env vulkan1.3 -DPASS=${pass} --vn spirv_effects_${pass}
+        COMMAND ${GLSLANG} -V --target-env vulkan1.3 -DPASS=${pass} --vn spirv_effects_${pass}
                 -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/effects.comp
-        DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/effects.comp glslang-standalone
+        DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/effects.comp ${GLSLANG}
         COMMENT "glslang effects.comp (pass ${pass})")
     list(APPEND PS2GPU_SHADER_HEADERS ${out})
 endforeach()
@@ -139,7 +147,9 @@ if(MSVC)
     target_compile_options(ps2gpu PRIVATE /W3 /Z7)        # symbols for --sample, as ps2host has
 endif()
 
-add_executable(ps2gpu_smoke ${CMAKE_CURRENT_LIST_DIR}/tests/display_smoke.cpp)
-target_link_libraries(ps2gpu_smoke PRIVATE ps2gpu)
-add_executable(ps2gpu_tests ${CMAKE_CURRENT_LIST_DIR}/tests/renderer_tests.cpp)
-target_link_libraries(ps2gpu_tests PRIVATE ps2gpu)
+if(NOT ANDROID)
+    add_executable(ps2gpu_smoke ${CMAKE_CURRENT_LIST_DIR}/tests/display_smoke.cpp)
+    target_link_libraries(ps2gpu_smoke PRIVATE ps2gpu)
+    add_executable(ps2gpu_tests ${CMAKE_CURRENT_LIST_DIR}/tests/renderer_tests.cpp)
+    target_link_libraries(ps2gpu_tests PRIVATE ps2gpu)
+endif()

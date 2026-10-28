@@ -2,6 +2,7 @@
  * libmc2's handlers over a directory (mc2.h).
  */
 
+#include "ps2host/platform.h"
 #include "ps2host/mc2.h"
 
 #include <algorithm>

@@ -26,11 +26,16 @@
  * rethrown by the scheduler, on the host's own stack.
  */
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#include <timeapi.h>
+#include "fiber.h"
+#ifdef _WIN32
 #pragma comment(lib, "synchronization.lib")
+#else
+#include <cerrno>
+#include <sched.h>
+#include <sys/resource.h>
+#include <time.h>
+#include <unistd.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -84,10 +89,10 @@ struct Thread {
     u64 runs = 0;                   // times the scheduler switched to it, for the report
     lifted::Context context = NewContext();
     std::vector<u32> calls;         // the guest call stack, for the report
-    LPVOID fiber = nullptr;         // the fiber it runs on now (a coroutine's, while one runs)
+    void* fiber = nullptr;         // the fiber it runs on now (a coroutine's, while one runs)
     // Guest coroutines (run.h): the thread's own fiber while one of them runs,
     // which runs, and the thread's own call stack meanwhile.
-    LPVOID home = nullptr;
+    void* home = nullptr;
     Coroutine* coroutine = nullptr;
     std::vector<u32> home_calls;
     // RequestDelivery: its budget was zeroed to deliver an interrupt at its
@@ -99,7 +104,7 @@ struct Thread {
 }  // namespace
 
 struct Coroutine {
-    LPVOID fiber = nullptr;
+    void* fiber = nullptr;
     std::function<void()> body;
     std::vector<u32> calls;         // its guest call stack, while it is not running
     bool finished = false;
@@ -124,7 +129,7 @@ struct Scheduler {
     std::map<u32, std::unique_ptr<Thread>> threads;
     u32 next_thread = 1;
     Thread* current = nullptr;
-    LPVOID host_fiber = nullptr;
+    void* host_fiber = nullptr;
     u64 counter = 0;
     std::exception_ptr stop;
     std::map<u32, Semaphore> semaphores;
@@ -431,6 +436,14 @@ std::atomic<u64> g_last_vblank_ns{0};       // LastVblankNs
    waitable timer (Windows 10 1803 on), not Sleep's millisecond steps that can
    overshoot by more; sleep_until where there is none. */
 void SleepUntil(std::chrono::steady_clock::time_point when) {
+#ifndef _WIN32
+    // (POSIX: an absolute sleep on the monotonic clock steady_clock reads.)
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(when.time_since_epoch()).count();
+    if (ns <= 0) return;
+    timespec due{time_t(ns / 1000000000), long(ns % 1000000000)};
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &due, nullptr) == EINTR) {
+    }
+#else
     thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                                                        TIMER_ALL_ACCESS);
     const auto left = when - std::chrono::steady_clock::now();
@@ -443,6 +456,7 @@ void SleepUntil(std::chrono::steady_clock::time_point when) {
     due.QuadPart = -std::max<long long>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(left).count() / 100);
     if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) WaitForSingleObject(timer, INFINITE);
     else std::this_thread::sleep_until(when);
+#endif
 }
 
 /* Whether a deadline may be waited for by spinning its last stretch (a
@@ -460,12 +474,17 @@ bool SpareCores() {
     static std::atomic<int> looks{0};
     static std::atomic<bool> spare{true};
     if (looks.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
-        DWORD_PTR process = 0, system = 0;
         int cores = int(std::thread::hardware_concurrency());
+#ifdef _WIN32
+        DWORD_PTR process = 0, system = 0;
         if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) && process) {
             cores = 0;
             for (DWORD_PTR m = process; m; m &= m - 1) ++cores;
         }
+#else
+        cpu_set_t set;
+        if (sched_getaffinity(0, sizeof set, &set) == 0) cores = CPU_COUNT(&set);
+#endif
         spare.store(cores >= 4, std::memory_order_relaxed);
     }
     return spare.load(std::memory_order_relaxed);
@@ -837,11 +856,15 @@ namespace {
 // GuestCallsNow's read, apart: no C++ objects, so it can be guarded.
 int ReadCalls(const u32* data, std::size_t size, u32* out, int max) {
     int n = 0;
+#ifdef _WIN32
     __try {
         for (std::size_t i = size; i > 0 && n < max; --i) out[n++] = data[i - 1];
     } __except (1) {
         n = 0;
     }
+#else
+    (void)data, (void)size, (void)out, (void)max;     // (the sampler is Windows')
+#endif
     return n;
 }
 }  // namespace
@@ -930,6 +953,7 @@ namespace {
 /* The run's real time (RunThreads, or StartRealTime): the blanks' timer,
    VIF1's worker. */
 void StartRealTimeThreads() {
+#ifdef _WIN32
     timeBeginPeriod(1);             // sleeps to the millisecond, not Windows' 15.6 ms
     // ...even with the window hidden behind others: Windows 11 drops a
     // process's timer resolution then (a 200 us sleep took 15 ms, a blank
@@ -939,6 +963,7 @@ void StartRealTimeThreads() {
     process.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
     process.StateMask = 0;
     SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &process, sizeof process);
+#endif
     FastThread();
     // The EE above the threads it feeds (VIF1's worker, the GS thread): it
     // takes the blanks, and what they do waits for it - queued, at most two
@@ -946,14 +971,14 @@ void StartRealTimeThreads() {
     // blank waited for the EE's turn behind them: on two cores (Resident
     // Evil Outbreak, J's Bar, 30 s) 200 blanks taken late and 82 pictures a
     // period late; above them, 14-23 and 1-6. No change with cores to spare.
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    SetHostPriority(HostPriority::kHighest);
     if (!TimerThread().joinable()) {
         TimerThread() = std::thread([] {
             timeline::NameThread("vertical blank timer");
             // Asleep almost always, it must wake on time with every core busy
             // (a blank 13 ms late was a frame shown late): the highest priority.
             FastThread();
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            SetHostPriority(HostPriority::kTimeCritical);
             VblankTimer();
         });
         std::atexit(StopTimer);
@@ -1454,18 +1479,34 @@ u64 LastVblankNs() { return g_last_vblank_ns.load(std::memory_order_relaxed); }
 
 void SetRefreshLead(u64 ns) { g_refresh_lead.store(ns, std::memory_order_relaxed); }
 
+void SetHostPriority(HostPriority priority) {
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), priority == HostPriority::kTimeCritical ? THREAD_PRIORITY_TIME_CRITICAL
+                                          : priority == HostPriority::kHighest      ? THREAD_PRIORITY_HIGHEST
+                                          : priority == HostPriority::kBelowNormal  ? THREAD_PRIORITY_BELOW_NORMAL
+                                                                                    : THREAD_PRIORITY_ABOVE_NORMAL);
+#else
+    // Linux's nice values, as Android's own threads have them (its display
+    // -8, its audio -16): taken where the system allows.
+    setpriority(PRIO_PROCESS, 0, priority == HostPriority::kTimeCritical ? -16 : priority == HostPriority::kHighest ? -8
+                                 : priority == HostPriority::kBelowNormal ? 4 : -4);
+#endif
+}
+
 void FastThread() {
+#ifdef _WIN32
     THREAD_POWER_THROTTLING_STATE throttling{};
     throttling.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
     throttling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
     throttling.StateMask = 0;               // never throttled
     SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &throttling, sizeof throttling);
+#endif
     // Above the rest only with cores to spare (SpareCores): on a machine
     // with few, the EE, the GS thread and VIF1's worker together keep every
     // core busy, and at a higher priority the threads they depend on - the
     // GPU driver's, the window's - waited seconds for one (until Windows
     // lifts a starved thread, after about four).
-    if (SpareCores()) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    if (SpareCores()) SetHostPriority(HostPriority::kAboveNormal);
 }
 
 }  // namespace ps2host

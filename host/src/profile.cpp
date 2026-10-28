@@ -28,6 +28,9 @@
 #include <dbghelp.h>
 #include <intrin.h>
 #include <timeapi.h>
+#else
+#include <pthread.h>
+#include <time.h>
 #endif
 
 namespace ps2host {
@@ -187,6 +190,7 @@ namespace {
 std::atomic<bool> g_sample_vif1{false};
 std::atomic<bool> g_sample_renderer{false};
 }  // namespace
+#ifdef _WIN32
 namespace {
 std::atomic<HANDLE> g_renderer_thread{nullptr};
 }  // namespace
@@ -203,6 +207,21 @@ double RendererThreadCpuMs() {
     };
     return ms(kernel) + ms(user);
 }
+#else
+namespace {
+std::atomic<bool> g_renderer_noted{false};
+clockid_t g_renderer_clock;
+}  // namespace
+void NoteRendererThread() {
+    timeline::NameThread("GPU renderer");
+    if (pthread_getcpuclockid(pthread_self(), &g_renderer_clock) == 0) g_renderer_noted = true;
+}
+double RendererThreadCpuMs() {
+    timespec t{};
+    if (!g_renderer_noted || clock_gettime(g_renderer_clock, &t) != 0) return 0;
+    return double(t.tv_sec) * 1000.0 + double(t.tv_nsec) / 1e6;
+}
+#endif
 void SetSampleRendererThread(bool on) {
     g_sample_renderer = on;
 #if PS2HOST_VULKAN

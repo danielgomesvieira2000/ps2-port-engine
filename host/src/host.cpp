@@ -1,8 +1,9 @@
 #include "ps2host/host.h"
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "ps2host/platform.h"
+#ifndef _WIN32
+#include <time.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -50,10 +51,16 @@ namespace ps2host {
    PS2HOST_REPLAY_SAMPLE=1 sampled too (the sampler's report after). */
 /* The calling thread's CPU time (user and kernel), in milliseconds. */
 double ThreadCpuMs() {
+#ifdef _WIN32
     FILETIME created, exited, kernel, user;
     if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return 0;
     auto ms = [](const FILETIME& t) { return double(u64(t.dwHighDateTime) << 32 | t.dwLowDateTime) / 10000.0; };
     return ms(kernel) + ms(user);
+#else
+    timespec t{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t) != 0) return 0;
+    return double(t.tv_sec) * 1000.0 + double(t.tv_nsec) / 1e6;
+#endif
 }
 
 int GsReplay(const std::string& file, const std::string& out) {
@@ -725,9 +732,13 @@ int Run(const Options& options) {
         if (!options.memcard.empty()) {
             where = std::filesystem::absolute(options.memcard).parent_path();
         } else {
+#ifdef _WIN32
             wchar_t exe[MAX_PATH] = {};
             GetModuleFileNameW(nullptr, exe, MAX_PATH);
             where = std::filesystem::path(exe).parent_path();
+#else
+            where = std::filesystem::current_path();
+#endif
         }
         LoadSettings((where / "pc_settings.ini").string());
     }
@@ -841,6 +852,7 @@ int Main(int argc, char** argv) {
     // machine with that many, to measure a low-end one on a big one. Or a
     // mask (0x5: logical cores 0 and 2 - two physical cores where the first
     // ones are hyperthreaded pairs).
+#ifdef _WIN32
     if (const char* cores = std::getenv("PS2HOST_CORES")) {
         DWORD_PTR mask = 0;
         if (cores[0] == '0' && (cores[1] == 'x' || cores[1] == 'X')) {
@@ -852,6 +864,7 @@ int Main(int argc, char** argv) {
         if (mask && SetProcessAffinityMask(GetCurrentProcess(), mask))
             std::fprintf(stderr, "[host] held to cores 0x%llX (PS2HOST_CORES)\n", (unsigned long long)mask);
     }
+#endif
     Options options;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];

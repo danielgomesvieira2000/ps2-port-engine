@@ -35,14 +35,7 @@
 #include <set>
 #include <string>
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "ps2host/sockets.h"
 
 #include "ps2host/host.h"
 #include "ps2host/run.h"
@@ -77,8 +70,12 @@ Stats& Counts() {
 
 void Summary() {
     if (!Debug()) return;
-    static DWORD last = GetTickCount();
-    const DWORD now = GetTickCount();
+    const auto Ms = [] {
+        return u32(std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count());
+    };
+    static u32 last = Ms();
+    const u32 now = Ms();
     if (now - last < 2000) return;
     last = now;
     Stats& n = Counts();
@@ -228,7 +225,7 @@ void Open(lifted::Context& c) {
         }
         NonBlocking(k->s);
         sockaddr_in bound{};
-        int size = sizeof bound;
+        SockLen size = sizeof bound;
         getsockname(k->s, reinterpret_cast<sockaddr*>(&bound), &size);
         Log("open " + std::to_string(id) + ": udp on " + Text(bound.sin_addr.s_addr, ntohs(bound.sin_port)));
         k->connected = true;
@@ -265,7 +262,7 @@ bool Ready(Socket& k) {
     if (k.connected) return true;
     if (k.listener != INVALID_SOCKET) {
         sockaddr_in from{};
-        int size = sizeof from;
+        SockLen size = sizeof from;
         const SOCKET s = accept(k.listener, reinterpret_cast<sockaddr*>(&from), &size);
         if (s == INVALID_SOCKET) return false;
         NonBlocking(s);
@@ -357,7 +354,7 @@ void RecvFrom(lifted::Context& c) {
     if (flags) generated::Write32(flags, 0);
     std::string buffer(length ? length : 1, '\0');
     sockaddr_in from{};
-    int size = sizeof from;
+    SockLen size = sizeof from;
     const int got = recvfrom(k->s, buffer.data(), int(length), 0, reinterpret_cast<sockaddr*>(&from), &size);
     Summary();
     if (got < 0) {
@@ -426,7 +423,7 @@ void Control(lifted::Context& c) {
     }
     for (u32 i = 0; i < length; i += 4) generated::Write32(buffer + i, 0);
     sockaddr_in local{};
-    int size = sizeof local;
+    SockLen size = sizeof local;
     if (k->s != INVALID_SOCKET) getsockname(k->s, reinterpret_cast<sockaddr*>(&local), &size);
     generated::Write32(buffer + 0x14, GuestIp(local.sin_addr.s_addr));
     generated::Write32(buffer + 0x20, ntohs(local.sin_port));

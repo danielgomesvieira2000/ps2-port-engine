@@ -22,6 +22,7 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/ipu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/vif1_worker.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/threads.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/fiber.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/high_fps.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/display_list.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/iop.cpp
@@ -80,12 +81,14 @@ target_link_libraries(ps2host PUBLIC ps2rt)
 # Texture packs (texture_pack.cpp): single headers, pinned by hash - xxHash
 # (BSD-2-Clause; PCSX2's names are XXH3 hashes), bcdec (MIT or Unlicense; DDS
 # BC1-BC7) and stb_image (MIT or public domain; PNG). And for the host's music
-# (music.cpp), minimp3 (CC0: public domain; MP3).
+# (music.cpp), minimp3 (CC0: public domain; MP3); for the overlay's text where
+# there is no GDI (window.cpp), stb_easy_font (MIT or public domain).
 set(third_party_dir ${CMAKE_CURRENT_BINARY_DIR}/third_party)
 foreach(entry
         "xxhash.h|https://raw.githubusercontent.com/Cyan4973/xxHash/v0.8.3/xxhash.h|17973c0dc49d9854ca26caa191f0e12f7a424b68858d9a78de3860d959d85e4b"
         "bcdec.h|https://raw.githubusercontent.com/iOrange/bcdec/80859ed3b7afb1c527a2a99d70c61457bea72d0c/bcdec.h|134520764d96f70a27db814173616c89ad85db95fbd3328417c7a8c77e7ca189"
         "stb_image.h|https://raw.githubusercontent.com/nothings/stb/2c980bb59875b0d32144a71867fbdebb2f77cd20/stb_image.h|594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3"
+        "stb_easy_font.h|https://raw.githubusercontent.com/nothings/stb/2c980bb59875b0d32144a71867fbdebb2f77cd20/stb_easy_font.h|7b48b52a316477766c0a7a096b33a29bcbd847b6fab4fabd32bb3fdb7cea1a60"
         "minimp3.h|https://raw.githubusercontent.com/lieff/minimp3/afb604c06bc8beb145fecd42c0ceb5bda8795144/minimp3.h|5fb296a790734772b65a5514438cc06d14f24e539c13475ff2a7f737681c82c0")
     string(REPLACE "|" ";" parts "${entry}")
     list(GET parts 0 name)
@@ -177,6 +180,35 @@ endif()
 if(WIN32)
     target_link_libraries(ps2host PRIVATE ws2_32)         # the IOP's inet (iop_inet.cpp)
 endif()
+if(NOT MSVC)
+    # clang or GCC (Android's NDK): translated code throws lifted::Abort; no
+    # multiply-add fused into one rounding (AArch64's clang fuses by default)
+    # - the game's floats as the PC's builds have them.
+    target_compile_options(ps2rt PUBLIC -fexceptions -ffp-contract=off -Wno-unused-parameter)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i.86)$")
+        if(PS2HOST_AVX2)
+            target_compile_options(ps2rt PUBLIC -mavx2 -mfma -mbmi -mbmi2)
+        else()
+            target_compile_options(ps2rt PUBLIC -msse4.1)
+        endif()
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        # Arm: the SSE intrinsics the runtime and the VU's code use, as NEON -
+        # sse2neon (MIT, pinned by hash), behind the x86 headers' names.
+        set(sse2neon_dir ${CMAKE_CURRENT_BINARY_DIR}/sse2neon)
+        if(NOT EXISTS ${sse2neon_dir}/sse2neon.h)
+            file(DOWNLOAD https://raw.githubusercontent.com/DLTcollab/sse2neon/v1.8.0/sse2neon.h
+                 ${sse2neon_dir}/sse2neon.h
+                 EXPECTED_HASH SHA256=07723c9f9457dd4316f1fde3dd4eb6f31dd67d9955f6c21f4e609ac1698be48a TLS_VERIFY ON)
+        endif()
+        foreach(header immintrin.h emmintrin.h xmmintrin.h pmmintrin.h tmmintrin.h smmintrin.h nmmintrin.h)
+            file(WRITE ${sse2neon_dir}/${header} "#pragma once\n#include \"sse2neon.h\"\n")
+        endforeach()
+        target_include_directories(ps2rt SYSTEM BEFORE PUBLIC ${sse2neon_dir})
+    endif()
+    if(ANDROID)
+        target_link_libraries(ps2host PUBLIC android log)
+    endif()
+endif()
 
 # The host's own tests, which need no game.
 # vu_corpus.cpp: random microprograms, compiled by engine/tools/vurecomp.py
@@ -188,8 +220,13 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/vu_corpus.cpp
             --out ${CMAKE_CURRENT_BINARY_DIR}/vu_corpus.cpp
     DEPENDS ${PS2HOST_VURECOMP}
     COMMENT "vurecomp: the VU test corpus")
+if(ANDROID)
+    # (The tests run on the PC's build.)
+    add_library(ps2host_tests OBJECT EXCLUDE_FROM_ALL ${CMAKE_CURRENT_LIST_DIR}/tests/host_tests.cpp)
+else()
 add_executable(ps2host_tests ${CMAKE_CURRENT_LIST_DIR}/tests/host_tests.cpp
                              ${CMAKE_CURRENT_BINARY_DIR}/vu_corpus.cpp)
+endif()
 target_link_libraries(ps2host_tests PRIVATE ps2host)
 if(PS2HOST_VULKAN)
     target_compile_definitions(ps2host_tests PRIVATE PS2HOST_VULKAN=1)
@@ -214,11 +251,21 @@ function(ps2_add_port target)
     file(GLOB translated ${PORT_TRANSLATED}/*.cpp)
     # dispatch.cpp, and discovered.cpp: code found copied at run time, translated.
     file(GLOB generated ${PORT_GENERATED}/*.cpp)
+    if(ANDROID)
+        # Android: the game as a library SDL's activity loads (lib<target>.so,
+        # its SDL_main main.cpp's main), in an APK (engine/tools/android.py).
+        add_library(${target} SHARED
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/src/main.cpp
+            ${generated}
+            ${translated}
+            ${PORT_SOURCES})
+    else()
     add_executable(${target}
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/src/main.cpp
         ${generated}
         ${translated}
         ${PORT_SOURCES})
+    endif()
     if(MSVC)
         target_link_libraries(${target} PRIVATE ps2_cpu_check)
     endif()
@@ -240,8 +287,11 @@ function(ps2_add_port target)
         target_compile_definitions(${target} PRIVATE PS2HOST_GAME_NAME="${game_name}"
                                                      PS2HOST_GAME_TITLE="${game_title}"
                                                      PS2HOST_GAME_VERSION="${game_version}"
-                                                     PS2HOST_GAME_EXECUTABLE="${game_executable}")
-        target_link_libraries(${target} PRIVATE comdlg32)
+                                                     PS2HOST_GAME_EXECUTABLE="${game_executable}"
+                                                     PS2HOST_GAME_TARGET="${target}")
+        if(WIN32)
+            target_link_libraries(${target} PRIVATE comdlg32)
+        endif()
         set(icon ${game_dir}/build/port/icon.ico)
         if(NOT EXISTS ${icon})
             set(icon ${game_dir}/port/icon.ico)

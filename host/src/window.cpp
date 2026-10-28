@@ -8,9 +8,10 @@
  * thread at each frame (FrameDone).
  */
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "ps2host/platform.h"
+#ifndef _WIN32
+#include "stb_easy_font.h"      // the overlay's text where there is no GDI
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -41,7 +42,11 @@ std::atomic<std::uint64_t> g_late_pictures{0};    // LatePictures
 
 namespace {
 
-HWND g_window = nullptr;
+#ifdef _WIN32
+HWND g_window = nullptr;        // GDI's window, without a Vulkan display
+#else
+void* g_window = nullptr;       // (none: Vulkan's display or nothing)
+#endif
 bool g_closed = false;
 
 #ifdef PS2HOST_VULKAN
@@ -103,6 +108,7 @@ int Scancode(int key) {
 }
 #endif
 
+#ifdef _WIN32
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM w, LPARAM l) {
     switch (message) {
         case WM_CLOSE:
@@ -157,6 +163,10 @@ void PresentGdi() {
                   DIB_RGB_COLORS, SRCCOPY);
     ReleaseDC(g_window, dc);
 }
+#else
+bool OpenGdiWindow(const wchar_t*, int, int) { return false; }
+void PresentGdi() {}
+#endif
 
 #ifdef PS2HOST_VULKAN
 /* The "antialiasing" setting as the display takes it: supersampling's
@@ -352,14 +362,22 @@ bool WindowFocused() {
 #ifdef PS2HOST_VULKAN
     if (g_display) return g_display->Focused();
 #endif
+#ifdef _WIN32
     return g_window && GetForegroundWindow() == g_window;
+#else
+    return false;
+#endif
 }
 
 bool WindowMinimized() {
 #ifdef PS2HOST_VULKAN
     if (g_display) return g_display->Minimized();
 #endif
+#ifdef _WIN32
     return g_window && IsIconic(g_window);
+#else
+    return false;
+#endif
 }
 
 bool WindowClosed() { return g_closed; }
@@ -374,7 +392,11 @@ bool HostKeyDown(int key) {
 #ifdef PS2HOST_VULKAN
     if (g_display) return g_display->KeyDown(Scancode(key));
 #endif
+#ifdef _WIN32
     return (GetAsyncKeyState(key) & 0x8000) != 0;
+#else
+    return false;
+#endif
 }
 
 void HostTriggerEffects(const HostTriggerEffect& left, const HostTriggerEffect& right) {
@@ -618,6 +640,7 @@ void DrawOverlay(const std::vector<std::string>& lines) {
     // yellow (the one chosen).
     const std::uint32_t screen = std::max(480u, g_display->PixelHeight());
     const int line = std::max(14, int(screen / 48));
+#ifdef _WIN32
     HDC dc = CreateCompatibleDC(nullptr);
     HFONT font = CreateFontA(-(line - 4), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS,
                              CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
@@ -661,6 +684,34 @@ void DrawOverlay(const std::vector<std::string>& lines) {
     SelectObject(dc, old_font);
     DeleteObject(font);
     DeleteDC(dc);
+#else
+    // stb_easy_font's strokes (each glyph quads on a 7-unit-tall cell),
+    // scaled to the line and filled in.
+    const int scale = std::max(1, (line - 4) / 9);
+    int width = 0;
+    for (const std::string& text : lines)
+        width = std::max(width, stb_easy_font_width(const_cast<char*>(text.c_str())) * scale);
+    width = std::min(1280, width + line);
+    const int height = std::min(720, int(lines.size()) * line + line / 2);
+    std::vector<std::uint32_t> pixels(std::size_t(width) * height, 0xFF101420u);    // RGB(16, 20, 32), as GDI leaves it
+    std::vector<float> quads(4 * 1024 * 4);
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        const bool chosen = !lines[i].empty() && lines[i][0] == '>';
+        const std::uint32_t colour = chosen ? 0xFFFFD23Cu : i == 0 ? 0xFF78BEFFu : 0xFFEBEBEBu;  // (0xAARRGGBB, GDI's order)
+        unsigned char unused[4] = {255, 255, 255, 255};
+        const int n = stb_easy_font_print(0, 0, const_cast<char*>(lines[i].c_str()), unused, quads.data(),
+                                          int(quads.size() * sizeof(float)));
+        const int x0 = line / 2, y0 = int(i) * line + line / 4 + 1;
+        for (int q = 0; q < n; ++q) {
+            const float* v = &quads[std::size_t(q) * 16];      // 4 vertices: x y z colour
+            const int left = x0 + int(v[0] * scale), top = y0 + int(v[1] * scale);
+            const int right = x0 + int(v[8] * scale), bottom = y0 + int(v[9] * scale);
+            for (int y = std::max(0, top); y < std::min(height, bottom); ++y)
+                for (int x = std::max(0, left); x < std::min(width, right); ++x)
+                    pixels[std::size_t(y) * width + x] = colour;
+        }
+    }
+#endif
     g_display->SetOverlay(std::move(pixels), std::uint32_t(width), std::uint32_t(height));
 #else
     (void)lines;

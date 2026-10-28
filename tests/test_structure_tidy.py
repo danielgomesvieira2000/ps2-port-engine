@@ -114,7 +114,7 @@ class TestLoopShapes(unittest.TestCase):
         self.assertEqual(structure.negate("ReadS32((u32)a0) == 0ull"), "!(ReadS32((u32)a0) == 0ull)")
 
     def test_independent_delay_slot_is_hoisted(self):
-        lines = ["    { const bool t = v1 != 0ull;",
+        lines = ["    { bool t; t = v1 != 0ull;",
                  "      s2 = Sx32(s2 + s4);",
                  "      if (t) {",
                  "            a0 = s2;",
@@ -130,12 +130,12 @@ class TestLoopShapes(unittest.TestCase):
                           "    }"])
 
     def test_dependent_delay_slot_stays(self):
-        lines = ["    { const bool t = v1 != 0ull;",
+        lines = ["    { bool t; t = v1 != 0ull;",
                  "      v1 = Sx32(s2 + s4);",
                  "      if (t) {",
                  "      } }"]
         self.assertEqual(structure.hoist_delay_slots(lines), lines)
-        stored = ["    { const bool t = v1 != 0ull;",
+        stored = ["    { bool t; t = v1 != 0ull;",
                   "      Write32((u32)a0, (u32)v1);",
                   "      if (t) {",
                   "      } }"]

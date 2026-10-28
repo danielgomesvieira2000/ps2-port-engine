@@ -49,6 +49,7 @@
 #include <system_error>
 #include <vector>
 
+#include "ps2host/platform.h"
 #include "ps2host/host.h"
 #include "ps2host/mc2.h"
 #include "ps2host/memory.h"

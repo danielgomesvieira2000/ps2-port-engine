@@ -38,6 +38,7 @@
 #include <string>
 #include <vector>
 
+#include "ps2host/platform.h"
 #include "ps2host/dma.h"
 #include "ps2host/timeline.h"
 #ifdef PS2HOST_VULKAN

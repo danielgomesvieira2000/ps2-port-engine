@@ -451,7 +451,10 @@ class _Emitter:
             # Nothing runs between the test and the branch: no temporary needed.
             lines.append(pad + "if (%s) {" % block.condition)
         else:
-            lines.append(pad + "{ const bool t = %s;" % block.condition)
+            # (Declared, then set: a goto to a label inside the block may
+            # pass it - C++ for a declaration without an initializer, an
+            # error for one with it outside MSVC's compatibility.)
+            lines.append(pad + "{ bool t; t = %s;" % block.condition)
             if block.slot:
                 lines.append(pad + "  " + block.slot)
             lines.append(pad + "  if (t) {")
@@ -610,10 +613,12 @@ def _close_of(lines, k, texts):
 
 
 _PLAIN_SLOT = re.compile(r"^([a-z][a-z0-9]*) = [^;]*;$")
+# A branch's temporary as the structurer writes it (and as it once did).
+_TEMPORARY = ("{ bool t; t = ", "{ const bool t = ")
 
 
 def hoist_delay_slots(lines):
-    """`{ const bool t = C; S; if (t) {...} else {...} }` is `S; if (C) {...}
+    """`{ bool t; t = C; S; if (t) {...} else {...} }` is `S; if (C) {...}
     else {...}` when S cannot change C: S is a plain assignment to a name C does
     not mention, writing no memory and calling nothing. With the slot elided, it
     is just `if (C)`."""
@@ -621,11 +626,12 @@ def hoist_delay_slots(lines):
     k = 0
     while k + 1 < len(lines):
         head = lines[k].strip()
-        if not (head.startswith("{ const bool t = ") and head.endswith(";")):
+        prefix = next((p for p in _TEMPORARY if head.startswith(p)), None)
+        if not (prefix and head.endswith(";")):
             k += 1
             continue
         pad = lines[k][:len(lines[k]) - len(lines[k].lstrip())]
-        condition = head[len("{ const bool t = "):-1]
+        condition = head[len(prefix):-1]
         if lines[k + 1] == pad + "  if (t) {":
             slot, test = None, k + 1
         else:

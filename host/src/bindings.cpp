@@ -4,13 +4,7 @@
 
 #include "ps2host/bindings.h"
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
+#include "ps2host/platform.h"      // the keys' names
 
 #include <cstdio>
 #include <cstring>
