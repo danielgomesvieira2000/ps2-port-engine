@@ -253,6 +253,7 @@ std::unique_ptr<Display> CreateVulkanDisplay(const char* title, int width, int h
 constexpr std::uint32_t kTouchPadId = 0x7F000001u;
 void SetTouchPad(const Display::PadState& state);
 void ShowTouchPad(bool shown);
+bool TouchPadShown();
 
 }  // namespace ps2gpu
 

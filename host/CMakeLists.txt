@@ -23,6 +23,7 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/vif1_worker.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/threads.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/fiber.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/platform.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/high_fps.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/display_list.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/iop.cpp

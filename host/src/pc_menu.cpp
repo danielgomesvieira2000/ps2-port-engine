@@ -149,6 +149,9 @@ std::vector<int> Rows() {
         // FRAME RATE: the row for the game's own rate (30 or 60), when it has one.
         if (label == "Frame rate" && HighFpsOwnRate() != 30.0) continue;
         if (label == "Frame rate " && HighFpsOwnRate() != 60.0) continue;
+        // A phone's screen: always the whole of it, synced, no VRR or GPU boost to ask for.
+        if (OnPhone() && (label == "Fullscreen" || label == "V-sync" || label == "VRR" || label == "GPU boost"))
+            continue;
         if (label != "Texture pack" || texture_pack::Count()) rows.push_back(i);
     }
     return rows;
@@ -162,7 +165,7 @@ std::vector<Row> Shown() {
         for (int i : Rows()) rows.push_back({Row::kChoice, i});
         const int pages = int(Pages().size());
         for (int p = 0; p < pages; ++p) rows.push_back({Row::kPage, p});
-        if (!bindings::PortMapsKeyboard()) rows.push_back({Row::kKeyLink, 0});
+        if (!bindings::PortMapsKeyboard() && KeyboardPresent()) rows.push_back({Row::kKeyLink, 0});
     } else if (g_page == kKeyboard) {
         for (int input : kKeyRows) rows.push_back({Row::kKey, input});
     } else {
@@ -180,9 +183,12 @@ std::string Padded(const std::string& label) {
 }
 
 void Draw(bool force = false) {
-    std::vector<std::string> lines = {g_page == kKeyboard ? "PC SETTINGS > Keyboard   (F9 closes)"
-                                      : g_page < 0           ? "PC SETTINGS   (F9 closes)"
-                                      : "PC SETTINGS > " + Pages()[std::size_t(g_page)] + "   (F9 closes)"};
+    // A phone's: PORT SETTINGS, closed as opened (L3 + R3: no F9 there).
+    const std::string title = OnPhone() ? "PORT SETTINGS" : "PC SETTINGS";
+    const std::string closes = OnPhone() ? "   (L3+R3 closes)" : "   (F9 closes)";
+    std::vector<std::string> lines = {g_page == kKeyboard ? title + " > Keyboard" + closes
+                                      : g_page < 0           ? title + closes
+                                      : title + " > " + Pages()[std::size_t(g_page)] + closes};
     const std::vector<Row> rows = Shown();
     std::string help;
     for (int r = 0; r < int(rows.size()); ++r) {

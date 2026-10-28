@@ -880,7 +880,10 @@ void PresentFrame() {
         std::vector<u32> pixels;
         u32 w = 0, h = 0;
         const bool got = (g_picture_source && g_picture_source(&pixels, &w, &h)) || gs::TheGs().Picture(&pixels, &w, &h);
-        if (got && !g_display->Present(pixels.data(), w, h)) g_closed = true;
+        if (got && !g_display->Present(pixels.data(), w, h)) {
+            std::fprintf(stderr, "[window] a picture could not be shown: the window closed\n");
+            g_closed = true;
+        }
         return;
     }
 #endif

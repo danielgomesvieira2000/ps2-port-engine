@@ -909,6 +909,7 @@ int Main(int argc, char** argv) {
         else if (arg == "--vu-fast") options.vu_fast = true;
         else if (arg == "--vu-exact") options.vu_exact = true;
         else if (arg == "--memcard" && i + 1 < argc) options.memcard = argv[++i];
+        else if (arg == "--no-memcard") options.memcard.clear();     // (a test on Android: no card, as on a PC)
         else if (arg == "--setting" && i + 1 < argc) options.settings.push_back(argv[++i]);
         else if (arg == "--setting-at" && i + 1 < argc) {
             // --setting-at KEY=VALUE@FRAME: changed mid-run (settings.h).

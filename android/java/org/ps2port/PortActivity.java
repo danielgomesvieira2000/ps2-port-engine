@@ -14,6 +14,7 @@ import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
+import android.content.res.Configuration;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Bundle;
@@ -77,6 +78,7 @@ public class PortActivity extends SDLActivity {
         final boolean shown = prefs.getBoolean(KEY_TOUCH, !ControllerPresent());
         touch.setShown(shown);
         nativeTouchShown(shown);
+        tellKeyboard(getResources().getConfiguration());
         touch.setListener(new TouchControls.Listener() {
             @Override public void onPad(int buttons, int lx, int ly, int rx, int ry) {
                 nativeTouchPad(buttons, lx, ly, rx, ry);
@@ -87,6 +89,34 @@ public class PortActivity extends SDLActivity {
                 nativeTouchShown(shown);
             }
         });
+    }
+
+    /* The touch controls shown or hidden from the game's settings (called
+       from native, on the game's thread): as the toggle button does. */
+    public void setTouchShown(final boolean on) {
+        runOnUiThread(new Runnable() {
+            @Override public void run() {
+                if (touch == null) return;
+                touch.setShown(on);
+                getPreferences(MODE_PRIVATE).edit().putBoolean(KEY_TOUCH, on).apply();
+                nativeTouchPad(0, 0x80, 0x80, 0x80, 0x80);
+                nativeTouchShown(on);
+            }
+        });
+    }
+
+    /* Whether a physical keyboard is attached (its key bindings shown then):
+       told to native at the start and as it changes - asked from the game's
+       thread it could not be (a fiber's stack, which ART takes for overflow). */
+    private void tellKeyboard(Configuration config) {
+        nativeKeyboard(config.keyboard == Configuration.KEYBOARD_QWERTY
+                       && config.hardKeyboardHidden != Configuration.HARDKEYBOARDHIDDEN_YES);
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration config) {
+        super.onConfigurationChanged(config);
+        tellKeyboard(config);
     }
 
     /* Whether a game controller is connected (the touch controls start hidden then). */
@@ -212,4 +242,6 @@ public class PortActivity extends SDLActivity {
     public static native void nativeTouchPad(int buttons, int lx, int ly, int rx, int ry);
     /* Whether they are shown (a controller among the game's then). */
     public static native void nativeTouchShown(boolean shown);
+    /* Whether a physical keyboard is attached. */
+    public static native void nativeKeyboard(boolean present);
 }

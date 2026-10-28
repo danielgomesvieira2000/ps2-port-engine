@@ -457,6 +457,14 @@ struct PortOption {
 void AddPortOptions(const std::vector<PortOption>& options);
 /* A port's EXIT GAME: the run ends as when the window is closed. */
 void QuitGame();
+/* The platform's (platform.cpp), for a port's settings - the rows that mean
+   something there: a phone (Android: always full screen, synced, its touch
+   controls), a keyboard attached (a PC's always), the touch controls shown
+   (the activity's toggle button does the same; false without them). */
+bool OnPhone();
+bool KeyboardPresent();
+bool TouchControlsShown();
+void SetTouchControls(bool shown);
 /* A port's look at the 2D on its way to the GS (VIF1 DIRECT, PATH2): each
    block of words, `from` the guest address of the first, before the GS takes
    it. A copy - the guest's packets stay as the game wrote them - on the EE

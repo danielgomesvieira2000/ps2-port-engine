@@ -532,6 +532,7 @@ bool VulkanDisplay::Check(VkResult result, const char* what) {
     char text[160];
     std::snprintf(text, sizeof text, "%s failed (VkResult %d)", what, int(result));
     error_ = text;
+    std::fprintf(stderr, "[display] %s\n", text);
     return false;
 }
 
@@ -746,6 +747,15 @@ bool VulkanDisplay::CreateSwapchain() {
         transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     else
         std::swap(extent_.width, extent_.height);    // (the turn can only be the app's: as it was)
+#ifdef __ANDROID__
+    // The window's way round, whatever the surface said: an app started in
+    // portrait and turned to landscape (sensorLandscape) can be asked before
+    // the surface has caught up - a picture squeezed into a strip otherwise.
+    if (w > 0 && h > 0 && (w > h) != (extent_.width > extent_.height)) std::swap(extent_.width, extent_.height);
+    std::fprintf(stderr, "[display] swapchain %ux%u (window %dx%d, surface %ux%u, transform 0x%X)\n", extent_.width,
+                 extent_.height, w, h, caps.currentExtent.width, caps.currentExtent.height,
+                 unsigned(caps.currentTransform));
+#endif
     if (extent_.width == 0 || extent_.height == 0) return true;      // minimised: nothing to show
     if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
         error_ = "the swapchain cannot be a transfer destination";
@@ -1830,7 +1840,16 @@ bool VulkanDisplay::Submit(std::uint32_t index) {
             fps_since_ = now;
         }
     }
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) stale_ = true;
+#ifdef __ANDROID__
+    // Android says SUBOPTIMAL for every picture of a turned screen not
+    // pre-rotated (the compositor turns it): shown, and not a reason to make
+    // the swapchain again.
+    const bool remake = r == VK_ERROR_OUT_OF_DATE_KHR;
+    if (r == VK_SUBOPTIMAL_KHR) return true;
+#else
+    const bool remake = r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR;
+#endif
+    if (remake) stale_ = true;
     else if (!Check(r, "vkQueuePresentKHR")) return false;
     return true;
 }
@@ -1990,7 +2009,10 @@ bool VulkanDisplay::Pump() {
     }
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) closed_ = true;
+        if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+            if (!closed_) std::fprintf(stderr, "[window] closed (SDL event 0x%X)\n", unsigned(e.type));
+            closed_ = true;
+        }
         if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) stale_ = true;
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_RETURN &&
             (e.key.mod & SDL_KMOD_ALT))
@@ -2210,6 +2232,11 @@ void ShowTouchPad(bool shown) {
     std::lock_guard<std::mutex> hold(g_touch_lock);
     g_touch_shown = shown;
     if (!shown) g_touch = Display::PadState{};
+}
+
+bool TouchPadShown() {
+    std::lock_guard<std::mutex> hold(g_touch_lock);
+    return g_touch_shown;
 }
 
 namespace {
