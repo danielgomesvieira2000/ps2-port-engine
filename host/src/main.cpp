@@ -178,8 +178,18 @@ std::vector<std::string> AndroidPlayArguments(const char* self, const std::strin
     }
     if (disc.empty()) return {};
     std::fprintf(stderr, "[port] disc %s\n", disc.c_str());
-    return {self, "--disc", disc, "--memcard", (here / "memcard").string(), "--window", "--gpu",
-            "--audio", "--timeout", "315360000"};     // ten years
+    std::vector<std::string> args = {self, "--disc", disc, "--memcard", (here / "memcard").string(),
+                                     "--window", "--gpu", "--audio", "--timeout", "315360000"};  // ten years
+    // A test's options (a scripted run's, port/runs/<run>.args), pushed with
+    // adb to args.txt beside the settings: added after these, so they win
+    // (the last --memcard is the one taken).
+    if (std::FILE* file = std::fopen((here / "args.txt").string().c_str(), "r")) {
+        char word[1024];
+        while (std::fscanf(file, "%1023s", word) == 1) args.push_back(word);
+        std::fclose(file);
+        std::fprintf(stderr, "[port] args.txt: %zu options added\n", args.size() - 10);
+    }
+    return args;
 }
 #endif
 
