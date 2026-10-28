@@ -976,8 +976,18 @@ void VulkanDisplay::DrawOverlay(VkImage target) {
         vkBindBufferMemory(device_, overlay_buffer_, overlay_memory_, 0);
         vkMapMemory(device_, overlay_memory_, 0, kOverlayBytes * kInFlight, 0, &overlay_mapped_);
     }
-    const std::uint32_t w = std::min(overlay_width_, extent_.width > 16 ? extent_.width - 16 : 0u);
-    const std::uint32_t h = std::min(overlay_height_, extent_.height > 16 ? extent_.height - 16 : 0u);
+    // At the top left - a phone's at the picture's own corner, clear of the
+    // touch controls' shoulder buttons beside it.
+    // (And below the touch controls' button at the top's middle.)
+    std::uint32_t x = 16, y = 16;
+#ifdef __ANDROID__
+    x = std::uint32_t(std::max(0, shown_x0_.load())) + 16;
+    y = extent_.height / 9;
+#endif
+    if (x + 16 >= extent_.width) x = 16;
+    if (y + 16 >= extent_.height) y = 16;
+    const std::uint32_t w = std::min(overlay_width_, extent_.width > x ? extent_.width - x : 0u);
+    const std::uint32_t h = std::min(overlay_height_, extent_.height > y ? extent_.height - y : 0u);
     if (!w || !h || VkDeviceSize(overlay_width_) * overlay_height_ * 4 > kOverlayBytes) return;
     // This slot's copy (BeginPresent waited for its fence: no present reads it).
     const VkDeviceSize offset = kOverlayBytes * VkDeviceSize(slot_);
@@ -990,7 +1000,7 @@ void VulkanDisplay::DrawOverlay(VkImage target) {
     copy.bufferOffset = offset;
     copy.bufferRowLength = overlay_width_;
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageOffset = {16, 16, 0};
+    copy.imageOffset = {std::int32_t(x), std::int32_t(y), 0};
     copy.imageExtent = {w, h, 1};
     vkCmdCopyBufferToImage(cmd_, overlay_buffer_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 }

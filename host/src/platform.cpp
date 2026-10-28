@@ -211,7 +211,7 @@ std::string HeavyThreadLoad() {
         const long long used = cpu - t.load_ns;
         t.load_ns = cpu;
         if (seconds <= 0) continue;
-        const char* shown = t.name == "VIF1 worker" ? "VU1" : t.name == "GPU renderer" ? "GPU" : t.name.c_str();
+        const char* shown = t.name == "VIF1 worker" ? "VU1" : t.name == "GPU renderer" ? "RENDER" : t.name.c_str();
         char one[48];
         std::snprintf(one, sizeof one, "%s%s %d%%", out.empty() ? "CPU " : "  ", shown,
                       int(100.0 * double(used) / 1e9 / seconds + 0.5));

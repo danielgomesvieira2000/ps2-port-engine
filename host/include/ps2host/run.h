@@ -479,7 +479,7 @@ bool Tilt(float* degrees);
    elsewhere. PS2HOST_PIN=0, PS2HOST_ADPF=0: either off. */
 void NoteHeavyThread(const char* name);
 void HeavyThreadsFrame();
-/* "CPU EE 80%  GS 61%  VU1 93%  GPU 40%": each heavy thread's share of a
+/* "CPU EE 80%  GS 61%  VU1 93%  RENDER 40%": each heavy thread's share of a
    core since the last call (the overlay's FPS + CPU); "" off a phone. */
 std::string HeavyThreadLoad();
 /* A port's look at the 2D on its way to the GS (VIF1 DIRECT, PATH2): each

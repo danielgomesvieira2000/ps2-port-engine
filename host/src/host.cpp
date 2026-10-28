@@ -832,8 +832,10 @@ int Run(const Options& options) {
         outcome = std::string("stopped: ") + reason + " at " + Hex(abort.address);
         if (abort.reason == 2 && watchdog.fired && abort.address == 0)
             outcome = "stopped: the time limit, between threads (no thread was in a loop)";
-        if (abort.reason == 2 && UntilFrameReached())
+        if (abort.reason == 2 && UntilFrameReached()) {
             outcome = "stopped: frame " + std::to_string(options.until_frame) + " reached (--until-frame)";
+            code = 0;           // (the end asked for: no error - Android's message box not shown)
+        }
     }
     // The GS takes what it was sent before the report reads it.
     try {

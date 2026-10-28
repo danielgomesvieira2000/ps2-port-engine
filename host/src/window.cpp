@@ -656,7 +656,11 @@ void DrawOverlay(const std::vector<std::string>& lines) {
     // 22-pixel lines), white on a dark panel; a line starting with '>' in
     // yellow (the one chosen).
     const std::uint32_t screen = std::max(480u, g_display->PixelHeight());
+#ifdef __ANDROID__
+    const int line = std::max(14, int(screen / 30));      // (a phone: a small screen)
+#else
     const int line = std::max(14, int(screen / 48));
+#endif
 #ifdef _WIN32
     HDC dc = CreateCompatibleDC(nullptr);
     HFONT font = CreateFontA(-(line - 4), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS,
@@ -751,6 +755,20 @@ void RefreshOverlay() {
         if (SettingOn("fps_detail", false)) {
             const std::string load = HeavyThreadLoad();
             if (!load.empty()) lines.push_back(load);
+            // The GPU's own time on the game's drawing (its timestamps): near
+            // 100% it is the limit, not the processor.
+            static std::uint64_t last_ns = 0;
+            static auto last_at = std::chrono::steady_clock::now();
+            const std::uint64_t busy = ps2gpu::GpuBusyNanoseconds();
+            const auto now = std::chrono::steady_clock::now();
+            const double seconds = std::chrono::duration<double>(now - last_at).count();
+            if (last_ns && busy >= last_ns && seconds > 0) {
+                char gpu[48];
+                std::snprintf(gpu, sizeof gpu, "GPU %d%%", int(100.0 * double(busy - last_ns) / 1e9 / seconds + 0.5));
+                lines.push_back(gpu);
+            }
+            last_ns = busy;
+            last_at = now;
         }
     }
 #endif
