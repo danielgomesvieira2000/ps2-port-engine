@@ -465,6 +465,11 @@ bool OnPhone();
 bool KeyboardPresent();
 bool TouchControlsShown();
 void SetTouchControls(bool shown);
+/* A phone's tilt, held as a wheel: degrees turned clockwise from level in
+   the screen's plane (its right side down: positive), whatever it leans back.
+   False with no reading in the last half second (no phone, no sensor, the
+   app in the background). */
+bool Tilt(float* degrees);
 /* A port's look at the 2D on its way to the GS (VIF1 DIRECT, PATH2): each
    block of words, `from` the guest address of the first, before the GS takes
    it. A copy - the guest's packets stay as the game wrote them - on the EE

@@ -20,7 +20,12 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.view.InputDevice;
+import android.view.Surface;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Toast;
@@ -117,6 +122,50 @@ public class PortActivity extends SDLActivity {
     public void onConfigurationChanged(Configuration config) {
         super.onConfigurationChanged(config);
         tellKeyboard(config);
+    }
+
+    /* The phone's tilt, held as a wheel (a port's gyro steering): the
+       accelerometer's reading, smoothed, turned to the screen's way round,
+       and its sideways part as an angle - clockwise, right side down,
+       positive - told to native while the app is in front. */
+    private SensorManager sensors;
+    private final float[] gravity = new float[3];
+    private boolean gravityKnown = false;
+    private final SensorEventListener tilt = new SensorEventListener() {
+        @Override public void onSensorChanged(SensorEvent event) {
+            final float smoothing = 0.25f;      // of each reading taken: the hand's shake left out
+            for (int i = 0; i < 3; ++i)
+                gravity[i] = gravityKnown ? gravity[i] + smoothing * (event.values[i] - gravity[i]) : event.values[i];
+            gravityKnown = true;
+            float x;                            // the screen's x (its right), in the reading's terms
+            switch (getWindowManager().getDefaultDisplay().getRotation()) {
+                case Surface.ROTATION_90: x = -gravity[1]; break;
+                case Surface.ROTATION_180: x = -gravity[0]; break;
+                case Surface.ROTATION_270: x = gravity[1]; break;
+                default: x = gravity[0]; break;
+            }
+            final float g = (float) Math.sqrt(gravity[0] * gravity[0] + gravity[1] * gravity[1] + gravity[2] * gravity[2]);
+            if (g < 1.0f) return;               // falling, or no reading yet
+            // The reading points up: right side down, the screen's x points
+            // up a little less - negative.
+            nativeTilt((float) Math.toDegrees(Math.asin(Math.max(-1.0f, Math.min(1.0f, -x / g)))));
+        }
+        @Override public void onAccuracyChanged(Sensor sensor, int accuracy) { }
+    };
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (sensors == null) sensors = (SensorManager) getSystemService(SENSOR_SERVICE);
+        Sensor accelerometer = sensors != null ? sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) : null;
+        gravityKnown = false;
+        if (accelerometer != null) sensors.registerListener(tilt, accelerometer, SensorManager.SENSOR_DELAY_GAME);
+    }
+
+    @Override
+    protected void onPause() {
+        if (sensors != null) sensors.unregisterListener(tilt);
+        super.onPause();
     }
 
     /* Whether a game controller is connected (the touch controls start hidden then). */
@@ -244,4 +293,6 @@ public class PortActivity extends SDLActivity {
     public static native void nativeTouchShown(boolean shown);
     /* Whether a physical keyboard is attached. */
     public static native void nativeKeyboard(boolean present);
+    /* The phone's tilt as a wheel, in degrees (right side down: positive). */
+    public static native void nativeTilt(float degrees);
 }
