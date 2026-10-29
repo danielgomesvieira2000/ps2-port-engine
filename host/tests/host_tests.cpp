@@ -415,6 +415,20 @@ void VifUnpacksInRunsAsWordByWord() {
     unpack(1, 1, 0x8, 5, 0x200, 3);         // V3-32
     unpack(1, 1, 0xD, 9, 0x240, 2);         // V4-16
     unpack(1, 1, 0xE, 4, 0x260, 1);         // V4-8
+    // Elements that are not whole words: V3-16 (6 bytes), S-16, V2-8,
+    // V3-8, S-8, V4-5, unsigned too, the last word part-used.
+    auto bytes = [&](u32 cl, u32 wl, u32 format, u32 num, u32 address, u32 size, bool unsigned_ = false) {
+        words.push_back(0x01000000u | wl << 8 | cl);
+        words.push_back((0x60u | format) << 24 | num << 16 | address | (unsigned_ ? 0x4000u : 0u));
+        for (u32 i = 0; i < (num * size + 3) / 4; ++i) words.push_back(seed = seed * 1664525u + 1013904223u);
+    };
+    bytes(1, 1, 0x9, 7, 0x270, 6);          // V3-16
+    bytes(4, 4, 0x9, 9, 0x278, 6, true);
+    bytes(1, 1, 0x1, 5, 0x288, 2);          // S-16
+    bytes(1, 1, 0x6, 7, 0x290, 2);          // V2-8
+    bytes(4, 2, 0xA, 9, 0x2A0, 3);          // V3-8, skipping
+    bytes(1, 1, 0x2, 11, 0x2C0, 1, true);   // S-8
+    bytes(1, 1, 0xF, 5, 0x2D0, 2);          // V4-5
     // Masked and added (STMOD 1, as Burnout 3's offset rows), accumulated
     // (STMOD 2), each with a mask using all four sources and the cycle's
     // positions past 3 (WL 6): what UnpackRun's selects store.
@@ -439,16 +453,21 @@ void VifUnpacksInRunsAsWordByWord() {
         masked(1, 1, 0xE, 5, at + 0x30, 1);                 // V4-8
         unpack(4, 4, 0xC, 5, at + 0x38, 4);                 // unmasked, added (modes 1, 2)
         unpack(1, 1, 0x8, 3, at + 0x3D, 3);
+        bytes(1, 1, 0x9, 3, at + 0x2E, 6);                  // V3-16, added
     }
     words.push_back(0x05000000u);                           // STMOD 0 again
-    ps2host::Vu bulk(1), single(1);
-    ps2host::VifStream a, b;
+    ps2host::Vu bulk(1), single(1), chunked(1);
+    ps2host::VifStream a, b, c;
     a.vu = &bulk;
     b.vu = &single;
+    c.vu = &chunked;
     a.Words(words.data(), u32(words.size()), 0);
-    for (u32 w : words) b.Words(&w, 1, 0);
+    for (u32 w : words) b.Word(w);              // the byte buffer's way, word by word
+    for (u32 i = 0; i < words.size(); i += 5) c.Words(words.data() + i, std::min<u32>(5, u32(words.size()) - i), 0);
     Check(std::memcmp(bulk.Quad(0), single.Quad(0), 1024 * 16) == 0,
           "UNPACKs in runs store what they do a word at a time");
+    Check(std::memcmp(chunked.Quad(0), single.Quad(0), 1024 * 16) == 0,
+          "UNPACKs in runs of five words (elements split between runs) store what they do a word at a time");
 }
 
 void Path3GoesOneGroupPerWindow() {

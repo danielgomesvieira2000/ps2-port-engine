@@ -216,21 +216,30 @@ void VifStream::UnpackRun(const std::uint32_t* words, std::uint32_t count) {
         words += used;
         count -= used;
     }
-    // Elements of whole words, none part-read: straight from the words (the
-    // bytes are the same; the byte buffer would hold just these).
-    if (u.bytes.empty() && size % 4 == 0) {
-        const std::uint32_t per = size / 4;
+    // An element part-read before this run: a word at a time until the byte
+    // buffer is empty again (a word's end is an element's every few words -
+    // V3-16's 6 bytes every 3).
+    while (!u.bytes.empty() && count > 0 && u.written < u.num) {
+        UnpackData(*words++);
+        --count;
+    }
+    // Then straight from the words' bytes (the bytes are the same; the byte
+    // buffer would hold just these), elements of any size - V3-16, S-16,
+    // V3-8, V4-5 too; what is left, part of an element or past the last,
+    // kept as UnpackData keeps it.
+    if (u.bytes.empty()) {
         const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(words);
-        std::uint32_t used = 0;
-        while (count - used >= per && u.written < u.num) {
+        const std::size_t total = std::size_t(count) * 4;
+        std::size_t used = 0;
+        while (total - used >= size && u.written < u.num) {
             std::uint32_t c[4];
-            Element(bytes + std::size_t(used) * 4, c);
-            used += per;
+            Element(bytes + used, c);
+            used += size;
             WriteElement(c, true);
             UnpackFill();
         }
-        words += used;
-        count -= used;
+        u.bytes.insert(u.bytes.end(), bytes + used, bytes + total);
+        return;
     }
     for (std::uint32_t i = 0; i < count; ++i) UnpackData(words[i]);
 }
