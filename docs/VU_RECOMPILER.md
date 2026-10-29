@@ -154,9 +154,11 @@ arithmetic is 46 (25 vmulps, 21 vaddps); the operand clamps ~138 (vpand,
 vpminud, vpor: three times the arithmetic); vector loads and stores of the
 VF registers 132; ~300 scalar (VI registers, addresses, the flags and the
 timing). At ~1.15 ns a pair the code runs near four instructions a cycle:
-it is bound by how many it has, not by one part. What would take a large
-share now is the registers' traffic: VF held in host registers across a
-block's pairs (loaded at the first read, stored at the exits) - the
-generator emitting operations on locals rather than VuCore's calls on
-v.regs.vf - a rewrite of the emitter and VuCore's operations, with x86's
-sixteen vector registers for the VU's thirty-two. Not started.
+it is bound by how many it has, not by one part. The registers' traffic,
+counted: of the block's 76 VF loads, 58 are a register's first read in the
+block and 18 read one again (7 after a store of it) - so VF held in host
+registers across a block's pairs (loaded at the first read, stored at the
+exits; a rewrite of the emitter and VuCore's operations) would save the 18
+and some overwritten stores, ~4% of the instructions: not worth it. What
+is left is across blocks (the first reads and last writes, superblocks)
+and the clamps of operands from before the block (step 8's ceiling).
