@@ -48,6 +48,8 @@ bool SampleRendererThread();
    read (RendererThreadCpuMs, milliseconds; 0 without one). */
 void NoteRendererThread();
 double RendererThreadCpuMs();
+/* Its cycles (Windows: exact; elsewhere its CPU time in nanoseconds). */
+std::uint64_t RendererThreadCycles();
 bool SampleVif1Thread();
 /* A host crash (an access violation and the like, on any thread): its code,
    address and the stack by name, to stderr, before the process ends. */

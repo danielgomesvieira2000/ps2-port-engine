@@ -207,7 +207,14 @@ double RendererThreadCpuMs() {
     };
     return ms(kernel) + ms(user);
 }
+std::uint64_t RendererThreadCycles() {
+    const HANDLE thread = g_renderer_thread.load();
+    ULONG64 cycles = 0;
+    if (!thread || !QueryThreadCycleTime(thread, &cycles)) return 0;
+    return cycles;
+}
 #else
+std::uint64_t RendererThreadCycles() { return std::uint64_t(RendererThreadCpuMs() * 1e6); }
 namespace {
 std::atomic<bool> g_renderer_noted{false};
 clockid_t g_renderer_clock;

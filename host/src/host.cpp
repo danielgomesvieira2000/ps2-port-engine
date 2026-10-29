@@ -63,6 +63,18 @@ double ThreadCpuMs() {
 #endif
 }
 
+/* The calling thread's cycles (Windows: exact, where its CPU time moves in
+   15.6 ms ticks); elsewhere its CPU time in nanoseconds. */
+static u64 ThreadCycles() {
+#ifdef _WIN32
+    ULONG64 cycles = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &cycles);
+    return cycles;
+#else
+    return u64(ThreadCpuMs() * 1e6);
+#endif
+}
+
 int GsReplay(const std::string& file, const std::string& out) {
     std::FILE* f = std::fopen(file.c_str(), "rb");
     if (!f) {
@@ -123,6 +135,9 @@ int GsReplay(const std::string& file, const std::string& out) {
     int pass = 0;
     std::chrono::steady_clock::time_point started;
     double cpu_started = 0, renderer_started = 0;
+    std::vector<u64> pass_cycles;       // each timed pass's, this thread's (the least: the work without the waits' noise)
+    u64 cycles_at = 0;
+    u64 renderer_cycles = 0;            // the renderer's thread's over the timed passes (it lags them: a total)
     for (;;) {
     while (at < data.size()) {
         const char kind = char(data[at++]);
@@ -197,7 +212,11 @@ int GsReplay(const std::string& file, const std::string& out) {
         started = std::chrono::steady_clock::now();
         cpu_started = ThreadCpuMs();
         renderer_started = RendererThreadCpuMs();
+        renderer_cycles = RendererThreadCycles();
+    } else {
+        pass_cycles.push_back(ThreadCycles() - cycles_at);
     }
+    cycles_at = ThreadCycles();
     if (pass++ >= repeat) break;
     timing = true;
     at = stream;
@@ -214,6 +233,12 @@ int GsReplay(const std::string& file, const std::string& out) {
         std::fprintf(stderr, "gs-replay: %d passes, %.2f ms a pass (%d pictures each), this thread's CPU %.2f ms a pass, the renderer's %.2f\n",
                      repeat, ms / repeat, pictures, (ThreadCpuMs() - cpu_started) / repeat,
                      (RendererThreadCpuMs() - renderer_started) / repeat);
+        if (!pass_cycles.empty()) {
+            std::sort(pass_cycles.begin(), pass_cycles.end());
+            std::fprintf(stderr, "gs-replay: this thread's cycles a pass: least %.2f M, median %.2f M; the renderer's %.2f M\n",
+                         double(pass_cycles.front()) / 1e6, double(pass_cycles[pass_cycles.size() / 2]) / 1e6,
+                         double(RendererThreadCycles() - renderer_cycles) / 1e6 / double(repeat));
+        }
         if (std::getenv("PS2HOST_REPLAY_SAMPLE"))
             std::printf("%s", SampleReport(std::getenv("PS2HOST_SAMPLE_TOP") ? std::atoi(std::getenv("PS2HOST_SAMPLE_TOP")) : 30).c_str());
     }

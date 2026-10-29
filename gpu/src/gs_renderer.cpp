@@ -3674,7 +3674,11 @@ void VulkanGsRenderer::Flush() {
                         vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_FRAGMENT_BIT, kFragmentOffset,
                                            sizeof params, &params);
                         ++g_draws;
-                        vkCmdDraw(cmd, count, 1, first, 0);
+                        // PS2HOST_GPU_NO_DRAW: a measure only - everything but the
+                        // primitives' drawing recorded (a software device, as
+                        // SwiftShader, then times the CPU's side, not its own).
+                        static const bool no_draw = std::getenv("PS2HOST_GPU_NO_DRAW") != nullptr;
+                        if (!no_draw) vkCmdDraw(cmd, count, 1, first, 0);
                         g_.MarkDraw(cmd, tag);
                     }
                 }
