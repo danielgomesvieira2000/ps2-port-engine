@@ -196,6 +196,10 @@ struct BlockTime {
 };
 std::unordered_map<const void*, BlockTime>* g_block_times = nullptr;
 
+/* PS2HOST_VU_PC_COUNTS=file (--vu-bench): how many times the interpreter ran
+   each pair, a count a pair of the run's program (the loops' iterations). */
+std::vector<std::uint64_t>* g_pc_counts = nullptr;
+
 std::unordered_set<std::size_t>& Recorded() {
     static std::unordered_set<std::size_t> seen;
     return seen;
@@ -825,6 +829,13 @@ int Vu::Bench(const std::string& path, int passes, bool fast) {
     static const bool by_program = std::getenv("PS2HOST_VU_BY_PROGRAM") != nullptr;
     std::unordered_map<const void*, BlockTime> block_times;
     if (std::getenv("PS2HOST_VU_BY_BLOCK")) g_block_times = &block_times;
+    // PS2HOST_VU_PC_COUNTS: one pass, interpreted, every pair counted by program.
+    const char* pc_counts_path = std::getenv("PS2HOST_VU_PC_COUNTS");
+    std::map<u64, std::vector<std::uint64_t>> pc_counts;
+    if (pc_counts_path) {
+        passes = 1;
+        vu.use_compiled = false;
+    }
     std::map<u64, std::pair<double, u64>> programs, best_programs;
     std::map<u64, u64> program_runs;
     for (int pass = 0; pass < passes; ++pass) {
@@ -849,6 +860,11 @@ int Vu::Bench(const std::string& path, int passes, bool fast) {
             vu.p = r.s.flags[3];
             vu.top = r.s.flags[4];
             vu.itop = r.s.flags[5];
+            if (pc_counts_path) {
+                auto& counts = pc_counts[u64(r.image) << 32 | r.s.pc];
+                counts.resize(16384 / 8);
+                g_pc_counts = &counts;
+            }
             const auto began = std::chrono::steady_clock::now();
             const u64 run_pairs = vu.Run(r.s.pc);
             const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
@@ -902,6 +918,18 @@ int Vu::Bench(const std::string& path, int passes, bool fast) {
                         best ? 100 * so_far / best : 0, (unsigned long long)program_runs[program],
                         (unsigned long long)best_programs[program].second,
                         best_programs[program].second ? t * 1e9 / double(best_programs[program].second) : 0.0);
+        }
+    }
+    if (pc_counts_path) {
+        g_pc_counts = nullptr;
+        if (std::FILE* out = std::fopen(pc_counts_path, "w")) {
+            // A line a pair run: image, entry, pair address (bytes), count.
+            for (const auto& [program, counts] : pc_counts)
+                for (std::size_t i = 0; i < counts.size(); ++i)
+                    if (counts[i])
+                        std::fprintf(out, "%08X %04X %04X %llu\n", u32(program >> 32), u32(program), u32(i * 8),
+                                     (unsigned long long)counts[i]);
+            std::fclose(out);
         }
     }
     if (g_block_times) {
@@ -1467,6 +1495,7 @@ void Vu::Interpret(VuRunState& state, u64 limit) {
         std::memcpy(&upper, micro.data() + pc + 4, 4);
         const DecodedPair& d = Decoded(decoded_, pc, lower, upper);
         const bool immediate = d.immediate;
+        if (g_pc_counts) ++(*g_pc_counts)[pc >> 3];
 
         // Stalls: operands still in the pipeline, a busy divider or EFU, the waits.
         const Reads& reads = d.reads;
