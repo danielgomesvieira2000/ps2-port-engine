@@ -211,6 +211,7 @@ struct Texture {
 
 // What the frames' command buffers hold (RendererCounters, PS2HOST_GPU_LOG).
 std::uint64_t g_barriers = 0, g_transitions = 0, g_dispatches = 0, g_draws = 0, g_passes = 0, g_feedback = 0;
+std::uint64_t g_feedback_blend = 0;     // of them, for the shader's blending alone (its own pixel: no texture of itself)
 // Why each pass ended (RendererCounters): a draw's destination alpha test,
 // its copy of its own target, a source to make readable, another target,
 // another depth buffer; anything else recorded (VulkanGpu::end_pass).
@@ -3457,6 +3458,7 @@ void VulkanGsRenderer::Flush() {
             if (state_.date) DateSetup(cmd, *t, *depth, state_.datm);
             if (copy_first) {
                 ++g_feedback;
+                if (shader_blend && source != t) ++g_feedback_blend;
                 Transition(cmd, *t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
                            VK_PIPELINE_STAGE_TRANSFER_BIT);
                 Transition(cmd, *feedback_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -3933,14 +3935,16 @@ std::string GpuProfileReport() {
 }
 
 std::string RendererCounters() {
-    static std::uint64_t last[6] = {};
-    const std::uint64_t now[6] = {g_barriers, g_transitions, g_dispatches, g_draws, g_passes, g_feedback};
-    char text[200];
-    std::snprintf(text, sizeof text, "%llu barriers, %llu transitions, %llu dispatches, %llu draws, %llu passes, %llu feedback copies",
+    static std::uint64_t last[7] = {};
+    const std::uint64_t now[7] = {g_barriers, g_transitions, g_dispatches, g_draws, g_passes, g_feedback, g_feedback_blend};
+    char text[240];
+    std::snprintf(text, sizeof text, "%llu barriers, %llu transitions, %llu dispatches, %llu draws, %llu passes, "
+                  "%llu feedback copies (%llu for blending alone)",
                   (unsigned long long)(now[0] - last[0]), (unsigned long long)(now[1] - last[1]),
                   (unsigned long long)(now[2] - last[2]), (unsigned long long)(now[3] - last[3]),
-                  (unsigned long long)(now[4] - last[4]), (unsigned long long)(now[5] - last[5]));
-    for (int i = 0; i < 6; ++i) last[i] = now[i];
+                  (unsigned long long)(now[4] - last[4]), (unsigned long long)(now[5] - last[5]),
+                  (unsigned long long)(now[6] - last[6]));
+    for (int i = 0; i < 7; ++i) last[i] = now[i];
     static std::uint64_t last_ends[kEndWhys] = {};
     char ends[160];
     std::snprintf(ends, sizeof ends, "; passes ended by: alpha test %llu, own copy %llu, a source %llu, target %llu, "
