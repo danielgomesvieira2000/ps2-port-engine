@@ -668,12 +668,34 @@ struct VuCore {
         return exponent == 0 ? 0 : exponent == 0x7F800000u ? lifted::kMax : bits & 0x7FFFFFFFu;
     }
     static PS2HOST_VU_INLINE void ClipJudge(Vu& v, int fs, int ft) {
+#if PS2RT_VU_SSE
+        /* The three lanes at once, without a branch (a vertex's judgement is
+           data, and a branch a lane mispredicted): CleanMagnitude in lanes,
+           every magnitude at most 0x7FFFFFFF, so the signed compare is the
+           unsigned one. */
+        auto magnitude = [](__m128i bits) {
+            const __m128i exponent = _mm_and_si128(bits, _mm_set1_epi32(0x7F800000));
+            const __m128i denormal = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
+            const __m128i special = _mm_cmpeq_epi32(exponent, _mm_set1_epi32(0x7F800000));
+            const __m128i m = _mm_andnot_si128(denormal, _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF)));
+            return _mm_or_si128(_mm_andnot_si128(special, m), _mm_and_si128(special, _mm_set1_epi32(int(lifted::kMax))));
+        };
+        const __m128i f = _mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs]));
+        const __m128i w = _mm_shuffle_epi32(magnitude(_mm_cvtsi32_si128(int(v.regs.vf[ft][3]))), 0);
+        const __m128i over = _mm_cmpgt_epi32(magnitude(f), w);
+        const u32 negative = u32(_mm_movemask_ps(_mm_castsi128_ps(f)));
+        const u32 lanes = u32(_mm_movemask_ps(_mm_castsi128_ps(over))) & 7u;
+        static constexpr std::uint8_t kSpread[8] = {0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15};
+        const u32 judgement = kSpread[lanes & ~negative & 7u] | u32(kSpread[lanes & negative]) << 1;
+        v.clip_latest_ = ((v.clip_latest_ << 6) | judgement) & 0xFFFFFF;
+#else
         const u32* f = v.regs.vf[fs];
         const u32 w = CleanMagnitude(v.regs.vf[ft][3]);
         u32 judgement = 0;
         for (int lane = 0; lane < 3; ++lane)
             if (CleanMagnitude(f[lane]) > w) judgement |= (f[lane] >> 31 ? 2u : 1u) << (2 * lane);
         v.clip_latest_ = ((v.clip_latest_ << 6) | judgement) & 0xFFFFFF;
+#endif
     }
     /* MAC: zero (bits 3-0) and sign (7-4) of each written field, x highest;
        `out` the register the upper wrote (Target: -1 ACC, 0 VF0 - the result
