@@ -219,6 +219,8 @@ std::uint64_t g_pass_ends[kEndWhys] = {};
 // Deferred passes (PS2HOST_GPU_COUNT): the pixels their render areas took, of
 // their images' whole; the depth-stencils neither stored nor loaded.
 std::uint64_t g_area_used = 0, g_area_whole = 0, g_depth_unstored = 0, g_depth_unloaded = 0;
+std::uint64_t g_beside = 0;     // work recorded beside an open deferred pass (RecordBeside)
+std::uint64_t g_renamed = 0;    // textures decoded into another image for it (TextureFromMemory)
 
 void Transition(VkCommandBuffer cmd, Image& t, VkImageLayout to, VkAccessFlags dst_access,
                 VkPipelineStageFlags dst_stage) {
@@ -690,6 +692,22 @@ private:
     VkRect2D pass_area_{};                  // the image's whole, at the pass's start
     std::int32_t pass_x0_ = 0, pass_y0_ = 0, pass_x1_ = 0, pass_y1_ = 0;    // the draws' bounds (x1, y1 past)
     bool pass_drew_ = false, pass_depth_read_ = false, pass_depth_written_ = false;
+    std::vector<VkImage> pass_sampled_;     // the images the open deferred pass's draws read
+    /* Work recorded beside the open deferred pass - ahead of it, the pass
+       left open - where it writes nothing the pass's draws read: no image of
+       theirs (`image`, or none: VK_NULL_HANDLE) and not the CLUT buffer
+       (`clut`), which every draw reads (gs.frag's set 1). Else the pass ends
+       first, as always. */
+    template <typename F>
+    void RecordBeside(VkImage image, bool clut, F&& record) {
+        if (pass_cmd_ && !clut &&
+            (!image || std::find(pass_sampled_.begin(), pass_sampled_.end(), image) == pass_sampled_.end())) {
+            ++g_beside;
+            g_.RecordInPass(std::forward<F>(record));
+        } else {
+            g_.Record(std::forward<F>(record));
+        }
+    }
     void BeginDeferredPass(VkCommandBuffer cmd) {
         vkEndCommandBuffer(pass_cmd_);
         const VkCommandBuffer drawn = pass_cmd_;
@@ -724,6 +742,7 @@ private:
     }
     VkPipeline date_pipeline_ = VK_NULL_HANDLE;
     VkDescriptorSet SetFor(Texture& texture, int sampler);
+    void RetireTexture(Texture texture);
     void WriteTextureSet(VkDescriptorSet set, VkSampler sampler, const Image& image);
     bool Buffer(VkDeviceSize bytes, VkBufferUsageFlags usage, VkBuffer* buffer, VkDeviceMemory* memory, void** mapped);
 
@@ -1756,7 +1775,8 @@ void VulkanGsRenderer::MemoryWrite(std::uint32_t begin, std::uint32_t end, const
     void* mapped = Staging(size, &buffer, &offset);
     if (!mapped) return;
     std::memcpy(mapped, bytes, std::size_t(size));
-    g_.Record([&](VkCommandBuffer cmd) {
+    // (Local memory: read by decodes, swizzles and reloads, never by a draw.)
+    RecordBeside(VK_NULL_HANDLE, false, [&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         const VkBufferCopy copy{offset, VkDeviceSize(begin) * 256, size};
         vkCmdCopyBuffer(cmd, buffer, gsmem_, 1, &copy);
@@ -2669,6 +2689,25 @@ void VulkanGsRenderer::TextureFromMemory(std::uint64_t key, const GsTextureDecod
     for (std::uint32_t n = 0; n < levels; ++n) height += std::max(1u, d.th >> n);
     Texture* texture = TextureImage(key, d.tw, height);
     if (!texture) return;
+    // A deferred pass's draws sampled it already: they keep its image (and
+    // their sets), retired once they have run; the new contents go into
+    // another - the pass left open, not ended for the decode.
+    if (pass_cmd_ && texture->image.image &&
+        std::find(pass_sampled_.begin(), pass_sampled_.end(), texture->image.image) != pass_sampled_.end()) {
+        const Texture old = *texture;
+        *texture = Texture{};
+        texture = TextureImage(key, d.tw, height);
+        if (!texture || !texture->image.image) {
+            if (texture) *texture = old;        // (no image to be had: the pass ends after all)
+            else textures_[key] = old;
+            texture = &textures_[key];
+        } else {
+            texture->replaced = old.replaced;
+            texture->last_used = old.last_used;
+            RetireTexture(old);
+            ++g_renamed;
+        }
+    }
     texture->replacement = 0;
     Image& t = texture->image;
     // Straight into the image where it can be (see decode_image_pipeline_):
@@ -2679,7 +2718,7 @@ void VulkanGsRenderer::TextureFromMemory(std::uint64_t key, const GsTextureDecod
     const VkDescriptorSet direct =
         decode_image_pipeline_ && (t.usage & VK_IMAGE_USAGE_STORAGE_BIT) ? TextureStorageSet(t) : VK_NULL_HANDLE;
     if (direct) {
-        g_.Record([&](VkCommandBuffer cmd) {
+        RecordBeside(t.image, d.clut != nullptr, [&](VkCommandBuffer cmd) {
             MemoryBarrier(cmd);
             if (d.clut) {
                 vkCmdUpdateBuffer(cmd, clut_, 0, 1024, d.clut);
@@ -2708,7 +2747,7 @@ void VulkanGsRenderer::TextureFromMemory(std::uint64_t key, const GsTextureDecod
         });
         return;
     }
-    g_.Record([&](VkCommandBuffer cmd) {
+    RecordBeside(t.image, d.clut != nullptr, [&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         if (d.clut) vkCmdUpdateBuffer(cmd, clut_, 0, 1024, d.clut);
         MemoryBarrier(cmd);
@@ -2821,6 +2860,10 @@ void VulkanGsRenderer::ReleaseTexture(std::uint64_t key) {
     Flush();
     Texture texture = found->second;
     textures_.erase(found);
+    RetireTexture(texture);
+}
+
+void VulkanGsRenderer::RetireTexture(Texture texture) {
     texture.replacement = 0;
     // Recorded draws may still sample it: it goes after they have run - into
     // the pool, or away.
@@ -3475,6 +3518,7 @@ void VulkanGsRenderer::Flush() {
                 pass_x0_ = pass_y0_ = INT32_MAX;
                 pass_x1_ = pass_y1_ = INT32_MIN;
                 pass_drew_ = pass_depth_read_ = pass_depth_written_ = false;
+                pass_sampled_.clear();
                 drawn_ = DrawState{};           // (a secondary inherits no state)
             } else {
                 vkCmdBeginRendering(cmd, &ri);
@@ -3550,6 +3594,8 @@ void VulkanGsRenderer::Flush() {
             }
             if (pass_cmd_ && sc.extent.width && sc.extent.height) {
                 pass_drew_ = true;
+                if (std::find(pass_sampled_.begin(), pass_sampled_.end(), bound->image) == pass_sampled_.end())
+                    pass_sampled_.push_back(bound->image);
                 pass_x0_ = std::min(pass_x0_, sc.offset.x);
                 pass_y0_ = std::min(pass_y0_, sc.offset.y);
                 pass_x1_ = std::max(pass_x1_, sc.offset.x + std::int32_t(sc.extent.width));
@@ -3903,11 +3949,13 @@ std::string RendererCounters() {
                   (unsigned long long)(g_pass_ends[2] - last_ends[2]), (unsigned long long)(g_pass_ends[3] - last_ends[3]),
                   (unsigned long long)(g_pass_ends[4] - last_ends[4]), (unsigned long long)(g_pass_ends[5] - last_ends[5]));
     for (int i = 0; i < kEndWhys; ++i) last_ends[i] = g_pass_ends[i];
-    char deferred[160] = "";
+    char deferred[256] = "";
     if (g_area_whole)
         std::snprintf(deferred, sizeof deferred, "; deferred passes: %.0f%% of their area drawn, depth not stored %llu, "
-                      "not loaded %llu (in all)", 100.0 * double(g_area_used) / double(g_area_whole),
-                      (unsigned long long)g_depth_unstored, (unsigned long long)g_depth_unloaded);
+                      "not loaded %llu, work beside them %llu, textures renamed %llu (in all)",
+                      100.0 * double(g_area_used) / double(g_area_whole),
+                      (unsigned long long)g_depth_unstored, (unsigned long long)g_depth_unloaded,
+                      (unsigned long long)g_beside, (unsigned long long)g_renamed);
     return std::string(text) + ends + deferred;
 }
 
