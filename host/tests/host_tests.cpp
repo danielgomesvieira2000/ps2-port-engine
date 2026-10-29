@@ -415,6 +415,32 @@ void VifUnpacksInRunsAsWordByWord() {
     unpack(1, 1, 0x8, 5, 0x200, 3);         // V3-32
     unpack(1, 1, 0xD, 9, 0x240, 2);         // V4-16
     unpack(1, 1, 0xE, 4, 0x260, 1);         // V4-8
+    // Masked and added (STMOD 1, as Burnout 3's offset rows), accumulated
+    // (STMOD 2), each with a mask using all four sources and the cycle's
+    // positions past 3 (WL 6): what UnpackRun's selects store.
+    auto set = [&](u32 command, std::initializer_list<u32> data) {
+        words.push_back(command);
+        for (u32 d : data) words.push_back(d);
+    };
+    set(0x20000000u, {0xE4B1D872u});                        // STMASK: 0-3 in every arrangement
+    set(0x30000000u, {0x47800000u, 0x11111111u, 0x22222222u, 0x33333333u});      // STROW
+    set(0x31000000u, {0x44444444u, 0x55555555u, 0x66666666u, 0x77777777u});      // STCOL
+    for (u32 mode : {0u, 1u, 2u}) {
+        words.push_back(0x05000000u | mode);               // STMOD
+        auto masked = [&](u32 cl, u32 wl, u32 format, u32 num, u32 address, u32 per) {
+            words.push_back(0x01000000u | wl << 8 | cl);
+            words.push_back((0x70u | format) << 24 | num << 16 | address);     // UNPACK, masked
+            for (u32 i = 0; i < num * per; ++i) words.push_back(seed = seed * 1664525u + 1013904223u);
+        };
+        const u32 at = 0x280 + mode * 0x40;
+        masked(4, 4, 0xC, 9, at, 4);                        // V4-32
+        masked(6, 6, 0x8, 7, at + 0x10, 3);                 // V3-32, positions past 3
+        masked(4, 2, 0xD, 6, at + 0x20, 2);                 // V4-16 skipping
+        masked(1, 1, 0xE, 5, at + 0x30, 1);                 // V4-8
+        unpack(4, 4, 0xC, 5, at + 0x38, 4);                 // unmasked, added (modes 1, 2)
+        unpack(1, 1, 0x8, 3, at + 0x3D, 3);
+    }
+    words.push_back(0x05000000u);                           // STMOD 0 again
     ps2host::Vu bulk(1), single(1);
     ps2host::VifStream a, b;
     a.vu = &bulk;
