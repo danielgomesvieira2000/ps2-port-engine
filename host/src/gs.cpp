@@ -352,6 +352,49 @@ void Gs::LoadClut(u64 tex0) {
     // (TEXCLUT COU * 16 + i, COV) in a buffer CBW wide - no swizzle, no CSA.
     const bool csm2 = Bits(tex0, 55, 1);
     const u32 cbw = csm2 ? std::max<u32>(1, Bits(texclut_, 0, 6)) : 1;
+    const u32 format = cpsm == 0 ? PSMCT32 : cpsm;
+    if (!csm2 && (format == PSMCT32 || format == PSMCT24 || format == PSMCT16 || format == PSMCT16S)) {
+        // CSM1, the usual: every entry inside the CLUT's first page, so its
+        // byte is the base block's (cbp * 256) plus where the page puts it -
+        // the same each load: the entries' offsets once a format, the bytes
+        // read straight (Burnout 3 loads ~650 CLUTs a frame in a pile-up,
+        // 256 Memory::Read each were a twentieth of the GS thread).
+        struct Offsets {
+            u32 at[4][2][256];      // [format: CT32, CT24, CT16, CT16S][eight][entry]
+            Offsets() {
+                const u32 formats[4] = {PSMCT32, PSMCT24, PSMCT16, PSMCT16S};
+                for (u32 f = 0; f < 4; ++f)
+                    for (u32 e = 0; e < 2; ++e)
+                        for (u32 i = 0; i < (e ? 256u : 16u); ++i) {
+                            const u32 p = (i & 0xE7) | ((i & 0x08) << 1) | ((i & 0x10) >> 1);
+                            u32 nibble = 0;
+                            at[f][e][i] = e ? Memory::Address(0, 1, p % 16, p / 16, formats[f], &nibble)
+                                            : Memory::Address(0, 1, i % 8, i / 8, formats[f], &nibble);
+                        }
+            }
+        };
+        static const Offsets offsets;
+        const u32 f = format == PSMCT32 ? 0 : format == PSMCT24 ? 1 : format == PSMCT16 ? 2 : 3;
+        const u32* at = offsets.at[f][eight ? 1 : 0];
+        const u8* bytes = memory.data();
+        const u32 base = cbp * 256;
+        constexpr u32 kMemoryMask = (4u << 20) - 1;
+        for (u32 i = 0; i < count; ++i) {
+            const u8* p = bytes + ((base + at[i]) & kMemoryMask);
+            u32 color;
+            if (f == 0) {
+                color = u32(p[0]) | u32(p[1]) << 8 | u32(p[2]) << 16 | u32(p[3]) << 24;
+            } else if (f == 1) {
+                const u32 rgb = u32(p[0]) | u32(p[1]) << 8 | u32(p[2]) << 16;
+                color = rgb | ((Bits(texa_, 15, 1) && !rgb) ? 0 : Bits(texa_, 0, 8)) << 24;
+            } else {
+                color = From16(u32(p[0]) | u32(p[1]) << 8, texa_);
+            }
+            (*clut)[eight ? i : (csa * 16 + i) % 256] = color;
+        }
+        clut_ = clut;
+        return;
+    }
     for (u32 i = 0; i < count; ++i) {
         // CSM1: an 8-bit CLUT is a 16x16 image with index bits 3 and 4 swapped;
         // a 4-bit one an 8x2 image.

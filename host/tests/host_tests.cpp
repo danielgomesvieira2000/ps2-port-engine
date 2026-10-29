@@ -522,6 +522,43 @@ void Path3GoesOneGroupPerWindow() {
           "held runs, borrowed or copied, go a group at a time with a tag split between them");
 }
 
+// CLUT loads (TEX0, CLD 1) from random memory: every CSM1 CLUT format, 8- and
+// 4-bit textures, CSA, a base at memory's end (the entries wrap), against the
+// entries Memory::Read finds where the GS manual puts them.
+void GsLoadsCluts() {
+    using namespace ps2host::gs;
+    Gs gs;
+    gs.rasterize = false;
+    u32 seed = 11;
+    for (u32 i = 0; i < (4u << 20); i += 4) {
+        seed = seed * 1664525u + 1013904223u;
+        std::memcpy(gs.memory.data() + i, &seed, 4);
+    }
+    gs.WriteRegister(0x3B, u64(0x80) | u64(1) << 15 | u64(0x40) << 32);       // TEXA: TA0 0x80, AEM, TA1 0x40
+    bool all = true;
+    for (u32 cpsm : {0x0u, 0x1u, 0x2u, 0xAu})
+        for (u32 psm : {u32(PSMT8), u32(PSMT4)})
+            for (u32 cbp : {0x2C40u, 0x3FFCu, 0x1234u})
+                for (u32 csa : {0u, 5u, 31u}) {
+                    const u64 tex0 = u64(psm) << 20 | u64(cbp) << 37 | u64(cpsm) << 51 | u64(csa) << 56 | u64(1) << 61;
+                    gs.WriteRegister(0x06, tex0);
+                    const auto& clut = gs.Clut();
+                    const bool eight = psm == PSMT8;
+                    for (u32 i = 0; i < (eight ? 256u : 16u); ++i) {
+                        const u32 p = eight ? (i & 0xE7) | ((i & 0x08) << 1) | ((i & 0x10) >> 1) : i;
+                        const u32 x = eight ? p % 16 : p % 8, y = eight ? p / 16 : p / 8;
+                        const u32 raw = gs.memory.Read(cbp, 1, x, y, cpsm == 0 ? PSMCT32 : cpsm);
+                        u32 want;
+                        if (cpsm == 0) want = raw;
+                        else if (cpsm == 1) want = (raw & 0xFFFFFF) | (!(raw & 0xFFFFFF) ? 0u : 0x80u) << 24;
+                        else want = (raw & 0x1F) << 3 | ((raw >> 5) & 0x1F) << 11 | ((raw >> 10) & 0x1F) << 19 |
+                                    ((raw & 0x8000) ? 0x40u : ((raw & 0x7FFF) ? 0x80u : 0u)) << 24;
+                        if (clut[eight ? i : (csa * 16 + i) % 256] != want) all = false;
+                    }
+                }
+    Check(all, "CLUT loads take every entry from where the GS keeps it, each format, with TEXA's alpha");
+}
+
 // Fog (PRIM.FGE): C = (F * C + (255 - F) * FOGCOL) >> 8, F from XYZF2 or the
 // FOG register for XYZ2.
 void GsFogsTowardsFogcol() {
@@ -2120,6 +2157,7 @@ int main() {
     DmaChainsAreWalked();
     GsLayoutsArePermutations();
     GsDrawsASprite();
+    GsLoadsCluts();
     GsFogsTowardsFogcol();
     GsLoadsACsm2Clut();
     Path3GoesOneGroupPerWindow();
