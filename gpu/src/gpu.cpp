@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -108,11 +109,28 @@ bool VulkanGpu::Init(std::string* error) {
         anisotropy = properties.limits.maxSamplerAnisotropy;
     }
     features.pNext = &v13;
+    // A pass's unread attachments not loaded (the renderer's deferred passes),
+    // as the Display's device does.
+    const char* load_none = nullptr;
+    {
+        std::uint32_t count = 0;
+        vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> offered(count);
+        vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, offered.data());
+        for (const VkExtensionProperties& e : offered) {
+            if (std::strcmp(e.extensionName, "VK_KHR_load_store_op_none") == 0) load_none = "VK_KHR_load_store_op_none";
+            if (!load_none && std::strcmp(e.extensionName, "VK_EXT_load_store_op_none") == 0)
+                load_none = "VK_EXT_load_store_op_none";
+        }
+    }
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &features;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = load_none ? 1 : 0;
+    dci.ppEnabledExtensionNames = &load_none;
     if ((r = vkCreateDevice(gpu, &dci, nullptr, &device)) != VK_SUCCESS) return fail("vkCreateDevice", r);
+    g_load_op_none = load_none != nullptr;
     // Device functions stay the loader's (volkLoadInstance): they dispatch by
     // handle, so the window's device and this one can live side by side. volk
     // keeps one global table; loading a device into it would point the other

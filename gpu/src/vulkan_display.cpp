@@ -644,7 +644,7 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     qci.queueFamilyIndex = family_;
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
-    const char* device_extensions[2] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, nullptr};
+    const char* device_extensions[3] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, nullptr, nullptr};
     std::uint32_t device_extension_count = 1;
     {
         // NVIDIA's low latency (its boost: SetGpuBoost), where the driver has it.
@@ -652,8 +652,19 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
         vkEnumerateDeviceExtensionProperties(gpu_, nullptr, &count, nullptr);
         std::vector<VkExtensionProperties> offered(count);
         vkEnumerateDeviceExtensionProperties(gpu_, nullptr, &count, offered.data());
-        for (const VkExtensionProperties& e : offered)
+        const char* load_none = nullptr;
+        for (const VkExtensionProperties& e : offered) {
             if (std::strcmp(e.extensionName, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) == 0) low_latency_ = true;
+            // A pass's attachment it never reads, not loaded (the GS renderer's deferred passes: a tiler's).
+            if (std::strcmp(e.extensionName, "VK_KHR_load_store_op_none") == 0) load_none = "VK_KHR_load_store_op_none";
+            if (!load_none && std::strcmp(e.extensionName, "VK_EXT_load_store_op_none") == 0)
+                load_none = "VK_EXT_load_store_op_none";
+        }
+        if (load_none) {
+            device_extensions[device_extension_count++] = load_none;
+            g_load_op_none = true;
+            std::fprintf(stderr, "[display] %s: a pass's unread attachments not loaded\n", load_none);
+        }
         if (const char* env = std::getenv("PS2HOST_GPU_BOOST"); env && env[0] == '0') low_latency_ = false;
         if (low_latency_) device_extensions[device_extension_count++] = VK_NV_LOW_LATENCY_2_EXTENSION_NAME;
     }

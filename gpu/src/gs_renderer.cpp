@@ -216,6 +216,9 @@ std::uint64_t g_barriers = 0, g_transitions = 0, g_dispatches = 0, g_draws = 0, 
 // another depth buffer; anything else recorded (VulkanGpu::end_pass).
 enum PassEnd { kEndDate, kEndFeedback, kEndSource, kEndTarget, kEndDepth, kEndOther, kEndWhys };
 std::uint64_t g_pass_ends[kEndWhys] = {};
+// Deferred passes (PS2HOST_GPU_COUNT): the pixels their render areas took, of
+// their images' whole; the depth-stencils neither stored nor loaded.
+std::uint64_t g_area_used = 0, g_area_whole = 0, g_depth_unstored = 0, g_depth_unloaded = 0;
 
 void Transition(VkCommandBuffer cmd, Image& t, VkImageLayout to, VkAccessFlags dst_access,
                 VkPipelineStageFlags dst_stage) {
@@ -669,8 +672,55 @@ private:
     void EndPass(VkCommandBuffer cmd, PassEnd why = kEndOther) {
         if (!open_target_) return;
         ++g_pass_ends[why];
-        vkCmdEndRendering(cmd);
+        if (pass_cmd_) {
+            BeginDeferredPass(cmd);
+        } else {
+            vkCmdEndRendering(cmd);
+        }
         open_target_ = open_depth_ = nullptr;
+    }
+    /* Deferred passes (a tiler's - Android's - or PS2HOST_GPU_DEFER_PASSES=1):
+       a pass's draws recorded into a secondary command buffer, the pass
+       itself begun only as it ends - its render area then the draws' own
+       (tiles outside it neither loaded nor stored), the depth-stencil
+       stored only if a draw wrote it, loaded only if one read it. */
+    bool defer_passes_ = false;
+    VkCommandBuffer pass_cmd_ = VK_NULL_HANDLE;
+    VkRenderingAttachmentInfo pass_colour_{}, pass_z_{};
+    VkRect2D pass_area_{};                  // the image's whole, at the pass's start
+    std::int32_t pass_x0_ = 0, pass_y0_ = 0, pass_x1_ = 0, pass_y1_ = 0;    // the draws' bounds (x1, y1 past)
+    bool pass_drew_ = false, pass_depth_read_ = false, pass_depth_written_ = false;
+    void BeginDeferredPass(VkCommandBuffer cmd) {
+        vkEndCommandBuffer(pass_cmd_);
+        const VkCommandBuffer drawn = pass_cmd_;
+        pass_cmd_ = VK_NULL_HANDLE;
+        if (!pass_drew_) return;                // (nothing drawn: no pass at all)
+        const std::int32_t right = std::int32_t(pass_area_.extent.width), bottom = std::int32_t(pass_area_.extent.height);
+        const std::int32_t x0 = std::clamp(pass_x0_, 0, right), y0 = std::clamp(pass_y0_, 0, bottom);
+        const std::int32_t x1 = std::clamp(pass_x1_, x0, right), y1 = std::clamp(pass_y1_, y0, bottom);
+        if (x1 <= x0 || y1 <= y0) return;
+        VkRenderingAttachmentInfo colour = pass_colour_, z = pass_z_;
+        if (!pass_depth_written_) {
+            z.storeOp = VK_ATTACHMENT_STORE_OP_NONE;
+            ++g_depth_unstored;
+        }
+        if (!pass_depth_read_ && !pass_depth_written_ && g_load_op_none) {
+            z.loadOp = VK_ATTACHMENT_LOAD_OP_NONE_EXT;
+            ++g_depth_unloaded;
+        }
+        g_area_used += std::uint64_t(x1 - x0) * std::uint64_t(y1 - y0);
+        g_area_whole += std::uint64_t(right) * std::uint64_t(bottom);
+        VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        ri.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+        ri.renderArea = {{x0, y0}, {std::uint32_t(x1 - x0), std::uint32_t(y1 - y0)}};
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &colour;
+        ri.pDepthAttachment = &z;
+        ri.pStencilAttachment = &z;
+        vkCmdBeginRendering(cmd, &ri);
+        vkCmdExecuteCommands(cmd, 1, &drawn);
+        vkCmdEndRendering(cmd);
     }
     VkPipeline date_pipeline_ = VK_NULL_HANDLE;
     VkDescriptorSet SetFor(Texture& texture, int sampler);
@@ -1141,6 +1191,11 @@ void VulkanGsRenderer::FreeImageMemory(VkDeviceMemory memory, VkDeviceSize offse
 }
 
 bool VulkanGsRenderer::Init(std::string* error) {
+    // Deferred passes: a tiler's (a phone's); PS2HOST_GPU_DEFER_PASSES=1 or 0 decides.
+    if (const char* defer = std::getenv("PS2HOST_GPU_DEFER_PASSES")) defer_passes_ = defer[0] == '1';
+#ifdef __ANDROID__
+    else defer_passes_ = true;
+#endif
     OpenPipelineCache();
     auto module = [&](const std::uint32_t* code, std::size_t bytes) {
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -3412,14 +3467,27 @@ void VulkanGsRenderer::Flush() {
             ri.pDepthAttachment = &z;
             ri.pStencilAttachment = &z;
             ++g_passes;
-            vkCmdBeginRendering(cmd, &ri);
+            if (defer_passes_) pass_cmd_ = g_.BeginSecondary(VK_FORMAT_R8G8B8A8_UNORM, kDepthFormat);
+            if (pass_cmd_) {
+                pass_colour_ = colour;
+                pass_z_ = z;
+                pass_area_ = ri.renderArea;
+                pass_x0_ = pass_y0_ = INT32_MAX;
+                pass_x1_ = pass_y1_ = INT32_MIN;
+                pass_drew_ = pass_depth_read_ = pass_depth_written_ = false;
+                drawn_ = DrawState{};           // (a secondary inherits no state)
+            } else {
+                vkCmdBeginRendering(cmd, &ri);
+            }
             open_target_ = t;
             open_depth_ = depth;
             }
+            // The pass's draws into its own command buffer, when deferred.
+            if (pass_cmd_) cmd = pass_cmd_;
             // ZTST: NEVER, ALWAYS, GEQUAL, GREATER - the larger Z is nearer.
             static const VkCompareOp kCompare[4] = {VK_COMPARE_OP_NEVER, VK_COMPARE_OP_ALWAYS,
                                                     VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
-            if (drawn_.recording != g_.recording_id()) drawn_ = DrawState{g_.recording_id()};
+            if (!pass_cmd_ && drawn_.recording != g_.recording_id()) drawn_ = DrawState{g_.recording_id()};
             DrawState& d = drawn_;
             // The stencil: the destination alpha test (bit 1, the setup
             // pass's), else - once a game tags paint to be marked (tag bit 3,
@@ -3479,6 +3547,16 @@ void VulkanGsRenderer::Flush() {
             if (std::memcmp(&sc, &d.scissor, sizeof sc) != 0) {
                 d.scissor = sc;
                 vkCmdSetScissor(cmd, 0, 1, &sc);
+            }
+            if (pass_cmd_ && sc.extent.width && sc.extent.height) {
+                pass_drew_ = true;
+                pass_x0_ = std::min(pass_x0_, sc.offset.x);
+                pass_y0_ = std::min(pass_y0_, sc.offset.y);
+                pass_x1_ = std::max(pass_x1_, sc.offset.x + std::int32_t(sc.extent.width));
+                pass_y1_ = std::max(pass_y1_, sc.offset.y + std::int32_t(sc.extent.height));
+                // (ZTST ALWAYS - the GS's way of not testing - or NEVER reads no depth.)
+                pass_depth_read_ = pass_depth_read_ || (depth_test && compare >= 2) || stencil_test == 1;
+                pass_depth_written_ = pass_depth_written_ || stencil_test >= 2;
             }
             const float size[2] = {float(t->width), float(t->height)};
             if (size[0] != d.size[0] || size[1] != d.size[1]) {
@@ -3541,6 +3619,7 @@ void VulkanGsRenderer::Flush() {
                             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, chosen);
                         }
                         const int depth_write = pass.depth_write && op != 1 ? 1 : 0;
+                        if (depth_write) pass_depth_written_ = true;
                         if (d.depth_write != depth_write)
                             vkCmdSetDepthWriteEnable(cmd, VkBool32(d.depth_write = depth_write));
                         params.keep = keep;
@@ -3824,7 +3903,12 @@ std::string RendererCounters() {
                   (unsigned long long)(g_pass_ends[2] - last_ends[2]), (unsigned long long)(g_pass_ends[3] - last_ends[3]),
                   (unsigned long long)(g_pass_ends[4] - last_ends[4]), (unsigned long long)(g_pass_ends[5] - last_ends[5]));
     for (int i = 0; i < kEndWhys; ++i) last_ends[i] = g_pass_ends[i];
-    return std::string(text) + ends;
+    char deferred[160] = "";
+    if (g_area_whole)
+        std::snprintf(deferred, sizeof deferred, "; deferred passes: %.0f%% of their area drawn, depth not stored %llu, "
+                      "not loaded %llu (in all)", 100.0 * double(g_area_used) / double(g_area_whole),
+                      (unsigned long long)g_depth_unstored, (unsigned long long)g_depth_unloaded);
+    return std::string(text) + ends + deferred;
 }
 
 std::string SubmitStats() {

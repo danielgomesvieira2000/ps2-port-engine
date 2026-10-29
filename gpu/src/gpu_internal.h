@@ -41,6 +41,9 @@ inline std::mutex g_draw_ns_lock;
 inline std::unordered_map<std::uint32_t, std::uint64_t> g_draw_ns;
 struct WaitReason { const char* why; std::uint64_t count; double seconds; };
 inline WaitReason g_waits[16] = {};
+/* The device takes VK_ATTACHMENT_LOAD_OP_NONE (VK_EXT/KHR_load_store_op_none,
+   enabled by the Display where offered): an attachment a pass never reads. */
+inline bool g_load_op_none = false;
 inline void CountWait(const char* why, double seconds) {
     for (WaitReason& w : g_waits) {
         if (!w.why) w.why = why;
@@ -100,6 +103,36 @@ public:
         Mark(c, kProfDraw);
         tags_[current_].back() = tag;
     }
+    /* A secondary command buffer of this slot's, begun to continue a
+       rendering pass into an RGBA8 colour and the GS's depth-stencil (the
+       renderer's deferred passes): free again once the slot's primary is. */
+    VkCommandBuffer BeginSecondary(VkFormat colour, VkFormat depth) {
+        std::vector<VkCommandBuffer>& list = secondaries_[current_];
+        if (secondary_used_[current_] == list.size()) {
+            VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            cai.commandPool = pool;
+            cai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+            cai.commandBufferCount = 1;
+            VkCommandBuffer made = VK_NULL_HANDLE;
+            if (vkAllocateCommandBuffers(device, &cai, &made) != VK_SUCCESS) return VK_NULL_HANDLE;
+            list.push_back(made);
+        }
+        VkCommandBuffer c = list[secondary_used_[current_]++];
+        vkResetCommandBuffer(c, 0);
+        VkCommandBufferInheritanceRenderingInfo rendering{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO};
+        rendering.colorAttachmentCount = 1;
+        rendering.pColorAttachmentFormats = &colour;
+        rendering.depthAttachmentFormat = depth;
+        rendering.stencilAttachmentFormat = depth;
+        rendering.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkCommandBufferInheritanceInfo inherit{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO};
+        inherit.pNext = &rendering;
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+        begin.pInheritanceInfo = &inherit;
+        vkBeginCommandBuffer(c, &begin);
+        return c;
+    }
     /* Counts command buffers begun: what was set in one is not in the next. */
     std::uint64_t recording_id() const { return recordings_; }
     static constexpr int kSlots = 3;
@@ -131,6 +164,8 @@ private:
     std::string describe_;
     bool open_ = false;
     std::uint64_t recordings_ = 0;
+    std::vector<VkCommandBuffer> secondaries_[kSlots];     // BeginSecondary's
+    std::size_t secondary_used_[kSlots] = {};
     // Two timestamps a slot: as its command buffer starts and as it ends.
     VkQueryPool timestamps_ = VK_NULL_HANDLE;
     double timestamp_ns_ = 0;               // a tick, in nanoseconds
@@ -158,6 +193,7 @@ void VulkanGpu::RecordInPass(F&& record) {
         vkBeginCommandBuffer(cmd, &begin);
         open_ = true;
         ++recordings_;
+        secondary_used_[current_] = 0;
         if (timestamps_) {
             vkCmdResetQueryPool(cmd, timestamps_, 2 * std::uint32_t(current_), 2);
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamps_, 2 * std::uint32_t(current_));
