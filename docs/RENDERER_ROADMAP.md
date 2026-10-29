@@ -30,6 +30,25 @@ Our engine aims for exact output for any game, so the transferable parts are the
 | Interpolation for high refresh (all three) | `high_fps.h` |
 | Frame skip when behind (T3) | **Not taken on purpose** (memory: "no fps step-down"). |
 
+## Measured on 2026-10-29 (Burnout 3; RTX 4070 Laptop and Intel UHD)
+
+Several items were measured before being built:
+
+| Item | Measured | Verdict |
+|---|---|---|
+| R1 DATE setup area | The race has 0 passes ended by the alpha test (`PS2HOST_GPU_COUNT`) | Not for Burnout 3; keep for games that use DATE |
+| R2 exact barrier stages | Doubling every barrier on the Intel UHD changed nothing (PERFORMANCE_PLAN, 2026-10-17) | Desktop: none. Android/tilers only |
+| R5 in-pass reads | ~75 own-target copies a frame: 33 for blending alone, ~40 self-texture reads (which need the copy anyway). Local read exists only on the RTX 4070, not the Intel UHD; neither has rasterization-order access | ~17% of passes and ~4% of GPU time, only where the GPU has room. Deferred |
+| GPU time by kind, race 1x, RTX 4070 | draws 64%, swizzle 13%, feedback copies 9%, decodes 7%, memory copies 6% (2.8 ms a frame) | |
+| GPU time by kind, race 2x, Intel UHD | draws 83-86% (16-21 ms a frame: GPU-bound), swizzle 7-11% | Per-pixel cost. 1x remains the setting there |
+| VU1 steady-state loops | Ablation: stall checks 2-4% of VU1, the flag queue ~6% | ~3-5% realistic. Not built |
+| VU1 SIMD across iterations | `tools/vulanes.py`: 28-37% of pairs qualify, ~5-7% at best | Not built |
+| Speculative VU1 threads (roadmap A) | `PS2HOST_VU_SPEC`: 8-11% of runs right, 1.00x | Dropped for Burnout 3 |
+| Renderer queue: vertices copied at fixed size | GS thread 16.9-17.2 ms either way (pile-up replay) | No gain, reverted (the sampled memcpy was mostly the replay harness's) |
+| VIF masked/offset unpack as lane selects | vif.cpp 1.8% of the crash's VIF1 worker samples either way | No gain, reverted. The test that compares it with word-by-word unpacking was kept |
+
+Leads left from this: the generic unpack path (`UnpackData`/`WriteElement`, ~0.6% of the VIF1 worker's samples in the crash, about 6% of its busy time) runs for formats whose elements are not whole words (V3-16 and the like); a fast path for them must carry partial words across runs. The GS memory's reloads in the race are ~24 a frame (and write-backs as many); the 64x128 target at 1A3 is reloaded ~12 times a frame after memory writes in one stretch before the race.
+
 ## The roadmap
 
 The order follows our measured bottlenecks: own-copy feedback copies and passes on the GPU, the GS thread (OnDraw) and VU1 on the CPU. Every step is measured with `bench.py` and `PS2HOST_GPU_PROFILE` before and after, and run through `regress.py` on car_select, race_training and race (pixel-exact). Each new path gets an env switch to turn it off, plus a check mode where possible (rac-rs does this for every speedup and it pays off).
