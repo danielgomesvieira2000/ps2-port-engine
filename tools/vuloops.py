@@ -7,8 +7,13 @@ branch back) reports its size, its loads and stores, the integer registers it
 steps (pointers, counters) and its float recurrences: registers whose value at
 the end of the body depends on their own value at the start. Software
 pipelining - a value loaded at the bottom of one iteration and used at the top
-of the next - is not a recurrence. Memory and MAC/CLIP flags are not followed:
-read the body (--list) before concluding.
+of the next - is not a recurrence. Memory and MAC/CLIP flags are not followed,
+nor the divider's latency: Q and P read soon after a DIV/SQRT/RSQRT (or EFU op)
+are still the one before's, so a chain through Q or P may not exist. A float
+recurrence reported here is a suspect; settle it with PS2HOST_VU_PERTURB
+(host/src/vu.cpp), e.g. 14E0's vf12z on 2026-10-29 (no recurrence).
+
+    PS2HOST_VU_PERTURB=14E0,C20,5,12,2,1 <port.exe> <elf> --vu-bench SNAP
 
     # programs and their image hashes: PS2HOST_VU_BY_PROGRAM=1 <port.exe> <elf> --vu-bench SNAP
     # pair counts: PS2HOST_VU_PC_COUNTS=counts.txt <port.exe> <elf> --vu-bench SNAP

@@ -200,6 +200,18 @@ std::unordered_map<const void*, BlockTime>* g_block_times = nullptr;
    each pair, a count a pair of the run's program (the loops' iterations). */
 std::vector<std::uint64_t>* g_pc_counts = nullptr;
 
+/* PS2HOST_VU_PERTURB (--vu-bench): when the interpreter reaches `pc` the
+   nth time, one lane of one VF register is changed (x1.25, or 1 if 0) - does
+   a loop's later work depend on it? `vi` is a VI register's value at each
+   arrival (the loop's pointer), to place what changed. */
+struct PerturbHook {
+    std::uint32_t pc = 0;
+    std::uint64_t nth = 0, seen = 0;
+    int reg = 0, lane = 0, vi_reg = 0;
+    std::vector<std::uint32_t> vi;
+};
+PerturbHook* g_perturb = nullptr;
+
 std::unordered_set<std::size_t>& Recorded() {
     static std::unordered_set<std::size_t> seen;
     return seen;
@@ -733,24 +745,74 @@ int Vu::Bench(const std::string& path, int passes, bool fast) {
     // PS2HOST_VU_FIND=x,y,z,w (hex words): the run that leaves that quadword
     // in data memory, the pair that first stores it (the interpreter, run
     // again with a growing limit) and the registers before and after.
+    auto load = [&](const Run& r) {
+        std::memcpy(vu.micro.data(), r.micro.data(), 16384);
+        vu.MicroWritten();
+        std::memcpy(vu.data.data(), r.data.data(), 16384);
+        std::memcpy(vu.regs.vf, r.s.vf, sizeof r.s.vf);
+        std::memcpy(vu.regs.vc, r.s.vc, sizeof r.s.vc);
+        std::memcpy(vu.regs.vacc, r.s.vacc, sizeof r.s.vacc);
+        vu.mac = r.s.flags[0];
+        vu.status = r.s.flags[1];
+        vu.clip = r.s.flags[2];
+        vu.p = r.s.flags[3];
+        vu.top = r.s.flags[4];
+        vu.itop = r.s.flags[5];
+    };
+    // PS2HOST_VU_PERTURB=entry,pc,nth,reg,lane,vi[,skip] (hex entry and pc):
+    // the first run from `entry` (after `skip` of them) that reaches `pc` at
+    // least nth+8 times, run twice by the interpreter - as it is, and with
+    // vf`reg`'s `lane` (0 = x) changed at the nth arrival - and the data
+    // quadwords that differ, with vi`vi` at each arrival.
+    if (const char* perturb = std::getenv("PS2HOST_VU_PERTURB")) {
+        unsigned entry = 0, pc = 0, skip = 0;
+        unsigned long long nth = 0;
+        int reg = 0, lane = 0, vi_reg = 0;
+        if (std::sscanf(perturb, "%x,%x,%llu,%d,%d,%d,%u", &entry, &pc, &nth, &reg, &lane, &vi_reg, &skip) < 6)
+            return 64;
+        vu.use_compiled = false;
+        PerturbHook hook;
+        hook.pc = pc;
+        hook.reg = reg;
+        hook.lane = lane;
+        hook.vi_reg = vi_reg;
+        g_perturb = &hook;
+        for (std::size_t n = 0; n < runs.size(); ++n) {
+            if (runs[n].s.pc != entry) continue;
+            load(runs[n]);
+            hook.nth = 0;
+            hook.seen = 0;
+            hook.vi.clear();
+            vu.Run(entry);
+            if (hook.seen < nth + 8 || skip-- > 0) continue;
+            const std::vector<std::uint8_t> before(vu.data.data(), vu.data.data() + 16384);
+            const std::vector<std::uint32_t> pointers = hook.vi;
+            load(runs[n]);
+            hook.nth = nth;
+            hook.seen = 0;
+            vu.Run(entry);
+            g_perturb = nullptr;
+            std::printf("run %zu: %llu arrivals at %04X, vf%d lane %d changed at arrival %llu\n", n,
+                        (unsigned long long)pointers.size(), pc, reg, lane, nth);
+            std::printf("vi%d at arrivals:", vi_reg);
+            for (std::uint32_t v : pointers) std::printf(" %X", v);
+            std::printf("\nquadwords that differ:");
+            int differ = 0;
+            for (u32 q = 0; q < 1024; ++q)
+                if (std::memcmp(before.data() + q * 16, vu.data.data() + q * 16, 16) != 0) {
+                    std::printf(" %X", q);
+                    ++differ;
+                }
+            std::printf("\n%d quadwords differ\n", differ);
+            return 0;
+        }
+        std::printf("no run from %04X reaches %04X %llu times\n", entry, pc, nth + 8);
+        return 1;
+    }
     if (const char* find = std::getenv("PS2HOST_VU_FIND")) {
         u32 want[4] = {};
         if (std::sscanf(find, "%x,%x,%x,%x", &want[0], &want[1], &want[2], &want[3]) != 4) return 64;
         vu.use_compiled = false;
-        auto load = [&](const Run& r) {
-            std::memcpy(vu.micro.data(), r.micro.data(), 16384);
-            vu.MicroWritten();
-            std::memcpy(vu.data.data(), r.data.data(), 16384);
-            std::memcpy(vu.regs.vf, r.s.vf, sizeof r.s.vf);
-            std::memcpy(vu.regs.vc, r.s.vc, sizeof r.s.vc);
-            std::memcpy(vu.regs.vacc, r.s.vacc, sizeof r.s.vacc);
-            vu.mac = r.s.flags[0];
-            vu.status = r.s.flags[1];
-            vu.clip = r.s.flags[2];
-            vu.p = r.s.flags[3];
-            vu.top = r.s.flags[4];
-            vu.itop = r.s.flags[5];
-        };
         auto holds = [&]() -> int {
             for (u32 q = 0; q < 1024; ++q) {
                 u32 w[4];
@@ -1496,6 +1558,15 @@ void Vu::Interpret(VuRunState& state, u64 limit) {
         const DecodedPair& d = Decoded(decoded_, pc, lower, upper);
         const bool immediate = d.immediate;
         if (g_pc_counts) ++(*g_pc_counts)[pc >> 3];
+        if (g_perturb && pc == g_perturb->pc) {
+            g_perturb->vi.push_back(regs.vc[g_perturb->vi_reg] & 0xFFFF);
+            if (++g_perturb->seen == g_perturb->nth) {
+                float f;
+                std::memcpy(&f, &regs.vf[g_perturb->reg][g_perturb->lane], 4);
+                f = f != 0.0f ? f * 1.25f : 1.0f;
+                std::memcpy(&regs.vf[g_perturb->reg][g_perturb->lane], &f, 4);
+            }
+        }
 
         // Stalls: operands still in the pipeline, a busy divider or EFU, the waits.
         const Reads& reads = d.reads;
