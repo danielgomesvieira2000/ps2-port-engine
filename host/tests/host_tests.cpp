@@ -454,6 +454,15 @@ void VifUnpacksInRunsAsWordByWord() {
         unpack(4, 4, 0xC, 5, at + 0x38, 4);                 // unmasked, added (modes 1, 2)
         unpack(1, 1, 0x8, 3, at + 0x3D, 3);
         bytes(1, 1, 0x9, 3, at + 0x2E, 6);                  // V3-16, added
+        auto masked_bytes = [&](u32 cl, u32 wl, u32 format, u32 num, u32 address, u32 size) {
+            words.push_back(0x01000000u | wl << 8 | cl);
+            words.push_back((0x70u | format) << 24 | num << 16 | address);
+            for (u32 i = 0; i < (num * size + 3) / 4; ++i) words.push_back(seed = seed * 1664525u + 1013904223u);
+        };
+        masked_bytes(6, 6, 0x9, 7, at + 0x08, 6);           // V3-16 masked, positions past 3
+        masked_bytes(4, 2, 0x1, 5, at + 0x18, 2);           // S-16 masked, skipping
+        masked_bytes(1, 1, 0xA, 3, at + 0x1E, 3);           // V3-8 masked
+        masked_bytes(1, 1, 0xF, 3, at + 0x25, 2);           // V4-5 masked
     }
     words.push_back(0x05000000u);                           // STMOD 0 again
     ps2host::Vu bulk(1), single(1), chunked(1);

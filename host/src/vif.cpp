@@ -129,36 +129,53 @@ void VifStream::UnpackRun(const std::uint32_t* words, std::uint32_t count) {
     Unpack& u = unpack_;
     const std::uint32_t vl = u.format & 3, vn = (u.format >> 2) & 3;
     const std::uint32_t size = (vn == 3 && vl == 3) ? 2 : (vn + 1) * (4u >> vl);
-    // The usual case, in one loop: CL >= WL (no filling writes), elements of
-    // whole words, none part-read - each stored as WriteElement would, its
-    // address kept by counting rather than dividing. Unmasked with no
-    // addition (STMOD 0) stored as it is; masked or added (Burnout 3's
-    // STMOD 1 unpacks, half of them) through Store.
-    if (u.bytes.empty() && size % 4 == 0 && vu && write_length_ != 0 &&
-        write_length_ <= cycle_length_ && (u.format == 0xC || u.format == 0x8 || u.format == 0x4 ||
-                                           u.format == 0x0 || u.format == 0xD || u.format == 0x5 ||
-                                           u.format == 0xE)) {
-        const std::uint32_t per = size / 4, wl = write_length_, cl = cycle_length_;
-        std::uint32_t k = u.written, in_cycle = k % wl, base = u.address + (k / wl) * cl, used = 0;
+    // An element part-read before this run: a word at a time until the byte
+    // buffer is empty again (a word's end is an element's every few words -
+    // V3-16's 6 bytes every 3).
+    while (!u.bytes.empty() && count > 0 && u.written < u.num) {
+        UnpackData(*words++);
+        --count;
+    }
+    if (!u.bytes.empty()) {
+        for (std::uint32_t i = 0; i < count; ++i) UnpackData(words[i]);
+        return;
+    }
+    // Then straight from the words' bytes (the bytes are the same; the byte
+    // buffer would hold just these), elements of any size; what is left, part
+    // of an element or past the last, kept as UnpackData keeps it.
+    const std::uint8_t* const bytes = reinterpret_cast<const std::uint8_t*>(words);
+    const std::size_t total = std::size_t(count) * 4;
+    std::size_t used = 0;
+    // The usual case, in one loop: CL >= WL (no filling writes) - each
+    // element stored as WriteElement would, its address kept by counting
+    // rather than dividing. Unmasked with no addition (STMOD 0) stored as it
+    // is; masked or added (Burnout 3's STMOD 1 unpacks, half of them) through
+    // Store.
+    if (vu && write_length_ != 0 && write_length_ <= cycle_length_ && (vl != 3 || vn == 3)) {    // (vl 3 is V4-5 alone)
+        const std::uint32_t wl = write_length_, cl = cycle_length_;
+        std::uint32_t k = u.written, in_cycle = k % wl, base = u.address + (k / wl) * cl;
         const bool zero_extend = u.unsigned_;
-        auto half = [zero_extend](std::uint32_t h) {
-            return zero_extend ? (h & 0xFFFF) : std::uint32_t(std::int32_t(std::int16_t(std::uint16_t(h))));
+        auto word = [](const std::uint8_t* p) {
+            std::uint32_t w;
+            std::memcpy(&w, p, 4);
+            return w;
         };
-        auto byte = [zero_extend](std::uint32_t b) {
-            return zero_extend ? (b & 0xFF) : std::uint32_t(std::int32_t(std::int8_t(std::uint8_t(b))));
+        auto half = [zero_extend](const std::uint8_t* p) {
+            const std::uint32_t h = std::uint32_t(p[0]) | std::uint32_t(p[1]) << 8;
+            return zero_extend ? h : std::uint32_t(std::int32_t(std::int16_t(std::uint16_t(h))));
         };
-        // V4-32 writing every quadword it passes (WL = CL): the words as they
-        // are into consecutive quadwords - a run at a time, up to the end of
-        // data memory (the vertices the game sends, most of an UNPACK's data).
+        auto byte = [zero_extend](std::uint8_t b) {
+            return zero_extend ? std::uint32_t(b) : std::uint32_t(std::int32_t(std::int8_t(b)));
+        };
         const bool plain = !u.masked && mode == 0;
-        const bool three = u.format == 0x8;
+        const bool three = vn == 2;                         // V3 leaves w as it was
         // WriteElement's masked or added store of element `c` at `q`.
         auto store = [&](std::uint32_t* q, const std::uint32_t c[4], std::uint32_t position) {
             for (std::uint32_t f = 0; f < 4; ++f) {
                 const std::uint32_t m = u.masked ? (mask >> (position * 8 + f * 2)) & 3 : 0;
                 switch (m) {
                     case 0: {
-                        if (three && f == 3) break;         // V3 leaves w as it was
+                        if (three && f == 3) break;
                         std::uint32_t v = c[f];
                         if (mode == 1) v += row[f];
                         else if (mode == 2) row[f] = v = v + row[f];
@@ -171,41 +188,62 @@ void VifStream::UnpackRun(const std::uint32_t* words, std::uint32_t count) {
                 }
             }
         };
+        // V4-32 writing every quadword it passes (WL = CL): the words as they
+        // are into consecutive quadwords - a run at a time, up to the end of
+        // data memory (the vertices the game sends, most of an UNPACK's data).
         if (plain && u.format == 0xC && wl == cl) {
-            while (count - used >= 4 && k < u.num) {
+            while (total - used >= 16 && k < u.num) {
                 const std::uint32_t at = u.address + k;
-                const std::uint32_t n = std::min({(count - used) / 4, u.num - k, vu->QuadsToEnd(at)});
-                std::memcpy(vu->Quad(at), words + used, std::size_t(n) * 16);
-                used += 4 * n;
+                const std::uint32_t n =
+                    std::min({std::uint32_t((total - used) / 16), u.num - k, vu->QuadsToEnd(at)});
+                std::memcpy(vu->Quad(at), bytes + used, std::size_t(n) * 16);
+                used += std::size_t(n) * 16;
                 k += n;
             }
             in_cycle = k % wl;
             base = u.address + (k / wl) * cl;
         }
-        while (count - used >= per && k < u.num) {
+        while (total - used >= size && k < u.num) {
             std::uint32_t* const target = vu->Quad(base + in_cycle);
             std::uint32_t element[4];
             std::uint32_t* q = plain ? target : element;
-            const std::uint32_t* w = words + used;
+            const std::uint8_t* b = bytes + used;
             switch (u.format) {
-                case 0xC: std::memcpy(q, w, 16); break;                             // V4-32
-                case 0x8: std::memcpy(q, w, 12); break;                             // V3-32: w stays
-                case 0x4: q[0] = w[0]; q[1] = w[1]; q[2] = w[0]; q[3] = w[1]; break; // V2-32: x y x y
-                case 0x0: q[0] = q[1] = q[2] = q[3] = w[0]; break;                  // S-32
-                case 0xD:                                                           // V4-16
-                    q[0] = half(w[0]); q[1] = half(w[0] >> 16); q[2] = half(w[1]); q[3] = half(w[1] >> 16);
-                    break;
-                case 0x5: {                                                         // V2-16
-                    const std::uint32_t x = half(w[0]), y = half(w[0] >> 16);
+                case 0xC: std::memcpy(q, b, 16); break;                             // V4-32
+                case 0x8: std::memcpy(q, b, 12); break;                             // V3-32: w stays
+                case 0x4: {                                                         // V2-32: x y x y
+                    const std::uint32_t x = word(b), y = word(b + 4);
                     q[0] = x; q[1] = y; q[2] = x; q[3] = y;
                     break;
                 }
-                default:                                                            // V4-8
-                    q[0] = byte(w[0]); q[1] = byte(w[0] >> 8); q[2] = byte(w[0] >> 16); q[3] = byte(w[0] >> 24);
+                case 0x0: q[0] = q[1] = q[2] = q[3] = word(b); break;              // S-32
+                case 0xD: q[0] = half(b); q[1] = half(b + 2); q[2] = half(b + 4); q[3] = half(b + 6); break;  // V4-16
+                case 0x9: q[0] = half(b); q[1] = half(b + 2); q[2] = half(b + 4); if (!plain) q[3] = 0; break; // V3-16
+                case 0x5: {                                                         // V2-16
+                    const std::uint32_t x = half(b), y = half(b + 2);
+                    q[0] = x; q[1] = y; q[2] = x; q[3] = y;
                     break;
+                }
+                case 0x1: q[0] = q[1] = q[2] = q[3] = half(b); break;              // S-16
+                case 0xE: q[0] = byte(b[0]); q[1] = byte(b[1]); q[2] = byte(b[2]); q[3] = byte(b[3]); break;  // V4-8
+                case 0xA: q[0] = byte(b[0]); q[1] = byte(b[1]); q[2] = byte(b[2]); if (!plain) q[3] = 0; break; // V3-8
+                case 0x6: {                                                         // V2-8
+                    const std::uint32_t x = byte(b[0]), y = byte(b[1]);
+                    q[0] = x; q[1] = y; q[2] = x; q[3] = y;
+                    break;
+                }
+                case 0x2: q[0] = q[1] = q[2] = q[3] = byte(b[0]); break;           // S-8
+                default: {                                                          // V4-5
+                    const std::uint32_t v = std::uint32_t(b[0]) | std::uint32_t(b[1]) << 8;
+                    q[0] = (v & 0x1F) << 3;
+                    q[1] = ((v >> 5) & 0x1F) << 3;
+                    q[2] = ((v >> 10) & 0x1F) << 3;
+                    q[3] = ((v >> 15) & 1) << 7;
+                    break;
+                }
             }
             if (!plain) store(target, element, std::min(in_cycle, 3u));
-            used += per;
+            used += size;
             ++k;
             if (++in_cycle == wl) {
                 in_cycle = 0;
@@ -213,35 +251,15 @@ void VifStream::UnpackRun(const std::uint32_t* words, std::uint32_t count) {
             }
         }
         u.written = k;
-        words += used;
-        count -= used;
     }
-    // An element part-read before this run: a word at a time until the byte
-    // buffer is empty again (a word's end is an element's every few words -
-    // V3-16's 6 bytes every 3).
-    while (!u.bytes.empty() && count > 0 && u.written < u.num) {
-        UnpackData(*words++);
-        --count;
+    while (total - used >= size && u.written < u.num) {
+        std::uint32_t c[4];
+        Element(bytes + used, c);
+        used += size;
+        WriteElement(c, true);
+        UnpackFill();
     }
-    // Then straight from the words' bytes (the bytes are the same; the byte
-    // buffer would hold just these), elements of any size - V3-16, S-16,
-    // V3-8, V4-5 too; what is left, part of an element or past the last,
-    // kept as UnpackData keeps it.
-    if (u.bytes.empty()) {
-        const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(words);
-        const std::size_t total = std::size_t(count) * 4;
-        std::size_t used = 0;
-        while (total - used >= size && u.written < u.num) {
-            std::uint32_t c[4];
-            Element(bytes + used, c);
-            used += size;
-            WriteElement(c, true);
-            UnpackFill();
-        }
-        u.bytes.insert(u.bytes.end(), bytes + used, bytes + total);
-        return;
-    }
-    for (std::uint32_t i = 0; i < count; ++i) UnpackData(words[i]);
+    u.bytes.insert(u.bytes.end(), bytes + used, bytes + total);
 }
 
 void VifStream::Start(std::uint32_t pc) {
