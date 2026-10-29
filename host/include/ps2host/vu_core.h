@@ -680,13 +680,20 @@ struct VuCore {
             const __m128i m = _mm_andnot_si128(denormal, _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF)));
             return _mm_or_si128(_mm_andnot_si128(special, m), _mm_and_si128(special, _mm_set1_epi32(int(lifted::kMax))));
         };
+        // ft whole (a lane of it alone, read just after a pair stored the
+        // register, waited for the store), its w in every lane.
         const __m128i f = _mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs]));
-        const __m128i w = _mm_shuffle_epi32(magnitude(_mm_cvtsi32_si128(int(v.regs.vf[ft][3]))), 0);
+        const __m128i w = _mm_shuffle_epi32(magnitude(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[ft]))),
+                                            _MM_SHUFFLE(3, 3, 3, 3));
         const __m128i over = _mm_cmpgt_epi32(magnitude(f), w);
-        const u32 negative = u32(_mm_movemask_ps(_mm_castsi128_ps(f)));
-        const u32 lanes = u32(_mm_movemask_ps(_mm_castsi128_ps(over))) & 7u;
-        static constexpr std::uint8_t kSpread[8] = {0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15};
-        const u32 judgement = kSpread[lanes & ~negative & 7u] | u32(kSpread[lanes & negative]) << 1;
+        // Each lane's two bits in place (x's 0-1, y's 2-3, z's 4-5; w none),
+        // then the lanes ORed together.
+        const __m128i negative = _mm_srai_epi32(f, 31);
+        __m128i bits = _mm_or_si128(_mm_and_si128(_mm_andnot_si128(negative, over), _mm_set_epi32(0, 16, 4, 1)),
+                                    _mm_and_si128(_mm_and_si128(negative, over), _mm_set_epi32(0, 32, 8, 2)));
+        bits = _mm_or_si128(bits, _mm_shuffle_epi32(bits, _MM_SHUFFLE(2, 3, 0, 1)));
+        bits = _mm_or_si128(bits, _mm_shuffle_epi32(bits, _MM_SHUFFLE(1, 0, 3, 2)));
+        const u32 judgement = u32(_mm_cvtsi128_si32(bits));
         v.clip_latest_ = ((v.clip_latest_ << 6) | judgement) & 0xFFFFFF;
 #else
         const u32* f = v.regs.vf[fs];
