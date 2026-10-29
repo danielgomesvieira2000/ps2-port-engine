@@ -120,3 +120,43 @@ comparison with a profiled build).
 
 Steps 2-4 need an entry version per known edge: code grows; only edges a
 recorded run took (PS2HOST_VU_BY_BLOCK counts) are worth one.
+
+## 2026-10-29, night: CLIP, and where a pair's time is now
+
+Measured with the same benches (`--vu-fast --vu-bench`, the crash, the
+pile-up and the race snapshots; two `--no-pgo` builds side by side, twice).
+
+9. **CLIP without branches** (done, engine da8aa95 and a2929f7). ClipJudge
+   was a scalar loop with a data-dependent branch a lane (a vertex's
+   judgement), ~8% of the compiled code's samples in the pile-up. Now the
+   three lanes' magnitudes are compared at once, and each lane's two bits
+   are put in place in the vector and ORed across (no table lookups after
+   a movemask); ft is read whole, not its w alone just after a pair stored
+   the register. Fast bench: crash 42.5 -> 40.3 ms, pile-up 42.2 -> 39.2,
+   race 37.4 -> 34.9 (-5 to -7%); exact pile-up 71.4 -> 66.8; every hash
+   the same.
+
+Tried, dropped (all exact, hashes the same):
+- *Stalls settled by the generator* within a block - a check on a field
+  the block itself wrote after its last pair with a run-time stall, the
+  stall's cycles known: only 851 of ~17,000 checks could be (most read
+  fields written before the block); pile-up -3%, race +1-4%: no clear gain.
+- *The run's count, cycle, pending branch and E bit as the blocks'
+  arguments* (registers from block to block, stored only where one returns
+  to the driver), against the ~5% of samples in the blocks' entry and exit
+  lines: pile-up and race +2.5% (register pressure in the blocks).
+- *DIV's and SQRT's results not cleaned* (they are clean under a run's
+  control word): no measurable change.
+
+**Where a pair's time goes now.** A 48-pair fast block of the pile-up's
+hottest program (Program70 0CA8), compiled: 807 instructions, of which the
+arithmetic is 46 (25 vmulps, 21 vaddps); the operand clamps ~138 (vpand,
+vpminud, vpor: three times the arithmetic); vector loads and stores of the
+VF registers 132; ~300 scalar (VI registers, addresses, the flags and the
+timing). At ~1.15 ns a pair the code runs near four instructions a cycle:
+it is bound by how many it has, not by one part. What would take a large
+share now is the registers' traffic: VF held in host registers across a
+block's pairs (loaded at the first read, stored at the exits) - the
+generator emitting operations on locals rather than VuCore's calls on
+v.regs.vf - a rewrite of the emitter and VuCore's operations, with x86's
+sixteen vector registers for the VU's thirty-two. Not started.
