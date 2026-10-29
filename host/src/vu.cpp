@@ -707,6 +707,7 @@ int Vu::Bench(const std::string& path, int passes, bool fast) {
     struct Run {
         Snapshot s;
         std::vector<std::uint8_t> micro, data;
+        u32 image = 0;                  // FNV-1a of the microcode (PS2HOST_VU_BY_PROGRAM)
     };
     std::vector<Run> runs;
     for (;;) {
@@ -716,6 +717,8 @@ int Vu::Bench(const std::string& path, int passes, bool fast) {
         if (std::fread(&r.s, sizeof r.s, 1, in) != 1 || std::fread(r.micro.data(), 1, 16384, in) != 16384 ||
             std::fread(r.data.data(), 1, 16384, in) != 16384)
             break;
+        r.image = 2166136261u;
+        for (std::uint8_t b : r.micro) r.image = (r.image ^ b) * 16777619u;
         runs.push_back(std::move(r));
     }
     std::fclose(in);
@@ -816,13 +819,14 @@ int Vu::Bench(const std::string& path, int passes, bool fast) {
     }
     double best = 0;
     u64 pairs = 0, hash = 0, data_hash = 0;
-    // PS2HOST_VU_BY_PROGRAM: the best pass's time and pairs by the address
-    // each run started at (the microprogram), most first.
+    // PS2HOST_VU_BY_PROGRAM: the best pass's time and pairs by the
+    // microprogram - the microcode loaded (its hash: a game loads several
+    // at the same addresses) and the address each run started at - most first.
     static const bool by_program = std::getenv("PS2HOST_VU_BY_PROGRAM") != nullptr;
     std::unordered_map<const void*, BlockTime> block_times;
     if (std::getenv("PS2HOST_VU_BY_BLOCK")) g_block_times = &block_times;
-    std::map<u32, std::pair<double, u64>> programs, best_programs;
-    std::map<u32, u64> program_runs;
+    std::map<u64, std::pair<double, u64>> programs, best_programs;
+    std::map<u64, u64> program_runs;
     for (int pass = 0; pass < passes; ++pass) {
         double seconds = 0;
         programs.clear();
@@ -851,10 +855,11 @@ int Vu::Bench(const std::string& path, int passes, bool fast) {
             pass_pairs += run_pairs;
             seconds += took;
             if (by_program) {
-                auto& [t, p] = programs[r.s.pc];
+                const u64 program = u64(r.image) << 32 | r.s.pc;
+                auto& [t, p] = programs[program];
                 t += took;
                 p += run_pairs;
-                if (pass == 0) ++program_runs[r.s.pc];
+                if (pass == 0) ++program_runs[program];
             }
             // FNV-1a, a word at a time, over what the run left: registers, flags, data memory.
             // The second (data_hash) all but MAC and STATUS: what fast mode
@@ -886,14 +891,18 @@ int Vu::Bench(const std::string& path, int passes, bool fast) {
         data_hash = pass_data_hash;
     }
     if (by_program) {
-        std::vector<std::pair<double, u32>> order;
-        for (const auto& [pc, tp] : best_programs) order.emplace_back(tp.first, pc);
+        std::vector<std::pair<double, u64>> order;
+        for (const auto& [program, tp] : best_programs) order.emplace_back(tp.first, program);
         std::sort(order.rbegin(), order.rend());
-        for (const auto& [t, pc] : order)
-            std::printf("  program %04X: %.2f ms (%.1f%%), %llu runs, %llu pairs, %.2f ns a pair\n", pc, t * 1000,
-                        best ? 100 * t / best : 0, (unsigned long long)program_runs[pc],
-                        (unsigned long long)best_programs[pc].second,
-                        best_programs[pc].second ? t * 1e9 / double(best_programs[pc].second) : 0.0);
+        double so_far = 0;
+        for (const auto& [t, program] : order) {
+            so_far += t;
+            std::printf("  program %08X:%04X: %.2f ms (%.1f%%, %.1f%% so far), %llu runs, %llu pairs, %.2f ns a pair\n",
+                        u32(program >> 32), u32(program), t * 1000, best ? 100 * t / best : 0,
+                        best ? 100 * so_far / best : 0, (unsigned long long)program_runs[program],
+                        (unsigned long long)best_programs[program].second,
+                        best_programs[program].second ? t * 1e9 / double(best_programs[program].second) : 0.0);
+        }
     }
     if (g_block_times) {
         // Over every pass (the clock around each block slows them all alike).
