@@ -123,6 +123,16 @@ public:
        longest chain of runs, by pairs, against all of them: the most that
        running VU1 programs side by side could win. Returns 0, or 1. */
     static int Dependencies(const std::string& path);
+    /* PS2HOST_VU_SPEC=livein[,workers,window,overhead] with --vu-bench:
+       speculative VU1 modelled on the snapshot (roadmap A) - each run started
+       on a predicted state (its program's latest committed start, the VIF's
+       writes since laid over it), right where that matches the true start on
+       everything the run reads (data memory tracked, registers from the
+       live-in file, engine/tools/vulivein.py); how often it is right, the
+       schedule's speed-up, and the speculated runs' results checked against
+       the runs in order. Returns 0, 1 on a file it cannot read, 2 when a run
+       judged right left a different result. */
+    static int Speculate(const std::string& path, const std::string& spec);
     /* Told each data-memory access a program makes (the interpreter's): the
        quadword and its fields as dest bits (x 8 .. w 1). Null: none. */
     struct Accesses {

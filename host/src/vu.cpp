@@ -715,6 +715,7 @@ void Vu::SnapshotFrame(u64 frame) {
 
 int Vu::Bench(const std::string& path, int passes, bool fast) {
     if (std::getenv("PS2HOST_VU_DEPS")) return Dependencies(path);
+    if (const char* spec = std::getenv("PS2HOST_VU_SPEC")) return Speculate(path, spec);
     std::FILE* in = std::fopen(path.c_str(), "rb");
     if (!in) {
         std::fprintf(stderr, "vu: cannot read %s\n", path.c_str());
@@ -1403,6 +1404,534 @@ int Vu::Dependencies(const std::string& path) {
         std::printf(" %s %llu", kinds[i].second.c_str(), (unsigned long long)kinds[i].first);
     std::printf("\n");
     return 0;
+}
+
+/* PS2HOST_VU_SPEC (vu.h, Speculate). Three steps:
+   1. The runs in order on the interpreter, each from its own snapshot (its
+      true start): what it reads before writing (quadwords), its pairs, and
+      between runs the VIF's writes - the quadwords and registers where the
+      next snapshot differs from where the run left them.
+   2. The schedule, in pairs: runs dispatched in order to `workers`, at most
+      `window` past the last committed; each costs its pairs plus `overhead`
+      (the state's copy and the check). Its prediction: the latest run of the
+      same program committed by then - its start, with the VIF's writes since
+      over it. Right if it matches the true start on the run's reads and its
+      program's live-in registers: committed when the run before is.
+      Otherwise run again, in order, after the run before commits.
+   3. Each run judged right in a 4-worker, 64-run schedule run for real from
+      its prediction; its writes laid over its true start must give what the
+      run in order gave (data, registers but MAC and STATUS, XGKICKs). */
+int Vu::Speculate(const std::string& path, const std::string& spec) {
+    char livein_path[512] = {};
+    int workers_arg = 4, window_arg = 64, overhead = 400;
+    {
+        std::string text = spec;
+        const std::size_t comma = text.find(',');
+        std::string file = text.substr(0, comma);
+        std::snprintf(livein_path, sizeof livein_path, "%s", file.c_str());
+        if (comma != std::string::npos)
+            std::sscanf(text.c_str() + comma + 1, "%d,%d,%d", &workers_arg, &window_arg, &overhead);
+    }
+    std::FILE* in = std::fopen(path.c_str(), "rb");
+    if (!in) {
+        std::fprintf(stderr, "vu: cannot read %s\n", path.c_str());
+        return 1;
+    }
+    struct Run {
+        Snapshot s;
+        std::vector<std::uint8_t> micro, data;
+        u32 image = 0;
+    };
+    std::vector<Run> runs;
+    for (;;) {
+        Run r;
+        r.micro.resize(16384);
+        r.data.resize(16384);
+        if (std::fread(&r.s, sizeof r.s, 1, in) != 1 || std::fread(r.micro.data(), 1, 16384, in) != 16384 ||
+            std::fread(r.data.data(), 1, 16384, in) != 16384)
+            break;
+        r.image = 2166136261u;
+        for (std::uint8_t b : r.micro) r.image = (r.image ^ b) * 16777619u;
+        runs.push_back(std::move(r));
+    }
+    std::fclose(in);
+    const std::size_t n = runs.size();
+    if (!n) return 1;
+
+    // Registers as words: VF 0-127 (reg*4+lane), VI 128-143, ACC 144-147, Q P I R MAC STATUS CLIP 148-154.
+    enum { kWVi = 128, kWAcc = 144, kWQ = 148, kWP, kWI, kWR, kWMac, kWStatus, kWClip, kWords };
+    struct Regs { u32 w[kWords]; };
+    auto regs_of_snapshot = [](const Snapshot& s) {
+        Regs r{};
+        std::memcpy(r.w, s.vf, 512);
+        for (int i = 0; i < 16; ++i) r.w[kWVi + i] = s.vc[i] & 0xFFFF;
+        std::memcpy(r.w + kWAcc, s.vacc, 16);
+        r.w[kWQ] = s.vc[22];
+        r.w[kWP] = s.flags[3];
+        r.w[kWI] = s.vc[21];
+        r.w[kWR] = s.vc[20];
+        r.w[kWMac] = s.flags[0];
+        r.w[kWStatus] = s.flags[1];
+        r.w[kWClip] = s.flags[2];
+        return r;
+    };
+    auto regs_of_vu = [](const Vu& v) {
+        Regs r{};
+        std::memcpy(r.w, v.regs.vf, 512);
+        for (int i = 0; i < 16; ++i) r.w[kWVi + i] = v.regs.vc[i] & 0xFFFF;
+        std::memcpy(r.w + kWAcc, v.regs.vacc, 16);
+        r.w[kWQ] = v.regs.vc[22];
+        r.w[kWP] = v.p;
+        r.w[kWI] = v.regs.vc[21];
+        r.w[kWR] = v.regs.vc[20];
+        r.w[kWMac] = v.mac;
+        r.w[kWStatus] = v.status;
+        r.w[kWClip] = v.clip;
+        return r;
+    };
+
+    // The live-in file: IMAGE ENTRY names... -> the words each program reads.
+    std::map<u64, std::vector<int>> liveins;
+    {
+        std::FILE* f = std::fopen(livein_path, "r");
+        if (!f) {
+            std::fprintf(stderr, "vu-spec: cannot read %s\n", livein_path);
+            return 1;
+        }
+        char line[8192];
+        while (std::fgets(line, sizeof line, f)) {
+            unsigned image = 0, entry = 0;
+            int used = 0;
+            if (std::sscanf(line, "%x %x%n", &image, &entry, &used) < 2) continue;
+            std::vector<int>& words = liveins[u64(image) << 32 | entry];
+            char* p = line + used;
+            char name[32];
+            int len = 0;
+            while (std::sscanf(p, "%31s%n", name, &len) == 1) {
+                p += len;
+                const std::string t = name;
+                auto lane = [](char c) { return c == 'x' ? 0 : c == 'y' ? 1 : c == 'z' ? 2 : 3; };
+                if (t.rfind("vf", 0) == 0) words.push_back(std::atoi(t.c_str() + 2) * 4 + lane(t.back()));
+                else if (t.rfind("vi", 0) == 0) words.push_back(kWVi + std::atoi(t.c_str() + 2));
+                else if (t.rfind("ACC", 0) == 0) words.push_back(kWAcc + lane(t.back()));
+                else if (t == "Q") words.push_back(kWQ);
+                else if (t == "P") words.push_back(kWP);
+                else if (t == "I") words.push_back(kWI);
+                else if (t == "R") words.push_back(kWR);
+                else if (t == "MAC") words.push_back(kWMac);
+                else if (t == "STATUS") words.push_back(kWStatus);
+                else if (t == "CLIP") words.push_back(kWClip);
+            }
+        }
+        std::fclose(f);
+    }
+
+    Vu vu(1);
+    vu.use_compiled = false;
+    u64 kick_hash = 0;
+    vu.on_kick = [](u64, u64) {};
+    vu.on_kick_block = [&kick_hash](const u32* words, u32 count) {
+        for (u32 i = 0; i < count; ++i) kick_hash = (kick_hash ^ words[i]) * 1099511628211ull;
+        kick_hash = (kick_hash ^ 0xFFFFFFFFu) * 1099511628211ull;
+    };
+    const std::uint8_t* micro_now = nullptr;
+    // A state loaded, the pipeline settled.
+    auto load = [&](const Run& r, const std::uint8_t* data, const Regs& g) {
+        if (micro_now != r.micro.data() && (!micro_now || std::memcmp(micro_now, r.micro.data(), 16384) != 0)) {
+            std::memcpy(vu.micro.data(), r.micro.data(), 16384);
+            vu.MicroWritten();
+        }
+        micro_now = r.micro.data();
+        std::memcpy(vu.data.data(), data, 16384);
+        std::memcpy(vu.regs.vf, g.w, 512);
+        std::memcpy(vu.regs.vc, r.s.vc, sizeof r.s.vc);      // (VI from g below; the rest as the snapshot)
+        for (int i = 0; i < 16; ++i) vu.regs.vc[i] = g.w[kWVi + i];
+        std::memcpy(vu.regs.vacc, g.w + kWAcc, 16);
+        vu.regs.vc[22] = g.w[kWQ];
+        vu.regs.vc[21] = g.w[kWI];
+        vu.regs.vc[20] = g.w[kWR];
+        vu.mac = vu.mac_latest_ = g.w[kWMac];
+        vu.status = vu.status_latest_ = g.w[kWStatus];
+        vu.clip = vu.clip_latest_ = g.w[kWClip];
+        vu.p = g.w[kWP];
+        vu.top = r.s.flags[4];
+        vu.itop = r.s.flags[5];
+        vu.cycle_ = 0;
+        std::memset(vu.vf_ready_, 0, sizeof vu.vf_ready_);
+        vu.q_busy_ = vu.p_busy_ = false;
+        vu.q_ready_ = vu.p_ready_ = 0;
+        vu.qp_due_ = ~u64(0);
+        vu.flag_head_ = vu.flag_count_ = 0;
+        std::memset(vu.discarded_, 0, sizeof vu.discarded_);
+        kick_hash = 1469598103934665603ull;
+    };
+    struct Tracker : Accesses {
+        std::uint8_t written[1024] = {}, read[1024] = {};
+        std::vector<std::uint16_t> reads, writes;           // each quadword once; read[q]: its lanes read first
+        void Read(u32 q, u32 lanes) override {
+            const u32 fresh = lanes & ~written[q] & 0xF;    // lanes not written by the run yet
+            if (!fresh) return;
+            if (!read[q]) reads.push_back(std::uint16_t(q));
+            read[q] |= std::uint8_t(fresh);
+        }
+        void Write(u32 q, u32 lanes) override {
+            if (!(written[q] & 0x10)) {
+                written[q] |= 0x10;
+                writes.push_back(std::uint16_t(q));
+            }
+            written[q] |= std::uint8_t(lanes);
+        }
+    };
+
+    // Step 1: in order.
+    struct Ref {
+        std::vector<std::uint16_t> reads, writes;
+        std::vector<std::uint8_t> read_lanes, write_lanes;  // dest bits (x 8 .. w 1), by the above
+        u64 pairs = 0, kicks = 0;
+        std::vector<std::uint64_t> vif;     // the VIF's fields before this run, a bit each (q*4 + lane, 4096)
+        std::vector<int> vif_regs;          // and register words
+        std::vector<int> reg_writes;        // register words the run left changed
+        std::unordered_map<u32, u32> wrote; // fields it wrote (q*4 + lane): their values at its end
+        Regs start{}, end{};
+    };
+    std::vector<Ref> ref(n);
+    std::vector<std::uint8_t> end(16384);
+    Regs end_regs{};
+    u64 total = 0, vif_quads = 0;
+    for (std::size_t k = 0; k < n; ++k) {
+        const Run& r = runs[k];
+        Ref& f = ref[k];
+        f.start = regs_of_snapshot(r.s);
+        f.vif.assign(64, 0);
+        if (k > 0) {
+            for (u32 field = 0; field < 4096; ++field)
+                if (std::memcmp(&end[field * 4], &r.data[field * 4], 4) != 0) {
+                    f.vif[field >> 6] |= 1ull << (field & 63);
+                    ++vif_quads;
+                }
+            for (int w = 0; w < kWords; ++w)
+                if (end_regs.w[w] != f.start.w[w] && w != kWMac && w != kWStatus) f.vif_regs.push_back(w);
+        }
+        Tracker track;
+        load(r, r.data.data(), f.start);
+        vu.accesses = &track;
+        f.pairs = std::max<u64>(vu.Run(r.s.pc), 1);
+        vu.accesses = nullptr;
+        f.kicks = kick_hash;
+        f.reads = std::move(track.reads);
+        f.writes = std::move(track.writes);
+        for (std::uint16_t q : f.reads) f.read_lanes.push_back(track.read[q]);
+        for (std::uint16_t q : f.writes) f.write_lanes.push_back(track.written[q] & 0xF);
+        total += f.pairs;
+        std::memcpy(end.data(), vu.data.data(), 16384);
+        end_regs = regs_of_vu(vu);
+        for (int w = 0; w < kWords; ++w)
+            if (end_regs.w[w] != f.start.w[w]) f.reg_writes.push_back(w);
+        f.end = end_regs;
+        for (std::size_t x = 0; x < f.writes.size(); ++x)
+            for (u32 lane = 0; lane < 4; ++lane)
+                if (f.write_lanes[x] & (8u >> lane)) {
+                    const u32 field = f.writes[x] * 4u + lane;
+                    std::uint32_t v;
+                    std::memcpy(&v, &end[field * 4], 4);
+                    f.wrote[field] = v;
+                }
+    }
+
+    // A prediction for run k from run m (an earlier run of its program): the
+    // value of quadword q / register word w as run k would be given it.
+    // With the committed-state predictor, the runs in flight (m .. k-1) are
+    // taken to write what their program's latest committed run wrote (its
+    // donor, before m): PS2HOST_VU_SPEC_WRITES=0 leaves them out.
+    static const bool predict_writes = !(std::getenv("PS2HOST_VU_SPEC_WRITES") &&
+                                         std::getenv("PS2HOST_VU_SPEC_WRITES")[0] == '0');
+    std::vector<u64> signature(n);          // which fields the VIF wrote before a run, hashed
+    for (std::size_t k = 0; k < n; ++k) {
+        u64 h = 1469598103934665603ull;
+        for (u64 b : ref[k].vif) h = (h ^ b) * 1099511628211ull;
+        signature[k] = h;
+    }
+    std::vector<std::size_t> donors;        // for runs m .. k-1, or ~0
+    std::size_t donors_m = ~std::size_t(0), donors_k = 0;
+    auto make_donors = [&](std::size_t m, std::size_t k) {
+        if (donors_m == m && donors_k == k) return;
+        donors_m = m;
+        donors_k = k;
+        donors.assign(k > m ? k - m : 0, ~std::size_t(0));
+        if (!predict_writes) return;
+        // The donor: the latest committed run of the same program that the VIF
+        // wrote the same fields before (an object's first run follows its
+        // upload); PS2HOST_VU_SPEC_SIGNATURE=0: the latest, whatever came before.
+        static const bool by_signature = !(std::getenv("PS2HOST_VU_SPEC_SIGNATURE") &&
+                                           std::getenv("PS2HOST_VU_SPEC_SIGNATURE")[0] == '0');
+        std::map<std::pair<u64, u64>, std::size_t> latest;
+        for (std::size_t j = m; j > 0 && m - j < 4096;) {
+            --j;
+            latest.emplace(std::make_pair(u64(runs[j].image) << 32 | runs[j].s.pc, by_signature ? signature[j] : 0), j);
+        }
+        for (std::size_t j = m; j < k; ++j) {
+            auto found = latest.find(std::make_pair(u64(runs[j].image) << 32 | runs[j].s.pc,
+                                                    by_signature ? signature[j] : 0));
+            if (found != latest.end()) donors[j - m] = found->second;
+        }
+    };
+    std::uint32_t scratch_field = 0;
+    auto predicted_field = [&](std::size_t m, std::size_t k, u32 field) -> const std::uint8_t* {
+        make_donors(m, k);
+        for (std::size_t i = k; i > m; --i) {
+            if (ref[i].vif[field >> 6] >> (field & 63) & 1) return &runs[i].data[field * 4];
+            const std::size_t d = donors[i - 1 - m];
+            if (d != ~std::size_t(0)) {
+                auto found = ref[d].wrote.find(field);
+                if (found != ref[d].wrote.end()) {
+                    scratch_field = found->second;
+                    return reinterpret_cast<const std::uint8_t*>(&scratch_field);
+                }
+            }
+        }
+        return &runs[m].data[field * 4];
+    };
+    auto predicted_reg = [&](std::size_t m, std::size_t k, int w) -> u32 {
+        make_donors(m, k);
+        for (std::size_t i = k; i > m; --i) {
+            if (std::find(ref[i].vif_regs.begin(), ref[i].vif_regs.end(), w) != ref[i].vif_regs.end())
+                return ref[i].start.w[w];
+            const std::size_t d = donors[i - 1 - m];
+            if (d != ~std::size_t(0) &&
+                std::find(ref[d].reg_writes.begin(), ref[d].reg_writes.end(), w) != ref[d].reg_writes.end())
+                return ref[d].end.w[w];
+        }
+        return ref[m].start.w[w];
+    };
+    auto reg_name = [](int w) {
+        char name[16];
+        if (w < kWVi) std::snprintf(name, sizeof name, "vf%d", w / 4);
+        else if (w < kWAcc) std::snprintf(name, sizeof name, "vi%d", w - kWVi);
+        else if (w < kWQ) std::snprintf(name, sizeof name, "ACC");
+        else {
+            static const char* names[] = {"Q", "P", "I", "R", "MAC", "STATUS", "CLIP"};
+            std::snprintf(name, sizeof name, "%s", names[w - kWQ]);
+        }
+        return std::string(name);
+    };
+    std::map<std::string, u64> miss_kinds;
+    std::map<std::pair<u64, u32>, u64> miss_quads;     // (program, quadword): its first wrong read
+    // A segment [s, e) run in order from a prediction for s made from run m:
+    // right if everything it reads that neither it nor the VIF wrote first
+    // is the prediction's value at s.
+    auto right = [&](std::size_t m, std::size_t s, std::size_t e, bool count) {
+        std::uint64_t known[64] = {};                   // fields, q*4 + lane
+        std::vector<char> reg_known(kWords, 0);
+        for (std::size_t i = s; i < e; ++i) {
+            const Run& r = runs[i];
+            if (i > s) {
+                for (int b = 0; b < 64; ++b) known[b] |= ref[i].vif[b];
+                for (int w : ref[i].vif_regs) reg_known[w] = 1;
+            }
+            for (std::size_t x = 0; x < ref[i].reads.size(); ++x) {
+                const u32 q = ref[i].reads[x];
+                for (u32 lane = 0; lane < 4; ++lane) {
+                    const u32 field = q * 4 + lane;
+                    if (!(ref[i].read_lanes[x] & (8u >> lane)) || (known[field >> 6] >> (field & 63) & 1)) continue;
+                    if (std::memcmp(predicted_field(m, s, field), &runs[s].data[field * 4], 4) != 0) {
+                        if (count) {
+                            ++miss_kinds["memory"];
+                            ++miss_quads[{u64(r.image) << 32 | r.s.pc, q * 4 + lane}];
+                        }
+                        return false;
+                    }
+                }
+            }
+            auto found = liveins.find(u64(r.image) << 32 | r.s.pc);
+            if (found == liveins.end()) {
+                if (count) ++miss_kinds["no live-ins"];
+                return false;
+            }
+            for (int w : found->second)
+                if (!reg_known[w] && predicted_reg(m, s, w) != ref[s].start.w[w]) {
+                    if (count) ++miss_kinds[reg_name(w)];
+                    return false;
+                }
+            for (std::size_t x = 0; x < ref[i].writes.size(); ++x)
+                for (u32 lane = 0; lane < 4; ++lane)
+                    if (ref[i].write_lanes[x] & (8u >> lane)) {
+                        const u32 field = ref[i].writes[x] * 4u + lane;
+                        known[field >> 6] |= 1ull << (field & 63);
+                    }
+            for (int w : ref[i].reg_writes) reg_known[w] = 1;
+        }
+        return true;
+    };
+
+    // Step 2: the schedule, a segment of `seg` runs a unit.
+    static const int back = std::getenv("PS2HOST_VU_SPEC_BACK") ? std::atoi(std::getenv("PS2HOST_VU_SPEC_BACK")) : 0;
+    static const int keep_seg = std::getenv("PS2HOST_VU_SPEC_SEG") ? std::atoi(std::getenv("PS2HOST_VU_SPEC_SEG")) : 8;
+    struct Kept { std::size_t s, e, m; };
+    std::vector<Kept> kept;
+    // Segments: seg > 0, `seg` runs each; seg <= 0, a new one before each run
+    // the VIF wrote at least -seg fields for (a new object's upload), at most
+    // 32 runs each.
+    std::vector<u64> vif_fields(n, 0);
+    for (std::size_t k = 0; k < n; ++k)
+        for (u64 b : ref[k].vif) vif_fields[k] += u64(__builtin_popcountll(b));
+    auto schedule = [&](int workers, int window, int seg, bool keep) {
+        std::vector<std::size_t> starts_at;
+        for (std::size_t k = 0, length = 0; k < n; ++k, ++length) {
+            // seg 1000: the ceiling - a cut wherever the run alone would be predicted
+            // right from the committed state 16 runs back (an oracle, for measuring).
+            const bool cut = seg == 1000 ? k == 0 || length >= 64 || right(k >= 16 ? k - 16 : 0, k, k + 1, false)
+                           : seg > 0 ? k % std::size_t(seg) == 0
+                                     : k == 0 || length >= 32 || vif_fields[k] >= u64(-seg);
+            if (cut) {
+                starts_at.push_back(k);
+                length = 0;
+            }
+        }
+        starts_at.push_back(n);
+        const std::size_t units = starts_at.size() - 1;
+        const std::size_t window_units = std::max<std::size_t>(1, std::size_t(window) * units / n);
+        std::vector<u64> free_at(workers, 0), commit(units, 0), run_commit(n, ~u64(0));
+        u64 last_dispatch = 0;
+        std::size_t right_units = 0, none = 0;
+        std::size_t committed_runs = 0;         // runs [0, committed_runs) committed by now
+        for (std::size_t u = 0; u < units; ++u) {
+            const std::size_t s = starts_at[u], e = starts_at[u + 1];
+            auto w = std::min_element(free_at.begin(), free_at.end());
+            u64 t = std::max(*w, last_dispatch);
+            if (u >= window_units) t = std::max(t, commit[u - window_units]);
+            last_dispatch = t;
+            while (committed_runs < s && run_commit[committed_runs] <= t) ++committed_runs;
+            const u64 program = u64(runs[s].image) << 32 | runs[s].s.pc;
+            std::size_t m = ~std::size_t(0);
+            // PS2HOST_VU_SPEC_PRED=program: the latest committed run of the same
+            // program's start. Otherwise the state as committed: the start of the
+            // first run not committed (the last committed one's end), the VIF's
+            // writes since over it - the true state but for the runs in flight.
+            static const bool by_program = std::getenv("PS2HOST_VU_SPEC_PRED") &&
+                                           std::string(std::getenv("PS2HOST_VU_SPEC_PRED")) == "program";
+            if (back) {
+                for (std::size_t j = s, seen = 0; j-- > 0 && s - j <= 4096;)
+                    if ((u64(runs[j].image) << 32 | runs[j].s.pc) == program && ++seen == std::size_t(back)) { m = j; break; }
+            } else if (!by_program) {
+                m = committed_runs;
+            } else {
+                for (std::size_t j = committed_runs; j-- > 0 && committed_runs - j <= 4096;)
+                    if ((u64(runs[j].image) << 32 | runs[j].s.pc) == program) { m = j; break; }
+            }
+            bool ok = false;
+            if (m == ~std::size_t(0)) ++none;
+            else ok = right(m, s, e, keep);
+            u64 pairs = 0;
+            for (std::size_t i = s; i < e; ++i) pairs += ref[i].pairs;
+            const u64 finish = t + pairs + u64(overhead);
+            *w = finish;
+            const u64 before = u ? commit[u - 1] : 0;
+            commit[u] = ok ? std::max(finish, before) : std::max(finish, before) + pairs;
+            if (ok) {
+                ++right_units;
+                if (keep) kept.push_back({s, e, m});
+            }
+            for (std::size_t i = s; i < e; ++i) run_commit[i] = commit[u];
+        }
+        std::printf("vu-spec: %d workers, %3d-run window, segments %s %3d (%.1f runs): %5.1f%% right (%4.1f%% unpredicted), %.2fx\n",
+                    workers, window, seg > 0 ? "of" : "at VIF >=", seg > 0 ? seg : -seg, double(n) / double(units),
+                    100.0 * double(right_units) / double(units),
+                    100.0 * double(none) / double(units), double(total) / double(commit[units - 1]));
+    };
+    std::printf("vu-spec: %zu runs, %llu pairs; the VIF wrote %.1f quadwords between runs on average; "
+                "%d pairs a unit's cost%s\n", n, (unsigned long long)total, double(vif_quads) / double(n), overhead,
+                back ? " (oracle predictor)" : "");
+    schedule(4, 64, keep_seg, true);
+    for (int seg : {1, 4, 16, -64, 1000})
+        for (int workers : {4, 8})
+            if (!(seg == keep_seg && workers == 4)) schedule(workers, 128, seg, false);
+    if (workers_arg != 4 || window_arg != 64) schedule(workers_arg, window_arg, keep_seg, false);
+    std::printf("vu-spec: wrong predictions (4 workers, segments of %d), by the first thing that differed:", keep_seg);
+    for (const auto& [kind, count] : miss_kinds) std::printf(" %s %llu", kind.c_str(), (unsigned long long)count);
+    std::printf("\n");
+    {
+        std::vector<std::pair<u64, std::pair<u64, u32>>> order;
+        for (const auto& [key, count] : miss_quads) order.emplace_back(count, key);
+        std::sort(order.rbegin(), order.rend());
+        std::printf("vu-spec: first wrong memory read, by program and field:");
+        for (std::size_t i = 0; i < order.size() && i < 16; ++i)
+            std::printf(" %08X:%04X@%03X.%c %llu", u32(order[i].second.first >> 32), u32(order[i].second.first),
+                        order[i].second.second >> 2, "xyzw"[order[i].second.second & 3],
+                        (unsigned long long)order[i].first);
+        std::printf("\n");
+    }
+
+    // Step 3: the segments judged right, run from their predictions, in order,
+    // the VIF's writes laid in between as they came: every run's XGKICKs the
+    // same as in order, and what the segment wrote the same at its end.
+    std::vector<std::uint8_t> state(16384);
+    u64 checked = 0, bad = 0;
+    for (const Kept& seg : kept) {
+        const std::size_t s = seg.s, e = seg.e, m = seg.m;
+        for (u32 field = 0; field < 4096; ++field) std::memcpy(&state[field * 4], predicted_field(m, s, field), 4);
+        Regs g{};
+        for (int w = 0; w < kWords; ++w) g.w[w] = predicted_reg(m, s, w);
+        std::uint64_t wrote[64] = {};           // fields the segment wrote, q*4 + lane
+        bool same = true;
+        const char* why = "";
+        std::size_t differs_at = e;
+        for (std::size_t i = s; i < e && same; ++i) {
+            if (i > s) {
+                std::memcpy(state.data(), vu.data.data(), 16384);
+                g = regs_of_vu(vu);
+                for (u32 field = 0; field < 4096; ++field)
+                    if (ref[i].vif[field >> 6] >> (field & 63) & 1)
+                        std::memcpy(&state[field * 4], &runs[i].data[field * 4], 4);
+                for (int w : ref[i].vif_regs) g.w[w] = ref[i].start.w[w];
+            }
+            Tracker track;
+            load(runs[i], state.data(), g);
+            vu.accesses = &track;
+            vu.Run(runs[i].s.pc);
+            vu.accesses = nullptr;
+            for (std::uint16_t q : track.writes)
+                for (u32 lane = 0; lane < 4; ++lane)
+                    if (track.written[q] & (8u >> lane)) wrote[(q * 4 + lane) >> 6] |= 1ull << ((q * 4 + lane) & 63);
+            if (kick_hash != ref[i].kicks) {
+                same = false;
+                differs_at = i;
+                why = "XGKICKs";
+            }
+        }
+        if (same) {
+            const std::vector<std::uint8_t> got(vu.data.data(), vu.data.data() + 16384);
+            load(runs[e - 1], runs[e - 1].data.data(), ref[e - 1].start);       // the last run, in order
+            vu.Run(runs[e - 1].s.pc);
+            for (u32 field = 0; field < 4096 && same; ++field)
+                if ((wrote[field >> 6] >> (field & 63) & 1) &&
+                    std::memcmp(&got[field * 4], vu.data.data() + field * 4, 4) != 0) {
+                    same = false;
+                    differs_at = e - 1;
+                    why = "data written";
+                }
+        }
+        ++checked;
+        if (!same) {
+            if (bad < 8) {
+                std::printf("vu-spec: segment %zu-%zu (from %zu) differs at run %zu (%08X:%04X), %s; predicted registers "
+                            "other than the true start:", s, e - 1, m, differs_at, runs[differs_at].image,
+                            runs[differs_at].s.pc, why);
+                Regs first{};
+                for (int w = 0; w < kWords; ++w) first.w[w] = predicted_reg(m, s, w);
+                for (int w = 0; w < kWords; ++w)
+                    if (first.w[w] != ref[s].start.w[w]) std::printf(" %s%s", reg_name(w).c_str(),
+                                                                       w < kWVi ? (w % 4 == 0 ? "x" : w % 4 == 1 ? "y" : w % 4 == 2 ? "z" : "w") : "");
+                u32 fields = 0;
+                for (u32 field = 0; field < 4096; ++field)
+                    if (std::memcmp(predicted_field(m, s, field), &runs[s].data[field * 4], 4) != 0) ++fields;
+                std::printf("; %u data fields\n", fields);
+            }
+            ++bad;
+        }
+    }
+    std::printf("vu-spec: %llu segments judged right run from their predictions: %llu gave a different result\n",
+                (unsigned long long)checked, (unsigned long long)bad);
+    return bad ? 2 : 0;
 }
 
 Vu::u64 Vu::Run(u32 pc, u64 limit) {
