@@ -24,6 +24,7 @@
 
 #include "ps2host/disc.h"
 #include "ps2host/gs.h"
+#include "ps2host/gs_blend.h"
 #include "ps2host/iop_vm.h"
 #include "ps2host/vif.h"
 #include "ps2host/vu.h"
@@ -94,6 +95,74 @@ int GsReplay(const std::string& file, const std::string& out) {
         return 65;
     }
     std::filesystem::create_directories(out);
+    // PS2HOST_REPLAY_BLEND=t (0.5 if empty): before each picture after the
+    // first, one made `t` of the way to it from the one before, from their
+    // GS input (gs_blend.h) - the pictures between a game's own, as a high
+    // frame rate on a weak machine would have them.
+    if (const char* blend = std::getenv("PS2HOST_REPLAY_BLEND")) {
+        const float t = *blend ? float(std::atof(blend)) : 0.5f;
+        std::vector<GsPicture> pictures(1);
+        std::size_t at = 5 + kMemory;
+        while (at < data.size()) {
+            const char kind = char(data[at++]);
+            GsPicture& p = pictures.back();
+            if (kind == 'R' || kind == 'P') {
+                GsPicture::Entry e{kind, 0, 0, 0, 0, 0};
+                std::memcpy(&e.address, data.data() + at, 4);
+                std::memcpy(&e.value, data.data() + at + 4, 8);
+                p.entries.push_back(e);
+                at += 12;
+            } else if (kind == 'W') {
+                const u8 path = data[at];
+                u32 bytes;
+                std::memcpy(&bytes, data.data() + at + 1, 4);
+                std::vector<u32>& words = p.paths[path - 1];
+                p.entries.push_back({'W', path, 0, 0, u32(words.size()), bytes / 4});
+                words.resize(words.size() + bytes / 4);
+                std::memcpy(words.data() + words.size() - bytes / 4, data.data() + at + 5, bytes);
+                at += 5 + bytes;
+            } else if (kind == 'V') {
+                pictures.emplace_back();
+            } else {
+                break;
+            }
+        }
+        if (pictures.back().entries.empty()) pictures.pop_back();
+        std::vector<unsigned char> rebuilt(data.begin(), data.begin() + 5 + kMemory);
+        auto put = [&rebuilt](const GsPicture& p) {
+            for (const GsPicture::Entry& e : p.entries) {
+                rebuilt.push_back(u8(e.kind));
+                if (e.kind == 'W') {
+                    rebuilt.push_back(e.path);
+                    const u32 bytes = e.count * 4;
+                    const u8* b = reinterpret_cast<const u8*>(&bytes);
+                    rebuilt.insert(rebuilt.end(), b, b + 4);
+                    const u8* w = reinterpret_cast<const u8*>(p.paths[e.path - 1].data() + e.first);
+                    rebuilt.insert(rebuilt.end(), w, w + bytes);
+                } else {
+                    const u8* a = reinterpret_cast<const u8*>(&e.address);
+                    const u8* v = reinterpret_cast<const u8*>(&e.value);
+                    rebuilt.insert(rebuilt.end(), a, a + 4);
+                    rebuilt.insert(rebuilt.end(), v, v + 8);
+                }
+            }
+            rebuilt.push_back('V');
+        };
+        put(pictures[0]);
+        for (std::size_t k = 1; k < pictures.size(); ++k) {
+            GsPicture between;
+            const auto began = std::chrono::steady_clock::now();
+            const GsBlendStats s = BlendGsPictures(pictures[k - 1], pictures[k], t, between);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+            std::fprintf(stderr, "gs-replay: picture %zu made between: %u packets, %u matched (%u jumped), %u of %u vertices "
+                                 "blended (%u still, %u jumped), %.2f ms (copy %.2f, align %.2f, blend %.2f)\n",
+                         k, s.packets, s.matched, s.jumped, s.blended, s.vertices, s.still, s.jumped_vertices, ms,
+                         s.ms_copy, s.ms_align, s.ms_blend);
+            put(between);
+            put(pictures[k]);
+        }
+        data.swap(rebuilt);
+    }
     gs::Gs& g = gs::TheGs();
     std::memcpy(g.memory.data(), data.data() + 5, kMemory);
     const bool gpu = std::getenv("PS2HOST_REPLAY_GPU") != nullptr;

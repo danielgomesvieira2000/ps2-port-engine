@@ -26,6 +26,7 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/platform.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/high_fps.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/display_list.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/gs_blend.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/iop.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/sdk.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/disc.cpp
