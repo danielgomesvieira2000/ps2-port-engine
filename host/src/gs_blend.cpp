@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <utility>
@@ -158,9 +159,11 @@ bool BlendPacked(const u32* a, const u32* b, u32* to, const Packet& p, float t, 
     const float limit = jump * 16.0f;
     u32 count = 0;
     for (u32 q = 0; q < nloop * nreg; ++q) {
-        if (!IsXyz(regs[q % nreg])) continue;
         const u32* x = a + 4 + 4 * q;
         const u32* y = b + 4 + 4 * q;
+        // State among the vertices (A+D, PRIM) that differs: another thing.
+        if ((regs[q % nreg] == 0xE || regs[q % nreg] == 0) && std::memcmp(x, y, 16) != 0) return false;
+        if (!IsXyz(regs[q % nreg])) continue;
         const float dx = std::fabs(float(x[0] & 0xFFFF) - float(y[0] & 0xFFFF));
         const float dy = std::fabs(float(x[1] & 0xFFFF) - float(y[1] & 0xFFFF));
         if (dx > limit || dy > limit) return false;
@@ -223,21 +226,41 @@ GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, flo
         Align(a, b, pairs);
         stats.ms_align += ms(began);
         began = Clock::now();
-        for (const auto& [i, j] : pairs) {
-            const Packet& p = b[j];
-            ++stats.matched;
-            const u32 flg = u32(p.lo >> 58) & 3;
-            const u32* x = older.paths[path].data() + a[i].first;
-            const u32* y = newer.paths[path].data() + p.first;
-            if (flg == 0) {
-                const u32 nloop = u32(p.lo & 0x7FFF), nreg = u32(p.lo >> 60) ? u32(p.lo >> 60) : 16;
-                u32 xyz = 0;
-                for (u32 r = 0; r < nreg; ++r) xyz += IsXyz(u32(p.hi >> (4 * r)) & 0xF) ? nloop : 0;
-                u32 vertices = 0;
-                if (std::memcmp(x, y, p.size * 4) == 0) stats.still += xyz;
-                else if (BlendPacked(x, y, out.paths[path].data() + p.first, p, t, jump, &vertices)) stats.blended += vertices;
-                else { ++stats.jumped; stats.jumped_vertices += xyz; }
+        // PS2HOST_BLEND_HIDE (a test's): packets of these kinds drawn as
+        // nothing (every vertex at the first's) - 1 not matched, 2 jumped,
+        // 4 blended, 8 the same in both.
+        static const int hide = std::getenv("PS2HOST_BLEND_HIDE") ? std::atoi(std::getenv("PS2HOST_BLEND_HIDE")) : 0;
+        auto collapse = [&](const Packet& p) {
+            if ((u32(p.lo >> 58) & 3) != 0) return;
+            const u32 nloop = u32(p.lo & 0x7FFF), nreg = u32(p.lo >> 60) ? u32(p.lo >> 60) : 16;
+            u32* w = out.paths[path].data() + p.first + 4;
+            const u32* first = nullptr;
+            for (u32 q = 0; q < nloop * nreg; ++q) {
+                if (!IsXyz(u32(p.hi >> (4 * (q % nreg))) & 0xF)) continue;
+                if (!first) first = w + 4 * q;
+                else { w[4 * q] = first[0]; w[4 * q + 1] = first[1]; }
             }
+        };
+        std::vector<int> match(b.size(), -1);
+        for (const auto& [i, j] : pairs) match[j] = int(i);
+        for (std::size_t j = 0; j < b.size(); ++j) {
+            const Packet& p = b[j];
+            const u32 flg = u32(p.lo >> 58) & 3;
+            const u32 nloop = u32(p.lo & 0x7FFF), nreg = u32(p.lo >> 60) ? u32(p.lo >> 60) : 16;
+            u32 xyz = 0;
+            if (flg == 0)
+                for (u32 r = 0; r < nreg; ++r) xyz += IsXyz(u32(p.hi >> (4 * r)) & 0xF) ? nloop : 0;
+            const u32* y = newer.paths[path].data() + p.first;
+            const u32* x = match[j] >= 0 ? older.paths[path].data() + a[match[j]].first : nullptr;
+            if (x) ++stats.matched;
+            if (!xyz) continue;
+            int kind;
+            u32 vertices = 0;
+            if (!x) kind = 1;
+            else if (std::memcmp(x, y, p.size * 4) == 0) { stats.still += xyz; kind = 8; }
+            else if (BlendPacked(x, y, out.paths[path].data() + p.first, p, t, jump, &vertices)) { stats.blended += vertices; kind = 4; }
+            else { ++stats.jumped; stats.jumped_vertices += xyz; kind = 2; }
+            if (hide & kind) collapse(p);
         }
         stats.ms_blend += ms(began);
         for (const Packet& p : b) {
