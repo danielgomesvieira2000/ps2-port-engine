@@ -1043,6 +1043,10 @@ void VulkanDisplay::DrawOverlay(VkImage target) {
                     std::size_t(overlay_width_) * overlay_height_ * 4);
         overlay_slot_generation_[slot_] = overlay_generation_;
     }
+    // After the picture's blit to the same image (its write first).
+    Barrier(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkBufferImageCopy copy{};
     copy.bufferOffset = offset;
     copy.bufferRowLength = overlay_width_;
@@ -1474,6 +1478,13 @@ bool VulkanDisplay::FinishPresent(std::uint32_t index, VkImage source, std::uint
     const VkClearColorValue black{};
     const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+    // The clear done before the picture is blitted over it: two writes to the
+    // same image, unordered without this (AMD's RDNA 3 finished the clear
+    // late, over the picture in a staircase of black tiles - issue #28;
+    // anti-aliasing's passes between happened to order them).
+    Barrier(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT);
     // 4:3 as a television shows it, 16:9, or the window's own shape (SetAspect),
     // centred in the window.
     std::int32_t w = std::int32_t(extent_.width), h = std::int32_t(extent_.height);
