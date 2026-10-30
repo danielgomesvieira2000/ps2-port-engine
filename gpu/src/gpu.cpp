@@ -1,6 +1,6 @@
 /*
  * VulkanGpu: an instance and a device with one graphics queue, no window.
- * Vulkan 1.3 for dynamic rendering (drawing without render pass objects).
+ * Vulkan 1.3, else 1.2 (vk_device.cpp).
  */
 
 #include "gpu_internal.h"
@@ -18,22 +18,6 @@ void SetGpuWaitObserver(GpuWaitObserver observer) { g_wait_observer = observer; 
 void (*g_renderer_thread_start)() = nullptr;
 void SetRendererThreadStart(void (*start)()) { g_renderer_thread_start = start; }
 
-namespace {
-/* A GPU's preference: PS2HOST_GPU=<part of its name> (any case: "intel",
-   "4070") first - a laptop's integrated GPU measured beside its discrete
-   one - then a discrete GPU. */
-int DeviceScore(const VkPhysicalDeviceProperties& p) {
-    int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : 1;
-    if (const char* want = std::getenv("PS2HOST_GPU")) {
-        std::string name = p.deviceName, part = want;
-        for (char& ch : name) ch = char(std::tolower(static_cast<unsigned char>(ch)));
-        for (char& ch : part) ch = char(std::tolower(static_cast<unsigned char>(ch)));
-        if (!part.empty() && name.find(part) != std::string::npos) score += 10;
-    }
-    return score;
-}
-}  // namespace
-
 bool VulkanGpu::Init(std::string* error) {
     auto fail = [&](const char* what, VkResult r) {
         char text[160];
@@ -45,7 +29,7 @@ bool VulkanGpu::Init(std::string* error) {
     if (r != VK_SUCCESS) return fail("volkInitialize (is there a Vulkan driver?)", r);
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "ps2gpu";
-    app.apiVersion = VK_API_VERSION_1_3;
+    app.apiVersion = VkInstanceVersion();
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
     if ((r = vkCreateInstance(&ici, nullptr, &instance)) != VK_SUCCESS) return fail("vkCreateInstance", r);
@@ -56,81 +40,62 @@ bool VulkanGpu::Init(std::string* error) {
     std::vector<VkPhysicalDevice> list(n);
     vkEnumeratePhysicalDevices(instance, &n, list.data());
     int best = -1;
+    VkPath path = kVk13;
+    std::string passed_over;
     for (VkPhysicalDevice candidate : list) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(candidate, &p);
-        if (p.apiVersion < VK_API_VERSION_1_3) continue;
+        VkPath candidate_path;
+        std::string why;
+        if (!VkDevicePath(candidate, &candidate_path, &why)) {
+            passed_over += std::string(passed_over.empty() ? "" : ", ") + p.deviceName + " (" + why + ")";
+            continue;
+        }
         std::uint32_t families = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(candidate, &families, nullptr);
         std::vector<VkQueueFamilyProperties> props(families);
         vkGetPhysicalDeviceQueueFamilyProperties(candidate, &families, props.data());
         for (std::uint32_t f = 0; f < families; ++f) {
             if (!(props[f].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
-            const int score = DeviceScore(p);
+            const int score = VkDeviceScore(p);
             if (score > best) {
                 best = score;
                 gpu = candidate;
                 family = f;
+                path = candidate_path;
             }
             break;
         }
     }
     if (!gpu) {
-        if (error) *error = "no Vulkan 1.3 device with a graphics queue";
+        if (error) *error = "no Vulkan 1.2 device with a graphics queue" + (passed_over.empty() ? std::string()
+                                                                         : "; passed over: " + passed_over);
         return false;
     }
     VkPhysicalDeviceProperties p;
     vkGetPhysicalDeviceProperties(gpu, &p);
-    describe_ = p.deviceName;
+    describe_ = std::string(p.deviceName) + " (" + VkPathName(path) + ")";
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = family;
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
-    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    v13.dynamicRendering = VK_TRUE;
-    v13.synchronization2 = VK_TRUE;
-    // Dual-source blending: the GS's blend factor (source alpha or FIX, where
-    // 0x80 is 1.0) is a second fragment output, not the alpha written.
-    VkPhysicalDeviceFeatures supported;
-    vkGetPhysicalDeviceFeatures(gpu, &supported);
-    dual_source = supported.dualSrcBlend == VK_TRUE;
-    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    features.features.dualSrcBlend = supported.dualSrcBlend;
-    features.features.logicOp = supported.logicOp;      // FBMSK's partly masked channels
-    logic_op = supported.logicOp == VK_TRUE;
-    features.features.textureCompressionBC = supported.textureCompressionBC;     // texture packs' DDS
-    bc = supported.textureCompressionBC == VK_TRUE;
-    features.features.samplerAnisotropy = supported.samplerAnisotropy;           // texture packs' samplers
-    if (supported.samplerAnisotropy) {
-        VkPhysicalDeviceProperties properties;
-        vkGetPhysicalDeviceProperties(gpu, &properties);
-        anisotropy = properties.limits.maxSamplerAnisotropy;
-    }
-    features.pNext = &v13;
-    // A pass's unread attachments not loaded (the renderer's deferred passes),
-    // as the Display's device does.
-    const char* load_none = nullptr;
-    {
-        std::uint32_t count = 0;
-        vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, nullptr);
-        std::vector<VkExtensionProperties> offered(count);
-        vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, offered.data());
-        for (const VkExtensionProperties& e : offered) {
-            if (std::strcmp(e.extensionName, "VK_KHR_load_store_op_none") == 0) load_none = "VK_KHR_load_store_op_none";
-            if (!load_none && std::strcmp(e.extensionName, "VK_EXT_load_store_op_none") == 0)
-                load_none = "VK_EXT_load_store_op_none";
-        }
-    }
+    VkDeviceSetup setup;
+    setup.Fill(gpu, path);
+    dual_source = setup.supported.dualSrcBlend == VK_TRUE;
+    logic_op = setup.supported.logicOp == VK_TRUE;
+    bc = setup.supported.textureCompressionBC == VK_TRUE;
+    if (setup.supported.samplerAnisotropy) anisotropy = p.limits.maxSamplerAnisotropy;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    dci.pNext = &features;
+    dci.pNext = &setup.features;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = load_none ? 1 : 0;
-    dci.ppEnabledExtensionNames = &load_none;
+    dci.enabledExtensionCount = std::uint32_t(setup.extensions.size());
+    dci.ppEnabledExtensionNames = setup.extensions.data();
     if ((r = vkCreateDevice(gpu, &dci, nullptr, &device)) != VK_SUCCESS) return fail("vkCreateDevice", r);
-    g_load_op_none = load_none != nullptr;
+    g_load_op_none = setup.load_none != nullptr;
+    VkUseLegacyFunctions(path);
     // Device functions stay the loader's (volkLoadInstance): they dispatch by
     // handle, so the window's device and this one can live side by side. volk
     // keeps one global table; loading a device into it would point the other

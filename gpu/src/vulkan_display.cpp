@@ -518,22 +518,6 @@ Gpu* VulkanDisplay::SharedGpu() {
     return shared_.get();
 }
 
-namespace {
-/* A GPU's preference: PS2HOST_GPU=<part of its name> (any case: "intel",
-   "4070") first - a laptop's integrated GPU measured beside its discrete
-   one - then a discrete GPU. */
-int DeviceScore(const VkPhysicalDeviceProperties& p) {
-    int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : 1;
-    if (const char* want = std::getenv("PS2HOST_GPU")) {
-        std::string name = p.deviceName, part = want;
-        for (char& ch : name) ch = char(std::tolower(static_cast<unsigned char>(ch)));
-        for (char& ch : part) ch = char(std::tolower(static_cast<unsigned char>(ch)));
-        if (!part.empty() && name.find(part) != std::string::npos) score += 10;
-    }
-    return score;
-}
-}  // namespace
-
 bool VulkanDisplay::Check(VkResult result, const char* what) {
     if (result == VK_SUCCESS) return true;
     char text[160];
@@ -596,7 +580,7 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     const char* const* extensions = SDL_Vulkan_GetInstanceExtensions(&count);
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = title;
-    app.apiVersion = VK_API_VERSION_1_3;      // the GS renderer draws on this device too
+    app.apiVersion = VkInstanceVersion();     // the GS renderer draws on this device too
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
     ici.enabledExtensionCount = count;
@@ -614,19 +598,18 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     std::vector<VkPhysicalDevice> list(gpus);
     vkEnumeratePhysicalDevices(instance_, &gpus, list.data());
     int best = -1;
-    std::string too_old;     // GPUs whose driver is older than Vulkan 1.3 (issue #24): named in the error
+    VkPath path = kVk13;
+    std::string too_old;     // GPUs whose driver is older than Vulkan 1.2 (issue #24): named in the error
     for (VkPhysicalDevice candidate : list) {
-        // The device is made with 1.3's features and the GS renderer draws with
-        // them (dynamic rendering): an older driver's device would fail or crash
-        // later, so it is passed over and the window draws with GDI.
-        VkPhysicalDeviceProperties version;
-        vkGetPhysicalDeviceProperties(candidate, &version);
-        if (version.apiVersion < VK_API_VERSION_1_3) {
-            char text[320];
-            std::snprintf(text, sizeof text, "%s%s (Vulkan %u.%u.%u)", too_old.empty() ? "" : ", ", version.deviceName,
-                          VK_API_VERSION_MAJOR(version.apiVersion), VK_API_VERSION_MINOR(version.apiVersion),
-                          VK_API_VERSION_PATCH(version.apiVersion));
-            too_old += text;
+        // The GS renderer draws with Vulkan 1.3, or 1.2 with its extensions
+        // (vk_device.cpp): an older driver's device is passed over and the
+        // window draws with GDI.
+        VkPhysicalDeviceProperties p;
+        vkGetPhysicalDeviceProperties(candidate, &p);
+        VkPath candidate_path;
+        std::string why;
+        if (!VkDevicePath(candidate, &candidate_path, &why)) {
+            too_old += std::string(too_old.empty() ? "" : ", ") + p.deviceName + " (" + why + ")";
             continue;
         }
         std::uint32_t families = 0;
@@ -637,28 +620,27 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
             VkBool32 present = VK_FALSE;
             vkGetPhysicalDeviceSurfaceSupportKHR(candidate, f, surface_, &present);
             if (!(props[f].queueFlags & VK_QUEUE_GRAPHICS_BIT) || !present) continue;
-            VkPhysicalDeviceProperties p;
-            vkGetPhysicalDeviceProperties(candidate, &p);
-            const int score = DeviceScore(p);
+            const int score = VkDeviceScore(p);
             if (score > best) {
                 best = score;
                 gpu_ = candidate;
                 family_ = f;
+                path = candidate_path;
             }
             break;
         }
     }
     if (!gpu_) {
         error_ = too_old.empty() ? "no Vulkan device can draw and present to the window"
-                                 : "no Vulkan 1.3 GPU; older: " + too_old;
+                                 : "no Vulkan 1.2 GPU; passed over: " + too_old;
         return false;
     }
     VkPhysicalDeviceProperties p;
     vkGetPhysicalDeviceProperties(gpu_, &p);
     char text[320];
-    std::snprintf(text, sizeof text, "%s (Vulkan %u.%u.%u, driver %u)", p.deviceName,
+    std::snprintf(text, sizeof text, "%s (Vulkan %u.%u.%u, driver %u; drawn with %s)", p.deviceName,
                   VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
-                  VK_API_VERSION_PATCH(p.apiVersion), p.driverVersion);
+                  VK_API_VERSION_PATCH(p.apiVersion), p.driverVersion, VkPathName(path));
     describe_ = text;
 
     const float priority = 1.0f;
@@ -666,50 +648,35 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     qci.queueFamilyIndex = family_;
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
-    const char* device_extensions[3] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, nullptr, nullptr};
-    std::uint32_t device_extension_count = 1;
+    // What the GS renderer needs, for when it draws on this device
+    // (SharedGpu), and the window's own extensions.
+    VkDeviceSetup setup;
+    setup.Fill(gpu_, path);
+    setup.extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    dual_source_ = setup.supported.dualSrcBlend == VK_TRUE;
+    if (setup.load_none) {
+        g_load_op_none = true;
+        std::fprintf(stderr, "[display] %s: a pass's unread attachments not loaded\n", setup.load_none);
+    }
     {
         // NVIDIA's low latency (its boost: SetGpuBoost), where the driver has it.
         std::uint32_t count = 0;
         vkEnumerateDeviceExtensionProperties(gpu_, nullptr, &count, nullptr);
         std::vector<VkExtensionProperties> offered(count);
         vkEnumerateDeviceExtensionProperties(gpu_, nullptr, &count, offered.data());
-        const char* load_none = nullptr;
-        for (const VkExtensionProperties& e : offered) {
+        for (const VkExtensionProperties& e : offered)
             if (std::strcmp(e.extensionName, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) == 0) low_latency_ = true;
-            // A pass's attachment it never reads, not loaded (the GS renderer's deferred passes: a tiler's).
-            if (std::strcmp(e.extensionName, "VK_KHR_load_store_op_none") == 0) load_none = "VK_KHR_load_store_op_none";
-            if (!load_none && std::strcmp(e.extensionName, "VK_EXT_load_store_op_none") == 0)
-                load_none = "VK_EXT_load_store_op_none";
-        }
-        if (load_none) {
-            device_extensions[device_extension_count++] = load_none;
-            g_load_op_none = true;
-            std::fprintf(stderr, "[display] %s: a pass's unread attachments not loaded\n", load_none);
-        }
         if (const char* env = std::getenv("PS2HOST_GPU_BOOST"); env && env[0] == '0') low_latency_ = false;
-        if (low_latency_) device_extensions[device_extension_count++] = VK_NV_LOW_LATENCY_2_EXTENSION_NAME;
+        if (low_latency_) setup.extensions.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
     }
-    // What the GS renderer needs, for when it draws on this device
-    // (SharedGpu): dynamic rendering, and dual-source blending if there is any.
-    VkPhysicalDeviceFeatures supported;
-    vkGetPhysicalDeviceFeatures(gpu_, &supported);
-    dual_source_ = supported.dualSrcBlend == VK_TRUE;
-    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    v13.dynamicRendering = VK_TRUE;
-    v13.synchronization2 = VK_TRUE;
-    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    features.features.dualSrcBlend = supported.dualSrcBlend;
-    features.features.logicOp = supported.logicOp;
-    features.features.textureCompressionBC = supported.textureCompressionBC;     // texture packs' DDS
-    features.pNext = &v13;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    dci.pNext = &features;
+    dci.pNext = &setup.features;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = device_extension_count;
-    dci.ppEnabledExtensionNames = device_extensions;
+    dci.enabledExtensionCount = std::uint32_t(setup.extensions.size());
+    dci.ppEnabledExtensionNames = setup.extensions.data();
     if (!Check(vkCreateDevice(gpu_, &dci, nullptr, &device_), "vkCreateDevice")) return false;
+    VkUseLegacyFunctions(path);
     if (low_latency_) {
         set_sleep_mode_ = reinterpret_cast<PFN_vkSetLatencySleepModeNV>(
             vkGetDeviceProcAddr(device_, "vkSetLatencySleepModeNV"));

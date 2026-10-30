@@ -678,9 +678,48 @@ private:
         if (pass_cmd_) {
             BeginDeferredPass(cmd);
         } else {
-            vkCmdEndRendering(cmd);
+            EndRendering(cmd);
         }
         open_target_ = open_depth_ = nullptr;
+    }
+    /* A rendering pass begun and ended: dynamic rendering (Vulkan 1.3, or
+       1.2's extension), else (kVk12RenderPass) the same as a render pass with
+       its framebuffer, whose size is `whole` (the attachments' common size,
+       which the render area lies in). */
+    void BeginRendering(VkCommandBuffer cmd, const VkRenderingInfo& ri, VkExtent2D whole);
+    void EndRendering(VkCommandBuffer cmd) {
+        if (g_vk_path == kVk12RenderPass) vkCmdEndRenderPass(cmd);
+        else vkCmdEndRendering(cmd);
+    }
+    /* Render passes (kVk12RenderPass): a compatible one for each attachment
+       set - [0] depth-stencil alone, [1] colour and depth-stencil - that
+       pipelines and deferred secondaries are made for; the ones begun, by
+       their attachments' load and store ops; framebuffers by their views and
+       size, dropped with their images (DestroyImage). */
+    VkRenderPass compatible_passes_[2] = {};
+    std::unordered_map<std::uint32_t, VkRenderPass> render_passes_;
+    struct FramebufferKey {
+        VkImageView colour, depth;
+        std::uint32_t width, height;
+        bool operator==(const FramebufferKey& o) const {
+            return colour == o.colour && depth == o.depth && width == o.width && height == o.height;
+        }
+    };
+    struct FramebufferKeyHash {
+        std::size_t operator()(const FramebufferKey& k) const {
+            return std::hash<const void*>()(reinterpret_cast<const void*>(k.colour)) * 31 ^
+                   std::hash<const void*>()(reinterpret_cast<const void*>(k.depth)) ^
+                   (std::size_t(k.width) << 20 | k.height);
+        }
+    };
+    std::unordered_map<FramebufferKey, VkFramebuffer, FramebufferKeyHash> framebuffers_;
+    VkRenderPass RenderPass(bool colour, std::uint32_t ops);
+    bool MakeCompatiblePasses();
+    /* What a pipeline or a deferred secondary drawing into colour and depth
+       (or depth alone) is made for: the compatible render pass on
+       kVk12RenderPass, else none (dynamic rendering). */
+    VkRenderPass CompatiblePass(bool colour) const {
+        return g_vk_path == kVk12RenderPass ? compatible_passes_[colour ? 1 : 0] : VK_NULL_HANDLE;
     }
     /* Deferred passes (a tiler's - Android's - or PS2HOST_GPU_DEFER_PASSES=1):
        a pass's draws recorded into a secondary command buffer, the pass
@@ -719,7 +758,7 @@ private:
         const std::int32_t x1 = std::clamp(pass_x1_, x0, right), y1 = std::clamp(pass_y1_, y0, bottom);
         if (x1 <= x0 || y1 <= y0) return;
         VkRenderingAttachmentInfo colour = pass_colour_, z = pass_z_;
-        if (!pass_depth_written_) {
+        if (!pass_depth_written_ && g_store_op_none) {
             z.storeOp = VK_ATTACHMENT_STORE_OP_NONE;
             ++g_depth_unstored;
         }
@@ -737,9 +776,9 @@ private:
         ri.pColorAttachments = &colour;
         ri.pDepthAttachment = &z;
         ri.pStencilAttachment = &z;
-        vkCmdBeginRendering(cmd, &ri);
+        BeginRendering(cmd, ri, pass_area_.extent);
         vkCmdExecuteCommands(cmd, 1, &drawn);
-        vkCmdEndRendering(cmd);
+        EndRendering(cmd);
     }
     VkPipeline date_pipeline_ = VK_NULL_HANDLE;
     VkDescriptorSet SetFor(Texture& texture, int sampler);
@@ -1157,6 +1196,16 @@ bool VulkanGsRenderer::MakeImage(Image& t, std::uint32_t width, std::uint32_t he
 }
 
 void VulkanGsRenderer::DestroyImage(Image& t) {
+    if (!framebuffers_.empty() && t.view) {
+        for (auto it = framebuffers_.begin(); it != framebuffers_.end();) {
+            if (it->first.colour == t.view || it->first.depth == t.view) {
+                vkDestroyFramebuffer(g_.device, it->second, nullptr);
+                it = framebuffers_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     effects_.ForgetView(t.view);
     if (t.view) vkDestroyImageView(g_.device, t.view, nullptr);
     if (t.words) vkDestroyImageView(g_.device, t.words, nullptr);
@@ -1217,6 +1266,10 @@ bool VulkanGsRenderer::Init(std::string* error) {
     else defer_passes_ = true;
 #endif
     OpenPipelineCache();
+    if (g_vk_path == kVk12RenderPass && !MakeCompatiblePasses()) {
+        if (error) *error = "vkCreateRenderPass failed";
+        return false;
+    }
     auto module = [&](const std::uint32_t* code, std::size_t bytes) {
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         ci.codeSize = bytes;
@@ -1634,7 +1687,8 @@ bool VulkanGsRenderer::MakeDepthPipelines() {
     rendering.depthAttachmentFormat = kDepthFormat;
     rendering.stencilAttachmentFormat = kDepthFormat;
     VkGraphicsPipelineCreateInfo pci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    pci.pNext = &rendering;
+    pci.renderPass = CompatiblePass(false);
+    if (!pci.renderPass) pci.pNext = &rendering;
     pci.stageCount = 2;
     pci.pStages = stages;
     pci.pVertexInputState = &input;
@@ -1648,6 +1702,124 @@ bool VulkanGsRenderer::MakeDepthPipelines() {
     pci.layout = depth_load_layout_;
     return vkCreateGraphicsPipelines(g_.device, cache_, 1, &pci, nullptr, &depth_load_pipeline_) ==
            VK_SUCCESS;
+}
+
+namespace {
+/* Load and store ops in two bits each (RenderPass's key; 0 is LOAD, STORE). */
+std::uint32_t LoadBits(VkAttachmentLoadOp op) {
+    return op == VK_ATTACHMENT_LOAD_OP_LOAD ? 0u : op == VK_ATTACHMENT_LOAD_OP_CLEAR ? 1u
+           : op == VK_ATTACHMENT_LOAD_OP_DONT_CARE ? 2u : 3u;
+}
+std::uint32_t StoreBits(VkAttachmentStoreOp op) {
+    return op == VK_ATTACHMENT_STORE_OP_STORE ? 0u : op == VK_ATTACHMENT_STORE_OP_DONT_CARE ? 1u : 2u;
+}
+VkAttachmentLoadOp LoadOp(std::uint32_t bits) {
+    static const VkAttachmentLoadOp kOps[4] = {VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                               VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_LOAD_OP_NONE_EXT};
+    return kOps[bits & 3];
+}
+VkAttachmentStoreOp StoreOp(std::uint32_t bits) {
+    static const VkAttachmentStoreOp kOps[3] = {VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                                                VK_ATTACHMENT_STORE_OP_NONE};
+    return kOps[std::min(bits & 3, 2u)];
+}
+}  // namespace
+
+/* A render pass of one subpass drawing into colour (RGBA8, if `colour`) and
+   the GS's depth-stencil. `ops`: colour's load and store in bits 0-3,
+   depth's in 4-7, stencil's in 8-11 (LoadBits, StoreBits). Every attachment
+   starts and ends in its attachment layout: the renderer moves images
+   between layouts itself, outside passes. */
+VkRenderPass VulkanGsRenderer::RenderPass(bool colour, std::uint32_t ops) {
+    const std::uint32_t key = ops << 1 | (colour ? 1u : 0u);
+    if (auto found = render_passes_.find(key); found != render_passes_.end()) return found->second;
+    VkAttachmentDescription attachments[2] = {};
+    const VkAttachmentReference colour_ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    const VkAttachmentReference depth_ref{colour ? 1u : 0u, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    std::uint32_t count = 0;
+    if (colour) {
+        VkAttachmentDescription& c = attachments[count++];
+        c.format = VK_FORMAT_R8G8B8A8_UNORM;
+        c.samples = VK_SAMPLE_COUNT_1_BIT;
+        c.loadOp = LoadOp(ops);
+        c.storeOp = StoreOp(ops >> 2);
+        c.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        c.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        c.initialLayout = c.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    }
+    VkAttachmentDescription& z = attachments[count++];
+    z.format = kDepthFormat;
+    z.samples = VK_SAMPLE_COUNT_1_BIT;
+    z.loadOp = LoadOp(ops >> 4);
+    z.storeOp = StoreOp(ops >> 6);
+    z.stencilLoadOp = LoadOp(ops >> 8);
+    z.stencilStoreOp = StoreOp(ops >> 10);
+    z.initialLayout = z.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = colour ? 1 : 0;
+    subpass.pColorAttachments = colour ? &colour_ref : nullptr;
+    subpass.pDepthStencilAttachment = &depth_ref;
+    VkRenderPassCreateInfo rci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rci.attachmentCount = count;
+    rci.pAttachments = attachments;
+    rci.subpassCount = 1;
+    rci.pSubpasses = &subpass;
+    VkRenderPass pass = VK_NULL_HANDLE;
+    if (vkCreateRenderPass(g_.device, &rci, nullptr, &pass) != VK_SUCCESS) return VK_NULL_HANDLE;
+    render_passes_.emplace(key, pass);
+    return pass;
+}
+
+bool VulkanGsRenderer::MakeCompatiblePasses() {
+    // (Load and store ops do not make passes incompatible: the all-LOAD,
+    // all-STORE ones serve, kept in render_passes_ like the rest.)
+    compatible_passes_[0] = RenderPass(false, 0);
+    compatible_passes_[1] = RenderPass(true, 0);
+    std::fprintf(stderr, "[ps2gpu] drawing with render passes (Vulkan 1.2 without dynamic rendering)\n");
+    return compatible_passes_[0] && compatible_passes_[1];
+}
+
+void VulkanGsRenderer::BeginRendering(VkCommandBuffer cmd, const VkRenderingInfo& ri, VkExtent2D whole) {
+    if (g_vk_path != kVk12RenderPass) {
+        vkCmdBeginRendering(cmd, &ri);
+        return;
+    }
+    const VkRenderingAttachmentInfo* colour = ri.colorAttachmentCount ? ri.pColorAttachments : nullptr;
+    const VkRenderingAttachmentInfo* depth = ri.pDepthAttachment;
+    const VkRenderingAttachmentInfo* stencil = ri.pStencilAttachment ? ri.pStencilAttachment : depth;
+    std::uint32_t ops = 0;
+    if (colour) ops |= LoadBits(colour->loadOp) | StoreBits(colour->storeOp) << 2;
+    ops |= LoadBits(depth->loadOp) << 4 | StoreBits(depth->storeOp) << 6;
+    ops |= LoadBits(stencil->loadOp) << 8 | StoreBits(stencil->storeOp) << 10;
+    const VkRenderPass pass = RenderPass(colour != nullptr, ops);
+    const FramebufferKey key{colour ? colour->imageView : VK_NULL_HANDLE, depth->imageView, whole.width,
+                             whole.height};
+    VkFramebuffer& framebuffer = framebuffers_[key];
+    if (!framebuffer) {
+        const VkImageView views[2] = {colour ? colour->imageView : VK_NULL_HANDLE, depth->imageView};
+        VkFramebufferCreateInfo fci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fci.renderPass = CompatiblePass(colour != nullptr);
+        fci.attachmentCount = colour ? 2 : 1;
+        fci.pAttachments = colour ? views : views + 1;
+        fci.width = whole.width;
+        fci.height = whole.height;
+        fci.layers = 1;
+        vkCreateFramebuffer(g_.device, &fci, nullptr, &framebuffer);
+    }
+    VkClearValue clears[2] = {};
+    if (colour) clears[0] = colour->clearValue;
+    clears[colour ? 1 : 0].depthStencil = {depth->clearValue.depthStencil.depth,
+                                            stencil->clearValue.depthStencil.stencil};
+    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass = pass;
+    rbi.framebuffer = framebuffer;
+    rbi.renderArea = ri.renderArea;
+    rbi.clearValueCount = colour ? 2 : 1;
+    rbi.pClearValues = clears;
+    vkCmdBeginRenderPass(cmd, &rbi, (ri.flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)
+                                        ? VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS
+                                        : VK_SUBPASS_CONTENTS_INLINE);
 }
 
 VkDescriptorSet VulkanGsRenderer::DepthSampledSet(Image& image) {
@@ -1696,7 +1868,7 @@ void VulkanGsRenderer::DepthIn(VkCommandBuffer cmd, const SwizzleParams& params,
     ri.layerCount = 1;
     ri.pDepthAttachment = &z;
     ri.pStencilAttachment = &z;
-    vkCmdBeginRendering(cmd, &ri);
+    BeginRendering(cmd, ri, ri.renderArea.extent);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, depth_load_pipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, depth_load_layout_, 0, 1, &swizzle_set_, 0,
                             nullptr);
@@ -1709,7 +1881,7 @@ void VulkanGsRenderer::DepthIn(VkCommandBuffer cmd, const SwizzleParams& params,
     const VkRect2D sc{{0, std::int32_t(y0)}, {std::min(params.cols, d.width) * k, y1 - std::min(y0, y1)}};
     vkCmdSetScissor(cmd, 0, 1, &sc);
     vkCmdDraw(cmd, 3, 1, 0, 0);
-    vkCmdEndRendering(cmd);
+    EndRendering(cmd);
     g_.Mark(cmd, kProfSwizzle);
 }
 
@@ -2372,7 +2544,8 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     rendering.depthAttachmentFormat = kDepthFormat;
     rendering.stencilAttachmentFormat = kDepthFormat;
     VkGraphicsPipelineCreateInfo pci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    pci.pNext = &rendering;
+    pci.renderPass = CompatiblePass(true);
+    if (!pci.renderPass) pci.pNext = &rendering;
     pci.stageCount = 2;
     pci.pStages = stages;
     pci.pVertexInputState = &input;
@@ -2434,7 +2607,8 @@ bool VulkanGsRenderer::MakeDatePipeline() {
     rendering.depthAttachmentFormat = kDepthFormat;
     rendering.stencilAttachmentFormat = kDepthFormat;
     VkGraphicsPipelineCreateInfo pci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    pci.pNext = &rendering;
+    pci.renderPass = CompatiblePass(false);
+    if (!pci.renderPass) pci.pNext = &rendering;
     pci.stageCount = 2;
     pci.pStages = stages;
     pci.pVertexInputState = &input;
@@ -2500,7 +2674,7 @@ void VulkanGsRenderer::DateSetup(VkCommandBuffer cmd, Image& target, Image& dept
     ri.layerCount = 1;
     ri.pDepthAttachment = &z;
     ri.pStencilAttachment = &stencil;
-    vkCmdBeginRendering(cmd, &ri);
+    BeginRendering(cmd, ri, ri.renderArea.extent);
     drawn_ = DrawState{};           // its own pipeline, sets, viewport and scissor
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, date_pipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &target.sampled, 0, nullptr);
@@ -2513,7 +2687,7 @@ void VulkanGsRenderer::DateSetup(VkCommandBuffer cmd, Image& target, Image& dept
     vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_FRAGMENT_BIT, kFragmentOffset, sizeof params, &params);
     vkCmdDraw(cmd, 3, 1, 0, 0);
     g_.Mark(cmd, kProfDate);
-    vkCmdEndRendering(cmd);
+    EndRendering(cmd);
 }
 
 VkDescriptorSet VulkanGsRenderer::SetFor(Texture& texture, int sampler) {
@@ -3515,7 +3689,8 @@ void VulkanGsRenderer::Flush() {
             ri.pDepthAttachment = &z;
             ri.pStencilAttachment = &z;
             ++g_passes;
-            if (defer_passes_) pass_cmd_ = g_.BeginSecondary(VK_FORMAT_R8G8B8A8_UNORM, kDepthFormat);
+            if (defer_passes_)
+                pass_cmd_ = g_.BeginSecondary(VK_FORMAT_R8G8B8A8_UNORM, kDepthFormat, CompatiblePass(true));
             if (pass_cmd_) {
                 pass_colour_ = colour;
                 pass_z_ = z;
@@ -3526,7 +3701,7 @@ void VulkanGsRenderer::Flush() {
                 pass_sampled_.clear();
                 drawn_ = DrawState{};           // (a secondary inherits no state)
             } else {
-                vkCmdBeginRendering(cmd, &ri);
+                BeginRendering(cmd, ri, ri.renderArea.extent);
             }
             open_target_ = t;
             open_depth_ = depth;
@@ -3865,6 +4040,8 @@ VulkanGsRenderer::~VulkanGsRenderer() {
         }
     for (auto& [key, pipeline] : pipelines_) vkDestroyPipeline(g_.device, pipeline, nullptr);
     if (date_pipeline_) vkDestroyPipeline(g_.device, date_pipeline_, nullptr);
+    for (auto& [key, framebuffer] : framebuffers_) vkDestroyFramebuffer(g_.device, framebuffer, nullptr);
+    for (auto& [key, pass] : render_passes_) vkDestroyRenderPass(g_.device, pass, nullptr);
     for (VkSampler s : samplers_)
         if (s) vkDestroySampler(g_.device, s, nullptr);
     if (pool_) vkDestroyDescriptorPool(g_.device, pool_, nullptr);
