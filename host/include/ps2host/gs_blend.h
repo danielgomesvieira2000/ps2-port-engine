@@ -65,4 +65,28 @@ struct GsBlendOptions {
 GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, float t, GsPicture& out,
                              const GsBlendOptions& options = {});
 
+/* Where a picture's input first sets FRAME (A+D to FRAME_1 or FRAME_2) to a
+   buffer other than `shown` (its FBP): its entry and the word in it - what
+   comes before is a game's copy of its last frame to the shown buffer, in
+   the blank (Burnout 3), the rest its drawing. {entries.size(), 0}: never. */
+struct GsCut {
+    std::size_t entry = 0;
+    u32 word = 0;               // of the entry's words
+};
+GsCut GsFrameCut(const GsPicture& picture, u32 shown);
+
+/* `picture` (a picture between two, about to be played just after the
+   newer, whose input it was made from) without the image transfers that
+   leave local memory as the newer's already did: those to a place no other
+   transfer of the picture writes with other data - each with the A+D packet
+   that set it up, where that sets the transfer's registers alone. Those to
+   a place written twice with other data (a texture's memory used again
+   within the picture: Burnout 3, ~15% of its ~590 a picture) stay, in
+   order. Returns the words left out. */
+u32 DropKnownUploads(GsPicture& picture);
+
+/* `picture`'s words from `from` to `to`, through the GS's GIF input (the
+   'W' entries; the rest are the EE's, left out). */
+void PlayGsPicture(const GsPicture& picture, GsCut from, GsCut to);
+
 }  // namespace ps2host

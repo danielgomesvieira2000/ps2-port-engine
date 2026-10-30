@@ -64,6 +64,7 @@
 #include "xxhash.h"
 
 #include "ps2host/gs.h"
+#include "ps2host/gs_blend.h"
 #include "ps2host/profile.h"
 #include "ps2host/run.h"
 #include "ps2host/timeline.h"
@@ -390,6 +391,20 @@ bool g_present_at_blank_end = false;
 bool g_present_waits = false;
 u64 g_present_frame = 0;
 void PresentWaiting();
+
+/* PS2HOST_GS_BETWEEN=1: a picture between each two of the game's, made from
+   their GS input (gs_blend.h) instead of drawn by the game again - a high
+   frame rate for a weak machine (games/burnout3/docs/PERFORMANCE_PLAN.md,
+   option 2), the game at its own rate. Each frame's input kept (Gs::
+   KeepInput); at its end (MakeBetween) its copy to the shown buffer played
+   now and that picture held (the next blank's present shows it: g_held),
+   the picture between played and shown half a frame before it, the GS's
+   registers put back. Paced (frame pacing on). */
+bool g_between = false;
+GsPicture g_between_input[2];
+int g_between_now = 0;
+int g_held = -1;                // the real picture's paced slot while one between goes first
+u64 g_last_due = 0;             // the last real picture's time
 
 namespace {
 
@@ -2330,6 +2345,72 @@ void OpenTexturePack() {
                      texture_pack::Enabled() ? "on" : "off");
 }
 
+namespace {
+
+/* The shown target copied into a held slot of the display's (-1: none). */
+int HoldGpuPicture(ps2gpu::Display& display) {
+    u32 fbp = 0, fbw = 0, psm = 0;
+    if (!g_bridge || !gs::TheGs().Displayed(&fbp, &fbw, &psm)) return -1;
+    auto found = g_bridge->owned.find(std::make_tuple(fbp, fbw, psm, false));
+    std::uint64_t image = 0;
+    int layout = 0;
+    u32 w = 0, h = 0;
+    if (found == g_bridge->owned.end() || found->second.stale ||
+        !g_bridge->renderer->DisplayTarget(fbp, fbw, psm, &image, &layout, &w, &h))
+        return -1;
+    const u32 k = g_bridge->renderer->Scale();
+    const u32 lines = std::min(gs::TheGs().ShownLines(), 448u);
+    return display.HoldImage(image, layout, std::min(w, 640u * k), std::min(h, lines * k));
+}
+
+/* At a frame's end on the GS thread (PS2HOST_GS_BETWEEN): the picture
+   between the last two, as g_between says. */
+void MakeBetween() {
+    gs::Gs& g = gs::TheGs();
+    GsPicture& newer = g_between_input[g_between_now];
+    GsPicture& older = g_between_input[g_between_now ^ 1];
+    ps2gpu::Display* display = WindowDisplay();
+    u32 fbp = 0, fbw = 0, psm = 0;
+    if (display && !VirtualClock() && !older.entries.empty() && !newer.entries.empty() && g_held < 0 &&
+        g.Displayed(&fbp, &fbw, &psm)) {
+        g.KeepInput(nullptr);
+        const auto saved = g.Save();
+        const GsCut cut = GsFrameCut(newer, fbp);
+        // The game's copy of this frame to the shown buffer, as the next
+        // blank will make it: that picture held for its time.
+        g.FreshDecode();
+        PlayGsPicture(newer, {0, 0}, cut);
+        g_held = HoldGpuPicture(*display);
+        if (g_held >= 0) {
+            // The picture between: drawn, then copied as the game copies.
+            GsBlendOptions options;
+            const u64 offset = g.XyOffset(0);
+            const u32 x = u32(offset & 0xFFFF), y = u32((offset >> 32) & 0xFFFF);
+            options.window[0] = x > 64 * 16 ? x - 64 * 16 : 0;
+            options.window[1] = y > 64 * 16 ? y - 64 * 16 : 0;
+            options.window[2] = x + (640 + 64) * 16;
+            options.window[3] = y + (448 + 64) * 16;
+            GsPicture between;
+            BlendGsPictures(older, newer, 0.5f, between, options);
+            DropKnownUploads(between);     // (memory as the newer's transfers just left it)
+            g.FreshDecode();
+            PlayGsPicture(between, cut, {between.entries.size(), 0});
+            g.FreshDecode();
+            PlayGsPicture(newer, {0, 0}, cut);
+            const u64 due = g_last_due ? g_last_due + BlankPeriodNs() / 2 : 0;
+            PresentGpuPicture(*display, due);
+        }
+        g.Restore(*saved);
+    }
+    g_between_now ^= 1;
+    GsPicture& next = g_between_input[g_between_now];
+    next.entries.clear();
+    for (auto& words : next.paths) words.clear();
+    g.KeepInput(&next);
+}
+
+}  // namespace
+
 bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     static Bridge bridge;
     // On the window's device when there is a window: one Vulkan device for both.
@@ -2415,6 +2496,7 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
         // on meanwhile.
         SetGsFrameHandler([](u64 frame) {
             PresentWaiting();               // the last frame's, nothing having moved it on
+            if (g_between) MakeBetween();
             GpuShadowFrame(frame, std::string());
             // The internal resolution, between frames (the GS thread's).
             g_after_effects = false;
@@ -2432,6 +2514,11 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
             if (!g_present_at_blank_end || VirtualClock()) PresentWaiting();
         });
     }
+    if (bridge.primary && std::getenv("PS2HOST_GS_BETWEEN") && std::getenv("PS2HOST_GS_BETWEEN")[0] == '1') {
+        g_between = true;
+        gs::TheGs().KeepInput(&g_between_input[0]);
+        std::fprintf(stderr, "gpu: a picture between each two of the game's, from their GS input (PS2HOST_GS_BETWEEN)\n");
+    }
     g_gpu_name = device->Describe();
     std::fprintf(stderr, "gpu: drawing on %s %s\n", device->Describe().c_str(),
                  bridge.primary ? "instead of the software GS" : "beside the software GS");
@@ -2448,10 +2535,19 @@ void PresentWaiting() {
     if (!g_present_waits) return;
     g_present_waits = false;
     if (ps2gpu::Display* display = WindowDisplay()) {
-        const bool pace = !VirtualClock() && SettingOn("frame_pacing", FramePacingDefault());    // (PC SETTINGS)
+        const bool pace = !VirtualClock() && (g_between || SettingOn("frame_pacing", FramePacingDefault()));    // (PC SETTINGS)
         // (Its blank, for the GPU's done time: the locked blanks' lead, NoteGpuDone.)
         if (!pace && !VirtualClock()) display->SetPresentTag(FrameEndedNs(g_present_frame));
-        PresentGpuPicture(*display, pace ? FrameDue(g_present_frame) : 0);
+        const u64 due = pace ? FrameDue(g_present_frame) : 0;
+        if (g_held >= 0) {
+            // Copied as the frame ended (MakeBetween), before the picture
+            // between was drawn over it: the shown buffer holds that one now.
+            display->ShowHeld(g_held, due);
+            g_held = -1;
+        } else {
+            PresentGpuPicture(*display, due);
+        }
+        g_last_due = due;
     }
 }
 

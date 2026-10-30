@@ -49,6 +49,16 @@ public:
         (void)due_ns;
         return PresentImage(image, layout, width, height);
     }
+    /* PresentImageAt in two halves: the image copied now and held - not
+       shown, and not given up for a newer one - its slot returned (-1: none
+       to hold it in); ShowHeld gives it its time later, after pictures sent
+       meanwhile (a picture made between two: the later one copied before the
+       one between was drawn over it, shown after it). */
+    virtual int HoldImage(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height) {
+        (void)image, (void)layout, (void)width, (void)height;
+        return -1;
+    }
+    virtual void ShowHeld(int slot, std::uint64_t due_ns) { (void)slot, (void)due_ns; }
 
     /* Handles the window's events; false once it has been closed. Alt+Enter
        toggles fullscreen. */

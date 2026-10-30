@@ -2,6 +2,8 @@
 
 #include "ps2host/gs_blend.h"
 
+#include "ps2host/gs.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -669,6 +671,132 @@ GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, flo
         }
     }
     return stats;
+}
+
+GsCut GsFrameCut(const GsPicture& picture, u32 shown) {
+    // Each path's first packet setting FRAME elsewhere: its tag's word.
+    u32 first[3] = {~0u, ~0u, ~0u};
+    for (int path = 0; path < 3; ++path) {
+        std::vector<Packet> packets;
+        Cut(picture.paths[path], packets);
+        const u32* words = picture.paths[path].data();
+        for (const Packet& p : packets) {
+            if ((u32(p.lo >> 58) & 3) != 0) continue;
+            const u32 nloop = u32(p.lo & 0x7FFF), nreg = u32(p.lo >> 60) ? u32(p.lo >> 60) : 16;
+            bool found = false;
+            for (u32 q = 0; q < nloop * nreg && !found; ++q) {
+                if ((u32(p.hi >> (4 * (q % nreg))) & 0xF) != 0xE) continue;
+                const u32* w = words + p.first + 4 + 4 * q;
+                const u32 reg = w[2] & 0xFF;
+                if ((reg == 0x4C || reg == 0x4D) && (w[0] & 0x1FF) != shown) found = true;
+            }
+            if (found) {
+                first[path] = p.first;
+                break;
+            }
+        }
+    }
+    // The first of them in the entries' order.
+    for (std::size_t e = 0; e < picture.entries.size(); ++e) {
+        const GsPicture::Entry& en = picture.entries[e];
+        if (en.kind != 'W' || en.path < 1 || en.path > 3) continue;
+        const u32 at = first[en.path - 1];
+        if (at != ~0u && at >= en.first && at < en.first + en.count) return {e, at - en.first};
+    }
+    return {picture.entries.size(), 0};
+}
+
+void PlayGsPicture(const GsPicture& picture, GsCut from, GsCut to) {
+    gs::Gs& g = gs::TheGs();
+    for (std::size_t e = from.entry; e < picture.entries.size() && e <= to.entry; ++e) {
+        const GsPicture::Entry& en = picture.entries[e];
+        if (en.kind != 'W' || en.path < 1 || en.path > 3) continue;
+        u32 begin = e == from.entry ? from.word : 0;
+        u32 end = e == to.entry ? to.word : en.count;
+        if (end > en.count) end = en.count;
+        if (begin < end) g.Words(en.path, picture.paths[en.path - 1].data() + en.first + begin, end - begin);
+    }
+}
+
+u32 DropKnownUploads(GsPicture& picture) {
+    u32 dropped = 0;
+    for (int path = 0; path < 3; ++path) {
+        std::vector<u32>& words = picture.paths[path];
+        std::vector<Packet> packets;
+        Cut(words, packets);
+        // Each IMAGE packet's place (BITBLTBUF, TRXPOS, TRXREG as the A+D
+        // before it left them) and a hash of its data.
+        u64 bitblt = 0, pos = 0, reg = 0;
+        struct Upload { std::size_t packet; std::size_t setup; u64 place; u64 hash; };
+        std::vector<Upload> uploads;
+        std::size_t last_setup = ~std::size_t(0);
+        for (std::size_t i = 0; i < packets.size(); ++i) {
+            const Packet& p = packets[i];
+            const u32 flg = u32(p.lo >> 58) & 3;
+            if (flg == 0) {
+                const u32 nloop = u32(p.lo & 0x7FFF), nreg = u32(p.lo >> 60) ? u32(p.lo >> 60) : 16;
+                bool only_transfer = nloop * nreg > 0;
+                for (u32 q = 0; q < nloop * nreg; ++q) {
+                    if ((u32(p.hi >> (4 * (q % nreg))) & 0xF) != 0xE) { only_transfer = false; continue; }
+                    const u32* w = words.data() + p.first + 4 + 4 * q;
+                    const u64 value = w[0] | u64(w[1]) << 32;
+                    switch (w[2] & 0xFF) {
+                        case 0x50: bitblt = value; break;
+                        case 0x51: pos = value; break;
+                        case 0x52: reg = value; break;
+                        case 0x53: break;
+                        default: only_transfer = false; break;
+                    }
+                }
+                last_setup = only_transfer ? i : ~std::size_t(0);
+            } else if (flg == 2) {
+                u64 h = 1469598103934665603ull;
+                for (u32 k = 4; k < p.size; ++k) h = (h ^ words[p.first + k]) * 1099511628211ull;
+                const u64 place = (bitblt >> 32) * 0x9E3779B97F4A7C15ull ^ pos * 0xC2B2AE3D27D4EB4Full ^ reg;
+                uploads.push_back({i, last_setup, place, h});
+                last_setup = ~std::size_t(0);
+            } else {
+                last_setup = ~std::size_t(0);
+            }
+        }
+        // A place with one content in the picture: its transfers dropped.
+        std::unordered_map<u64, std::pair<u64, bool>> content;      // place -> (hash, only one)
+        for (const Upload& u : uploads) {
+            auto [it, fresh] = content.try_emplace(u.place, u.hash, true);
+            if (!fresh && it->second.first != u.hash) it->second.second = false;
+        }
+        std::vector<char> drop(packets.size(), 0);
+        for (const Upload& u : uploads) {
+            if (!content[u.place].second) continue;
+            drop[u.packet] = 1;
+            if (u.setup != ~std::size_t(0)) drop[u.setup] = 1;
+        }
+        // The words without them, and the entries' offsets with them gone.
+        std::vector<u32> kept;
+        kept.reserve(words.size());
+        std::vector<u32> removed_before(words.size() + 1, 0);       // words dropped before each offset
+        u32 gone = 0;
+        std::size_t next = 0;
+        for (u32 at = 0; at <= words.size(); ++at) {
+            while (next < packets.size() && packets[next].first + packets[next].size <= at) ++next;
+            removed_before[at] = gone;
+            if (at == words.size()) break;
+            const bool in_dropped = next < packets.size() && packets[next].first <= at && drop[next];
+            if (in_dropped) ++gone;
+            else kept.push_back(words[at]);
+        }
+        if (!gone) continue;
+        dropped += gone;
+        for (GsPicture::Entry& e : picture.entries) {
+            if (e.kind != 'W' || e.path != path + 1) continue;
+            const u32 first = e.first - removed_before[e.first];
+            const u32 end = (e.first + e.count) - removed_before[e.first + e.count];
+            e.first = first;
+            e.count = end - first;
+        }
+        words.swap(kept);
+    }
+    return dropped;
 }
 
 }  // namespace ps2host

@@ -141,6 +141,10 @@ public:
     bool PresentImage(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height) override;
     bool PresentImageAt(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height,
                         std::uint64_t due_ns) override;
+    int HoldImage(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height) override;
+    void ShowHeld(int slot, std::uint64_t due_ns) override;
+    int CopyPaced(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height, std::uint64_t due_ns,
+                  bool held);
     bool Pump() override;
     void SetFullscreen(bool on) override;
     bool Fullscreen() const override;
@@ -473,7 +477,7 @@ private:
     std::string describe_, error_;
     // PresentImageAt's pictures: copies of the frames' targets, three, each
     // its copy's command buffer and fence (the GS thread's own pool).
-    static constexpr int kPaced = 3;
+    static constexpr int kPaced = 4;          // (one of them held: HoldImage)
     struct PacedPicture {
         VkImage image = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -489,6 +493,7 @@ private:
     std::condition_variable paced_wake_;
     std::deque<int> ready_;                 // pictures waiting to be shown, oldest first
     int taken_ = -1;                        // the one being shown
+    int held_ = -1;                         // HoldImage's, until ShowHeld
     bool stop_ = false;
     std::thread present_thread_;
     std::mutex present_lock_;               // the swapchain and cmds_: the present thread, or Present
@@ -1595,11 +1600,13 @@ void VulkanDisplay::DestroyPaced() {
     paced_width_ = paced_height_ = 0;
 }
 
-bool VulkanDisplay::PresentImageAt(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height,
-                                   std::uint64_t due_ns) {
-    if (!width || !height || !image) return !closed_;
-    if (closed_) return false;
-    if (!EnsurePaced(width, height)) return false;
+/* PresentImageAt and HoldImage: the image into a slot (-1: none to copy,
+   -2: failed or closed); queued with its time, or held. */
+int VulkanDisplay::CopyPaced(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height,
+                             std::uint64_t due_ns, bool held) {
+    if (!width || !height || !image) return closed_ ? -2 : -1;
+    if (closed_) return -2;
+    if (!EnsurePaced(width, height)) return -2;
     // A picture neither waiting to be shown nor being shown - or, with all
     // of them waiting, the oldest waiting (its turn is lost: the shown
     // picture keeps no more than two frames behind). What the GPU still
@@ -1609,7 +1616,7 @@ bool VulkanDisplay::PresentImageAt(std::uint64_t image, int layout, std::uint32_
     {
         std::lock_guard<std::mutex> hold(paced_lock_);
         for (int i = 0; i < kPaced && slot < 0; ++i)
-            if (i != taken_ && std::find(ready_.begin(), ready_.end(), i) == ready_.end()) slot = i;
+            if (i != taken_ && i != held_ && std::find(ready_.begin(), ready_.end(), i) == ready_.end()) slot = i;
         if (slot < 0) {
             slot = ready_.front();
             ready_.pop_front();
@@ -1650,17 +1657,44 @@ bool VulkanDisplay::PresentImageAt(std::uint64_t image, int layout, std::uint32_
     submit.pCommandBuffers = &p.copy;
     {
         std::lock_guard<std::mutex> hold(g_queue_lock);
-        if (!Check(vkQueueSubmit(queue_, 1, &submit, p.copied), "vkQueueSubmit (paced)")) return false;
+        if (!Check(vkQueueSubmit(queue_, 1, &submit, p.copied), "vkQueueSubmit (paced)")) return -2;
     }
     p.width = width;
     p.height = height;
     p.due_ns = due_ns;
+    if (held) {
+        std::lock_guard<std::mutex> hold(paced_lock_);
+        held_ = slot;
+        return slot;
+    }
     {
         std::lock_guard<std::mutex> hold(paced_lock_);
         ready_.push_back(slot);
     }
     paced_wake_.notify_all();
-    return !closed_;
+    return closed_ ? -2 : slot;
+}
+
+bool VulkanDisplay::PresentImageAt(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height,
+                                   std::uint64_t due_ns) {
+    return CopyPaced(image, layout, width, height, due_ns, false) != -2;
+}
+
+int VulkanDisplay::HoldImage(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height) {
+    const int slot = CopyPaced(image, layout, width, height, 0, true);
+    return slot >= 0 ? slot : -1;
+}
+
+void VulkanDisplay::ShowHeld(int slot, std::uint64_t due_ns) {
+    if (slot < 0 || slot >= kPaced) return;
+    {
+        std::lock_guard<std::mutex> hold(paced_lock_);
+        if (held_ != slot) return;
+        held_ = -1;
+        paced_[slot].due_ns = due_ns;
+        ready_.push_back(slot);
+    }
+    paced_wake_.notify_all();
 }
 
 namespace {

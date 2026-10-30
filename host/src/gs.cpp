@@ -11,6 +11,7 @@
  */
 
 #include "ps2host/gs.h"
+#include "ps2host/gs_blend.h"
 #include "ps2host/profile.h"
 #include "ps2host/dma.h"
 #include "gs_decode.h"
@@ -59,6 +60,58 @@ Gs& MakeGs() {
     return gs;
 }
 }  // namespace detail
+
+
+void Gs::Keep(int path, const u32* words, u32 count) {
+    if (path < 1 || path > 3) return;
+    std::vector<u32>& to = keep_->paths[path - 1];
+    keep_->entries.push_back({'W', u8(path), 0, 0, u32(to.size()), count});
+    to.insert(to.end(), words, words + count);
+}
+
+struct Gs::Saved {
+    Context ctx[2];
+    u64 prim, prmode, prmodecont, texclut, texa, fogcol, dthe, colclamp, pabe;
+    u64 bitbltbuf, trxpos, trxreg, trxdir;
+    Vertex queue[3];
+    u32 queued, strip, trx_x, trx_y, trx_partial, trx_partial_bytes, cbp0, cbp1;
+    bool trx_active;
+    std::shared_ptr<std::array<u32, 256>> clut;
+    GifState gif;
+};
+
+std::shared_ptr<Gs::Saved> Gs::Save() const {
+    auto s = std::make_shared<Saved>();
+    s->ctx[0] = ctx_[0];
+    s->ctx[1] = ctx_[1];
+    s->prim = prim_; s->prmode = prmode_; s->prmodecont = prmodecont_; s->texclut = texclut_; s->texa = texa_;
+    s->fogcol = fogcol_; s->dthe = dthe_; s->colclamp = colclamp_; s->pabe = pabe_;
+    s->bitbltbuf = bitbltbuf_; s->trxpos = trxpos_; s->trxreg = trxreg_; s->trxdir = trxdir_;
+    for (int i = 0; i < 3; ++i) s->queue[i] = queue_[i];
+    s->queued = queued_; s->strip = strip_; s->trx_x = trx_x_; s->trx_y = trx_y_; s->trx_partial = trx_partial_;
+    s->trx_partial_bytes = trx_partial_bytes_; s->cbp0 = cbp0_; s->cbp1 = cbp1_; s->trx_active = trx_active_;
+    s->clut = clut_;
+    s->gif = gif;
+    return s;
+}
+
+void Gs::Restore(const Saved& s) {
+    ctx_[0] = s.ctx[0];
+    ctx_[1] = s.ctx[1];
+    prim_ = s.prim; prmode_ = s.prmode; prmodecont_ = s.prmodecont; texclut_ = s.texclut; texa_ = s.texa;
+    fogcol_ = s.fogcol; dthe_ = s.dthe; colclamp_ = s.colclamp; pabe_ = s.pabe;
+    bitbltbuf_ = s.bitbltbuf; trxpos_ = s.trxpos; trxreg_ = s.trxreg; trxdir_ = s.trxdir;
+    for (int i = 0; i < 3; ++i) queue_[i] = s.queue[i];
+    queued_ = s.queued; strip_ = s.strip; trx_x_ = s.trx_x; trx_y_ = s.trx_y; trx_partial_ = s.trx_partial;
+    trx_partial_bytes_ = s.trx_partial_bytes; cbp0_ = s.cbp0; cbp1_ = s.cbp1; trx_active_ = s.trx_active;
+    clut_ = s.clut;
+    gif = s.gif;
+    ++register_writes_;                 // (what was drawn with the registers as they were is stale for the bridge)
+}
+
+void Gs::FreshDecode() {
+    for (GifState::Path& p : gif.paths) p = GifState::Path{};
+}
 
 // ---------------------------------------------------------------- GIF
 

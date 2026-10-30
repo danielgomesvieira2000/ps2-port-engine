@@ -27,6 +27,7 @@
 #include <vector>
 
 namespace ps2host {
+struct GsPicture;       // gs_blend.h
 namespace gs {
 
 using u8 = std::uint8_t;
@@ -171,6 +172,7 @@ public:
     void Image(const u8* data, u32 qwords) { TransferBlock(data, qwords); }
     void ApplyPrivileged(u32 address, u64 value);
     void Record(int path, const u32* words, u32 count) {
+        if (keep_) Keep(path, words, count);
         if (!record_) return;
         std::fputc('W', record_);
         std::fputc(path, record_);
@@ -187,6 +189,21 @@ public:
     bool Tracing() const { return trace; }
     void TraceLine(const char* text) const { std::fputs(text, trace_out); }
     bool Recording() const { return record_ != nullptr; }
+    /* Every GIF word kept in `to` too ('W' entries, as a replay's picture),
+       until KeepInput(nullptr): a picture's input, for one made between two
+       (gs_blend.h). */
+    void KeepInput(GsPicture* to) { keep_ = to; }
+    /* The registers a GIF stream sets and the decoding's state, to put back
+       after a stream played that the game did not send (a picture made
+       between two): the GS goes on as the game's own stream left it. Not
+       local memory, not the counters. */
+    struct Saved;
+    std::shared_ptr<Saved> Save() const;
+    void Restore(const Saved& saved);
+    /* The decoding's state as a stream's start has it (every path between
+       packets). */
+    void FreshDecode();
+    u64 XyOffset(int context) const { return ctx_[context & 1].xyoffset; }
 
     /* The displayed picture, 32-bit BGRA, and its size. False if nothing is.
        In field mode (SMODE2 INT and FFMD) each field shows every line of the
@@ -326,6 +343,8 @@ private:
     void LocalToLocal();
 
     std::FILE* record_ = nullptr;               // BeginRecord's stream
+    GsPicture* keep_ = nullptr;                 // KeepInput's
+    void Keep(int path, const u32* words, u32 count);
     Context ctx_[2];
     u64 prim_ = 0, prmode_ = 0, prmodecont_ = 1;
     u64 register_writes_ = 0;           // Apply's (DrawCall::generation)
