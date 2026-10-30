@@ -162,3 +162,33 @@ exits; a rewrite of the emitter and VuCore's operations) would save the 18
 and some overwritten stores, ~4% of the instructions: not worth it. What
 is left is across blocks (the first reads and last writes, superblocks)
 and the clamps of operands from before the block (step 8's ceiling).
+
+## 2026-10-30: a hand-written native loop (Burn3's idea), measured
+
+The idea from github.com/UwUCammie/Burn3: a game's hot VU1 code written by
+hand as native C++, checked against the emulated code. Tried on Burnout 3's
+microcode 2678EB26 (entry 0x1548: 12-20% of VU1 in every scene), whose
+hottest stretch by pairs is the strip loop at 0x08E0-0x09B0 (27 pairs, two
+vertices a pass; ~30% of the program's pairs, 6% of the bench's).
+
+How: vurecomp took `--natives DIR` (a list of loop starts, pass lengths and
+the FNV-1a of the pass's words, and the game's .cpp files) and called the
+native function at the start of the fast entry version of the back edge -
+only where the pass has no stall checks or Q/P landing - for every pass that
+goes round again, the compiled block then running the last. The native pass:
+the pairs' own steps with VF and VI in locals, the loop's matrix clamped
+once, the flags and CLIP history as the block leaves them. Exact: every
+hash of the three snapshots the same.
+
+Result: no gain. The loop is ~4% of the VU work in the samples (1.2-1.4% of
+the bench process, the rest of which is the harness), ~0.26 ns a pair -
+a quarter of the program's average. Clang already keeps a wait-free block's
+registers in host registers (the block's `__restrict` state), so what a
+native version removes - VF loads and stores, the per-pair bookkeeping - is
+mostly gone already from straight loops: native 1.3% + the block's last pass
+0.2% against 1.4%; the bench -1%, within the noise. The program's time is
+spread over dozens of branchy blocks (the clip walker, the dispatch through
+`jr vi15`) at 0.3-1.8% each; a hand translation of those would remove block
+boundaries at most. The hook was reverted (its diff and the native pass are
+kept outside the repository). Not again for straight loops; what is left in
+VU1 is block entries and exits and branchy code, the across-block items above.
