@@ -506,6 +506,8 @@ void Override(u32 address, GuestFunction function, const char* name) {
     for (CachedCall& line : g_call_cache) line = CachedCall{};
 }
 
+bool Overridden(u32 address) { return g_overrides.count(address) != 0; }
+
 void OverrideInOverlay(const char* overlay, u32 address, GuestFunction function, const char* name) {
     g_overlay_overrides[{overlay, address}] = FunctionEntry{address, function, name, 0};
     for (CachedCall& line : g_call_cache) line = CachedCall{};
@@ -645,6 +647,7 @@ u32 LoadElf(const std::string& path, std::vector<u8> data) {
             g_image_end = vaddr + filesz;
         }
     }
+    ApplySdkPatterns(g_image_start, g_image_end);
     return entry;
 }
 

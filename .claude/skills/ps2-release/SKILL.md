@@ -72,10 +72,10 @@ rewriting published history is their decision.
    makes from their disc (`build/port/icon.ico`) is for their own build only.
 4. **Regressions** pass (skill `ps2-port`) and the benchmark has no new late
    frames.
-5. **Package**: `python games/<name>/port/tools/package.py` (the game's own
-   until a second game releases: then copy Burnout 3's
-   (burnout3-pc), and the second release moves the common part into
-   `engine/tools/`) writes
+5. **Package**: `python engine/tools/package.py --game games/<name>` (the
+   game's own bits from game.json: `title`, `version`, and `release` - the
+   zip's name and extra player files such as a texture pack folder's README)
+   writes
    `build/release/<Name>-PC-<version>-windows-x64.zip` - the executable, the
    player's README (`port/release/README.txt`: what is needed, getting started,
    controls, settings, the files beside the executable, known issues, the

@@ -160,6 +160,13 @@ std::atomic<bool>& StopRequested();
 
 /* SDK library routines the host implements, applied by name (sdk.cpp). */
 void ApplySdkOverrides(const FunctionEntry* table, std::size_t count);
+/* ...and those found by their instructions in the executable (its bytes,
+   loaded at start..end): applied as it is loaded, where the game's port has
+   no override of its own. */
+void ApplySdkPatterns(u32 start, u32 end);
+/* Whether an override (the host's or the game's) replaces the function at
+   `address`. */
+bool Overridden(u32 address);
 
 /* The EE kernel: lifted::Syscall's implementation (kernel.cpp). */
 void KernelSyscall(lifted::Context& c);
