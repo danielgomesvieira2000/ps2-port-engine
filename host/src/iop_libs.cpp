@@ -518,8 +518,24 @@ Outcome SignalSema(Vm& vm, Context& c) {
         waiter->second.c.r[2] = KE_OK;
         vm.MakeReady(waiter->second);
         woke = true;
+        s.taker = id;
+        s.taker_ra = waiter->second.c.pc;
+        s.taken_us = vm.NowUs();
     }
     if (!woke && (s.count < s.max || s.max <= 0)) ++s.count;
+    s.giver = vm.in_interrupt ? 0 : vm.current;
+    s.giver_ra = c.r[31];
+    s.given_us = vm.NowUs();
+    // PS2HOST_SEMA_TRACE=<id>: each signal of that semaphore - by whom, from
+    // where, whether it woke a waiter - to find what gives it.
+    static const long trace_id = std::getenv("PS2HOST_SEMA_TRACE") ? std::atol(std::getenv("PS2HOST_SEMA_TRACE")) : -1;
+    if (long(found->first) == trace_id) {
+        static std::map<std::pair<u32, u32>, u64> seen;
+        const u64 n = ++seen[{s.giver, s.giver_ra}];
+        if (n <= 3 || (n & (n - 1)) == 0)
+            std::fprintf(stderr, "[sema] %u given by thread %u at 0x%08X (%s), %llu times so far\n", unsigned(found->first),
+                         unsigned(s.giver), s.giver_ra, woke ? "woke its waiter" : "counted", (unsigned long long)n);
+    }
     Return(c, KE_OK);
     return vm.reschedule && !vm.in_interrupt ? Outcome::Yield : Outcome::Return;
 }
@@ -530,6 +546,9 @@ Outcome WaitSema(Vm& vm, Context& c) {
     Semaphore& s = found->second;
     if (s.count > 0) {
         --s.count;
+        s.taker = vm.current;
+        s.taker_ra = c.r[31];
+        s.taken_us = vm.NowUs();
         return Ret(c, KE_OK);
     }
     if (!vm.Block(c, Wait::Sema, found->first)) return Ret(c, u32(KE_CAN_NOT_WAIT));
@@ -542,6 +561,9 @@ Outcome PollSema(Vm& vm, Context& c) {
     if (found == vm.semaphores.end()) return Ret(c, u32(KE_UNKNOWN_SEMID));
     if (found->second.count <= 0) return Ret(c, u32(KE_SEMA_ZERO));
     --found->second.count;
+    found->second.taker = vm.current;
+    found->second.taker_ra = c.r[31];
+    found->second.taken_us = vm.NowUs();
     return Ret(c, KE_OK);
 }
 

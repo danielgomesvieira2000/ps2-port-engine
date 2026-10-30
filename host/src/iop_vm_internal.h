@@ -66,6 +66,11 @@ struct Semaphore {
     s32 count = 0, max = 0;
     u32 attr = 0;
     std::deque<u32> waiting;        // thread ids
+    // The last to take it (PollSema, WaitSema, or woken by a signal) and to
+    // give it (SignalSema; thread 0: an interrupt's), where (the caller's
+    // return address) and when: for a lock never given back (#16), who has it.
+    u32 taker = 0, taker_ra = 0, giver = 0, giver_ra = 0;
+    u64 taken_us = 0, given_us = 0;
 };
 
 struct EventFlag {

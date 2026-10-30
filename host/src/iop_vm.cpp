@@ -752,13 +752,19 @@ std::string Report() {
                                   "sleeping", "delayed", "dormant", "serving RPC",
                                   "waiting on a message box"};
     for (auto& [id, t] : vm.threads) {
-        char line[224];
+        char line[384];
         int n = std::snprintf(line, sizeof line, "  IOP thread %u: %s, priority %d, entry 0x%08X, at 0x%08X",
                               id, t.ready ? "ready" : waits[int(t.wait)], t.priority, t.entry, t.c.pc);
         const auto sema = vm.semaphores.find(t.object);
-        if (!t.ready && t.wait == Wait::Sema && sema != vm.semaphores.end())
-            n += std::snprintf(line + n, sizeof line - n, " (semaphore %u: count %d, %zu queued)", unsigned(t.object),
-                               int(sema->second.count), sema->second.waiting.size());
+        if (!t.ready && t.wait == Wait::Sema && sema != vm.semaphores.end()) {
+            const Semaphore& m = sema->second;
+            const u64 now = vm.NowUs();
+            n += std::snprintf(line + n, sizeof line - n, " (semaphore %u: count %d, %zu queued; taken by thread %u at "
+                               "0x%08X %.1f s ago, given by %u at 0x%08X %.1f s ago)", unsigned(t.object), int(m.count),
+                               m.waiting.size(), unsigned(m.taker), m.taker_ra,
+                               m.taken_us ? double(now - m.taken_us) / 1e6 : -1.0, unsigned(m.giver), m.giver_ra,
+                               m.given_us ? double(now - m.given_us) / 1e6 : -1.0);
+        }
         if (t.interrupts_off) n += std::snprintf(line + n, sizeof line - n, ", interrupts off");
         std::snprintf(line + n, sizeof line - n, "\n");
         out += line;
