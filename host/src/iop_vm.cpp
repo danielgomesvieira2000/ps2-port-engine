@@ -714,7 +714,11 @@ int WakeLongWaiters(u32 pc, u64 us) {
     Vm& vm = TheVm();
     const u64 now = vm.NowUs();
     int woken = 0;
+    static const bool debug = std::getenv("PS2HOST_WAKE_DEBUG") != nullptr;
     for (auto& [id, t] : vm.threads) {
+        if (debug && !t.ready)
+            std::fprintf(stderr, "[wake] thread %u: wait %d pc 0x%08X ra 0x%08X blocked %.1f s (looking for 0x%08X, %.1f s)\n",
+                         unsigned(id), int(t.wait), t.c.pc, t.c.r[31], double(now - t.blocked_us) / 1e6, pc, double(us) / 1e6);
         if (t.ready || t.wait != Wait::Sema || t.c.pc != pc || now - t.blocked_us < us) continue;
         auto sema = vm.semaphores.find(t.object);
         if (sema != vm.semaphores.end()) {

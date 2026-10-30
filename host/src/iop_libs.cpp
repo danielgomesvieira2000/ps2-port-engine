@@ -486,6 +486,25 @@ Outcome SignalSema(Vm& vm, Context& c) {
     auto found = vm.semaphores.find(A(vm, c, 0));
     if (found == vm.semaphores.end()) return Ret(c, u32(KE_UNKNOWN_SEMID));
     Semaphore& s = found->second;
+    // PS2HOST_IOP_LOSE_WAKE=<pc, hex> (a test's): once, after
+    // PS2HOST_IOP_LOSE_AFTER_US (20 s), a signal for a thread waiting there
+    // is lost - neither wakes it nor counts - as #16's lost wake-up did, to
+    // try what is meant to recover from one (a game's watchdog).
+    static const u32 lose_pc = std::getenv("PS2HOST_IOP_LOSE_WAKE")
+                                   ? u32(std::strtoul(std::getenv("PS2HOST_IOP_LOSE_WAKE"), nullptr, 16)) : 0;
+    if (lose_pc && !s.waiting.empty()) {
+        static bool lost = false;
+        static const u64 after = std::getenv("PS2HOST_IOP_LOSE_AFTER_US")
+                                     ? std::strtoull(std::getenv("PS2HOST_IOP_LOSE_AFTER_US"), nullptr, 10) : 20'000'000ull;
+        auto waiter = vm.threads.find(s.waiting.front());
+        if (!lost && vm.NowUs() >= after && waiter != vm.threads.end() && waiter->second.c.pc == lose_pc) {
+            lost = true;
+            std::fprintf(stderr, "[iop] a signal to semaphore %u lost on purpose (PS2HOST_IOP_LOSE_WAKE): thread %u waits on\n",
+                         unsigned(found->first), unsigned(waiter->first));
+            Return(c, KE_OK);
+            return Outcome::Return;
+        }
+    }
     // The first queued that still waits here (one no longer - terminated,
     // deleted - is dropped, not given the count: LeaveWaitQueue).
     bool woke = false;
