@@ -1,0 +1,176 @@
+# Graphics backends roadmap: Vulkan 1.2, then DirectX 11 (and maybe 12)
+
+Written 2026-10-30, after issue #24 (burnout3-pc): a player whose GPU has no Vulkan 1.3 driver. Today the engine draws on the GPU only with Vulkan 1.3. Without it, the window falls back to GDI and the GS is drawn on the CPU, which is too slow on a weak PC.
+
+The goal is that every PC able to run the game's CPU side also draws on its GPU, in this order: **Vulkan 1.3 → Vulkan 1.2 → Direct3D 11 → software GS + GDI**.
+
+## Where we start (checked in code)
+
+**What we ask for today:**
+- `gpu.cpp` skips devices below 1.3.
+- `vulkan_display.cpp` did not, until engine 5414705: it now skips them, names them in the log and falls back to GDI.
+- Both create the device with `VkPhysicalDeviceVulkan13Features`: `dynamicRendering` and `synchronization2`.
+
+**What we use from Vulkan 1.3:**
+
+| Feature | Where | 1.2 equivalent |
+|---|---|---|
+| Dynamic rendering | `gs_renderer.cpp`: 4 `vkCmdBeginRendering` sites (the deferred pass, `DepthIn`, the DATE pass, the draw pass) and 3 pipeline kinds created with `VkPipelineRenderingCreateInfo` (`gs_renderer.cpp:1633`, `:2369`, `:2433`). Deferred passes are recorded into secondary command buffers. | The `VK_KHR_dynamic_rendering` extension, or classic `VkRenderPass` + `VkFramebuffer` |
+| Extended dynamic state | Depth test/write/compare, stencil test/op/masks/reference, vertex stride (`gs_renderer.cpp:2360-2364`) | The `VK_EXT_extended_dynamic_state` extension (same functions, `EXT` names) |
+| `synchronization2` | Enabled, but never called (no `*2` barrier or submit) | Drop it |
+| SPIR-V 1.6 | Every shader is built with `--target-env vulkan1.3` (`gpu/CMakeLists.txt:70-127`) | `vulkan1.2` (SPIR-V 1.5) |
+
+**Already optional:**
+- dual-source blending
+- logic op (FBMSK: there is a fallback path when it's missing)
+- BC textures
+- anisotropy
+- `load_store_op_none`
+- NVIDIA low latency
+
+**Also noted under validation** (2026-10-30): the shaders use `DemoteToHelperInvocation` without the device enabling `shaderDemoteToHelperInvocation`. The SPIR-V 1.5 build of phase V2 removes it.
+
+**The API-neutral seams:**
+- `ps2gpu::GsRenderer` (`gs_renderer.h`) is what the host draws through.
+- `ps2gpu::Display` (`display.h`) is the window, presentation, pacing and input.
+- `ps2gpu::Gpu` is the shared device.
+- `threaded_renderer.cpp` makes no Vulkan calls.
+- The Vulkan parts are `gs_renderer.cpp` (4,000 lines), `vulkan_display.cpp` (2,600 lines: SDL window, input and swapchain together), `effects.cpp` and `gpu.cpp`.
+- 17 GLSL shaders, about 2,100 lines.
+
+## Which GPUs each step reaches (Windows)
+
+| GPU | Best driver | Today | After Vulkan 1.2 | After D3D11 |
+|---|---|---|---|---|
+| NVIDIA Maxwell and later (GTX 900+), AMD Polaris and later (RX 400+), Intel HD 500+ (Skylake+) | Vulkan 1.3 | GPU | GPU | GPU |
+| NVIDIA Kepler (GTX 600/700) | Vulkan 1.2 (R470), D3D11/12 | CPU | **GPU** (needs V3 if the driver lacks dynamic rendering) | GPU |
+| AMD GCN 1-3 (HD 7000, R7/R9 200-300, Fury) | Vulkan 1.2 (21.5/22.6.1), D3D11/12 | CPU | **GPU** (as Kepler) | GPU |
+| Intel HD 4000/4600, Iris (Ivy Bridge, Haswell, Broadwell) | **no Vulkan on Windows**, D3D11 | CPU | CPU | **GPU** |
+| Older DX10-class GPUs | D3D10/11 at feature level 10 | CPU | CPU | out of scope (no compute shaders at level 10) |
+
+Which driver versions carry `VK_KHR_dynamic_rendering` on Kepler and GCN 1-3 is **not verified**. V3 makes the answer not matter. A player's `burnout3.log` from 5414705 on names the GPU and its Vulkan version.
+
+## Part 1: Vulkan 1.2
+
+### V1. A 1.2 device (about 2 h)
+- **One device-creation routine** for `gpu.cpp` and `vulkan_display.cpp`, which today duplicate it.
+- **Which devices are accepted:** `apiVersion >= 1.2` with `VK_EXT_extended_dynamic_state`.
+- **What is enabled:**
+  - on 1.3: what we enable today, minus `synchronization2`;
+  - on 1.2: `VK_KHR_dynamic_rendering` (when offered), `VK_EXT_extended_dynamic_state`, `VK_KHR_create_renderpass2` if V3 uses it, each with its feature struct.
+- **On a 1.2 device, point the core function pointers volk declares at the extension versions:**
+  - `vkCmdBeginRendering` and `vkCmdEndRendering` at their `KHR` versions;
+  - `vkCmdSetStencilOp` and the other dynamic-state calls at their `EXT` versions.
+
+  The structures are the same (the `KHR` ones are aliases), so the renderer's code stays as it is.
+- **Logs:** the log says which path is in use: `Vulkan 1.3`, `Vulkan 1.2 + dynamic rendering` or `Vulkan 1.2, render passes`.
+- **Test switch:** `PS2HOST_VK_LEGACY=1|2` forces the 1.2 path (1 = with the extension, 2 = render passes) on a 1.3 GPU. The real driver then runs exactly what a 1.2 one would be asked for.
+
+### V2. Shaders for SPIR-V 1.5 (about 1 h)
+- Every shader built with `--target-env vulkan1.2`. One set for all devices: two sets would double the pipeline cache and the tests.
+- `discard` becomes `OpKill` rather than 1.3's terminate or demote. The pixels should be the same, but the regressions decide.
+- This also clears the `DemoteToHelperInvocation` validation error.
+
+### V3. Render passes where dynamic rendering is missing (about 3-4 h)
+- **`BeginPass` and `EndPass` helpers** replace the four `vkCmdBeginRendering` sites. They begin dynamic rendering, or a render pass with its framebuffer.
+- **Render pass cache:** keyed by attachments (colour+depth, depth only), load ops (`LOAD` / `CLEAR` / `NONE`) and store ops (`STORE` / `NONE`).
+  - Load and store ops don't affect compatibility. So one *compatible* pass per attachment set serves the pipelines and the deferred secondaries' inheritance.
+  - The initial and final layouts are the attachment's own: the renderer already moves images between layouts itself.
+- **Framebuffer cache:** keyed by image views and extent. A framebuffer is dropped when its image is (where `Image` is destroyed or resized).
+- **Pipelines:** with `renderPass` set instead of `VkPipelineRenderingCreateInfo`. The pipeline cache key gets the path, so a cache made on one path isn't used on the other.
+- **Deferred passes:** secondaries take `VkCommandBufferInheritanceInfo::renderPass` (with `subpass 0`), not `VkCommandBufferInheritanceRenderingInfo`.
+
+### V4. Verification (about 1-2 h)
+1. **GPU regressions in all three modes** (normal, `PS2HOST_VK_LEGACY=1` and `=2`): car_select, race_training, race, crash, road_rage. Every mode must match the recordings picture for picture. Nothing here changes what is drawn.
+2. **The 1.3-only check:**
+   - a run under the Khronos profiles layer, which makes this GPU look like a 1.2 one (`api-version 1.2.175`, `VK_KHR_dynamic_rendering` and `VK_KHR_synchronization2` hidden: `scratchpad/legacy` recipe, 2026-10-30);
+   - the validation layer stacked above the profiles layer, so any leftover 1.3 call or feature is reported.
+3. A hand run with AA off and on, a texture pack, the HUD overlay and splitscreen, in mode 2.
+4. **Android**: the same build on the phone, since Android shares this code.
+5. **A test build for the #24 reporter**, and any Kepler or GCN owner.
+
+**Not in Part 1:** devices without `VK_EXT_extended_dynamic_state`, which means baking those states into pipelines (about 4× the pipeline variants). No Windows GPU in the table needs it. Older Android phones would, so it's a later Android item (V5) if wanted.
+
+## Part 2: DirectX
+
+### Which DirectX first: Direct3D 11
+- **It reaches more GPUs.** Feature level 11_0 covers every GPU in the table, including Haswell's HD 4600, which has no Vulkan.
+- **The drivers are mature everywhere.** Haswell's D3D12 support is weak.
+- **Its two gaps are covered:**
+  - logic ops need integer render targets in D3D11.1, so we use the engine's existing path for GPUs without logic ops;
+  - D3D11 doesn't let us record passes in advance (secondary command buffers), but those passes are a speed-up for phone GPUs and not needed here.
+- **It's the simplest of the three APIs to run right.**
+
+**D3D12 brings no new GPUs on Windows:** every D3D12 GPU also has Vulkan 1.2+ or D3D11. It is a later, optional phase (X6), only if D3D11's per-draw CPU cost measures too high on weak CPUs. Its design is close to Vulkan's (command lists, pipeline state objects, explicit barriers), so it would follow `gs_renderer.cpp` almost one to one.
+
+**Considered and not taken: SDL3's GPU API** (Vulkan, D3D12, Metal behind one interface). It has no D3D11, no dual-source blending and no logic ops. Both blending features carry exactness for us, and D3D11 is the backend #24 needs.
+
+**Design reference:** ico-pc (MIT) has an RHI over Vulkan, D3D12, D3D11 and GL. We take ideas from it, not files (see RENDERER_ROADMAP.md).
+
+### X0. The backend seam (about half a day)
+- **Split `vulkan_display.cpp` in two:**
+  - `window_display.cpp`, shared by every backend: the SDL window, input, controllers, mouse, rumble, triggers, pacing and the refresh timer (about 170 SDL, input and pad references today);
+  - the Vulkan swapchain, `PresentImage`, overlay and AA posts.
+- **The image handle `Display::PresentImage` takes** becomes the backend's own (`std::uint64_t` already: a `VkImage` or an `ID3D11Texture2D*`).
+- **Backend choice:** `renderer=auto|vulkan|d3d11` in `pc_settings.ini`, plus a PC SETTINGS > VIDEO row. `auto` takes the first that works: Vulkan 1.3, Vulkan 1.2, D3D11, GDI. The log names the backend and why the ones before it were passed over.
+- **GDI's software path through D3D11:** a CPU picture uploaded and shown through the D3D11 swapchain, so the CPU fallback gets proper vsync and scaling too.
+
+### X1. Shaders for HLSL (about 1 day)
+- **The build chain:** glslang (SPIR-V, already built) → SPIRV-Cross (vendored like glslang, MIT/Apache-2.0) → HLSL → FXC (`d3dcompiler_47.dll`, part of Windows) at shader model 5.0 → bytecode built into the exe like the SPIR-V today.
+- **Mappings to settle:**
+  - 12 push-constant blocks become constant buffers;
+  - specialisation constants (`gs.frag`, `gs_address.glsl`, `swizzle.comp`) become `#define` variants compiled per value;
+  - `imageLoad`/`imageStore` become `RWTexture2D` (a typed UAV load needs `R32_UINT` on feature level 11_0: check each format);
+  - atomics (`swizzle.comp`) become `Interlocked*`;
+  - the dual-source output becomes `SV_Target1`;
+  - `texelFetch` becomes `Load`.
+- **Exit:** all 17 shaders, in all their variants, compile at build time.
+
+### X2. D3D11 presentation (about 1 day)
+- **Swapchain:** a flip-model swapchain with its waitable object, for pacing like the Vulkan present thread. VRR through `ALLOW_TEARING`, fullscreen, vsync.
+- **The window's extras:** FXAA, SMAA and SSAA as compute passes (the same shaders), the overlay, captures (F12).
+- **Exit:** the menus shown through D3D11 with the software GS.
+
+### X3. D3D11 GS renderer (about 3-5 days)
+A `D3D11GsRenderer` behind `GsRenderer`, ported part by part from `gs_renderer.cpp`.
+
+**The ported parts:**
+1. **GS local memory:** a 4 MB raw buffer read and written by the compute shaders `swizzle`, `decode`, `shuffle` and `patch`.
+2. **Targets and depth:**
+   - colour is RGBA8;
+   - depth is `D32_FLOAT_S8X24_UINT`, read through `R32_FLOAT_X8X24_TYPELESS` views;
+   - feedback copies use `CopySubresourceRegion`.
+3. **State:** blend, depth-stencil and raster state objects cached by the same keys as today's pipelines. D3D11 builds shaders and state separately, so there is no pipeline building and no first-start wait (#29 can't happen on this path).
+4. **Draws:** dynamic vertex buffers, `DrawTriangleRun`'s batching kept as it is.
+5. **Read-backs** (`MemoryRead`, `TargetToMemory`) through staging buffers, mapped once a GPU query says the copy is done.
+6. **Texture packs:** BC formats are native, anisotropy too.
+7. **`effects.cpp`'s passes** (AO, bloom, blur, grade) as compute.
+
+The steps run in that order, each checked with `--gs-replay` on the recorded captures before the next.
+
+### X4. D3D11 verification (about 1 day)
+- **The same GPU regressions with `renderer=d3d11`.** Byte-for-byte equality with Vulkan is the aim. Where the rasterisers or the samplers' rounding legitimately differ, it is recorded as its own `.d3d11.crc` set, after looking at each difference (`framediff.py`).
+- **Speed:** the race benchmark on the Intel UHD and the RTX 4070 against Vulkan, and real-time 60/120 with frame times.
+- **A test build** for the #24 reporter and any owner of an old Intel chip.
+
+### X5. Release
+README and release notes: the backends, `renderer=` and what `auto` picks.
+
+### X6 (optional). D3D12
+Only if X4 shows D3D11's CPU cost hurting weak CPUs. It would be a port of the Vulkan renderer: root constants for push constants, PSOs with a disk cache, explicit barriers. About 3-5 days.
+
+## Order and size
+
+| Step | What | Size | Releasable alone |
+|---|---|---|---|
+| done | 5414705: old Vulkan GPUs skipped and named, GDI fallback | - | yes |
+| V1-V4 | Vulkan 1.2 | ~1 day | yes (0.7.4) |
+| X0-X1 | Backend seam, shaders to HLSL | ~1.5 days | no (no player change; X0 lands with X2) |
+| X2-X4 | D3D11 presentation, renderer, verification | ~5-7 days | yes |
+| X6 | D3D12 | ~3-5 days | optional |
+
+**Risks:**
+- **Exactness on D3D11:** the rasterisers' top-left rule is the same, but sampler and blend rounding may differ. X4 decides how the regressions handle it.
+- **Typed UAV loads on feature level 11_0:** X1 may need `R32_UINT` views with packing done in the shader.
+- **Kepler and GCN 1-3 drivers are old and could have bugs of their own.** That's the reason for test builds before releasing.
+- **An abstraction tax on the Vulkan path:** X0 must keep the present thread and pacing exactly as they are. The Vulkan regressions plus the frame-time benchmark guard it.
