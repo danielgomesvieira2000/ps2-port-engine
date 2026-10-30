@@ -150,6 +150,19 @@ inline u32 LerpU(u32 a, u32 b, float) {
 float AsFloat(u32 w) { float f; std::memcpy(&f, &w, 4); return f; }
 u32 AsWord(float f) { u32 w; std::memcpy(&w, &f, 4); return w; }
 
+/* A screen coordinate (1/16 pixels) between two, through the projection:
+   (c - centre) * w blended with w, then divided again. */
+u32 Projected(u32 a, u32 b, double centre, double wa, double wb, double wm, float t) {
+    const double ua = (double(a) - centre) * wa, ub = (double(b) - centre) * wb;
+    return u32(std::lround(std::clamp(centre + (ua + (ub - ua) * t) / wm, 0.0, 65535.0)));
+}
+/* Z, affine in Q: where the blended Q falls between the two's (linear in
+   time where the Qs are the same). */
+double AlongQ(u32 a, u32 b, double qa, double qb, double qm, float t, u32 most) {
+    const double k = std::fabs(qb - qa) > 1e-12 * std::max(qa, qb) ? (qm - qa) / (qb - qa) : double(t);
+    return std::clamp(std::round(double(a) + (double(b) - double(a)) * k), 0.0, double(most));
+}
+
 /* The affine map of the screen taking `from` to `to` (least squares, about
    the means): to = m * (from - mf) + mt. A translation where the points are
    too few or in a line. */
@@ -210,7 +223,8 @@ int BlendPacked(const u32* a, const u32* b, u32* to, const Packet& p, float t, c
         const float dy = std::fabs(float(x[1] & 0xFFFF) - float(y[1] & 0xFFFF));
         // (Only where it is seen, in one picture or the other: a polygon
         // reaching far off the screen - the road under the camera - swings
-        // its far corners by thousands of pixels as it nears the camera.)
+        // its far corners by thousands of pixels as it nears the camera;
+        // blended through its 1/w below, they come out right.)
         if ((dx > limit || dy > limit) && (shown(x) || shown(y))) return kJumped;
         ++count;
     }
@@ -240,32 +254,90 @@ int BlendPacked(const u32* a, const u32* b, u32* to, const Packet& p, float t, c
         }
     }
     *vertices = count;
+    // In perspective where the vertex has its Q (ST's third: 1/w): screen
+    // positions are not linear in time - a corner near the camera swings far
+    // as its w nears 0, and its edge, blended on the screen, became a thin
+    // line across it. Blended as the projection's own (homogeneous) values -
+    // (x - centre) * w and w, then divided - they are, for things moving
+    // steadily before the camera; S and T kept per the vertex's s = S/Q and
+    // put on the blended Q; Z (affine in Q) taken along with Q.
+    int st = -1;
+    for (u32 r = 0; r < nreg; ++r)
+        if (regs[r] == 2) st = int(r);
+    const double cx = (double(o.window[0]) + double(o.window[2])) / 2, cy = (double(o.window[1]) + double(o.window[3])) / 2;
+    bool persp = false;
+    double wa = 0, wb = 0, wm = 0, qa = 0, qb = 0, qm = 0;
+    const u32* const window = o.window;
     for (u32 q = 0; q < nloop * nreg; ++q) {
         const u32 reg = regs[q % nreg];
+        if (q % nreg == 0) {                // a vertex's registers begin: its Q, both pictures'
+            persp = false;
+            if (st >= 0) {
+                qa = AsFloat(a[4 + 4 * (q + u32(st)) + 2]);
+                qb = AsFloat(b[4 + 4 * (q + u32(st)) + 2]);
+                persp = qa > 1e-9 && qb > 1e-9 && qa < 1e9 && qb < 1e9;
+                if (persp) {
+                    wa = 1.0 / qa;
+                    wb = 1.0 / qb;
+                    wm = wa + (wb - wa) * t;
+                    qm = 1.0 / wm;
+                }
+            }
+        }
         const u32* x = a + 4 + 4 * q;
         const u32* y = b + 4 + 4 * q;
         u32* o = to + 4 + 4 * q;
+        // Off the screen in both, but on its other side, in front of the
+        // camera both times (behind it, the projection itself throws a vertex
+        // over - the road under the car): another vertex of a strip in that
+        // place (a road's line reaching far both ways, its far ends swapped).
+        // Blended, it crossed the screen as a thin line; it stays the newer's.
+        if (IsXyz(reg) && st >= 0 && AsFloat(a[4 + 4 * (q - q % nreg + u32(st)) + 2]) > 0.0f &&
+            AsFloat(b[4 + 4 * (q - q % nreg + u32(st)) + 2]) > 0.0f) {
+            const u32 ax = x[0] & 0xFFFF, ay = x[1] & 0xFFFF, bx = y[0] & 0xFFFF, by = y[1] & 0xFFFF;
+            if ((ax < window[0] && bx > window[2]) || (ax > window[2] && bx < window[0]) ||
+                (ay < window[1] && by > window[3]) || (ay > window[3] && by < window[1]))
+                continue;                   // (`to` holds the newer's)
+        }
         switch (reg) {
             case 1:             // RGBAQ: each byte
                 for (int i = 0; i < 4; ++i) o[i] = (y[i] & ~0xFFu) | LerpU(x[i] & 0xFF, y[i] & 0xFF, t);
                 break;
             case 2:             // ST (and Q)
-                for (int i = 0; i < 3; ++i) o[i] = AsWord(Lerp(AsFloat(x[i]), AsFloat(y[i]), t));
+                if (persp) {
+                    o[0] = AsWord(float(double(AsFloat(y[0])) / qb * qm));
+                    o[1] = AsWord(float(double(AsFloat(y[1])) / qb * qm));
+                    o[2] = AsWord(float(qm));
+                } else {
+                    for (int i = 0; i < 3; ++i) o[i] = AsWord(Lerp(AsFloat(x[i]), AsFloat(y[i]), t));
+                }
                 break;
             case 3:             // UV: 14 bits each
                 o[0] = (y[0] & ~0x3FFFu) | LerpU(x[0] & 0x3FFF, y[0] & 0x3FFF, t);
                 o[1] = (y[1] & ~0x3FFFu) | LerpU(x[1] & 0x3FFF, y[1] & 0x3FFF, t);
                 break;
             case 4: case 0xC:   // XYZF: x, y 16 bits, z 24 (<<4), f 8 (<<4 of the fourth)
-                o[0] = (y[0] & ~0xFFFFu) | LerpU(x[0] & 0xFFFF, y[0] & 0xFFFF, t);
-                o[1] = (y[1] & ~0xFFFFu) | LerpU(x[1] & 0xFFFF, y[1] & 0xFFFF, t);
-                o[2] = (y[2] & ~0xFFFFFF0u) | LerpU((x[2] >> 4) & 0xFFFFFF, (y[2] >> 4) & 0xFFFFFF, t) << 4;
+                if (persp) {
+                    o[0] = (y[0] & ~0xFFFFu) | Projected(x[0] & 0xFFFF, y[0] & 0xFFFF, cx, wa, wb, wm, t);
+                    o[1] = (y[1] & ~0xFFFFu) | Projected(x[1] & 0xFFFF, y[1] & 0xFFFF, cy, wa, wb, wm, t);
+                    o[2] = (y[2] & ~0xFFFFFF0u) | u32(AlongQ((x[2] >> 4) & 0xFFFFFF, (y[2] >> 4) & 0xFFFFFF, qa, qb, qm, t, 0xFFFFFF)) << 4;
+                } else {
+                    o[0] = (y[0] & ~0xFFFFu) | LerpU(x[0] & 0xFFFF, y[0] & 0xFFFF, t);
+                    o[1] = (y[1] & ~0xFFFFu) | LerpU(x[1] & 0xFFFF, y[1] & 0xFFFF, t);
+                    o[2] = (y[2] & ~0xFFFFFF0u) | LerpU((x[2] >> 4) & 0xFFFFFF, (y[2] >> 4) & 0xFFFFFF, t) << 4;
+                }
                 o[3] = (y[3] & ~0xFF0u) | LerpU((x[3] >> 4) & 0xFF, (y[3] >> 4) & 0xFF, t) << 4;
                 break;
             case 5: case 0xD:   // XYZ: x, y 16 bits, z 32
-                o[0] = (y[0] & ~0xFFFFu) | LerpU(x[0] & 0xFFFF, y[0] & 0xFFFF, t);
-                o[1] = (y[1] & ~0xFFFFu) | LerpU(x[1] & 0xFFFF, y[1] & 0xFFFF, t);
-                o[2] = LerpU(x[2], y[2], t);
+                if (persp) {
+                    o[0] = (y[0] & ~0xFFFFu) | Projected(x[0] & 0xFFFF, y[0] & 0xFFFF, cx, wa, wb, wm, t);
+                    o[1] = (y[1] & ~0xFFFFu) | Projected(x[1] & 0xFFFF, y[1] & 0xFFFF, cy, wa, wb, wm, t);
+                    o[2] = u32(AlongQ(x[2], y[2], qa, qb, qm, t, 0xFFFFFFFFu));
+                } else {
+                    o[0] = (y[0] & ~0xFFFFu) | LerpU(x[0] & 0xFFFF, y[0] & 0xFFFF, t);
+                    o[1] = (y[1] & ~0xFFFFu) | LerpU(x[1] & 0xFFFF, y[1] & 0xFFFF, t);
+                    o[2] = LerpU(x[2], y[2], t);
+                }
                 break;
             case 0xA:           // FOG: 8 bits (<<4 of the fourth)
                 o[3] = (y[3] & ~0xFF0u) | LerpU((x[3] >> 4) & 0xFF, (y[3] >> 4) & 0xFF, t) << 4;
