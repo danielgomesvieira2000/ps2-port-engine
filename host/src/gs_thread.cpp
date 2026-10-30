@@ -304,6 +304,7 @@ Feed& TheBack() {
 u64 Value(const u32* at) { return u64(at[0]) | u64(at[1]) << 32; }
 
 void FrameEnd(const u32* e) {
+    gs::TheGs().RecordBlank();          // (a capture's replay.bin: the frames apart)
     if (!g_frame_handler) return;
     const u64 frame = Value(e + 1);
     const u64 took = g_hitch ? ClockNs() : 0;
