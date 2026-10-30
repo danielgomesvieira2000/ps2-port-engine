@@ -285,6 +285,21 @@ void Points(const u32* words, const Packet& p, std::vector<std::pair<double, dou
             out.push_back({double(words[4 + 4 * q] & 0xFFFF), double(words[4 + 4 * q + 1] & 0xFFFF)});
 }
 
+/* A packet's vertices' box on the screen (1/16 pixels). */
+struct Box {
+    double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
+};
+Box BoxOf(const u32* words, const Packet& p) {
+    std::vector<std::pair<double, double>> points;
+    Points(words, p, points);
+    Box b;
+    for (const auto& [x, y] : points) {
+        b.x0 = std::min(b.x0, x); b.x1 = std::max(b.x1, x);
+        b.y0 = std::min(b.y0, y); b.y1 = std::max(b.y1, y);
+    }
+    return b;
+}
+
 /* `to` (an unmatched packet, the newer's copy) moved back `t` of the way
    along the screen motion of its neighbour (older `na`, newer `nb`). */
 bool Carry(const u32* na, const u32* nb, const Packet& n, u32* to, const Packet& p, float t,
@@ -315,6 +330,106 @@ bool Carry(const u32* na, const u32* nb, const Packet& n, u32* to, const Packet&
     return true;
 }
 
+/* BlendGsPictures' last step on a path: the older's unmatched vertex
+   packets moved forward and put into `out` (its words and the 'W' entries
+   that hold them). */
+void Add(const GsPicture& older, const GsPicture& newer, const std::vector<Packet>& a, const std::vector<Packet>& b,
+         const std::vector<std::pair<u32, u32>>& pairs, const std::vector<int>& kinds, int path, float t,
+         const GsBlendOptions& options, GsPicture& out, GsBlendStats& stats) {
+    auto vertices = [](const Packet& p) {
+        if ((u32(p.lo >> 58) & 3) != 0) return false;
+        const u32 nreg = u32(p.lo >> 60) ? u32(p.lo >> 60) : 16;
+        for (u32 r = 0; r < nreg; ++r)
+            if (IsXyz(u32(p.hi >> (4 * r)) & 0xF)) return true;
+        return false;
+    };
+    std::vector<int> partner(a.size(), -1);
+    for (const auto& [i, j] : pairs) partner[i] = int(j);
+    std::vector<u32> run(a.size(), 0);
+    for (std::size_t i = 0, r = 0; i < a.size(); ++i) {
+        run[i] = u32(r);
+        if (!vertices(a[i]) && (u32(a[i].lo >> 58) & 3) != 2) ++r;
+    }
+    struct Insert {
+        u32 at;                 // after the newer's packet ending here (its words' offset)
+        std::size_t after;      // ...which is b[after]
+        std::vector<u32> words;
+    };
+    std::vector<Insert> inserts;
+    const u32* ow = older.paths[path].data();
+    const u32* nw = newer.paths[path].data();
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (partner[i] >= 0 || !vertices(a[i])) continue;
+        const Box mine = BoxOf(ow + a[i].first, a[i]);
+        int near = -1;
+        double best = 1e300;
+        for (std::size_t d = 1; d <= 8; ++d) {
+            for (const std::size_t n : {i - d, i + d}) {
+                if (n >= a.size() || partner[n] < 0 || kinds[partner[n]] != 4 || run[n] != run[i]) continue;
+                const Box theirs = BoxOf(ow + a[n].first, a[n]);
+                const double w = theirs.x1 - theirs.x0, h = theirs.y1 - theirs.y0;
+                if (mine.x0 < theirs.x0 - w || mine.x1 > theirs.x1 + w || mine.y0 < theirs.y0 - h || mine.y1 > theirs.y1 + h)
+                    continue;
+                const double dx = (mine.x0 + mine.x1 - theirs.x0 - theirs.x1) / 2,
+                             dy = (mine.y0 + mine.y1 - theirs.y0 - theirs.y1) / 2;
+                if (dx * dx + dy * dy < best) { best = dx * dx + dy * dy; near = int(n); }
+            }
+        }
+        if (near < 0) continue;
+        // In after the neighbour's newer packet where it came before this one,
+        // else after the packet before that (the same run: no state between).
+        const std::size_t j = std::size_t(partner[near]);
+        std::size_t after;
+        if (std::size_t(near) < i) after = j;
+        else if (j > 0) after = j - 1;
+        else continue;
+        Insert in{b[after].first + b[after].size, after, std::vector<u32>(ow + a[i].first, ow + a[i].first + a[i].size)};
+        // Older to newer: `nb` the older's, `na` the newer's, moved 1 - t back from where it is (the older's).
+        if (!Carry(nw + b[j].first, ow + a[near].first, a[near], in.words.data(), a[i], 1.0f - t, options)) continue;
+        inserts.push_back(std::move(in));
+    }
+    if (inserts.empty()) return;
+    std::stable_sort(inserts.begin(), inserts.end(), [](const Insert& x, const Insert& y) { return x.at < y.at; });
+    // EOP: the packet before an insert's moves to the insert (the last of them).
+    std::vector<u32>& words = out.paths[path];
+    for (std::size_t k = 0; k < inserts.size(); ++k) {
+        const bool last = k + 1 == inserts.size() || inserts[k + 1].at != inserts[k].at;
+        u32& tag = words[b[inserts[k].after].first];
+        if (last && (tag & 0x8000u)) {
+            tag &= ~0x8000u;
+            inserts[k].words[0] |= 0x8000u;
+        } else {
+            inserts[k].words[0] &= ~0x8000u;
+        }
+    }
+    std::vector<u32> merged;
+    merged.reserve(words.size() + 1024);
+    std::size_t k = 0;
+    for (u32 at = 0; at <= words.size(); ++at) {
+        while (k < inserts.size() && inserts[k].at == at) {
+            merged.insert(merged.end(), inserts[k].words.begin(), inserts[k].words.end());
+            stats.added += 1;
+            ++k;
+        }
+        if (at < words.size()) merged.push_back(words[at]);
+    }
+    // The entries' words: an insert at `p` belongs to the entry holding the
+    // word before it (first < p <= first + count).
+    auto shift = [&inserts](u32 offset) {
+        std::size_t n = 0;
+        for (const Insert& in : inserts)
+            if (in.at <= offset) n += in.words.size();
+        return u32(offset + n);
+    };
+    for (GsPicture::Entry& e : out.entries) {
+        if (e.kind != 'W' || e.path != path + 1) continue;
+        const u32 first = e.first == 0 ? 0 : shift(e.first), end = shift(e.first + e.count);
+        e.first = first;
+        e.count = end - first;
+    }
+    words.swap(merged);
+}
+
 }  // namespace
 
 GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, float t, GsPicture& out,
@@ -339,7 +454,8 @@ GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, flo
         // PS2HOST_BLEND_HIDE (a test's): packets of these kinds drawn as
         // nothing (every vertex at the first's) - 1 not matched, 2 jumped,
         // 4 blended, 8 the same in both, 16 carried (no match, moved as a
-        // neighbour moved).
+        // neighbour moved), 64 snapped (its thing the newer's whole); 32: the older's
+        // with no match not added.
         static const int hide = std::getenv("PS2HOST_BLEND_HIDE") ? std::atoi(std::getenv("PS2HOST_BLEND_HIDE")) : 0;
         auto collapse = [&](const Packet& p) {
             if ((u32(p.lo >> 58) & 3) != 0) return;
@@ -355,6 +471,9 @@ GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, flo
         std::vector<int> match(b.size(), -1);
         for (const auto& [i, j] : pairs) match[j] = int(i);
         std::vector<int> kinds(b.size(), 0);
+        std::vector<u32> xyzs(b.size(), 0);
+        std::vector<u32> run(b.size(), 0);      // which run of vertex packets between state packets
+        u32 runs = 0;
         for (std::size_t j = 0; j < b.size(); ++j) {
             const Packet& p = b[j];
             const u32 flg = u32(p.lo >> 58) & 3;
@@ -365,7 +484,11 @@ GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, flo
             const u32* y = newer.paths[path].data() + p.first;
             const u32* x = match[j] >= 0 ? older.paths[path].data() + a[match[j]].first : nullptr;
             if (x) ++stats.matched;
-            if (!xyz) continue;
+            run[j] = runs;
+            if (!xyz) {
+                if (flg != 2) ++runs;           // a state packet (an IMAGE's data is none)
+                continue;
+            }
             int kind;
             u32 vertices = 0;
             if (!x) kind = 1;
@@ -377,6 +500,32 @@ GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, flo
                 else { ++stats.jumped; stats.jumped_vertices += xyz; kind = 2; }
             }
             kinds[j] = kind;
+            xyzs[j] = xyz;
+        }
+        // A thing that cannot be blended whole is the newer's whole: in a run
+        // of vertex packets under one state (a material of a thing) with
+        // under 70% of its vertices blended or still, none is blended, carried
+        // or added - drawn as the newer picture has it, it steps once; in
+        // pieces, some blended and some not, it tore (a white car coming in
+        // fast at the screen's corner, its panels strewn over the road).
+        {
+            std::vector<u32> total(runs + 1, 0), clean(runs + 1, 0);
+            for (std::size_t j = 0; j < b.size(); ++j) {
+                total[run[j]] += xyzs[j];
+                if (kinds[j] == 4 || kinds[j] == 8) clean[run[j]] += xyzs[j];
+            }
+            // PS2HOST_BLEND_SNAP: the share blended or still, in percent, a thing needs (70:
+            // the pile-up's strays -60% for 10% of its vertices stepping; 90 stepped half).
+            static const u32 need = std::getenv("PS2HOST_BLEND_SNAP") ? u32(std::atoi(std::getenv("PS2HOST_BLEND_SNAP"))) : 70;
+            for (std::size_t j = 0; j < b.size(); ++j) {
+                if (!xyzs[j] || u64(100) * clean[run[j]] >= u64(need) * total[run[j]]) continue;
+                if (kinds[j] == 4) {
+                    std::memcpy(out.paths[path].data() + b[j].first, newer.paths[path].data() + b[j].first, b[j].size * 4);
+                    stats.blended -= xyzs[j];
+                }
+                stats.snapped += xyzs[j];
+                kinds[j] = 64;
+            }
         }
         // A packet with no match - most often a piece VU1's clipper cut
         // anew at the screen's edge, its vertices not the older's - moved
@@ -388,10 +537,28 @@ GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, flo
         // round it (a strip of the crossing's stripes across the road).
         for (std::size_t j = 0; j < b.size(); ++j) {
             if (kinds[j] != 1) continue;
+            // Under the same state (no state packet between: the same
+            // material - carried by another thing's motion, a crossing's
+            // stripe went 40 pixels down the road), the one nearest on the
+            // screen within eight, and only where this one lies within it
+            // widened by its own size: an affine map taken far past the
+            // points it was fitted to is not the perspective's (a piece of
+            // pavement thrown up over the kerb).
+            const Box mine = BoxOf(newer.paths[path].data() + b[j].first, b[j]);
             int near = -1;
-            for (std::size_t d = 1; d <= 4 && near < 0; ++d) {
-                if (j >= d && kinds[j - d] == 4) near = int(j - d);
-                else if (j + d < b.size() && kinds[j + d] == 4) near = int(j + d);
+            double best = 1e300;
+            for (std::size_t d = 1; d <= 8; ++d) {
+                for (const std::size_t n : {j - d, j + d}) {
+                    if (n >= b.size() || kinds[n] != 4 || run[n] != run[j]) continue;      // (j - d wraps past 0)
+                    const Box theirs = BoxOf(newer.paths[path].data() + b[n].first, b[n]);
+                    const double w = theirs.x1 - theirs.x0, h = theirs.y1 - theirs.y0;
+                    if (mine.x0 < theirs.x0 - w || mine.x1 > theirs.x1 + w || mine.y0 < theirs.y0 - h ||
+                        mine.y1 > theirs.y1 + h)
+                        continue;
+                    const double dx = (mine.x0 + mine.x1 - theirs.x0 - theirs.x1) / 2,
+                                 dy = (mine.y0 + mine.y1 - theirs.y0 - theirs.y1) / 2;
+                    if (dx * dx + dy * dy < best) { best = dx * dx + dy * dy; near = int(n); }
+                }
             }
             if (near >= 0 && Carry(older.paths[path].data() + a[match[near]].first,
                                    newer.paths[path].data() + b[near].first, b[near],
@@ -400,6 +567,14 @@ GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, flo
         }
         for (std::size_t j = 0; j < b.size(); ++j)
             if (hide & kinds[j]) collapse(b[j]);
+        // The older's packets with no match drawn too, moved forward `t` of
+        // the way along a blended neighbour's motion (as carried, older to
+        // newer): what goes out of the picture, or VU1's clipper cut anew,
+        // covers its part of the screen still (the camera turning, a strip
+        // along the screen's edge was left with nothing drawn - the glow
+        // behind it showing white). Each goes in after the newer packet its
+        // neighbour's place in the list is (its state the same).
+        if (!(hide & 32)) Add(older, newer, a, b, pairs, kinds, path, t, options, out, stats);
         stats.ms_blend += ms(began);
         for (const Packet& p : b) {
             if ((u32(p.lo >> 58) & 3) != 0) continue;
