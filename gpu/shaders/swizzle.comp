@@ -14,7 +14,18 @@ layout(std430, binding = 1) buffer Linear { uint lin[]; };
 // Compiled a second time with IMAGE: a colour target's pixels straight from
 // and to the image (no copy of it through Linear - at 3x those copies were
 // most of the GPU's time).
+#ifdef WORD_IMAGE
+// (Direct3D 11's: the RGBA8 target viewed as 32-bit words - feature level
+// 11_0 loads no RGBA8 from an unordered-access view - packed as
+// packUnorm4x8 packs.)
+layout(set = 1, binding = 0, r32ui) uniform uimage2D target;
+uint LoadPixel(ivec2 at) { return imageLoad(target, at).x; }
+void StorePixel(ivec2 at, vec4 c) { imageStore(target, at, uvec4(packUnorm4x8(c))); }
+#else
 layout(set = 1, binding = 0, rgba8) uniform image2D target;
+uint LoadPixel(ivec2 at) { return packUnorm4x8(imageLoad(target, at)); }
+void StorePixel(ivec2 at, vec4 c) { imageStore(target, at, c); }
+#endif
 #endif
 #ifdef DEPTH_IMAGE
 // ...and with DEPTH_IMAGE: a depth buffer's Z sampled straight from it, to
@@ -78,7 +89,7 @@ void main() {
     const bool z24 = Format() == PSMCT24 || Format() == PSMZ24;
     if (direction == 1u) {
 #ifdef IMAGE
-        uint v = packUnorm4x8(imageLoad(target, at + ivec2(k / 2u)));
+        uint v = LoadPixel(at + ivec2(k / 2u));
 #elif defined(DEPTH_IMAGE)
         uint v = floatBitsToUint(texelFetch(depth_image, at + ivec2(k / 2u), 0).r);
 #else
@@ -88,7 +99,7 @@ void main() {
         if (Is16()) {
             if(paired) {
 #ifdef IMAGE
-                uint other=packUnorm4x8(imageLoad(target,at+ivec2(8u*k+k/2u,k/2u)));
+                uint other=LoadPixel(at+ivec2(8u*k+k/2u,k/2u));
 #elif defined(DEPTH_IMAGE)
                 uint other=floatBitsToUint(texelFetch(depth_image,at+ivec2(8u*k+k/2u,k/2u),0).r);
 #else
@@ -124,13 +135,13 @@ void main() {
         // Memory differing from the square's middle (what went to memory) in
         // alpha alone: each pixel keeps its colour, takes memory's alpha.
         const bool keep = p.keep_colour == 1u && k > 1u && !Is16() && !z24 &&
-                          ((packUnorm4x8(imageLoad(target, at + ivec2(k / 2u))) ^ value) & 0xFFFFFFu) == 0u;
+                          ((LoadPixel(at + ivec2(k / 2u)) ^ value) & 0xFFFFFFu) == 0u;
         for (uint dy = 0u; dy < k; ++dy)
             for (uint dx = 0u; dx < k; ++dx) {
                 const ivec2 xy = at + ivec2(dx, dy);
                 vec4 c = unpackUnorm4x8(value);
-                if (keep) c = vec4(imageLoad(target, xy).rgb, c.a);
-                imageStore(target, xy, c);
+                if (keep) c = vec4(unpackUnorm4x8(LoadPixel(xy)).rgb, c.a);
+                StorePixel(xy, c);
             }
 #else
         for (uint dy = 0u; dy < k; ++dy)

@@ -77,6 +77,9 @@ struct VkDeviceSetup {
     std::vector<const char*> extensions;
     const char* load_none = nullptr;        // a load_store_op_none extension, if offered
 };
+/* The GS renderer on a D3D11Gpu (d3d11_renderer.cpp). */
+std::unique_ptr<GsRenderer> CreateD3D11GsRenderer(Gpu& gpu, std::string* error);
+
 /* After the device is made: the path taken, and on 1.2 the core names the
    renderer calls pointed at the extensions' entries. */
 void VkUseLegacyFunctions(VkPath path);

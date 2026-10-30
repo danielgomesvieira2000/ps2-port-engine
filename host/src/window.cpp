@@ -3,9 +3,11 @@
  * blank, scaled to the window, and the keyboard the controller reads.
  *
  * With the GPU display built in (PS2HOST_VULKAN, engine/gpu) the window is an
- * SDL3 window presenting through Vulkan; without it, or when no Vulkan device
- * can be had, a plain Win32 window drawn with GDI. Both are pumped on the host's
- * thread at each frame (FrameDone).
+ * SDL3 window presenting through Vulkan, or Direct3D 11 where there is no
+ * Vulkan 1.2 device (or the "renderer" setting asks for it: auto, vulkan,
+ * d3d11; PS2HOST_RENDERER overrides it); without either, a plain Win32 window
+ * drawn with GDI. Each is pumped on the host's thread at each frame
+ * (FrameDone).
  */
 
 #include "ps2host/platform.h"
@@ -313,10 +315,21 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
     for (const wchar_t* p = title; *p; ++p) narrow += char(*p < 128 ? *p : '?');
     if (!GameTitle().empty()) narrow = GameTitle();
     g_title = narrow;
-    std::string error;
-    g_display = ps2gpu::CreateVulkanDisplay(narrow.c_str(), width, height, &error);
+    // The backend: the setting's, else Vulkan, then Direct3D 11 (Windows).
+    std::string want = Setting("renderer", "auto");
+    if (const char* forced = std::getenv("PS2HOST_RENDERER")) want = forced;
+    std::string error, why_not;
+    const char* api = "Vulkan";
+    if (want != "d3d11") g_display = ps2gpu::CreateVulkanDisplay(narrow.c_str(), width, height, &error);
+#ifdef _WIN32
+    if (!g_display && want != "vulkan") {
+        if (want != "d3d11") why_not = " (no Vulkan display: " + error + ")";
+        g_display = ps2gpu::CreateD3D11Display(narrow.c_str(), width, height, &error);
+        api = "Direct3D 11";
+    }
+#endif
     if (g_display) {
-        Note("window", "window: Vulkan on " + g_display->Describe());
+        Note("window", std::string("window: ") + api + " on " + g_display->Describe() + why_not);
         g_display->SetVrr(SettingOn("vrr"));
         g_display->SetGpuBoost(SettingOn("gpu_boost", true));      // (the GPU's clocks kept up)
         g_display->SetKeepRefresh(Setting("frame_rate", "60") == "display" || SettingOn("vrr"));
@@ -350,7 +363,7 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
         g_display->SetAntiAliasing(DisplayAntiAliasing(Setting("antialiasing", "off")));
         return true;
     }
-    Note("window", "window: no Vulkan display (" + error + "); drawing with GDI");
+    Note("window", "window: no GPU display (" + error + ")" + why_not + "; drawing with GDI");
 #endif
     return OpenGdiWindow(title, width, height);
 }

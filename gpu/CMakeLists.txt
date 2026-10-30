@@ -130,10 +130,79 @@ foreach(pass RANGE 0 15)
         COMMENT "glslang effects.comp (pass ${pass})")
     list(APPEND PS2GPU_SHADER_HEADERS ${out})
 endforeach()
+# Direct3D 11's shaders (Windows): the same GLSL, its SPIR-V turned into HLSL
+# by SPIRV-Cross (tools/spirv_to_hlsl.cpp names the registers) and compiled
+# by fxc (the Windows SDK's) at shader model 5.0, embedded as arrays (dxbc_*).
+# A cross build (Android's) has no Direct3D.
+set(PS2GPU_D3D11 OFF)
+if(WIN32 AND NOT PS2_HOST_GLSLANG)
+    find_program(PS2GPU_FXC fxc HINTS "$ENV{WindowsSdkVerBinPath}x64" "$ENV{WindowsSdkBinPath}x64")
+    if(NOT PS2GPU_FXC)
+        file(GLOB PS2GPU_FXC_FOUND "C:/Program Files (x86)/Windows Kits/10/bin/10.*/x64/fxc.exe")
+        if(PS2GPU_FXC_FOUND)
+            list(SORT PS2GPU_FXC_FOUND)
+            list(GET PS2GPU_FXC_FOUND -1 PS2GPU_FXC)
+        endif()
+    endif()
+    if(PS2GPU_FXC)
+        set(PS2GPU_D3D11 ON)
+    else()
+        message(WARNING "no fxc.exe (Windows SDK): Direct3D 11's GS renderer left out")
+    endif()
+endif()
+if(PS2GPU_D3D11)
+    FetchContent_Declare(spirv_cross
+        GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Cross.git
+        GIT_TAG vulkan-sdk-1.4.363.0
+        GIT_SHALLOW TRUE)
+    set(SPIRV_CROSS_CLI OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_MSL OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_CPP OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_REFLECT OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_C_API OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_UTIL OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_SKIP_INSTALL ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(spirv_cross)
+    add_executable(ps2gpu_spirv_to_hlsl ${CMAKE_CURRENT_LIST_DIR}/tools/spirv_to_hlsl.cpp)
+    target_link_libraries(ps2gpu_spirv_to_hlsl PRIVATE spirv-cross-hlsl spirv-cross-glsl spirv-cross-core)
+    # ps2gpu_hlsl(<name> <source> <fxc profile> [glslang -D...]): dxbc_<name> in <name>_dxbc.h.
+    function(ps2gpu_hlsl name source profile)
+        set(spv ${PS2GPU_SHADER_DIR}/${name}.spv)
+        set(hlsl ${PS2GPU_SHADER_DIR}/${name}.hlsl)
+        set(out ${PS2GPU_SHADER_DIR}/${name}_dxbc.h)
+        add_custom_command(OUTPUT ${out}
+            COMMAND ${GLSLANG} -V --target-env vulkan1.2 -DD3D11 ${ARGN}
+                    -I${CMAKE_CURRENT_LIST_DIR}/third_party/smaa -o ${spv} ${CMAKE_CURRENT_LIST_DIR}/shaders/${source}
+            COMMAND ps2gpu_spirv_to_hlsl ${spv} ${hlsl}
+            COMMAND ${PS2GPU_FXC} /nologo /O3 /T ${profile} /E main /Fh ${out} /Vn dxbc_${name} ${hlsl}
+            DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${source} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
+                    ${GLSLANG} ps2gpu_spirv_to_hlsl
+            COMMENT "HLSL ${name} (${source})")
+        set(PS2GPU_SHADER_HEADERS ${PS2GPU_SHADER_HEADERS} ${out} PARENT_SCOPE)
+    endfunction()
+    ps2gpu_hlsl(d3d_gs_vert gs.vert vs_5_0)
+    ps2gpu_hlsl(d3d_gs_frag gs.frag ps_5_0)
+    ps2gpu_hlsl(d3d_gs_frag_single gs.frag ps_5_0 -DSINGLE_OUTPUT)
+    ps2gpu_hlsl(d3d_gs_frag_blend gs.frag ps_5_0 -DSHADER_BLEND)
+    ps2gpu_hlsl(d3d_date_vert date.vert vs_5_0)
+    ps2gpu_hlsl(d3d_date_frag date.frag ps_5_0)
+    ps2gpu_hlsl(d3d_depth_load_frag depth_load.frag ps_5_0)
+    ps2gpu_hlsl(d3d_swizzle swizzle.comp cs_5_0)
+    ps2gpu_hlsl(d3d_swizzle_image swizzle.comp cs_5_0 -DIMAGE -DWORD_IMAGE)
+    ps2gpu_hlsl(d3d_swizzle_depth swizzle.comp cs_5_0 -DDEPTH_IMAGE)
+    ps2gpu_hlsl(d3d_decode decode.comp cs_5_0)
+    ps2gpu_hlsl(d3d_decode_image decode.comp cs_5_0 -DTO_IMAGE)
+    ps2gpu_hlsl(d3d_patch patch.comp cs_5_0)
+endif()
 add_custom_target(ps2gpu_shaders DEPENDS ${PS2GPU_SHADER_HEADERS})
 
 add_library(ps2gpu STATIC
+    ${CMAKE_CURRENT_LIST_DIR}/src/window_display.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/vulkan_display.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/d3d11_gpu.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/d3d11_display.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/d3d11_renderer.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gpu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/vk_device.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gs_renderer.cpp
@@ -144,6 +213,9 @@ target_include_directories(ps2gpu PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include PRIVA
                            ${CMAKE_CURRENT_LIST_DIR}/third_party/smaa)
 target_compile_features(ps2gpu PUBLIC cxx_std_17)
 target_link_libraries(ps2gpu PUBLIC SDL3::SDL3-static PRIVATE volk::volk Vulkan::Headers)
+if(PS2GPU_D3D11)
+    target_compile_definitions(ps2gpu PRIVATE PS2GPU_D3D11=1)
+endif()
 if(MSVC)
     target_compile_options(ps2gpu PRIVATE /W3 /Z7)        # symbols for --sample, as ps2host has
 endif()

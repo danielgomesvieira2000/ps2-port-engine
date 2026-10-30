@@ -38,12 +38,16 @@ void SetGpuWaitObserver(GpuWaitObserver observer);
    the host's profiler sampling it (--sample-renderer). */
 void SetRendererThreadStart(void (*start)());
 
-/* A Vulkan instance and device with one graphics queue (Vulkan 1.3: dynamic
-   rendering). Opaque; created headless. */
+/* A GPU device the GS renderer draws with: a Vulkan instance and device with
+   one graphics queue (Vulkan 1.3, or 1.2 with its extensions), or a Direct3D
+   11 device (a D3D11 display's). Opaque; CreateGpu makes a Vulkan one,
+   headless. */
 class Gpu {
 public:
+    enum class Api { kVulkan, kD3D11 };
     virtual ~Gpu() = default;
     virtual std::string Describe() const = 0;
+    virtual Api api() const { return Api::kVulkan; }
 };
 std::unique_ptr<Gpu> CreateGpu(std::string* error);
 

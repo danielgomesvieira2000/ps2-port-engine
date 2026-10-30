@@ -255,6 +255,9 @@ public:
 /* A window with a Vulkan swapchain; null, with `error` saying why, when there is
    no Vulkan device or window to be had. */
 std::unique_ptr<Display> CreateVulkanDisplay(const char* title, int width, int height, std::string* error);
+/* A window drawn with Direct3D 11 (Windows; feature level 11_0): its device
+   a Gpu of Api::kD3D11 (SharedGpu). Null, with `error`, when there is none. */
+std::unique_ptr<Display> CreateD3D11Display(const char* title, int width, int height, std::string* error);
 
 /* On-screen controls (a touch screen's: Android's activity draws them, over
    the picture) as one more controller, a DualShock 2's: its state as they

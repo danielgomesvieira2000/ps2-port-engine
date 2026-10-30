@@ -4172,6 +4172,7 @@ bool PipelineWarmProgress(std::size_t* made, std::size_t* total) {
 }
 
 std::unique_ptr<GsRenderer> CreateGsRenderer(Gpu& gpu, std::string* error) {
+    if (gpu.api() == Gpu::Api::kD3D11) return CreateD3D11GsRenderer(gpu, error);
     auto renderer = std::make_unique<VulkanGsRenderer>(static_cast<VulkanGpu&>(gpu));
     if (!renderer->Init(error)) return nullptr;
     return renderer;
