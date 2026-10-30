@@ -44,12 +44,22 @@ struct GsBlendStats {
     u32 blended = 0;        // vertices blended
     u32 still = 0;          // vertices in matched packets the same in both
     u32 jumped_vertices = 0;    // vertices in jumped packets
+    u32 carried = 0;        // packets with no match moved as their blended neighbour moved
+    u32 loose = 0;          // matched packets whose vertices' moves are not one motion (carried, or the newer's)
     double ms_copy = 0, ms_align = 0, ms_blend = 0;     // the time: copying the newer, cutting and lining up, blending
+};
+
+struct GsBlendOptions {
+    float jump = 256.0f;    // pixels: a vertex moving further is another thing in its place
+    // Where the screen is, in the GS's coordinates (XYOFFSET's units, 1/16
+    // pixel), with a margin: only a vertex here, in one picture or the
+    // other, can jump. Everywhere, by default.
+    u32 window[4] = {0, 0, 0xFFFF, 0xFFFF};
 };
 
 /* `out`: `newer` with its matched packets' vertex values `t` of the way from
    `older`'s (0: older's, 1: newer's). */
 GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, float t, GsPicture& out,
-                             float jump = 256.0f);
+                             const GsBlendOptions& options = {});
 
 }  // namespace ps2host

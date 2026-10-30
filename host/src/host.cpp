@@ -149,14 +149,24 @@ int GsReplay(const std::string& file, const std::string& out) {
             rebuilt.push_back('V');
         };
         put(pictures[0]);
+        // The screen: XYOFFSET_1 as the replay starts (its 640x448, 64 pixels round).
+        GsBlendOptions options;
+        for (const GsPicture::Entry& e : pictures[0].entries)
+            if (e.kind == 'R' && e.address == 0x18) {
+                const u32 x = u32(e.value & 0xFFFF), y = u32((e.value >> 32) & 0xFFFF);
+                options.window[0] = x > 64 * 16 ? x - 64 * 16 : 0;
+                options.window[1] = y > 64 * 16 ? y - 64 * 16 : 0;
+                options.window[2] = x + (640 + 64) * 16;
+                options.window[3] = y + (448 + 64) * 16;
+            }
         for (std::size_t k = 1; k < pictures.size(); ++k) {
             GsPicture between;
             const auto began = std::chrono::steady_clock::now();
-            const GsBlendStats s = BlendGsPictures(pictures[k - 1], pictures[k], t, between);
+            const GsBlendStats s = BlendGsPictures(pictures[k - 1], pictures[k], t, between, options);
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
             std::fprintf(stderr, "gs-replay: picture %zu made between: %u packets, %u matched (%u jumped), %u of %u vertices "
-                                 "blended (%u still, %u jumped), %.2f ms (copy %.2f, align %.2f, blend %.2f)\n",
-                         k, s.packets, s.matched, s.jumped, s.blended, s.vertices, s.still, s.jumped_vertices, ms,
+                                 "blended (%u still, %u jumped; %u packets carried, %u loose), %.2f ms (copy %.2f, align %.2f, blend %.2f)\n",
+                         k, s.packets, s.matched, s.jumped, s.blended, s.vertices, s.still, s.jumped_vertices, s.carried, s.loose, ms,
                          s.ms_copy, s.ms_align, s.ms_blend);
             put(between);
             put(pictures[k]);

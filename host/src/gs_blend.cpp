@@ -150,24 +150,94 @@ inline u32 LerpU(u32 a, u32 b, float) {
 float AsFloat(u32 w) { float f; std::memcpy(&f, &w, 4); return f; }
 u32 AsWord(float f) { u32 w; std::memcpy(&w, &f, 4); return w; }
 
-/* A matched PACKED packet's vertex values blended into `to` (newer's copy);
-   false where it jumps. */
-bool BlendPacked(const u32* a, const u32* b, u32* to, const Packet& p, float t, float jump, u32* vertices) {
+/* The affine map of the screen taking `from` to `to` (least squares, about
+   the means): to = m * (from - mf) + mt. A translation where the points are
+   too few or in a line. */
+struct Affine {
+    double m00 = 1, m01 = 0, m10 = 0, m11 = 1, fx = 0, fy = 0, tx = 0, ty = 0;
+    void Apply(double x, double y, double* ox, double* oy) const {
+        *ox = tx + m00 * (x - fx) + m01 * (y - fy);
+        *oy = ty + m10 * (x - fx) + m11 * (y - fy);
+    }
+};
+Affine Fit(const std::vector<std::pair<double, double>>& from, const std::vector<std::pair<double, double>>& to) {
+    Affine f;
+    const double count = double(from.size());
+    for (std::size_t i = 0; i < from.size(); ++i) {
+        f.fx += from[i].first; f.fy += from[i].second; f.tx += to[i].first; f.ty += to[i].second;
+    }
+    f.fx /= count; f.fy /= count; f.tx /= count; f.ty /= count;
+    double sxx = 0, sxy = 0, syy = 0, bxx = 0, bxy = 0, byx = 0, byy = 0;
+    for (std::size_t i = 0; i < from.size(); ++i) {
+        const double x = from[i].first - f.fx, y = from[i].second - f.fy;
+        const double u = to[i].first - f.tx, v = to[i].second - f.ty;
+        sxx += x * x; sxy += x * y; syy += y * y;
+        bxx += x * u; bxy += y * u; byx += x * v; byy += y * v;
+    }
+    const double det = sxx * syy - sxy * sxy;
+    if (from.size() >= 3 && det > 1e-6 * (sxx + syy) * (sxx + syy) && det > 1.0) {
+        f.m00 = (bxx * syy - bxy * sxy) / det;
+        f.m01 = (bxy * sxx - bxx * sxy) / det;
+        f.m10 = (byx * syy - byy * sxy) / det;
+        f.m11 = (byy * sxx - byx * sxy) / det;
+    }
+    return f;
+}
+
+/* A matched PACKED packet's vertex values blended into `to` (newer's copy):
+   kBlended, kJumped (moved too far), or kLoose - its vertices' moves not one
+   motion of the screen (VU1's clipper cut the polygon anew, as many vertices
+   but other points of it: their texture coordinates blended across the
+   texture drew a strip of the crossing's stripes). */
+enum { kJumped, kBlended, kLoose };
+int BlendPacked(const u32* a, const u32* b, u32* to, const Packet& p, float t, const GsBlendOptions& o, u32* vertices) {
     const u32 nloop = u32(p.lo & 0x7FFF), nreg = u32(p.lo >> 60) ? u32(p.lo >> 60) : 16;
     u32 regs[16];
     for (u32 r = 0; r < nreg; ++r) regs[r] = u32(p.hi >> (4 * r)) & 0xF;
-    const float limit = jump * 16.0f;
+    const float limit = o.jump * 16.0f;
+    auto shown = [&o](const u32* v) {
+        const u32 x = v[0] & 0xFFFF, y = v[1] & 0xFFFF;
+        return x >= o.window[0] && x <= o.window[2] && y >= o.window[1] && y <= o.window[3];
+    };
     u32 count = 0;
     for (u32 q = 0; q < nloop * nreg; ++q) {
         const u32* x = a + 4 + 4 * q;
         const u32* y = b + 4 + 4 * q;
         // State among the vertices (A+D, PRIM) that differs: another thing.
-        if ((regs[q % nreg] == 0xE || regs[q % nreg] == 0) && std::memcmp(x, y, 16) != 0) return false;
+        if ((regs[q % nreg] == 0xE || regs[q % nreg] == 0) && std::memcmp(x, y, 16) != 0) return kJumped;
         if (!IsXyz(regs[q % nreg])) continue;
         const float dx = std::fabs(float(x[0] & 0xFFFF) - float(y[0] & 0xFFFF));
         const float dy = std::fabs(float(x[1] & 0xFFFF) - float(y[1] & 0xFFFF));
-        if (dx > limit || dy > limit) return false;
+        // (Only where it is seen, in one picture or the other: a polygon
+        // reaching far off the screen - the road under the camera - swings
+        // its far corners by thousands of pixels as it nears the camera.)
+        if ((dx > limit || dy > limit) && (shown(x) || shown(y))) return kJumped;
         ++count;
+    }
+    // One motion: the vertices on the screen, older to newer, an affine map's
+    // to within 4 pixels or a quarter of their mean move.
+    {
+        std::vector<std::pair<double, double>> from, onto;
+        for (u32 q = 0; q < nloop * nreg; ++q) {
+            if (!IsXyz(regs[q % nreg])) continue;
+            const u32* x = a + 4 + 4 * q;
+            const u32* y = b + 4 + 4 * q;
+            if (!shown(x) && !shown(y)) continue;
+            from.push_back({double(x[0] & 0xFFFF), double(x[1] & 0xFFFF)});
+            onto.push_back({double(y[0] & 0xFFFF), double(y[1] & 0xFFFF)});
+        }
+        if (from.size() >= 4) {
+            const Affine f = Fit(from, onto);
+            double worst = 0, moved = 0;
+            for (std::size_t i = 0; i < from.size(); ++i) {
+                double ex, ey;
+                f.Apply(from[i].first, from[i].second, &ex, &ey);
+                worst = std::max(worst, std::max(std::fabs(ex - onto[i].first), std::fabs(ey - onto[i].second)));
+                moved += std::max(std::fabs(from[i].first - onto[i].first), std::fabs(from[i].second - onto[i].second));
+            }
+            moved /= double(from.size());
+            if (worst > std::max(4.0 * 16.0, 0.25 * moved)) return kLoose;
+        }
     }
     *vertices = count;
     for (u32 q = 0; q < nloop * nreg; ++q) {
@@ -203,12 +273,52 @@ bool BlendPacked(const u32* a, const u32* b, u32* to, const Packet& p, float t, 
             default: break;     // A+D, PRIM, NOP: the newer's
         }
     }
+    return kBlended;
+}
+
+/* Each XYZ register's x, y (1/16 pixels) in a PACKED packet. */
+void Points(const u32* words, const Packet& p, std::vector<std::pair<double, double>>& out) {
+    const u32 nloop = u32(p.lo & 0x7FFF), nreg = u32(p.lo >> 60) ? u32(p.lo >> 60) : 16;
+    out.clear();
+    for (u32 q = 0; q < nloop * nreg; ++q)
+        if (IsXyz(u32(p.hi >> (4 * (q % nreg))) & 0xF))
+            out.push_back({double(words[4 + 4 * q] & 0xFFFF), double(words[4 + 4 * q + 1] & 0xFFFF)});
+}
+
+/* `to` (an unmatched packet, the newer's copy) moved back `t` of the way
+   along the screen motion of its neighbour (older `na`, newer `nb`). */
+bool Carry(const u32* na, const u32* nb, const Packet& n, u32* to, const Packet& p, float t,
+           const GsBlendOptions& o) {
+    std::vector<std::pair<double, double>> from, back;
+    Points(nb, n, from);        // newer
+    Points(na, n, back);        // older
+    if (from.empty() || from.size() != back.size()) return false;
+    const Affine f = Fit(from, back);       // newer to older
+    const double limit = o.jump * 16.0;
+    const u32 nloop = u32(p.lo & 0x7FFF), nreg = u32(p.lo >> 60) ? u32(p.lo >> 60) : 16;
+    for (int pass = 0; pass < 2; ++pass) {          // (looked at whole first: none moving past `jump`)
+        for (u32 q = 0; q < nloop * nreg; ++q) {
+            if (!IsXyz(u32(p.hi >> (4 * (q % nreg))) & 0xF)) continue;
+            u32* w = to + 4 + 4 * q;
+            const double x = double(w[0] & 0xFFFF), y = double(w[1] & 0xFFFF);
+            double bx, by;
+            f.Apply(x, y, &bx, &by);
+            if (pass == 0) {
+                if (std::fabs(bx - x) > limit || std::fabs(by - y) > limit) return false;
+                continue;
+            }
+            const double nx = std::clamp(bx + (x - bx) * t, 0.0, 65535.0), ny = std::clamp(by + (y - by) * t, 0.0, 65535.0);
+            w[0] = (w[0] & ~0xFFFFu) | u32(std::lround(nx));
+            w[1] = (w[1] & ~0xFFFFu) | u32(std::lround(ny));
+        }
+    }
     return true;
 }
 
 }  // namespace
 
-GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, float t, GsPicture& out, float jump) {
+GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, float t, GsPicture& out,
+                             const GsBlendOptions& options) {
     GsBlendStats stats;
     using Clock = std::chrono::steady_clock;
     auto ms = [](Clock::time_point from) { return std::chrono::duration<double, std::milli>(Clock::now() - from).count(); };
@@ -228,7 +338,8 @@ GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, flo
         began = Clock::now();
         // PS2HOST_BLEND_HIDE (a test's): packets of these kinds drawn as
         // nothing (every vertex at the first's) - 1 not matched, 2 jumped,
-        // 4 blended, 8 the same in both.
+        // 4 blended, 8 the same in both, 16 carried (no match, moved as a
+        // neighbour moved).
         static const int hide = std::getenv("PS2HOST_BLEND_HIDE") ? std::atoi(std::getenv("PS2HOST_BLEND_HIDE")) : 0;
         auto collapse = [&](const Packet& p) {
             if ((u32(p.lo >> 58) & 3) != 0) return;
@@ -243,6 +354,7 @@ GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, flo
         };
         std::vector<int> match(b.size(), -1);
         for (const auto& [i, j] : pairs) match[j] = int(i);
+        std::vector<int> kinds(b.size(), 0);
         for (std::size_t j = 0; j < b.size(); ++j) {
             const Packet& p = b[j];
             const u32 flg = u32(p.lo >> 58) & 3;
@@ -258,10 +370,36 @@ GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, flo
             u32 vertices = 0;
             if (!x) kind = 1;
             else if (std::memcmp(x, y, p.size * 4) == 0) { stats.still += xyz; kind = 8; }
-            else if (BlendPacked(x, y, out.paths[path].data() + p.first, p, t, jump, &vertices)) { stats.blended += vertices; kind = 4; }
-            else { ++stats.jumped; stats.jumped_vertices += xyz; kind = 2; }
-            if (hide & kind) collapse(p);
+            else {
+                const int how = BlendPacked(x, y, out.paths[path].data() + p.first, p, t, options, &vertices);
+                if (how == kBlended) { stats.blended += vertices; kind = 4; }
+                else if (how == kLoose) { ++stats.loose; kind = 1; }     // (carried below, as one with no match)
+                else { ++stats.jumped; stats.jumped_vertices += xyz; kind = 2; }
+            }
+            kinds[j] = kind;
         }
+        // A packet with no match - most often a piece VU1's clipper cut
+        // anew at the screen's edge, its vertices not the older's - moved
+        // as the nearest blended packet beside it in the list moved (the
+        // same mesh's next piece, mostly): that one's vertices, newer to
+        // older, fitted as an affine map of the screen; this one's vertices
+        // taken back `t` of the way along it. Left where it was in the newer
+        // picture, its texture stood out of line with the blended road
+        // round it (a strip of the crossing's stripes across the road).
+        for (std::size_t j = 0; j < b.size(); ++j) {
+            if (kinds[j] != 1) continue;
+            int near = -1;
+            for (std::size_t d = 1; d <= 4 && near < 0; ++d) {
+                if (j >= d && kinds[j - d] == 4) near = int(j - d);
+                else if (j + d < b.size() && kinds[j + d] == 4) near = int(j + d);
+            }
+            if (near >= 0 && Carry(older.paths[path].data() + a[match[near]].first,
+                                   newer.paths[path].data() + b[near].first, b[near],
+                                   out.paths[path].data() + b[j].first, b[j], t, options))
+                kinds[j] = 16, ++stats.carried;
+        }
+        for (std::size_t j = 0; j < b.size(); ++j)
+            if (hide & kinds[j]) collapse(b[j]);
         stats.ms_blend += ms(began);
         for (const Packet& p : b) {
             if ((u32(p.lo >> 58) & 3) != 0) continue;
