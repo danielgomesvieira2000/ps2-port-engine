@@ -64,6 +64,16 @@ void SampleFrame(unsigned long long frame);
 void SampleOnly(unsigned long long from_ns, unsigned long long to_ns);
 std::string SampleReport(int top = 30);
 
+/* PS2HOST_STALL_WATCH=<ms>: while the GS thread has been on one batch of its
+   entries longer than that, a thread of its own takes the GS thread's and
+   the GPU renderer's stacks (every 200 ms, six at most a stall) and prints
+   them, named - what a stall of seconds that no span of the GS thread's
+   covers was doing (the timeline only says "busy"). The GS thread's calls
+   around each batch: StallWorkBegan, StallWorkEnded. */
+void StartStallWatch();
+void StallWorkBegan();
+void StallWorkEnded();
+
 }  // namespace ps2host
 
 #endif  /* PS2HOST_PROFILE_H */

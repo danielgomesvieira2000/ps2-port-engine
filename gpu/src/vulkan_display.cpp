@@ -494,6 +494,8 @@ private:
     std::deque<int> ready_;                 // pictures waiting to be shown, oldest first
     int taken_ = -1;                        // the one being shown
     int held_ = -1;                         // HoldImage's, until ShowHeld
+    bool bounded_ = false;                  // BeginPresent's waits bounded (PresentImage's, under present_lock_)
+    std::uint64_t skipped_ = 0;             // pictures not shown: no image within the bound
     bool stop_ = false;
     std::thread present_thread_;
     std::mutex present_lock_;               // the swapchain and cmds_: the present thread, or Present
@@ -944,19 +946,46 @@ bool VulkanDisplay::BeginPresent(std::uint32_t* index, bool* ok) {
         *ok = false;
         return false;
     }
+    // PS2HOST_PRESENT_WAIT_LOG=1: each wait here over 100 ms, which.
+    static const bool wait_log = std::getenv("PS2HOST_PRESENT_WAIT_LOG") != nullptr;
+    auto stamp = [] { return std::chrono::steady_clock::now(); };
+    auto over = [&](const char* what, std::chrono::steady_clock::time_point from) {
+        if (!wait_log) return;
+        const double ms = std::chrono::duration<double, std::milli>(stamp() - from).count();
+        if (ms > 100) std::fprintf(stderr, "[present] %s: %.0f ms%s\n", what, ms, bounded_ ? " (bounded)" : "");
+    };
+    auto t0 = stamp();
     if (stale_ && !CreateSwapchain()) {
         *ok = false;
         return false;
     }
     if (!swapchain_ || extent_.width == 0 || extent_.height == 0) return false;
-    slot_ = (slot_ + 1) % kInFlight;
+    // Presenting from the caller's thread (PresentImage: the GS thread's,
+    // unpaced), the waits for a slot and an image are bounded (bounded_):
+    // past them the picture is not shown and the caller goes on. Unbounded,
+    // a compositor's or a driver's hiccup held the GS thread - the whole
+    // game - for 300 ms to seconds (two cores, the integrated GPU; caught
+    // by PS2HOST_STALL_WATCH in vkAcquireNextImageKHR's wait).
+    const std::uint64_t limit = bounded_ ? 25'000'000ull : UINT64_MAX;
+    const int next = (slot_ + 1) % kInFlight;
+    over("swapchain made", t0);
+    t0 = stamp();
+    const bool slot_free = vkWaitForFences(device_, 1, &fences_[next], VK_TRUE, limit) != VK_TIMEOUT;
+    over("the slot's last submission", t0);
+    if (!slot_free) return false;
+    t0 = stamp();
+    VkFence acquire_fence = acquire_fences_[next];
+    vkResetFences(device_, 1, &acquire_fence);
+    VkResult r = vkAcquireNextImageKHR(device_, swapchain_, limit, acquireds_[next], acquire_fence, index);
+    over("vkAcquireNextImageKHR", t0);
+    if (r == VK_TIMEOUT || r == VK_NOT_READY) {
+        ++skipped_;
+        return false;               // (nothing acquired: the semaphore and the fence untouched)
+    }
+    slot_ = next;
     cmd_ = cmds_[slot_];
     acquired_ = acquireds_[slot_];
     fence_ = fences_[slot_];
-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
-    VkFence acquire_fence = acquire_fences_[slot_];
-    vkResetFences(device_, 1, &acquire_fence);
-    VkResult r = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, acquired_, acquire_fence, index);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         stale_ = true;
         return false;
@@ -965,7 +994,9 @@ bool VulkanDisplay::BeginPresent(std::uint32_t* index, bool* ok) {
         *ok = false;
         return false;
     }
+    t0 = stamp();
     vkWaitForFences(device_, 1, &acquire_fence, VK_TRUE, UINT64_MAX);
+    over("the acquired image's fence", t0);
     vkResetFences(device_, 1, &fence_);
     vkResetCommandBuffer(cmd_, 0);
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1522,7 +1553,10 @@ bool VulkanDisplay::PresentImage(std::uint64_t image, int layout, std::uint32_t 
     std::lock_guard<std::mutex> hold(present_lock_);
     std::uint32_t index = 0;
     bool ok = true;
-    if (!BeginPresent(&index, &ok)) return ok;
+    bounded_ = true;
+    const bool began = BeginPresent(&index, &ok);
+    bounded_ = false;
+    if (!began) return ok;
     const VkImage source = reinterpret_cast<VkImage>(image);
     const VkImageLayout kept = VkImageLayout(layout);
     // Whatever drew it was submitted before on this queue: a barrier from

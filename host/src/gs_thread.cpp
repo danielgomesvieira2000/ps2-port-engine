@@ -298,6 +298,7 @@ struct Feed {
                                        u64(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count()));
                 }
             } busy{began, busy_counts};
+            StallWorkBegan();
             try {
                 while (t < h) {
                     const u32 at = u32(t % kRing);
@@ -312,6 +313,7 @@ struct Feed {
                 tail.store(head.load(std::memory_order_acquire), std::memory_order_release);
                 Room();
             }
+            StallWorkEnded();
         }
     }
 };
@@ -490,6 +492,7 @@ void StartGsThread() {
         std::fprintf(stderr, "[host] GS split: the GIF's decoding on a thread of its own\n");
         return;
     }
+    StartStallWatch();
     g_feed->thread = std::thread([] {
         timeline::NameThread("GS");
         FastThread();

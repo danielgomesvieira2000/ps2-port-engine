@@ -194,9 +194,11 @@ std::atomic<bool> g_sample_renderer{false};
 namespace {
 std::atomic<HANDLE> g_renderer_thread{nullptr};
 }  // namespace
+std::atomic<DWORD> g_renderer_tid{0};
 void NoteRendererThread() {
     timeline::NameThread("GPU renderer");
     g_renderer_thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentThreadId());
+    g_renderer_tid = GetCurrentThreadId();
 }
 double RendererThreadCpuMs() {
     const HANDLE thread = g_renderer_thread.load();
@@ -250,10 +252,10 @@ void SampleFrame(unsigned long long frame) {
    (nothing here may allocate or lock). A walk that faults - a sample caught
    where the unwind tables do not describe the stack, as clang-cl's code was
    - keeps the frames found so far. */
-void WalkStack(CONTEXT ctx, std::uint64_t* frames) {
+void WalkStack(CONTEXT ctx, std::uint64_t* frames, int count = kFrames) {
     frames[0] = ctx.Rip;
     __try {
-        for (int n = 1; n < kFrames; ++n) {
+        for (int n = 1; n < count; ++n) {
             DWORD64 base = 0;
             PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
             if (entry) {
@@ -642,11 +644,91 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
 
 }  // namespace
 
+namespace {
+const long long g_stall_ms = [] {
+    const char* v = std::getenv("PS2HOST_STALL_WATCH");
+    return v ? std::atoll(v) : 0LL;
+}();
+std::atomic<std::uint64_t> g_work_began{0};
+std::atomic<DWORD> g_gs_tid{0};
+}  // namespace
+
+void StallWorkBegan() {
+    if (!g_stall_ms) return;
+    if (!g_gs_tid.load(std::memory_order_relaxed)) g_gs_tid = GetCurrentThreadId();
+    g_work_began.store(SteadyNs(), std::memory_order_relaxed);
+}
+void StallWorkEnded() {
+    if (g_stall_ms) g_work_began.store(0, std::memory_order_relaxed);
+}
+
+void StartStallWatch() {
+    if (!g_stall_ms) return;
+    std::thread([] {
+        HANDLE process = GetCurrentProcess();
+        bool symbols = false;
+        std::uint64_t last_stall = 0;
+        int taken = 0;
+        for (;;) {
+            Sleep(50);
+            const std::uint64_t began = g_work_began.load(std::memory_order_relaxed);
+            const std::uint64_t now = SteadyNs();
+            if (!began || now - began < std::uint64_t(g_stall_ms) * 1000000ull) continue;
+            if (began != last_stall) { last_stall = began; taken = 0; }
+            if (taken >= 6) continue;
+            ++taken;
+            if (!symbols) {
+                SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+                char exe_dir[MAX_PATH] = "";
+                GetModuleFileNameA(nullptr, exe_dir, MAX_PATH);
+                if (char* slash = std::strrchr(exe_dir, '\\')) *slash = 0;
+                symbols = SymInitialize(process, exe_dir, TRUE) != FALSE;
+            }
+            const struct { const char* name; DWORD id; } threads[] = {{"GS", g_gs_tid.load()},
+                                                                       {"renderer", g_renderer_tid.load()}};
+            for (const auto& t : threads) {
+                if (!t.id) continue;
+                HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, t.id);
+                if (!h) continue;
+                constexpr int kDeep = 40;
+                std::uint64_t frames[kDeep] = {};
+                CONTEXT ctx{};
+                ctx.ContextFlags = CONTEXT_FULL;
+                if (SuspendThread(h) != DWORD(-1)) {
+                    if (GetThreadContext(h, &ctx)) WalkStack(ctx, frames, kDeep);
+                    ResumeThread(h);
+                }
+                CloseHandle(h);
+                std::string line;
+                for (int n = 0; n < kDeep && frames[n]; ++n) {
+                    alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256];
+                    SYMBOL_INFO* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+                    symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+                    symbol->MaxNameLen = 255;
+                    DWORD64 displacement = 0;
+                    char text[300];
+                    if (symbols && SymFromAddr(process, frames[n], &displacement, symbol)) {
+                        std::snprintf(text, sizeof text, "%s%s", n ? " <- " : "", symbol->Name);
+                    } else {
+                        std::snprintf(text, sizeof text, "%s0x%llX", n ? " <- " : "", (unsigned long long)frames[n]);
+                    }
+                    line += text;
+                }
+                std::fprintf(stderr, "[stall] %llu ms: %s: %s\n", (unsigned long long)((now - began) / 1000000ull), t.name,
+                             line.c_str());
+            }
+        }
+    }).detach();
+}
+
 void InstallCrashReport() { SetUnhandledExceptionFilter(CrashFilter); }
 
 #else
 
 void InstallCrashReport() {}
+void StartStallWatch() {}
+void StallWorkBegan() {}
+void StallWorkEnded() {}
 void StartSampler() {}
 std::string SampleReport(int) { return ""; }
 
