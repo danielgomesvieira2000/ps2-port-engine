@@ -937,7 +937,11 @@ void PictureText(std::vector<u32>& picture, const char* text, int y, int scale, 
    compiled before the game starts, a loading screen saying so meanwhile -
    a phone's driver takes seconds to a minute, which would otherwise be a
    black screen and then stutter. A start whose pipelines come from the
-   cache is through before anything is shown. */
+   cache is through before anything is shown. On a PC the wait is at most
+   10 s, the rest made in the background as the game starts (the way
+   before the screen: a driver with no cache of its own took long enough
+   that players took the game for hung - issue #29); the log says how far
+   it got every 2 s. PS2HOST_PIPELINE_WAIT_S: that limit (0: none). */
 void WaitForGpuPipelines() {
 #ifdef PS2HOST_VULKAN
     if (!g_display) return;
@@ -947,8 +951,26 @@ void WaitForGpuPipelines() {
     // PS2HOST_LOADING_HOLD=ms: the screen shown at once and kept that long (to see it).
     const char* hold_env = std::getenv("PS2HOST_LOADING_HOLD");
     const auto hold = std::chrono::milliseconds(hold_env ? std::atoi(hold_env) : 0);
+#ifdef __ANDROID__
+    int limit_s = 0;
+#else
+    int limit_s = 10;
+#endif
+    if (const char* limit = std::getenv("PS2HOST_PIPELINE_WAIT_S")) limit_s = std::atoi(limit);
+    auto said = began;
     while (ps2gpu::PipelineWarmProgress(&made, &total) || std::chrono::steady_clock::now() - began < hold) {
         const auto now = std::chrono::steady_clock::now();
+        if (now - said >= std::chrono::seconds(2)) {
+            said = now;
+            std::fprintf(stderr, "[window] first start: %zu of %zu GPU pipelines made after %.0f s\n", made, total,
+                         std::chrono::duration<double>(now - began).count());
+            std::fflush(stderr);
+        }
+        if (limit_s > 0 && now - began >= std::chrono::seconds(limit_s) && now - began >= hold) {
+            std::fprintf(stderr, "[window] first start: the game goes on after %d s, %zu of %zu GPU pipelines made "
+                         "(the rest in the background)\n", limit_s, made, total);
+            break;
+        }
         if (hold_env || now - began >= std::chrono::milliseconds(300)) {
             shown = true;
             std::vector<u32> picture(640 * 448, 0xFF201410u);         // a dark blue
@@ -973,7 +995,7 @@ void WaitForGpuPipelines() {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(shown ? 30 : 5));
     }
-    if (shown)
+    if (shown && made == total)
         std::fprintf(stderr, "[window] first start: %zu GPU pipelines made in %.1f s behind the loading screen\n", total,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count());
 #endif
