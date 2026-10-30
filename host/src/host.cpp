@@ -165,9 +165,9 @@ int GsReplay(const std::string& file, const std::string& out) {
             const GsBlendStats s = BlendGsPictures(pictures[k - 1], pictures[k], t, between, options);
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
             std::fprintf(stderr, "gs-replay: picture %zu made between: %u packets, %u matched (%u jumped), %u of %u vertices "
-                                 "blended (%u still, %u jumped; %u packets carried, %u loose, %u added, %u vertices snapped), %.2f ms (copy %.2f, align %.2f, blend %.2f)\n",
+                                 "blended (%u still, %u jumped; %u packets carried, %u loose, %u added, %u vertices snapped), %.2f ms (copy %.2f, align %.2f, blend %.2f: packets %.2f, snap %.2f, carry %.2f, add %.2f)\n",
                          k, s.packets, s.matched, s.jumped, s.blended, s.vertices, s.still, s.jumped_vertices, s.carried, s.loose, s.added, s.snapped, ms,
-                         s.ms_copy, s.ms_align, s.ms_blend);
+                         s.ms_copy, s.ms_align, s.ms_blend, s.ms_packets, s.ms_snap, s.ms_carry, s.ms_add);
             put(between);
             put(pictures[k]);
         }

@@ -48,7 +48,8 @@ struct GsBlendStats {
     u32 snapped = 0;        // vertices of things not blendable whole: the newer's
     u32 added = 0;          // the older's packets with no match drawn too, moved forward
     u32 loose = 0;          // matched packets whose vertices' moves are not one motion (carried, or the newer's)
-    double ms_copy = 0, ms_align = 0, ms_blend = 0;     // the time: copying the newer, cutting and lining up, blending
+    double ms_copy = 0, ms_align = 0, ms_blend = 0;
+    double ms_packets = 0, ms_snap = 0, ms_carry = 0, ms_add = 0;     // (of ms_blend)     // the time: copying the newer, cutting and lining up, blending
 };
 
 struct GsBlendOptions {

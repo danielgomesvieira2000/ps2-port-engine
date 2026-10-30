@@ -152,15 +152,15 @@ u32 AsWord(float f) { u32 w; std::memcpy(&w, &f, 4); return w; }
 
 /* A screen coordinate (1/16 pixels) between two, through the projection:
    (c - centre) * w blended with w, then divided again. */
-u32 Projected(u32 a, u32 b, double centre, double wa, double wb, double wm, float t) {
+u32 Projected(u32 a, u32 b, double centre, double wa, double wb, double qm, float t) {
     const double ua = (double(a) - centre) * wa, ub = (double(b) - centre) * wb;
-    return u32(std::lround(std::clamp(centre + (ua + (ub - ua) * t) / wm, 0.0, 65535.0)));
+    return u32(std::clamp(centre + (ua + (ub - ua) * t) * qm, 0.0, 65535.0) + 0.5);     // (/ w: * Q)
 }
 /* Z, affine in Q: where the blended Q falls between the two's (linear in
    time where the Qs are the same). */
 double AlongQ(u32 a, u32 b, double qa, double qb, double qm, float t, u32 most) {
     const double k = std::fabs(qb - qa) > 1e-12 * std::max(qa, qb) ? (qm - qa) / (qb - qa) : double(t);
-    return std::clamp(std::round(double(a) + (double(b) - double(a)) * k), 0.0, double(most));
+    return std::floor(std::clamp(double(a) + (double(b) - double(a)) * k, 0.0, double(most)) + 0.5);
 }
 
 /* The affine map of the screen taking `from` to `to` (least squares, about
@@ -231,7 +231,9 @@ int BlendPacked(const u32* a, const u32* b, u32* to, const Packet& p, float t, c
     // One motion: the vertices on the screen, older to newer, an affine map's
     // to within 4 pixels or a quarter of their mean move.
     {
-        std::vector<std::pair<double, double>> from, onto;
+        thread_local std::vector<std::pair<double, double>> from, onto;     // (kept: a vector a packet was most of the time)
+        from.clear();
+        onto.clear();
         for (u32 q = 0; q < nloop * nreg; ++q) {
             if (!IsXyz(regs[q % nreg])) continue;
             const u32* x = a + 4 + 4 * q;
@@ -318,8 +320,8 @@ int BlendPacked(const u32* a, const u32* b, u32* to, const Packet& p, float t, c
                 break;
             case 4: case 0xC:   // XYZF: x, y 16 bits, z 24 (<<4), f 8 (<<4 of the fourth)
                 if (persp) {
-                    o[0] = (y[0] & ~0xFFFFu) | Projected(x[0] & 0xFFFF, y[0] & 0xFFFF, cx, wa, wb, wm, t);
-                    o[1] = (y[1] & ~0xFFFFu) | Projected(x[1] & 0xFFFF, y[1] & 0xFFFF, cy, wa, wb, wm, t);
+                    o[0] = (y[0] & ~0xFFFFu) | Projected(x[0] & 0xFFFF, y[0] & 0xFFFF, cx, wa, wb, qm, t);
+                    o[1] = (y[1] & ~0xFFFFu) | Projected(x[1] & 0xFFFF, y[1] & 0xFFFF, cy, wa, wb, qm, t);
                     o[2] = (y[2] & ~0xFFFFFF0u) | u32(AlongQ((x[2] >> 4) & 0xFFFFFF, (y[2] >> 4) & 0xFFFFFF, qa, qb, qm, t, 0xFFFFFF)) << 4;
                 } else {
                     o[0] = (y[0] & ~0xFFFFu) | LerpU(x[0] & 0xFFFF, y[0] & 0xFFFF, t);
@@ -330,8 +332,8 @@ int BlendPacked(const u32* a, const u32* b, u32* to, const Packet& p, float t, c
                 break;
             case 5: case 0xD:   // XYZ: x, y 16 bits, z 32
                 if (persp) {
-                    o[0] = (y[0] & ~0xFFFFu) | Projected(x[0] & 0xFFFF, y[0] & 0xFFFF, cx, wa, wb, wm, t);
-                    o[1] = (y[1] & ~0xFFFFu) | Projected(x[1] & 0xFFFF, y[1] & 0xFFFF, cy, wa, wb, wm, t);
+                    o[0] = (y[0] & ~0xFFFFu) | Projected(x[0] & 0xFFFF, y[0] & 0xFFFF, cx, wa, wb, qm, t);
+                    o[1] = (y[1] & ~0xFFFFu) | Projected(x[1] & 0xFFFF, y[1] & 0xFFFF, cy, wa, wb, qm, t);
                     o[2] = u32(AlongQ(x[2], y[2], qa, qb, qm, t, 0xFFFFFFFFu));
                 } else {
                     o[0] = (y[0] & ~0xFFFFu) | LerpU(x[0] & 0xFFFF, y[0] & 0xFFFF, t);
@@ -362,10 +364,11 @@ struct Box {
     double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
 };
 Box BoxOf(const u32* words, const Packet& p) {
-    std::vector<std::pair<double, double>> points;
-    Points(words, p, points);
+    const u32 nloop = u32(p.lo & 0x7FFF), nreg = u32(p.lo >> 60) ? u32(p.lo >> 60) : 16;
     Box b;
-    for (const auto& [x, y] : points) {
+    for (u32 q = 0; q < nloop * nreg; ++q) {
+        if (!IsXyz(u32(p.hi >> (4 * (q % nreg))) & 0xF)) continue;
+        const double x = double(words[4 + 4 * q] & 0xFFFF), y = double(words[4 + 4 * q + 1] & 0xFFFF);
         b.x0 = std::min(b.x0, x); b.x1 = std::max(b.x1, x);
         b.y0 = std::min(b.y0, y); b.y1 = std::max(b.y1, y);
     }
@@ -376,7 +379,7 @@ Box BoxOf(const u32* words, const Packet& p) {
    along the screen motion of its neighbour (older `na`, newer `nb`). */
 bool Carry(const u32* na, const u32* nb, const Packet& n, u32* to, const Packet& p, float t,
            const GsBlendOptions& o) {
-    std::vector<std::pair<double, double>> from, back;
+    thread_local std::vector<std::pair<double, double>> from, back;
     Points(nb, n, from);        // newer
     Points(na, n, back);        // older
     if (from.empty() || from.size() != back.size()) return false;
@@ -574,6 +577,8 @@ GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, flo
             kinds[j] = kind;
             xyzs[j] = xyz;
         }
+        stats.ms_packets += ms(began);
+        auto step = Clock::now();
         // A thing that cannot be blended whole is the newer's whole: in a run
         // of vertex packets under one state (a material of a thing) with
         // under 70% of its vertices blended or still, none is blended, carried
@@ -599,6 +604,8 @@ GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, flo
                 kinds[j] = 64;
             }
         }
+        stats.ms_snap += ms(step);
+        step = Clock::now();
         // A packet with no match - most often a piece VU1's clipper cut
         // anew at the screen's edge, its vertices not the older's - moved
         // as the nearest blended packet beside it in the list moved (the
@@ -646,7 +653,13 @@ GsBlendStats BlendGsPictures(const GsPicture& older, const GsPicture& newer, flo
         // along the screen's edge was left with nothing drawn - the glow
         // behind it showing white). Each goes in after the newer packet its
         // neighbour's place in the list is (its state the same).
-        if (!(hide & 32)) Add(older, newer, a, b, pairs, kinds, path, t, options, out, stats);
+        stats.ms_carry += ms(step);
+        step = Clock::now();
+        // (PS2HOST_BLEND_ADD=1: on - it changed no stray by the measure, and
+        // was a third of the blend's time.)
+        static const bool add = std::getenv("PS2HOST_BLEND_ADD") && std::getenv("PS2HOST_BLEND_ADD")[0] == '1';
+        if (add && !(hide & 32)) Add(older, newer, a, b, pairs, kinds, path, t, options, out, stats);
+        stats.ms_add += ms(step);
         stats.ms_blend += ms(began);
         for (const Packet& p : b) {
             if ((u32(p.lo >> 58) & 3) != 0) continue;
