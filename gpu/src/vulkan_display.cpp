@@ -614,7 +614,21 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     std::vector<VkPhysicalDevice> list(gpus);
     vkEnumeratePhysicalDevices(instance_, &gpus, list.data());
     int best = -1;
+    std::string too_old;     // GPUs whose driver is older than Vulkan 1.3 (issue #24): named in the error
     for (VkPhysicalDevice candidate : list) {
+        // The device is made with 1.3's features and the GS renderer draws with
+        // them (dynamic rendering): an older driver's device would fail or crash
+        // later, so it is passed over and the window draws with GDI.
+        VkPhysicalDeviceProperties version;
+        vkGetPhysicalDeviceProperties(candidate, &version);
+        if (version.apiVersion < VK_API_VERSION_1_3) {
+            char text[320];
+            std::snprintf(text, sizeof text, "%s%s (Vulkan %u.%u.%u)", too_old.empty() ? "" : ", ", version.deviceName,
+                          VK_API_VERSION_MAJOR(version.apiVersion), VK_API_VERSION_MINOR(version.apiVersion),
+                          VK_API_VERSION_PATCH(version.apiVersion));
+            too_old += text;
+            continue;
+        }
         std::uint32_t families = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(candidate, &families, nullptr);
         std::vector<VkQueueFamilyProperties> props(families);
@@ -635,7 +649,8 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
         }
     }
     if (!gpu_) {
-        error_ = "no Vulkan device can draw and present to the window";
+        error_ = too_old.empty() ? "no Vulkan device can draw and present to the window"
+                                 : "no Vulkan 1.3 GPU; older: " + too_old;
         return false;
     }
     VkPhysicalDeviceProperties p;
