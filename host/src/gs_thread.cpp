@@ -139,6 +139,11 @@ struct Feed {
     std::atomic<bool> sleeping{false};
     std::mutex mutex;
     std::condition_variable wake;
+    // The producer asleep for room (or for the ring to empty: Sync), the
+    // GS thread waking it as it takes entries (Room).
+    std::atomic<bool> waiting{false};
+    std::mutex room_mutex;
+    std::condition_variable room;
     std::exception_ptr failed;                  // set by the GS thread, taken by the EE's
     std::atomic<bool> has_failed{false};
     std::thread thread;
@@ -183,10 +188,35 @@ struct Feed {
         head.store(at, std::memory_order_release);      // all that is written, for the consumer to make room
         Wake();
         Timed timed(Section::GsWait);
-        while (at + words - tail.load(std::memory_order_acquire) > kRing) {
+        Await([&] { return at + words - tail.load(std::memory_order_acquire) <= kRing; });
+    }
+
+    /* Until `done`: a moment spinning, then asleep until the GS thread has
+       taken more (Room). Spinning the whole wait (yield) held a core while
+       the GS thread was full - VIF1's worker 53-62% of a core on two cores,
+       taken from the GS thread it waited for. */
+    template <class Done>
+    void Await(Done done) {
+        for (int spins = 0; !done(); ++spins) {
             Rethrow();
-            std::this_thread::yield();
+            if (spins < 256) {
+                Pause();
+            } else if (spins < 256 + 16) {
+                std::this_thread::yield();
+            } else {
+                std::unique_lock<std::mutex> lock(room_mutex);
+                waiting.store(true);
+                room.wait_for(lock, std::chrono::milliseconds(1), [&] { return done() || has_failed.load(); });
+                waiting.store(false);
+            }
         }
+    }
+
+    /* The GS thread, having taken entries: a producer waiting woken. */
+    void Room() {
+        if (!waiting.load(std::memory_order_relaxed)) return;
+        std::lock_guard<std::mutex> lock(room_mutex);
+        room.notify_all();
     }
 
     void Publish(u32 words, bool now = false) {
@@ -218,11 +248,7 @@ struct Feed {
         if (tail.load(std::memory_order_acquire) >= target) return Rethrow();
         Wake();
         Timed timed(Section::GsWait);
-        for (int spins = 0; tail.load(std::memory_order_acquire) < target; ++spins) {
-            Rethrow();
-            if (spins < 4096) Pause();
-            else std::this_thread::yield();
-        }
+        Await([&] { return tail.load(std::memory_order_acquire) >= target; });
         Rethrow();
     }
 
@@ -277,12 +303,14 @@ struct Feed {
                     const u32 at = u32(t % kRing);
                     t += handle(&ring[at], at);
                     tail.store(t, std::memory_order_release);
+                    Room();
                 }
             } catch (...) {
                 failed = std::current_exception();
                 has_failed = true;
                 // Skip what is left: the EE thread stops at its next call.
                 tail.store(head.load(std::memory_order_acquire), std::memory_order_release);
+                Room();
             }
         }
     }
