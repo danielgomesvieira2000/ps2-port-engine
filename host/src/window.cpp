@@ -54,6 +54,7 @@ bool g_closed = false;
 
 #ifdef PS2HOST_VULKAN
 std::unique_ptr<ps2gpu::Display> g_display;
+bool g_pipelines_behind = false;    // the first start went on before its pipelines were all made
 
 // The keys the controller reads, as Win32 virtual keys, by position.
 /* A Win32 virtual key as SDL's scancode: the key in that place on a US
@@ -626,6 +627,23 @@ bool PumpWindow() {
             notice = false;
             if (!PcMenuOpen()) SetWindowOverlay({});
         }
+        // A first start that went on before all its pipelines were made
+        // (WaitForGpuPipelines' limit): said on the screen until the rest are
+        // (a stutter meanwhile is why), its count redrawn twice a second.
+        static std::chrono::steady_clock::time_point behind_drawn{};
+        if (g_pipelines_behind && !notice && !PcMenuOpen() && now - behind_drawn >= std::chrono::milliseconds(500)) {
+            behind_drawn = now;
+            std::size_t made = 0, total = 0;
+            if (ps2gpu::PipelineWarmProgress(&made, &total)) {
+                char line[64];
+                std::snprintf(line, sizeof line, "PREPARING GRAPHICS  %zu of %zu", made, total);
+                SetWindowOverlay({line});
+            } else {
+                g_pipelines_behind = false;
+                SetWindowOverlay({});
+                std::fprintf(stderr, "[window] first start: all %zu GPU pipelines made\n", total);
+            }
+        }
         return !g_closed;
     }
 #endif
@@ -969,6 +987,7 @@ void WaitForGpuPipelines() {
         if (limit_s > 0 && now - began >= std::chrono::seconds(limit_s) && now - began >= hold) {
             std::fprintf(stderr, "[window] first start: the game goes on after %d s, %zu of %zu GPU pipelines made "
                          "(the rest in the background)\n", limit_s, made, total);
+            g_pipelines_behind = true;      // said on the screen until made (PumpWindow)
             break;
         }
         if (hold_env || now - began >= std::chrono::milliseconds(300)) {

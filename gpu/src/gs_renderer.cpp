@@ -2181,6 +2181,9 @@ void VulkanGsRenderer::AskWorker(std::uint32_t key, bool soon) {
                     const std::uint32_t next = pipeline_queue_.front();
                     pipeline_queue_.pop_front();
                     hold.unlock();
+                    // PS2HOST_PIPELINE_SLOW_MS: each made that much slower (a cold driver, to test).
+                    static const int slow_ms = std::getenv("PS2HOST_PIPELINE_SLOW_MS") ? std::atoi(std::getenv("PS2HOST_PIPELINE_SLOW_MS")) : 0;
+                    if (slow_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(slow_ms));
                     const VkPipeline made = MakePipeline(next);
                     hold.lock();
                     pipelines_made_.emplace_back(next, made);
