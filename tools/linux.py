@@ -116,16 +116,22 @@ def build(game, jobs: int):
     target = port_target(game)
     out = game.path(os.path.join(game.build, "linux"))
     os.makedirs(out, exist_ok=True)
+    # ThinLTO where the game asks for it (game.json's "lto", as port.py's;
+    # PS2_LTO=on/off overrides): its link compiles the files again, a VU
+    # file's 2 GB and more - fewer at once than the compiler's jobs.
+    wanted = os.environ.get("PS2_LTO", "").lower()
+    lto = wanted == "on" or (wanted != "off" and bool(port._game_json(game).get("lto")))
     script = " && ".join([
         "cmake -S %s -B /build/%s -G Ninja -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 "
-        "-DCMAKE_BUILD_TYPE=Release -DPS2_GENERATED_DIR=%s -DPS2HOST_LTO_JOBS=%d "
+        "-DCMAKE_BUILD_TYPE=Release -DPS2_GENERATED_DIR=%s -DPS2HOST_LTO=%s -DPS2HOST_LTO_JOBS=%d "
         "'-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc' > /build/configure.log"
-        % (inside(root, game.path("port")), target, inside(root, generated), jobs),
+        % (inside(root, game.path("port")), target, inside(root, generated), "ON" if lto else "OFF",
+           max(1, jobs // 2)),
         "cmake --build /build/%s -j %d" % (target, jobs),
         "cp /build/%s/%s %s/" % (target, target, inside(root, out)),
     ])
     container(game, script)
-    print("built %s" % os.path.join(out, target))
+    print("built %s%s" % (os.path.join(out, target), " (ThinLTO)" if lto else ""))
 
 
 def test(game, runs: str, gpu: bool):

@@ -242,6 +242,16 @@ if(NOT MSVC)
             target_compile_options(ps2rt PUBLIC "-fprofile-instr-use=${PS2HOST_PGO}" -Wno-profile-instr-unprofiled
                                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
         endif()
+    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        # Linux's clang (engine/tools/linux.py): ThinLTO with lld where the
+        # game asks for it (game.json's "lto", as port.py's) - the host's
+        # functions the game's code calls inlined across files.
+        option(PS2HOST_LTO "ThinLTO (clang and lld)" OFF)
+        set(PS2HOST_LTO_JOBS "all" CACHE STRING "ThinLTO's code generators at once in the link")
+        if(PS2HOST_LTO)
+            target_compile_options(ps2rt PUBLIC -flto=thin)
+            target_link_options(ps2rt PUBLIC -flto=thin -fuse-ld=lld -Wl,--thinlto-jobs=${PS2HOST_LTO_JOBS})
+        endif()
     endif()
 endif()
 
