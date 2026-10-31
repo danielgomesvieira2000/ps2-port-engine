@@ -4,6 +4,49 @@ Written 2026-10-30, after issue #24 (burnout3-pc): a player whose GPU has no Vul
 
 The goal is that every PC able to run the game's CPU side also draws on its GPU, in this order: **Vulkan 1.3 → Vulkan 1.2 → Direct3D 11 → software GS + GDI**.
 
+## Status (2026-10-31)
+
+**Done: Vulkan 1.2 (V1-V4) and Direct3D 11 (X0-X4).** The order of choice is as planned: `renderer=auto` takes Vulkan (1.3, else 1.2), then Direct3D 11, then GDI with the software GS.
+
+**Vulkan 1.2** (`vk_device.cpp`): as planned. A 1.2 device needs `VK_EXT_extended_dynamic_state`; it draws with `VK_KHR_dynamic_rendering` where offered, else with render passes (`gs_renderer.cpp`'s `BeginRendering`). `PS2HOST_VK_LEGACY=1|2` takes either path on a 1.3 GPU. Every Burnout 3 GPU regression is the same picture for picture in all three paths.
+
+**Direct3D 11: one renderer, not two.** X3 planned a second renderer, ported from `gs_renderer.cpp` part by part. What was built instead is a layer that implements the part of Vulkan the renderer uses with Direct3D 11 (`d3d11_vulkan.cpp`, ~1,900 lines: images, views, descriptor sets, pipelines, command buffers run at submit, copies, read-backs). The Vulkan renderer, its effects and `VulkanGpu` run on it unchanged.
+
+Why the change:
+- **Exactness by construction.** Both backends follow the same rules, so the Vulkan recordings are the D3D11 recordings: no `.d3d11.crc` set.
+- **No second renderer to keep in step** with every fix, game rule and feature.
+- **It was the shorter road**: about 100 distinct Vulkan calls against a 4,000-line renderer.
+
+How it maps:
+- **Shaders:** the same GLSL. Its SPIR-V goes through SPIRV-Cross (`tools/spirv_to_hlsl.cpp`: set `s` binding `b` is register `s*7+b`, push constants are `b0` with the same byte layout) and then fxc at shader model 5.0. The layer finds each shader's DXBC by its SPIR-V.
+  Specialisation constants are left at their defaults (the whole shader).
+  Under `-DD3D11` the GLSL differs where Direct3D 11 cannot follow:
+  - RGBA8 storage images are read as R32_UINT words (feature level 11_0 has no RGBA8 UAV loads);
+  - gs.frag's 4-texel words gather becomes four fetches (the same texels);
+  - a depth view's stencil is in `.g`;
+  - the effects' `float p[22]` is read through `vec4`s;
+  - logic ops use a `UINT_OUTPUT` variant of gs.frag, drawn through the target's R8G8B8A8_UINT view with Direct3D 11.1's logic ops.
+- **Memory:** device memory is only a size; images are textures made at `vkCreateImage`. Host-visible memory is the process's own: a host buffer's drawn range is copied to its GPU twin once per submission, and GPU-to-host copies are read back through staging resources when the fence is waited for.
+- **Depth uploads** (Direct3D 11 updates no depth-stencil resource) are drawn with `SV_Depth`.
+- **Buffer-to-image copies on the GPU** are a small compute shader.
+
+**The display** (`d3d11_display.cpp`, on `SdlWindowDisplay`, `window_display.cpp`):
+- flip-model swapchain, tearing where allowed (VRR);
+- FXAA, SMAA and SSAA through the same compute shaders;
+- the overlay.
+
+**Checked:**
+- renderer tests on Direct3D 11 on the RTX 4070 and the Intel UHD;
+- Burnout 3 GPU regressions on Direct3D 11 (`PS2HOST_RENDERER=d3d11`, headless): car_select 44/44, race_training 55/55, race 67/67, crash 77/77, road_rage 69/69, the same CRCs as Vulkan's.
+
+**Not done:**
+- D3D12 (X6): the layer approach would carry over, but it is a larger layer and brings no new GPUs;
+- GPU timestamps on Direct3D 11 (`PS2HOST_GPU_PROFILE`);
+- the display's frame pacing thread (`PresentImageAt` presents at once);
+- the NVIDIA low-latency boost.
+
+**Speed:** see the release notes' measurements. The layer records closures and runs them at submit. A scripted race took 83 s on Direct3D 11 against ~60 s on Vulkan before its upload batching (measured again after).
+
 ## Where we start (checked in code)
 
 **What we ask for today:**

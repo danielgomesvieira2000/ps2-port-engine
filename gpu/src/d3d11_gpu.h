@@ -18,6 +18,7 @@
 #include <dxgi1_2.h>
 #undef small
 
+#include <memory>
 #include <mutex>
 #include <string>
 
@@ -44,10 +45,21 @@ public:
     std::mutex context_lock;
     ID3D11RasterizerState* scissored = nullptr;     // no culling, scissor on
     bool logic_op = false;          // D3D11.1's output-merger logic ops (UNORM targets: OutputMergerLogicOp)
+    /* The Vulkan renderer's device on this one (d3d11_vulkan.cpp's layer):
+       made by CreateD3D11GsRenderer. */
+    std::unique_ptr<Gpu> vulkan;
 
 private:
     std::string describe_;
 };
+
+/* The Vulkan layer over Direct3D 11 (d3d11_vulkan.cpp): installed in volk's
+   table, after which Vulkan's calls are this device's; an image of its as
+   the display shows it (its whole, sampled; its size). */
+namespace vk11 {
+void Install(D3D11Gpu& gpu);
+ID3D11ShaderResourceView* ImageSrv(std::uint64_t image, std::uint32_t* width, std::uint32_t* height);
+}  // namespace vk11
 
 }  // namespace ps2gpu
 

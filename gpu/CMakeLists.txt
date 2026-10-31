@@ -177,7 +177,8 @@ if(PS2GPU_D3D11)
             COMMAND ps2gpu_spirv_to_hlsl ${spv} ${hlsl}
             COMMAND ${PS2GPU_FXC} /nologo /O3 /T ${profile} /E main /Fh ${out} /Vn dxbc_${name} ${hlsl}
             DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${source} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
-                    ${GLSLANG} ps2gpu_spirv_to_hlsl
+                    ${CMAKE_CURRENT_LIST_DIR}/shaders/smaa_common.glsl ${CMAKE_CURRENT_LIST_DIR}/third_party/smaa/SMAA.glsl
+                    ${CMAKE_CURRENT_LIST_DIR}/tools/spirv_to_hlsl.cpp ${GLSLANG} ps2gpu_spirv_to_hlsl
             COMMENT "HLSL ${name} (${source})")
         set(PS2GPU_SHADER_HEADERS ${PS2GPU_SHADER_HEADERS} ${out} PARENT_SCOPE)
     endfunction()
@@ -185,6 +186,7 @@ if(PS2GPU_D3D11)
     ps2gpu_hlsl(d3d_gs_frag gs.frag ps_5_0)
     ps2gpu_hlsl(d3d_gs_frag_single gs.frag ps_5_0 -DSINGLE_OUTPUT)
     ps2gpu_hlsl(d3d_gs_frag_blend gs.frag ps_5_0 -DSHADER_BLEND)
+    ps2gpu_hlsl(d3d_gs_frag_uint gs.frag ps_5_0 -DSINGLE_OUTPUT -DUINT_OUTPUT)
     ps2gpu_hlsl(d3d_date_vert date.vert vs_5_0)
     ps2gpu_hlsl(d3d_date_frag date.frag ps_5_0)
     ps2gpu_hlsl(d3d_depth_load_frag depth_load.frag ps_5_0)
@@ -194,6 +196,15 @@ if(PS2GPU_D3D11)
     ps2gpu_hlsl(d3d_decode decode.comp cs_5_0)
     ps2gpu_hlsl(d3d_decode_image decode.comp cs_5_0 -DTO_IMAGE)
     ps2gpu_hlsl(d3d_patch patch.comp cs_5_0)
+    ps2gpu_hlsl(d3d_shuffle shuffle.comp cs_5_0)
+    ps2gpu_hlsl(d3d_fxaa fxaa.comp cs_5_0)
+    ps2gpu_hlsl(d3d_downsample downsample.comp cs_5_0)
+    ps2gpu_hlsl(d3d_smaa_edges smaa_edges.comp cs_5_0)
+    ps2gpu_hlsl(d3d_smaa_weights smaa_weights.comp cs_5_0)
+    ps2gpu_hlsl(d3d_smaa_blend smaa_blend.comp cs_5_0)
+    foreach(pass RANGE 0 15)
+        ps2gpu_hlsl(d3d_effects_${pass} effects.comp cs_5_0 -DPASS=${pass})
+    endforeach()
 endif()
 add_custom_target(ps2gpu_shaders DEPENDS ${PS2GPU_SHADER_HEADERS})
 
@@ -203,6 +214,7 @@ add_library(ps2gpu STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/d3d11_gpu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/d3d11_display.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/d3d11_renderer.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/d3d11_vulkan.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gpu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/vk_device.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gs_renderer.cpp

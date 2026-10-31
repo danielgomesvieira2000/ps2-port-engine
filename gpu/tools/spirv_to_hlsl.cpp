@@ -3,7 +3,7 @@
  * HLSL for Direct3D 11 (shader model 5.0), at build time - fxc then compiles
  * it. SPIRV-Cross does the translation; this names the registers:
  *
- *   - a resource at (set, binding) is register set * 4 + binding of its kind
+ *   - a resource at (set, binding) is register set * 7 + binding of its kind
  *     (t for textures and read-only buffers, s for their samplers, u for
  *     storage images and buffers): Direct3D 11 has no sets;
  *   - the push constants are constant buffer b0.
@@ -38,10 +38,12 @@ int main(int argc, char** argv) {
         spirv_cross::CompilerHLSL::Options options;
         options.shader_model = 50;
         compiler.set_hlsl_options(options);
-        spirv_cross::CompilerGLSL::Options common = compiler.get_common_options();
-        common.vertex.flip_vert_y = false;
-        compiler.set_common_options(common);
         const spv::ExecutionModel model = compiler.get_execution_model();
+        // Vulkan's clip space has Y down, Direct3D's up: a vertex shader's
+        // position flipped, so the same pixels are covered.
+        spirv_cross::CompilerGLSL::Options common = compiler.get_common_options();
+        common.vertex.flip_vert_y = model == spv::ExecutionModelVertex;
+        compiler.set_common_options(common);
         const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
         auto bind = [&](const spirv_cross::Resource& r) {
             const std::uint32_t set = compiler.get_decoration(r.id, spv::DecorationDescriptorSet);
@@ -50,7 +52,7 @@ int main(int argc, char** argv) {
             b.stage = model;
             b.desc_set = set;
             b.binding = binding;
-            const std::uint32_t reg = set * 4 + binding;
+            const std::uint32_t reg = set * 7 + binding;
             b.cbv.register_binding = b.srv.register_binding = b.uav.register_binding = b.sampler.register_binding = reg;
             compiler.add_hlsl_resource_binding(b);
         };

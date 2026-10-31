@@ -156,10 +156,17 @@ bool VulkanGpu::InitShared(VkInstance shared_instance, VkPhysicalDevice shared_g
     family = shared_family;
     queue = shared_queue;
     dual_source = shared_dual_source;
-    VkPhysicalDeviceFeatures supported;                 // the Display enables logicOp where there is one
+    VkPhysicalDeviceFeatures supported;                 // the Display enables these where there are (VkDeviceSetup)
     vkGetPhysicalDeviceFeatures(shared_gpu, &supported);
     logic_op = supported.logicOp == VK_TRUE;
-    bc = supported.textureCompressionBC == VK_TRUE;     // (the Display enables it too)
+    bc = supported.textureCompressionBC == VK_TRUE;
+    // Anisotropy for texture packs' and ANISOTROPIC's samplers, as the
+    // headless device has it (a window's device kept 1: no anisotropy).
+    if (supported.samplerAnisotropy) {
+        VkPhysicalDeviceProperties properties;
+        vkGetPhysicalDeviceProperties(shared_gpu, &properties);
+        anisotropy = properties.limits.maxSamplerAnisotropy;
+    }
     describe_ = describe;
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;

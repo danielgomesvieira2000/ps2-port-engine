@@ -50,6 +50,9 @@ public:
     virtual Api api() const { return Api::kVulkan; }
 };
 std::unique_ptr<Gpu> CreateGpu(std::string* error);
+/* A Direct3D 11 device, headless (Windows; the renderer's tests): null, with
+   `error`, where there is none. */
+std::unique_ptr<Gpu> CreateD3D11Gpu(std::string* error);
 
 /* A vertex as the GS has it after XYOFFSET: position in pixels (the GS samples
    at whole pixel coordinates), colour 0-255, and the texture coordinate as

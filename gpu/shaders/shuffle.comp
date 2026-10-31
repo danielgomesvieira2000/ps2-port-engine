@@ -14,7 +14,17 @@
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
+#ifdef D3D11
+// (Direct3D 11's: the RGBA8 target viewed as 32-bit words - feature level
+// 11_0 loads no RGBA8 from an unordered-access view.)
+layout(set = 0, binding = 0, r32ui) uniform uimage2D target;
+vec4 LoadTarget(ivec2 at) { return unpackUnorm4x8(imageLoad(target, at).x); }
+void StoreTarget(ivec2 at, vec4 c) { imageStore(target, at, uvec4(packUnorm4x8(c))); }
+#else
 layout(set = 0, binding = 0, rgba8) uniform image2D target;
+vec4 LoadTarget(ivec2 at) { return imageLoad(target, at); }
+void StoreTarget(ivec2 at, vec4 c) { imageStore(target, at, c); }
+#endif
 layout(set = 1, binding = 0) uniform sampler2D depth;
 
 layout(push_constant) uniform Params {
@@ -97,7 +107,7 @@ void main() {
     if (any(greaterThanEqual(at, imageSize(target)))) return;
     const uvec2 pixel = uvec2(at) / p.scale, sub = uvec2(at) % p.scale;
     const uint word = Word32(p.dst_bp, p.dst_bw, pixel);
-    uint value = packUnorm4x8(imageLoad(target, at));
+    uint value = packUnorm4x8(LoadTarget(at));
     bool changed = false;
     for (uint h = 0u; h < 2u; ++h) {
         const ivec2 q = ivec2(Pixel16(word * 2u + h, p.view_bp, p.dst_bw, p.dst_view));
@@ -121,5 +131,5 @@ void main() {
         value = (value & ~(0xFFFFu << (16u * h))) | (new16 << (16u * h));
         changed = true;
     }
-    if (changed) imageStore(target, at, unpackUnorm4x8(value));
+    if (changed) StoreTarget(at, unpackUnorm4x8(value));
 }

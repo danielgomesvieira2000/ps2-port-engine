@@ -2416,7 +2416,10 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     // On the window's device when there is a window: one Vulkan device for both.
     ps2gpu::Gpu* device = WindowGpu();
     if (!device) {
-        bridge.gpu = ps2gpu::CreateGpu(error);
+        // (Without a window, PS2HOST_RENDERER=d3d11 draws on a Direct3D 11
+        // device of its own: a scripted run's regressions on that backend.)
+        const char* api = std::getenv("PS2HOST_RENDERER");
+        bridge.gpu = api && std::strcmp(api, "d3d11") == 0 ? ps2gpu::CreateD3D11Gpu(error) : ps2gpu::CreateGpu(error);
         if (!bridge.gpu) return false;
         device = bridge.gpu.get();
     }

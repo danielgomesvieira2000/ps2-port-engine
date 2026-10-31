@@ -414,7 +414,9 @@ void Fogged(ps2gpu::GsRenderer& renderer) {
 
 int main() {
     std::string error;
-    auto gpu = ps2gpu::CreateGpu(&error);
+    // PS2HOST_RENDERER=d3d11: the same tests on Direct3D 11.
+    const char* api = std::getenv("PS2HOST_RENDERER");
+    auto gpu = api && std::string(api) == "d3d11" ? ps2gpu::CreateD3D11Gpu(&error) : ps2gpu::CreateGpu(&error);
     if (!gpu) {
         std::printf("no GPU: %s (skipped)\n", error.c_str());
         return 0;

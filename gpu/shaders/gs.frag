@@ -199,7 +199,13 @@ vec4 Sample(vec2 uv, int n, bool linear) {
     const vec4 f = vec4(xy & 15, 0, 0);
     const ivec4 at = Neighbours(i0, n);
     vec4 c00, c10, c01, c11;
+#ifdef D3D11
+    // (Direct3D 11 views no RGBA8 image as 32-bit words: four fetches, the
+    // same texels.)
+    if (false) {
+#else
     if (at.y == at.x + 1 && at.w == at.z + 1) {
+#endif
         // Side by side in the image (almost always - not where a wrap or a
         // clamp parts them): gathered at the corner they share.
         const uvec4 w = textureGather(texture_words, vec2(at.yw) / vec2(ImageSize()), 0);
@@ -408,7 +414,13 @@ vec4 Sample(vec2 uv) {
     return floor(c0 + (c1 - c0) * f + 0.5);
 }
 
-#ifdef SINGLE_OUTPUT
+#ifdef UINT_OUTPUT
+// (Direct3D 11.1's logic ops - FBMSK's partly masked channels - are for UINT
+// targets alone: the colour written as its bytes, to a UINT view of the
+// target.)
+layout(location = 0) out uvec4 colour_bits;
+vec4 colour;
+#elif defined(SINGLE_OUTPUT)
 layout(location = 0) out vec4 colour;
 #else
 layout(location = 0, index = 0) out vec4 colour;
@@ -583,6 +595,9 @@ void main() {
         if (p.logic == 1u) colour = unpackUnorm4x8(p.keep);
         if (p.logic == 2u) colour = unpackUnorm4x8(packUnorm4x8(c / 255.0) & ~p.keep);
     }
+#ifdef UINT_OUTPUT
+    colour_bits = uvec4(round(colour * 255.0));
+#endif
 #ifndef SINGLE_OUTPUT
     float k = p.fix_factor != 0u ? float(p.fix) : c.a;
     factor = vec4(way != 0u ? 1.0 : k / 128.0);

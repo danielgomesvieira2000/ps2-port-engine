@@ -88,6 +88,7 @@ bool D3D11Gpu::Init(std::string* error) {
 }
 
 D3D11Gpu::~D3D11Gpu() {
+    vulkan.reset();                         // (its objects are this device's)
     if (scissored) scissored->Release();
     if (context) context->Release();
     if (device) device->Release();

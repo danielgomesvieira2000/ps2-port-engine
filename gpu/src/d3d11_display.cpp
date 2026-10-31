@@ -12,7 +12,9 @@
  * IMMEDIATE), else at the next refresh without waiting for it.
  *
  * Shaders are compiled from the HLSL below when the display is made
- * (d3dcompiler_47.dll, part of Windows).
+ * (d3dcompiler_47.dll, part of Windows); ANTI-ALIASING's passes - FXAA, SMAA's
+ * three, supersampling's average - are the Vulkan display's compute shaders,
+ * their HLSL built with the GS renderer's (gpu/CMakeLists.txt).
  */
 
 #ifdef _WIN32
@@ -31,7 +33,9 @@
 #pragma comment(lib, "d3dcompiler.lib")
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <initializer_list>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -39,6 +43,15 @@
 #include <string>
 
 #include "d3d11_gpu.h"
+#ifdef PS2GPU_D3D11
+#include "AreaTex.h"             // gpu/third_party/smaa
+#include "SearchTex.h"
+#include "d3d_downsample_dxbc.h"
+#include "d3d_fxaa_dxbc.h"
+#include "d3d_smaa_blend_dxbc.h"
+#include "d3d_smaa_edges_dxbc.h"
+#include "d3d_smaa_weights_dxbc.h"
+#endif
 
 namespace ps2gpu {
 
@@ -76,6 +89,7 @@ public:
     bool Vrr() const override { return vrr_; }
     Pacing TakePacing() override;
     double PresentsPerSecond() const override { return fps_.load(); }
+    void SetAntiAliasing(AntiAliasing mode) override { anti_aliasing_.store(int(mode)); }
     std::string Describe() const override { return describe_; }
     Gpu* SharedGpu() override { return gpu_.device ? &gpu_ : nullptr; }
 
@@ -89,6 +103,33 @@ private:
               std::uint32_t texture_width, std::uint32_t texture_height);
     void DrawOverlay(std::uint32_t target_width, std::uint32_t target_height);
     void CountPresent();
+    /* ANTI-ALIASING: the picture's used part copied into post_in_, then
+       FXAA or SMAA into post_out_ (its size), or supersampling's average
+       down to the shown size; the picture shown is then post_out_. False
+       (shown as drawn) where the passes cannot be made. */
+    bool Smooth(ID3D11ShaderResourceView** picture, std::uint32_t* width, std::uint32_t* height,
+                std::uint32_t* texture_width, std::uint32_t* texture_height, std::uint32_t shown_width,
+                std::uint32_t shown_height);
+    struct PostImage {
+        ID3D11Texture2D* texture = nullptr;
+        ID3D11ShaderResourceView* srv = nullptr;
+        ID3D11UnorderedAccessView* uav = nullptr;
+        std::uint32_t width = 0, height = 0;
+    };
+    bool EnsurePostImage(PostImage& image, std::uint32_t width, std::uint32_t height, bool uav);
+    void ReleasePostImage(PostImage& image);
+    void Dispatch(ID3D11ComputeShader* shader, std::initializer_list<ID3D11ShaderResourceView*> srvs,
+                  ID3D11UnorderedAccessView* uav, UINT uav_slot, const void* params, std::uint32_t width,
+                  std::uint32_t height);
+    std::atomic<int> anti_aliasing_{int(AntiAliasing::kOff)};
+    bool post_made_ = false, post_failed_ = false;
+    ID3D11ComputeShader* fxaa_ = nullptr;
+    ID3D11ComputeShader* downsample_ = nullptr;
+    ID3D11ComputeShader* smaa_[3] = {};
+    ID3D11Buffer* post_params_ = nullptr;
+    PostImage post_in_, post_out_, smaa_edges_, smaa_weights_;
+    ID3D11Texture2D* smaa_tables_[2] = {};
+    ID3D11ShaderResourceView* smaa_table_views_[2] = {};
 
     D3D11Gpu gpu_;                          // the device (SharedGpu: what a D3D11 GS renderer draws with)
     HWND hwnd_ = nullptr;
@@ -264,16 +305,13 @@ bool D3D11Display::Present(const std::uint32_t* pixels, std::uint32_t width, std
 bool D3D11Display::PresentImage(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height) {
     (void)layout;
     if (!width || !height || !image) return !closed_;
-    // A D3D11 GS renderer's target: its shader resource view, on this device.
-    auto* view = reinterpret_cast<ID3D11ShaderResourceView*>(image);
-    ID3D11Resource* resource = nullptr;
-    view->GetResource(&resource);
-    D3D11_TEXTURE2D_DESC td{};
-    static_cast<ID3D11Texture2D*>(resource)->GetDesc(&td);
-    resource->Release();
+    // The GS renderer's target: an image of the Vulkan layer's, on this device.
+    std::uint32_t texture_width = 0, texture_height = 0;
+    ID3D11ShaderResourceView* view = vk11::ImageSrv(image, &texture_width, &texture_height);
+    if (!view) return !closed_;
     std::lock_guard<std::mutex> hold(present_lock_);
     std::lock_guard<std::mutex> context(gpu_.context_lock);
-    return Show(view, width, height, td.Width, td.Height);
+    return Show(view, width, height, texture_width, texture_height);
 }
 
 bool D3D11Display::Show(ID3D11ShaderResourceView* picture, std::uint32_t width, std::uint32_t height,
@@ -296,6 +334,8 @@ bool D3D11Display::Show(ID3D11ShaderResourceView* picture, std::uint32_t width, 
     }
     const std::int32_t x0 = (w - dw) / 2, y0 = (h - dh) / 2;
     SetShownRect(x0, y0, std::max(dw, 1), std::max(dh, 1));
+    Smooth(&picture, &width, &height, &texture_width, &texture_height, std::uint32_t(std::max(dw, 1)),
+           std::uint32_t(std::max(dh, 1)));
     // The picture's used part stretched over the shown rectangle: the
     // viewport is as much larger as the texture is past the part.
     const float sx = float(dw) / float(width), sy = float(dh) / float(height);
@@ -366,6 +406,151 @@ void D3D11Display::DrawOverlay(std::uint32_t target_width, std::uint32_t target_
     c->Draw(3, 0);
 }
 
+bool D3D11Display::EnsurePostImage(PostImage& image, std::uint32_t width, std::uint32_t height, bool uav) {
+    if (image.texture && image.width == width && image.height == height) return true;
+    ReleasePostImage(image);
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = width;
+    td.Height = height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | (uav ? D3D11_BIND_UNORDERED_ACCESS : 0u);
+    if (FAILED(gpu_.device->CreateTexture2D(&td, nullptr, &image.texture)) ||
+        FAILED(gpu_.device->CreateShaderResourceView(image.texture, nullptr, &image.srv)) ||
+        (uav && FAILED(gpu_.device->CreateUnorderedAccessView(image.texture, nullptr, &image.uav)))) {
+        ReleasePostImage(image);
+        return false;
+    }
+    image.width = width;
+    image.height = height;
+    return true;
+}
+
+void D3D11Display::ReleasePostImage(PostImage& image) {
+    Release(image.uav);
+    Release(image.srv);
+    Release(image.texture);
+    image.width = image.height = 0;
+}
+
+void D3D11Display::Dispatch(ID3D11ComputeShader* shader, std::initializer_list<ID3D11ShaderResourceView*> srvs,
+                            ID3D11UnorderedAccessView* uav, UINT uav_slot, const void* params, std::uint32_t width,
+                            std::uint32_t height) {
+    ID3D11DeviceContext* c = gpu_.context;
+    c->UpdateSubresource(post_params_, 0, nullptr, params, 0, 0);
+    ID3D11SamplerState* samplers[3] = {linear_, linear_, point_};      // (SMAA's search table: point-sampled)
+    c->CSSetShader(shader, nullptr, 0);
+    c->CSSetConstantBuffers(0, 1, &post_params_);
+    c->CSSetSamplers(0, 3, samplers);
+    ID3D11ShaderResourceView* views[3] = {};
+    UINT n = 0;
+    for (ID3D11ShaderResourceView* v : srvs) views[n++] = v;
+    c->CSSetShaderResources(0, n, views);
+    c->CSSetUnorderedAccessViews(uav_slot, 1, &uav, nullptr);
+    c->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+    ID3D11ShaderResourceView* none[3] = {};
+    ID3D11UnorderedAccessView* no_uav = nullptr;
+    c->CSSetShaderResources(0, 3, none);
+    c->CSSetUnorderedAccessViews(uav_slot, 1, &no_uav, nullptr);
+}
+
+bool D3D11Display::Smooth(ID3D11ShaderResourceView** picture, std::uint32_t* width, std::uint32_t* height,
+                          std::uint32_t* texture_width, std::uint32_t* texture_height, std::uint32_t shown_width,
+                          std::uint32_t shown_height) {
+#ifdef PS2GPU_D3D11
+    const AntiAliasing mode = AntiAliasing(anti_aliasing_.load());
+    const bool larger = *width > shown_width || *height > shown_height;
+    if (mode == AntiAliasing::kOff || (mode == AntiAliasing::kDownsample && !larger) || post_failed_) return false;
+    ID3D11Device* dev = gpu_.device;
+    if (!post_made_) {
+        post_made_ = true;
+        auto cs = [&](const void* code, std::size_t bytes, ID3D11ComputeShader** out) {
+            return SUCCEEDED(dev->CreateComputeShader(code, bytes, nullptr, out));
+        };
+        D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = 16;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bool ok = cs(dxbc_d3d_fxaa, sizeof dxbc_d3d_fxaa, &fxaa_) &&
+                  cs(dxbc_d3d_downsample, sizeof dxbc_d3d_downsample, &downsample_) &&
+                  cs(dxbc_d3d_smaa_edges, sizeof dxbc_d3d_smaa_edges, &smaa_[0]) &&
+                  cs(dxbc_d3d_smaa_weights, sizeof dxbc_d3d_smaa_weights, &smaa_[1]) &&
+                  cs(dxbc_d3d_smaa_blend, sizeof dxbc_d3d_smaa_blend, &smaa_[2]) &&
+                  SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &post_params_));
+        // SMAA's area (RG8) and search (R8) tables.
+        const struct { DXGI_FORMAT format; UINT w, h, pitch; const void* bytes; } tables[2] = {
+            {DXGI_FORMAT_R8G8_UNORM, AREATEX_WIDTH, AREATEX_HEIGHT, AREATEX_PITCH, areaTexBytes},
+            {DXGI_FORMAT_R8_UNORM, SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, SEARCHTEX_PITCH, searchTexBytes}};
+        for (int i = 0; i < 2 && ok; ++i) {
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = tables[i].w;
+            td.Height = tables[i].h;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = tables[i].format;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_IMMUTABLE;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            const D3D11_SUBRESOURCE_DATA data{tables[i].bytes, tables[i].pitch, 0};
+            ok = SUCCEEDED(dev->CreateTexture2D(&td, &data, &smaa_tables_[i])) &&
+                 SUCCEEDED(dev->CreateShaderResourceView(smaa_tables_[i], nullptr, &smaa_table_views_[i]));
+        }
+        if (!ok) {
+            post_failed_ = true;
+            std::fprintf(stderr, "[display] anti-aliasing's passes could not be made: pictures shown as drawn\n");
+            return false;
+        }
+    }
+    const std::uint32_t w = *width, h = *height;
+    // The picture's used part, alone, as the passes read it.
+    if (!EnsurePostImage(post_in_, w, h, false)) return false;
+    ID3D11Resource* source = nullptr;
+    (*picture)->GetResource(&source);
+    const D3D11_BOX box{0, 0, 0, w, h, 1};
+    gpu_.context->CopySubresourceRegion(post_in_.texture, 0, 0, 0, 0, source, 0, &box);
+    source->Release();
+    if (mode == AntiAliasing::kDownsample) {
+        if (!EnsurePostImage(post_out_, shown_width, shown_height, true)) return false;
+        const struct { float texel[2]; std::int32_t size[2]; } params{{1.0f / float(w), 1.0f / float(h)},
+                                                                       {std::int32_t(shown_width), std::int32_t(shown_height)}};
+        Dispatch(downsample_, {post_in_.srv}, post_out_.uav, 1, &params, shown_width, shown_height);
+        *width = *texture_width = shown_width;
+        *height = *texture_height = shown_height;
+    } else if (mode == AntiAliasing::kFxaa) {
+        if (!EnsurePostImage(post_out_, w, h, true)) return false;
+        const struct { float texel[2]; std::int32_t size[2]; } params{{1.0f / float(w), 1.0f / float(h)},
+                                                                       {std::int32_t(w), std::int32_t(h)}};
+        Dispatch(fxaa_, {post_in_.srv}, post_out_.uav, 1, &params, w, h);
+        *texture_width = w;
+        *texture_height = h;
+    } else {
+        if (!EnsurePostImage(post_out_, w, h, true) || !EnsurePostImage(smaa_edges_, w, h, true) ||
+            !EnsurePostImage(smaa_weights_, w, h, true))
+            return false;
+        const float metrics[4] = {1.0f / float(w), 1.0f / float(h), float(w), float(h)};
+        // (Pixels with no edge keep what was there: cleared first, as Vulkan's.)
+        const float zero[4] = {};
+        gpu_.context->ClearUnorderedAccessViewFloat(smaa_edges_.uav, zero);
+        gpu_.context->ClearUnorderedAccessViewFloat(smaa_weights_.uav, zero);
+        Dispatch(smaa_[0], {post_in_.srv}, smaa_edges_.uav, 3, metrics, w, h);
+        Dispatch(smaa_[1], {smaa_edges_.srv, smaa_table_views_[0], smaa_table_views_[1]}, smaa_weights_.uav, 3, metrics,
+                 w, h);
+        Dispatch(smaa_[2], {post_in_.srv, smaa_weights_.srv}, post_out_.uav, 3, metrics, w, h);
+        *texture_width = w;
+        *texture_height = h;
+    }
+    *picture = post_out_.srv;
+    return true;
+#else
+    (void)picture, (void)width, (void)height, (void)texture_width, (void)texture_height, (void)shown_width,
+        (void)shown_height;
+    return false;
+#endif
+}
+
 void D3D11Display::CountPresent() {
     const auto now = std::chrono::steady_clock::now();
     {
@@ -410,6 +595,18 @@ D3D11Display::~D3D11Display() {
     }
     Release(overlay_view_);
     Release(overlay_texture_);
+    ReleasePostImage(post_in_);
+    ReleasePostImage(post_out_);
+    ReleasePostImage(smaa_edges_);
+    ReleasePostImage(smaa_weights_);
+    for (int i = 0; i < 2; ++i) {
+        Release(smaa_table_views_[i]);
+        Release(smaa_tables_[i]);
+    }
+    for (ID3D11ComputeShader*& s : smaa_) Release(s);
+    Release(fxaa_);
+    Release(downsample_);
+    Release(post_params_);
     Release(picture_view_);
     Release(picture_);
     Release(linear_);
