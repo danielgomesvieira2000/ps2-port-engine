@@ -31,6 +31,8 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>      // main is SDL_main, which the activity calls
 #include "ps2gpu/display.h"
+#elif defined(__linux__)
+#include <SDL3/SDL.h>           // (a player's messages: SDL's message box)
 #endif
 
 #include "ps2host/disc.h"
@@ -133,6 +135,48 @@ std::string PickDisc() {
     dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
     return GetOpenFileNameA(&dialog) ? std::string(file) : std::string();
 }
+#elif defined(__linux__)
+/* The player's disc image, from the desktop's file dialog (zenity, GNOME's
+   and most desktops'; kdialog, KDE's); "" if they cancel or there is none. */
+std::string PickDisc() {
+    const std::string title = "Choose your " PS2HOST_GAME_NAME " disc image";
+    const std::string commands[] = {
+        "zenity --file-selection --title=\"" + title + "\" --file-filter=\"Disc images | *.iso *.ISO *.cue *.CUE *.bin *.BIN\" 2>/dev/null",
+        "kdialog --getopenfilename \"$HOME\" \"*.iso *.cue *.bin|Disc images\" --title \"" + title + "\" 2>/dev/null",
+    };
+    for (const std::string& command : commands) {
+        const std::string tool = command.substr(0, command.find(' '));
+        if (std::system(("command -v " + tool + " >/dev/null 2>&1").c_str()) != 0) continue;
+        std::FILE* pipe = popen(command.c_str(), "r");
+        if (!pipe) continue;
+        std::string path;
+        char chunk[512];
+        while (std::fgets(chunk, sizeof chunk, pipe)) path += chunk;
+        pclose(pipe);
+        while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) path.pop_back();
+        return path;
+    }
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, PS2HOST_GAME_NAME,
+                             "Put an image of your " PS2HOST_GAME_NAME " disc (.iso, or .cue with its .bin) in the "
+                             "folder beside this program, or start it with --disc <image>.",
+                             nullptr);
+    return {};
+}
+
+/* Where a player's files go: beside the program, as on Windows (a folder
+   unpacked from the release), else - where it may not write (installed for
+   every user) - $XDG_DATA_HOME/<target>, ~/.local/share/<target>. */
+std::filesystem::path PlayerFolder(const std::filesystem::path& program) {
+    std::error_code error;
+    if (access(program.c_str(), W_OK) == 0) return program;
+    const char* data = std::getenv("XDG_DATA_HOME");
+    const char* home = std::getenv("HOME");
+    std::filesystem::path folder = data && *data ? std::filesystem::path(data)
+                                   : std::filesystem::path(home ? home : ".") / ".local" / "share";
+    folder /= PS2HOST_GAME_TARGET;
+    std::filesystem::create_directories(folder, error);
+    return folder;
+}
 #endif
 #endif
 
@@ -202,17 +246,24 @@ std::vector<std::string> AndroidPlayArguments(const char* self, const std::strin
    sound, on the GPU, with no time limit (the default is for test runs).
    An empty list: the player gave none. */
 std::vector<std::string> PlayArguments(const char* self) {
-#if defined(PS2HOST_GAME_EXECUTABLE) && defined(_WIN32)
+#if defined(PS2HOST_GAME_EXECUTABLE) && (defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
+#ifdef _WIN32
     wchar_t exe[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     const std::filesystem::path here = std::filesystem::path(exe).parent_path();
+#else
+    std::error_code error;
+    const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", error);
+    const std::filesystem::path program = error ? std::filesystem::current_path() : exe.parent_path();
+    const std::filesystem::path here = PlayerFolder(program);
+#endif
     ps2host::LoadSettings((here / "pc_settings.ini").string());     // where --memcard puts them
     std::string disc = ps2host::Setting("disc");
     // None chosen yet, or gone: an image of the game's disc beside the
     // executable is taken without asking.
     if (!IsGameDisc(disc)) {
-        std::error_code error;
-        for (const auto& entry : std::filesystem::directory_iterator(here, error)) {
+        std::error_code missing;
+        for (const auto& entry : std::filesystem::directory_iterator(here, missing)) {
             std::string ext = entry.path().extension().string();
             for (char& ch : ext) ch = char(tolower(static_cast<unsigned char>(ch)));
             if ((ext == ".iso" || ext == ".bin" || ext == ".cue") && IsGameDisc(entry.path().string())) {
@@ -222,10 +273,21 @@ std::vector<std::string> PlayArguments(const char* self) {
         }
     }
     while (!IsGameDisc(disc)) {
-        if (!disc.empty() && GetFileAttributesA(disc.c_str()) != INVALID_FILE_ATTRIBUTES)
-            MessageBoxA(nullptr, ("This is not an image of the " PS2HOST_GAME_NAME " disc "
-                                  "(" PS2HOST_GAME_EXECUTABLE "):\n\n" + disc).c_str(),
-                        PS2HOST_GAME_NAME, MB_OK | MB_ICONWARNING);
+#ifdef _WIN32
+        const bool there = !disc.empty() && GetFileAttributesA(disc.c_str()) != INVALID_FILE_ATTRIBUTES;
+#else
+        std::error_code missing;
+        const bool there = !disc.empty() && std::filesystem::exists(disc, missing);
+#endif
+        if (there) {
+            const std::string text = "This is not an image of the " PS2HOST_GAME_NAME " disc "
+                                     "(" PS2HOST_GAME_EXECUTABLE "):\n\n" + disc;
+#ifdef _WIN32
+            MessageBoxA(nullptr, text.c_str(), PS2HOST_GAME_NAME, MB_OK | MB_ICONWARNING);
+#else
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, PS2HOST_GAME_NAME, text.c_str(), nullptr);
+#endif
+        }
         disc = PickDisc();
         if (disc.empty()) return {};
     }
@@ -233,7 +295,7 @@ std::vector<std::string> PlayArguments(const char* self) {
     // No terminal to read: what the run says goes to a log beside it. Opened
     // once, shared (fopen's would lock the file to one stream), and given to
     // both: their lines in the order they were written.
-    g_log = std::filesystem::path(exe).stem().string() + ".log";
+    g_log = std::filesystem::path(exe).stem().string() + ".log";     // (on Linux: the program's name, .log)
     LogTo((here / g_log).string());
     std::fprintf(stderr, "[port] disc %s\n", disc.c_str());
     return {self, "--disc", disc, "--memcard", (here / "memcard").string(), "--window", "--gpu",
