@@ -38,7 +38,8 @@ bool D3D11Gpu::Init(std::string* error) {
     if (FAILED(hr)) return fail("CreateDXGIFactory1", hr);
     // PS2HOST_GPU=<part of its name> picks the adapter (as for Vulkan), else
     // the system's first - the one the desktop is on - leaving out
-    // Microsoft's software adapter.
+    // Microsoft's software adapter unless it is named ("basic": WARP, an
+    // older GPU's feature level with PS2HOST_D3D11_LEVEL=11_0, to test).
     const char* want = std::getenv("PS2HOST_GPU");
     IDXGIAdapter1* candidate = nullptr;
     for (UINT i = 0; factory->EnumAdapters1(i, &candidate) != DXGI_ERROR_NOT_FOUND; ++i) {
@@ -46,7 +47,7 @@ bool D3D11Gpu::Init(std::string* error) {
         candidate->GetDesc1(&desc);
         const bool software = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
         const bool named = want && *want && Lower(Narrow(desc.Description)).find(Lower(want)) != std::string::npos;
-        if (!software && (!adapter || named)) {
+        if (named || (!software && !adapter)) {
             if (adapter) adapter->Release();
             adapter = candidate;
             if (named) break;
@@ -61,8 +62,12 @@ bool D3D11Gpu::Init(std::string* error) {
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     if (std::getenv("PS2HOST_D3D11_DEBUG")) flags |= D3D11_CREATE_DEVICE_DEBUG;     // (the SDK layers installed)
-    hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels, 2, D3D11_SDK_VERSION, &device,
-                           &level, &context);
+    // PS2HOST_D3D11_LEVEL=11_0: no more than 11_0 (Haswell's, Kepler's), to test.
+    const char* most = std::getenv("PS2HOST_D3D11_LEVEL");
+    const bool eleven_oh = most && std::string(most) == "11_0";
+    hr = eleven_oh ? E_FAIL
+                   : D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels, 2, D3D11_SDK_VERSION,
+                                       &device, &level, &context);
     if (FAILED(hr)) {
         // (An 11_0-only runtime refuses a list naming 11_1.)
         hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels + 1, 1, D3D11_SDK_VERSION,

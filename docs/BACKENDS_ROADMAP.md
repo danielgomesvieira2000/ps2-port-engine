@@ -52,6 +52,8 @@ How it maps:
 - **Cause:** the layer kept one set of push constants. The renderer pushes the target's size once for a run of draws; that batch's CLUT, loaded on the GPU each primitive, is a compute dispatch with push constants of its own, which overwrote the size. Vulkan keeps push constants by bind point, so the layer now keeps the graphics stages' and compute's apart.
 - **Also:** after a secondary command buffer, or the depth upload's own draw, the layer forgets what it had bound (`Exec::ForgetBound`); the push-constant ring's blocks are rewritten after it wraps.
 
+**Feature level 11_0** (Haswell's, Kepler's: `PS2HOST_D3D11_LEVEL=11_0` caps the device at it): on the RTX 4070, car_select, race_training, race and crash are as recorded. On WARP (Microsoft's software adapter, taken when named: `PS2HOST_GPU=basic`) at 11_0 the renderer tests pass; car_select's pictures differ from the NVIDIA ones by small amounts (no pixel more than 32 levels off, a few thousand pixels a picture: WARP's own filtering), nothing missing.
+
 **Intel UHD, Vulkan against Direct3D 11** (its pictures differ from the NVIDIA recordings on both APIs alike, so compared with each other): car_select 42/44 the same, race 52/67. A frame that differs has 14-106 scattered pixels (at most 0.04%), on cars' coplanar parts and edges: the two Intel drivers' interpolation of depth and edges, not the layer (NVIDIA's pictures are the same on both).
 
 **Not done:**
