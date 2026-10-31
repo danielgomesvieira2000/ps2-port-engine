@@ -13,7 +13,7 @@ The goal is that every PC able to run the game's CPU side also draws on its GPU,
 **Direct3D 11: one renderer, not two.** X3 planned a second renderer, ported from `gs_renderer.cpp` part by part. What was built instead is a layer that implements the part of Vulkan the renderer uses with Direct3D 11 (`d3d11_vulkan.cpp`, ~1,900 lines: images, views, descriptor sets, pipelines, command buffers run at submit, copies, read-backs). The Vulkan renderer, its effects and `VulkanGpu` run on it unchanged.
 
 Why the change:
-- **Exactness by construction.** Both backends follow the same rules, so the Vulkan recordings are the D3D11 recordings: no `.d3d11.crc` set.
+- **Exactness by construction.** Both backends follow the same rules, so the Vulkan recordings are the D3D11 recordings. The one exception is the PC's modern effects: their float arithmetic is rounded differently by the two shader compilers (fxc and the Vulkan driver's), in about 0.6% of pixels and mostly by a few levels. race_modern therefore has a `.d3d11.crc` set of its own; regress.py uses it under `PS2HOST_RENDERER=d3d11`.
 - **No second renderer to keep in step** with every fix, game rule and feature.
 - **It was the shorter road**: about 100 distinct Vulkan calls against a 4,000-line renderer.
 
@@ -37,7 +37,13 @@ How it maps:
 
 **Checked:**
 - renderer tests on Direct3D 11 on the RTX 4070 and the Intel UHD;
-- Burnout 3 GPU regressions on Direct3D 11 (`PS2HOST_RENDERER=d3d11`, headless): car_select 44/44, race_training 55/55, race 67/67, crash 77/77, road_rage 69/69, the same CRCs as Vulkan's.
+- Burnout 3 GPU regressions on Direct3D 11 (`PS2HOST_RENDERER=d3d11`, headless): car_select 44/44, race_training 55/55, race 67/67, crash 77/77, road_rage 69/69, the same CRCs as Vulkan's. splitscreen is 50/52, the same two frames Vulkan misses. race_modern (2x, 120 fps, MODERN) matches its own set: 99.4% of pixels as Vulkan's.
+- The trap race_modern found: with dynamic vertex strides, binding a pipeline must keep the strides already bound. The renderer binds its sprite ranges at stride 0 and leaves them bound, so the layer's reset made 2x sprites read garbage: a dark sky, the paint unreflected.
+
+**Open: one difference in eliminator.** eliminator is 102/103 on Direct3D 11: frame 16200 has a blotch on the rock face above the tunnel. Vulkan is 103/103.
+- **Where it starts:** a capture of frames 16000-16202 (`PS2HOST_CAPTURE_FRAME=15999 PS2HOST_CAPTURE_FRAMES=202`, from a Vulkan run) replayed on both backends (`--gs-replay`, `PS2HOST_REPLAY_GPU=1`), and bisected with `PS2HOST_REPLAY_STOP_PRIM`. GS memory first differs after primitive 4,686,977 of the replay: a sub-pixel textured triangle-strip sliver (PSMT4, a CLUT load each primitive, blended) into the picture's tile at x 256-319, y 192-223. 12 pixels there differ: Vulkan has them near black, Direct3D 11 lit.
+- **How it grows:** the game's feedback blur spreads it over the next frames.
+- **Not yet known:** whether this is rasterisation of a degenerate primitive or the layer.
 
 **Not done:**
 - D3D12 (X6): the layer approach would carry over, but it is a larger layer and brings no new GPUs;
@@ -45,7 +51,7 @@ How it maps:
 - the display's frame pacing thread (`PresentImageAt` presents at once);
 - the NVIDIA low-latency boost.
 
-**Speed:** see the release notes' measurements. The layer records closures and runs them at submit. A scripted race took 83 s on Direct3D 11 against ~60 s on Vulkan before its upload batching (measured again after).
+**Speed:** the layer records closures and runs them at submit. A submission's host vertex ranges are uploaded once per buffer, and a stage's resources are bound again only when its sets or pipeline change. With both, scripted race_modern takes 47-48 s on Direct3D 11 against 46 s on Vulkan (RTX 4070); before them, a race took 83 s.
 
 ## Where we start (checked in code)
 

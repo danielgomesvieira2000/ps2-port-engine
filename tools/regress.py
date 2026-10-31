@@ -109,6 +109,15 @@ def main(argv=None) -> int:
                     found[key] = "%08X" % (zlib.crc32(handle.read()) & 0xFFFFFFFF)
         shutil.rmtree(card, ignore_errors=True)
     expected_path = os.path.join(runs, "%s.%s.crc" % (args.run, renderer))
+    # Direct3D 11 (PS2HOST_RENDERER=d3d11) draws the GPU recordings' pictures,
+    # but where a run has a set of its own (<run>.d3d11.crc: the PC's effects,
+    # whose float arithmetic two shader compilers round apart - looked at, a
+    # fraction of a percent of pixels by a few levels): that one, and
+    # --update writes it.
+    if args.gpu and os.environ.get("PS2HOST_RENDERER") == "d3d11":
+        own = os.path.join(runs, "%s.d3d11.crc" % args.run)
+        if os.path.exists(own) or args.update:
+            expected_path = own
     if args.update or not os.path.exists(expected_path):
         with open(expected_path, "w", encoding="utf-8", newline="\n") as handle:
             for name, crc in found.items():

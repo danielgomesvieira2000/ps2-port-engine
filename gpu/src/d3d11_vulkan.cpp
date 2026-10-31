@@ -244,6 +244,7 @@ struct Pipeline {
     VkStencilOpState front{};
     bool dyn_depth = false, dyn_stencil = false, dyn_stencil_values = false;
     bool logic = false;                     // a logic op: drawn into the target's UINT view
+    bool dyn_stride = false;                // VERTEX_INPUT_BINDING_STRIDE: the strides bound stay
 };
 
 struct Fence;
@@ -1520,6 +1521,7 @@ VkResult MakeGraphics(const VkGraphicsPipelineCreateInfo& ci, Pipeline* p) {
     p->dyn_depth = HasDynamic(ci.pDynamicState, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE);
     p->dyn_stencil = HasDynamic(ci.pDynamicState, VK_DYNAMIC_STATE_STENCIL_OP);
     p->dyn_stencil_values = HasDynamic(ci.pDynamicState, VK_DYNAMIC_STATE_STENCIL_REFERENCE);
+    p->dyn_stride = HasDynamic(ci.pDynamicState, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE);
     return VK_SUCCESS;
 }
 
@@ -1613,16 +1615,18 @@ CommandBuffer& Cmd(VkCommandBuffer c) { return *reinterpret_cast<CommandBuffer*>
 VKAPI_ATTR void VKAPI_CALL CmdBindPipeline(VkCommandBuffer cmd, VkPipelineBindPoint point, VkPipeline pipeline) {
     auto* p = reinterpret_cast<Pipeline*>(pipeline);
     const bool compute = point == VK_PIPELINE_BIND_POINT_COMPUTE;
-    if (!compute && p)
+    // (A pipeline with dynamic strides keeps those bound - the renderer binds
+    // its ranges' stream at stride 0 and leaves it bound across pipelines.)
+    if (!compute && p && !p->dyn_stride)
         for (int i = 0; i < 4; ++i) Cmd(cmd).bound[i].stride = p->strides[i];
     Cmd(cmd).steps.push_back([p, compute](Exec& x) {
         if (compute) {
             x.compute = p;
         } else {
             x.graphics = p;
-            // The vertex strides as made, until BindVertexBuffers2 says otherwise.
-            for (int i = 0; i < 4; ++i)
-                if (p) x.vbs[i].stride = p->strides[i];
+            // The vertex strides as made (a pipeline without dynamic ones).
+            if (p && !p->dyn_stride)
+                for (int i = 0; i < 4; ++i) x.vbs[i].stride = p->strides[i];
         }
     });
 }
