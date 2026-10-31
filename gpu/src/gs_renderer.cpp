@@ -2288,6 +2288,7 @@ std::atomic<std::size_t> g_warm_total{0}, g_warm_made{0};
 std::string CacheFile(const char* name) { return g_pipeline_cache_dir + "/" + name; }
 }  // namespace
 
+
 void VulkanGsRenderer::OpenPipelineCache() {
     // What a last run left (the driver checks it is its own, and ignores it
     // if not - another GPU, another driver).
@@ -4163,6 +4164,8 @@ std::string SubmitStats() {
 
 void SetPipelineCacheDir(const std::string& dir) { g_pipeline_cache_dir = dir; }
 void SetPipelineHints(const std::uint32_t* keys, std::size_t count) { g_pipeline_hints.assign(keys, keys + count); }
+
+std::string PipelineCacheDir() { return g_pipeline_cache_dir; }
 
 bool PipelineWarmProgress(std::size_t* made, std::size_t* total) {
     const std::size_t all = g_warm_total.load(), done = std::min(all, g_warm_made.load());

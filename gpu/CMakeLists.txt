@@ -171,10 +171,11 @@ if(PS2GPU_D3D11)
         set(spv ${PS2GPU_SHADER_DIR}/${name}.spv)
         set(hlsl ${PS2GPU_SHADER_DIR}/${name}.hlsl)
         set(out ${PS2GPU_SHADER_DIR}/${name}_dxbc.h)
-        add_custom_command(OUTPUT ${out}
+        # (the HLSL as an array too, for every shader: ${name}_hlsl.h)
+        add_custom_command(OUTPUT ${out} ${PS2GPU_SHADER_DIR}/${name}_hlsl.h
             COMMAND ${GLSLANG} -V --target-env vulkan1.2 -DD3D11 ${ARGN}
                     -I${CMAKE_CURRENT_LIST_DIR}/third_party/smaa -o ${spv} ${CMAKE_CURRENT_LIST_DIR}/shaders/${source}
-            COMMAND ps2gpu_spirv_to_hlsl ${spv} ${hlsl}
+            COMMAND ps2gpu_spirv_to_hlsl ${spv} ${hlsl} ${PS2GPU_SHADER_DIR}/${name}_hlsl.h ${name}
             COMMAND ${PS2GPU_FXC} /nologo /O3 /T ${profile} /E main /Fh ${out} /Vn dxbc_${name} ${hlsl}
             DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${source} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
                     ${CMAKE_CURRENT_LIST_DIR}/shaders/smaa_common.glsl ${CMAKE_CURRENT_LIST_DIR}/third_party/smaa/SMAA.glsl

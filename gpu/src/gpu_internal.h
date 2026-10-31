@@ -77,6 +77,9 @@ struct VkDeviceSetup {
     std::vector<const char*> extensions;
     const char* load_none = nullptr;        // a load_store_op_none extension, if offered
 };
+/* SetPipelineCacheDir's directory ("" for none: a scripted run's). */
+std::string PipelineCacheDir();
+
 /* The GS renderer on a D3D11Gpu (d3d11_renderer.cpp). */
 std::unique_ptr<GsRenderer> CreateD3D11GsRenderer(Gpu& gpu, std::string* error);
 

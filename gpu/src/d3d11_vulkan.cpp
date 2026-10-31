@@ -37,11 +37,16 @@
 #include "gpu_internal.h"
 #include "d3d11_gpu.h"
 
+#include <d3d11_4.h>
 #include <d3dcompiler.h>
 #pragma comment(lib, "d3dcompiler.lib")
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -74,6 +79,10 @@
 #include "d3d_gs_frag_single_dxbc.h"
 #include "d3d_gs_frag_blend_dxbc.h"
 #include "d3d_gs_frag_uint_dxbc.h"
+#include "d3d_gs_frag_hlsl.h"
+#include "d3d_gs_frag_single_hlsl.h"
+#include "d3d_gs_frag_blend_hlsl.h"
+#include "d3d_gs_frag_uint_hlsl.h"
 #include "d3d_date_vert_dxbc.h"
 #include "d3d_date_frag_dxbc.h"
 #include "d3d_depth_load_frag_dxbc.h"
@@ -162,6 +171,7 @@ struct Buffer {
     Memory* memory = nullptr;
     VkDeviceSize offset = 0;
     ID3D11Buffer* gpu = nullptr;            // the GPU's (a host buffer's twin, when the GPU reads it)
+    bool dynamic = false, mapped_once = false;      // a DYNAMIC twin (MakeGpuBuffer), and mapped before
     std::map<std::pair<VkDeviceSize, VkDeviceSize>, ID3D11ShaderResourceView*> srvs;
     std::map<std::pair<VkDeviceSize, VkDeviceSize>, ID3D11UnorderedAccessView*> uavs;
     bool host() const { return memory && memory->type == 1; }
@@ -219,7 +229,71 @@ struct ShaderModule {
     // gs.frag's colour as bytes (UINT_OUTPUT), for a pipeline with a logic op.
     const void* uint_dxbc = nullptr;
     std::size_t uint_dxbc_bytes = 0;
+    // The HLSL (gs.frag's), compiled again for a pipeline's specialisation
+    // (Specialised); and its UINT_OUTPUT's.
+    const char* hlsl = nullptr;
+    const char* uint_hlsl = nullptr;
 };
+
+/* A pipeline's specialisation of gs.frag (its kFeatures, constant 0)
+   compiled from its HLSL: the whole shader - every feature, its loops
+   unrolled by fxc - is 490 KB of DXBC, a variant a twentieth to a third of
+   it, and on an integrated GPU the whole one halved the rate. Compiled on
+   the thread making the pipeline (a player's: the pipeline workers, the
+   whole shader drawing meanwhile), kept in memory and in files beside the
+   pipeline cache (else in %TEMP%), by the HLSL's hash and the value. */
+struct Variant {
+    std::vector<std::uint8_t> dxbc;
+};
+std::mutex g_variants_lock;
+std::map<std::pair<const char*, std::uint32_t>, std::shared_ptr<Variant>> g_variants;
+
+std::filesystem::path VariantDir() {
+    std::filesystem::path dir = PipelineCacheDir();
+    if (dir.empty()) {
+        const char* temp = std::getenv("TEMP");
+        dir = std::filesystem::path(temp ? temp : ".") / "ps2gpu_d3d11";
+    } else {
+        dir /= "d3d11_shaders";
+    }
+    std::error_code ignored;
+    std::filesystem::create_directories(dir, ignored);
+    return dir;
+}
+
+std::shared_ptr<Variant> Specialised(const char* hlsl, std::uint32_t value) {
+    {
+        std::lock_guard<std::mutex> hold(g_variants_lock);
+        auto found = g_variants.find({hlsl, value});
+        if (found != g_variants.end()) return found->second;
+    }
+    auto v = std::make_shared<Variant>();
+    const std::size_t length = std::strlen(hlsl);
+    char name[64];
+    std::snprintf(name, sizeof name, "%016llx_%08x.dxbc", static_cast<unsigned long long>(Fnv(hlsl, length)), value);
+    const std::filesystem::path file = VariantDir() / name;
+    if (std::ifstream in{file, std::ios::binary}) v->dxbc.assign(std::istreambuf_iterator<char>(in), {});
+    if (v->dxbc.empty()) {
+        char define[32];
+        std::snprintf(define, sizeof define, "%uu", value);
+        const D3D_SHADER_MACRO macros[] = {{"SPIRV_CROSS_CONSTANT_ID_0", define}, {nullptr, nullptr}};
+        ID3DBlob* code = nullptr;
+        ID3DBlob* errors = nullptr;
+        if (SUCCEEDED(D3DCompile(hlsl, length, "gs.frag", macros, nullptr, "main", "ps_5_0",
+                                 D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors))) {
+            const auto* bytes = static_cast<const std::uint8_t*>(code->GetBufferPointer());
+            v->dxbc.assign(bytes, bytes + code->GetBufferSize());
+            std::ofstream out(file, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(v->dxbc.data()), std::streamsize(v->dxbc.size()));
+        } else {
+            Unsupported("a specialisation of gs.frag that fxc did not compile (the whole shader draws)");
+        }
+        Release(code);
+        Release(errors);
+    }
+    std::lock_guard<std::mutex> hold(g_variants_lock);
+    return g_variants.emplace(std::make_pair(hlsl, value), v).first->second;
+}
 
 /* A shader's resources by register, from its reflection. */
 struct Slot {
@@ -287,7 +361,33 @@ struct CommandBuffer {
 struct Fence {
     bool signaled = false;
     std::vector<Readback> readbacks;
+    ID3D11Query* done = nullptr;            // the submission's end on the GPU (an event query)...
+    std::uint64_t value = 0;                // ...or g_fence's value then (Direct3D 11.4: waited asleep)
 };
+
+/* Direct3D 11.4's fence (Windows 10): a submission's end signalled on it, a
+   wait for it asleep on an event - a query has only polling, which kept the
+   renderer's thread busy while it waited. */
+ID3D11Fence* g_fence = nullptr;
+ID3D11DeviceContext4* g_context4 = nullptr;
+std::uint64_t g_fence_value = 0;
+bool g_fence_tried = false;
+bool KernelFence() {
+    if (g_fence_tried) return g_fence != nullptr;
+    g_fence_tried = true;
+    ID3D11Device5* device5 = nullptr;
+    if (FAILED(g_gpu->device->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void**>(&device5)))) return false;
+    const bool made = SUCCEEDED(device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, __uuidof(ID3D11Fence),
+                                                     reinterpret_cast<void**>(&g_fence))) &&
+                      SUCCEEDED(g_gpu->context->QueryInterface(__uuidof(ID3D11DeviceContext4),
+                                                               reinterpret_cast<void**>(&g_context4)));
+    device5->Release();
+    if (!made) {
+        Release(g_fence);
+        Release(g_context4);
+    }
+    return g_fence != nullptr;
+}
 
 // ----------------------------------------------------------------- formats
 
@@ -576,6 +676,14 @@ bool MakeGpuBuffer(Buffer* b) {
     d.ByteWidth = UINT((b->size + 15) & ~VkDeviceSize(15));
     d.Usage = D3D11_USAGE_DEFAULT;
     if (b->usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) d.BindFlags |= D3D11_BIND_VERTEX_BUFFER;
+    // A host buffer of vertices alone (the renderer's vertex rings): its twin
+    // DYNAMIC, written in place with NO_OVERWRITE - the ring hands a part out
+    // again only once the GPU is past it (the fences wait for the GPU).
+    b->dynamic = b->host() && b->usage == VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    if (b->dynamic) {
+        d.Usage = D3D11_USAGE_DYNAMIC;
+        d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    }
     if (b->usage & (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
                     VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT)) {
         d.BindFlags |= D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
@@ -624,8 +732,56 @@ void Upload(Buffer* b, VkDeviceSize from, VkDeviceSize bytes) {
     from = std::min(from, b->size);
     bytes = std::min(bytes, b->size - from);
     if (!bytes) return;
+    if (b->dynamic) {
+        D3D11_MAPPED_SUBRESOURCE m;
+        const D3D11_MAP how = b->mapped_once ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD;
+        if (SUCCEEDED(g_gpu->context->Map(b->gpu, 0, how, 0, &m))) {
+            // (The first map's DISCARD: the whole of it, as the buffer is new.)
+            if (!b->mapped_once) std::memcpy(m.pData, b->bytes(), std::size_t(b->size));
+            else std::memcpy(static_cast<std::uint8_t*>(m.pData) + from, b->bytes() + from, std::size_t(bytes));
+            g_gpu->context->Unmap(b->gpu, 0);
+            b->mapped_once = true;
+        }
+        return;
+    }
     const D3D11_BOX box{UINT(from), 0, 0, UINT(from + bytes), 1, 1};
     g_gpu->context->UpdateSubresource(b->gpu, 0, &box, b->bytes() + from, 0, 0);
+}
+
+/* Bytes into a GPU buffer on the GPU's timeline (vkCmdUpdateBuffer, a host
+   buffer copied into a device one): written into an upload ring with
+   NO_OVERWRITE, then copied on the GPU. UpdateSubresource into a buffer the
+   GPU still reads made a driver wait (an integrated GPU's: a CLUT loaded a
+   primitive, each a wait). DISCARD as the ring wraps. */
+constexpr UINT kUploadRing = 8u << 20;
+ID3D11Buffer* g_upload_ring = nullptr;
+UINT g_upload_at = kUploadRing;
+bool g_upload_ring_failed = false;
+
+void UpdateOnGpu(ID3D11Buffer* dst, UINT offset, const void* data, UINT bytes) {
+    ID3D11DeviceContext* c = g_gpu->context;
+    if (!g_upload_ring && !g_upload_ring_failed) {
+        D3D11_BUFFER_DESC d{};
+        d.ByteWidth = kUploadRing;
+        d.Usage = D3D11_USAGE_DYNAMIC;
+        d.BindFlags = D3D11_BIND_VERTEX_BUFFER;         // (a dynamic buffer needs one)
+        d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        g_upload_ring_failed = FAILED(g_gpu->device->CreateBuffer(&d, nullptr, &g_upload_ring));
+    }
+    if (!g_upload_ring || bytes > kUploadRing / 4) {
+        const D3D11_BOX box{offset, 0, 0, offset + bytes, 1, 1};
+        c->UpdateSubresource(dst, 0, &box, data, 0, 0);
+        return;
+    }
+    const bool wrap = g_upload_at + bytes > kUploadRing;
+    if (wrap) g_upload_at = 0;
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(c->Map(g_upload_ring, 0, wrap ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &m))) return;
+    std::memcpy(static_cast<std::uint8_t*>(m.pData) + g_upload_at, data, bytes);
+    c->Unmap(g_upload_ring, 0);
+    const D3D11_BOX box{g_upload_at, 0, 0, g_upload_at + bytes, 1, 1};
+    c->CopySubresourceRegion(dst, 0, offset, 0, 0, g_upload_ring, 0, &box);
+    g_upload_at = (g_upload_at + bytes + 15) & ~15u;
 }
 
 // ------------------------------------------------------------- execution
@@ -637,6 +793,8 @@ struct Exec {
     DescriptorSet* sets[2][4] = {};         // [graphics, compute][set]
     std::uint8_t push[256] = {};
     bool push_dirty = true;
+    UINT push_offset = ~0u;                 // the push constants' block in the ring (PushRing)
+    UINT push_bound_graphics = ~0u, push_bound_compute = ~0u;      // ...as bound to the stages
     struct VertexBinding { Buffer* buffer = nullptr; VkDeviceSize offset = 0; std::uint32_t stride = 0; } vbs[4];
     bool depth_test = false, depth_write = false, stencil_test = false;
     VkCompareOp depth_compare = VK_COMPARE_OP_ALWAYS;
@@ -661,7 +819,66 @@ struct Exec {
 ID3D11Buffer* g_push_buffer = nullptr;      // b0: the push constants
 std::map<std::uint64_t, ID3D11DepthStencilState*> g_depth_states;
 
+/* The push constants' ring (Direct3D 11.1's constant buffer offsets): each
+   draw's or dispatch's block written at the next 256 bytes with
+   NO_OVERWRITE, bound by its offset - a DISCARD only as the ring wraps. A
+   map with DISCARD a draw (the plain buffer) made the driver wait for the
+   GPU at most of a race's thousands of batches. */
+constexpr UINT kPushRing = 256 * 1024;
+ID3D11Buffer* g_push_ring = nullptr;
+ID3D11DeviceContext1* g_context1 = nullptr;
+UINT g_push_at = kPushRing;                 // the next block's offset (kPushRing: wrap first)
+bool g_push_ring_tried = false;
+
+bool PushRing() {
+    if (g_push_ring_tried) return g_push_ring != nullptr;
+    g_push_ring_tried = true;
+    D3D11_FEATURE_DATA_D3D11_OPTIONS options{};
+    if (FAILED(g_gpu->device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof options)) ||
+        !options.ConstantBufferOffsetting || !options.MapNoOverwriteOnDynamicConstantBuffer)
+        return false;
+    if (FAILED(g_gpu->context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&g_context1))))
+        return false;
+    D3D11_BUFFER_DESC d{};
+    d.ByteWidth = kPushRing;
+    d.Usage = D3D11_USAGE_DYNAMIC;
+    d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(g_gpu->device->CreateBuffer(&d, nullptr, &g_push_ring))) {
+        Release(g_context1);
+        g_push_ring = nullptr;
+    }
+    return g_push_ring != nullptr;
+}
+
 void PushConstants(Exec& x, bool compute) {
+    if (PushRing()) {
+        ID3D11DeviceContext1* c = g_context1;
+        if (x.push_dirty || x.push_offset == ~0u) {
+            const bool wrap = g_push_at + sizeof x.push > kPushRing;
+            if (wrap) g_push_at = 0;
+            D3D11_MAPPED_SUBRESOURCE m;
+            if (FAILED(c->Map(g_push_ring, 0, wrap ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &m)))
+                return;
+            std::memcpy(static_cast<std::uint8_t*>(m.pData) + g_push_at, x.push, sizeof x.push);
+            c->Unmap(g_push_ring, 0);
+            x.push_offset = g_push_at;
+            g_push_at += sizeof x.push;
+            x.push_dirty = false;
+            x.push_bound_graphics = x.push_bound_compute = ~0u;
+        }
+        UINT& bound = compute ? x.push_bound_compute : x.push_bound_graphics;
+        if (bound == x.push_offset) return;
+        const UINT first = x.push_offset / 16, constants = sizeof x.push / 16;
+        if (compute) {
+            c->CSSetConstantBuffers1(0, 1, &g_push_ring, &first, &constants);
+        } else {
+            c->VSSetConstantBuffers1(0, 1, &g_push_ring, &first, &constants);
+            c->PSSetConstantBuffers1(0, 1, &g_push_ring, &first, &constants);
+        }
+        bound = x.push_offset;
+        return;
+    }
     if (!g_push_buffer) {
         D3D11_BUFFER_DESC d{};
         d.ByteWidth = sizeof x.push;
@@ -1309,7 +1526,10 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateShaderModule(VkDevice, const VkShaderModule
             if (k.dxbc == dxbc_d3d_gs_frag || k.dxbc == dxbc_d3d_gs_frag_single) {
                 m->uint_dxbc = dxbc_d3d_gs_frag_uint;
                 m->uint_dxbc_bytes = sizeof dxbc_d3d_gs_frag_uint;
+                m->uint_hlsl = hlsl_d3d_gs_frag_uint;
+                m->hlsl = k.dxbc == dxbc_d3d_gs_frag ? hlsl_d3d_gs_frag : hlsl_d3d_gs_frag_single;
             }
+            if (k.dxbc == dxbc_d3d_gs_frag_blend) m->hlsl = hlsl_d3d_gs_frag_blend;
             break;
         }
     *out = reinterpret_cast<VkShaderModule>(m);
@@ -1427,10 +1647,14 @@ bool HasDynamic(const VkPipelineDynamicStateCreateInfo* d, VkDynamicState s) {
 VkResult MakeGraphics(const VkGraphicsPipelineCreateInfo& ci, Pipeline* p) {
     const ShaderModule* vs = nullptr;
     const ShaderModule* ps = nullptr;
+    const VkSpecializationInfo* ps_spec = nullptr;
     for (std::uint32_t i = 0; i < ci.stageCount; ++i) {
         const auto* m = reinterpret_cast<const ShaderModule*>(ci.pStages[i].module);
         if (ci.pStages[i].stage == VK_SHADER_STAGE_VERTEX_BIT) vs = m;
-        if (ci.pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT) ps = m;
+        if (ci.pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
+            ps = m;
+            ps_spec = ci.pStages[i].pSpecializationInfo;
+        }
     }
     if (!vs || !vs->dxbc || (ps && !ps->dxbc)) {
         Unsupported("a graphics pipeline whose shader has no HLSL");
@@ -1447,7 +1671,23 @@ VkResult MakeGraphics(const VkGraphicsPipelineCreateInfo& ci, Pipeline* p) {
     }
     if (ps) {
         const void* code = p->logic ? ps->uint_dxbc : ps->dxbc;
-        const std::size_t bytes = p->logic ? ps->uint_dxbc_bytes : ps->dxbc_bytes;
+        std::size_t bytes = p->logic ? ps->uint_dxbc_bytes : ps->dxbc_bytes;
+        // gs.frag's features (constant 0) other than all of them: its variant.
+        const char* hlsl = p->logic ? ps->uint_hlsl : ps->hlsl;
+        std::uint32_t features = 0xFFFFFFFFu;
+        if (ps_spec)
+            for (std::uint32_t i = 0; i < ps_spec->mapEntryCount; ++i)
+                if (ps_spec->pMapEntries[i].constantID == 0 && ps_spec->pMapEntries[i].size == 4)
+                    std::memcpy(&features, static_cast<const std::uint8_t*>(ps_spec->pData) + ps_spec->pMapEntries[i].offset, 4);
+        std::shared_ptr<Variant> variant;
+        static const bool whole = std::getenv("PS2HOST_D3D11_WHOLE_SHADER") != nullptr;    // (to compare)
+        if (hlsl && features != 0xFFFFFFFFu && !whole) {
+            variant = Specialised(hlsl, features);
+            if (!variant->dxbc.empty()) {
+                code = variant->dxbc.data();
+                bytes = variant->dxbc.size();
+            }
+        }
         if (FAILED(dev->CreatePixelShader(code, bytes, nullptr, &p->ps))) return VK_ERROR_INITIALIZATION_FAILED;
         p->ps_slots = Reflect(code, bytes);
     }
@@ -1807,8 +2047,7 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyBuffer(VkCommandBuffer cmd, VkBuffer src, VkBu
         ID3D11DeviceContext* c = g_gpu->context;
         for (const VkBufferCopy& r : copies) {
             if (s->host() && !d->host()) {
-                const D3D11_BOX box{UINT(r.dstOffset), 0, 0, UINT(r.dstOffset + r.size), 1, 1};
-                c->UpdateSubresource(d->gpu, 0, &box, s->bytes() + r.srcOffset, 0, 0);
+                UpdateOnGpu(d->gpu, UINT(r.dstOffset), s->bytes() + r.srcOffset, UINT(r.size));
             } else if (!s->host() && d->host()) {
                 ID3D11Buffer* staging = StagingBuffer(UINT(r.size));
                 if (!staging) continue;
@@ -1840,8 +2079,7 @@ VKAPI_ATTR void VKAPI_CALL CmdUpdateBuffer(VkCommandBuffer cmd, VkBuffer dst, Vk
             std::memcpy(d->bytes() + offset, bytes.data(), bytes.size());
             return;
         }
-        const D3D11_BOX box{UINT(offset), 0, 0, UINT(offset + bytes.size()), 1, 1};
-        g_gpu->context->UpdateSubresource(d->gpu, 0, &box, bytes.data(), 0, 0);
+        UpdateOnGpu(d->gpu, UINT(offset), bytes.data(), UINT(bytes.size()));
     });
 }
 
@@ -2005,6 +2243,7 @@ VKAPI_ATTR void VKAPI_CALL DestroyFence(VkDevice, VkFence fence, const VkAllocat
     if (!f) return;
     std::lock_guard<std::mutex> hold(g_gpu->context_lock);
     for (Readback& r : f->readbacks) Release(r.staging);
+    Release(f->done);
     delete f;
 }
 
@@ -2015,6 +2254,23 @@ VKAPI_ATTR VkResult VKAPI_CALL ResetFences(VkDevice, std::uint32_t count, const 
 
 void CompleteFence(Fence* f) {
     if (!f || f->signaled) return;
+    // The GPU past the submission: what it read of host memory's twins (the
+    // vertex rings, written with NO_OVERWRITE) may be written again.
+    if (f->value && g_fence && g_fence->GetCompletedValue() < f->value) {
+        thread_local HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (SUCCEEDED(g_fence->SetEventOnCompletion(f->value, event))) WaitForSingleObject(event, 2000);
+    } else if (f->done) {
+        for (int spins = 0;; ++spins) {
+            HRESULT hr;
+            {
+                std::lock_guard<std::mutex> hold(g_gpu->context_lock);
+                hr = g_gpu->context->GetData(f->done, nullptr, 0, 0);
+            }
+            if (hr != S_FALSE) break;
+            if (spins < 64) SwitchToThread();
+            else Sleep(0);
+        }
+    }
     if (!f->readbacks.empty()) {
         std::lock_guard<std::mutex> hold(g_gpu->context_lock);
         for (Readback& r : f->readbacks) FinishReadback(r);
@@ -2044,6 +2300,16 @@ VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit(VkQueue, std::uint32_t count, const V
                 // (What the last pass drew into goes back to being read.)
                 g_gpu->context->OMSetRenderTargets(0, nullptr, nullptr);
             }
+        if (f && KernelFence()) {
+            f->value = ++g_fence_value;
+            g_context4->Signal(g_fence, f->value);
+        } else if (f) {
+            if (!f->done) {
+                D3D11_QUERY_DESC qd{D3D11_QUERY_EVENT, 0};
+                g_gpu->device->CreateQuery(&qd, &f->done);
+            }
+            if (f->done) g_gpu->context->End(f->done);
+        }
         g_gpu->context->Flush();
     }
     if (f) {

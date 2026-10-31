@@ -8,7 +8,10 @@
  *     storage images and buffers): Direct3D 11 has no sets;
  *   - the push constants are constant buffer b0.
  *
- *   spirv_to_hlsl in.spv out.hlsl
+ *   spirv_to_hlsl in.spv out.hlsl [out.h name]
+ *
+ * With out.h, the HLSL is also written there as a C array (hlsl_<name>):
+ * a shader the D3D11 layer compiles again for a pipeline's specialisation.
  */
 
 #include <spirv_hlsl.hpp>
@@ -21,8 +24,8 @@
 #include <vector>
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::fprintf(stderr, "usage: spirv_to_hlsl in.spv out.hlsl\n");
+    if (argc != 3 && argc != 5) {
+        std::fprintf(stderr, "usage: spirv_to_hlsl in.spv out.hlsl [out.h name]\n");
         return 2;
     }
     std::ifstream in(argv[1], std::ios::binary);
@@ -68,7 +71,16 @@ int main(int argc, char** argv) {
         const std::string hlsl = compiler.compile();
         std::ofstream out(argv[2], std::ios::binary);
         out << hlsl;
-        return out ? 0 : 1;
+        if (!out) return 1;
+        if (argc == 5) {
+            std::ofstream header(argv[3], std::ios::binary);
+            header << "static const char hlsl_" << argv[4] << "[] = {";
+            for (std::size_t i = 0; i < hlsl.size(); ++i)
+                header << (i % 24 ? "" : "\n    ") << int(static_cast<unsigned char>(hlsl[i])) << ",";
+            header << "\n    0};\n";
+            if (!header) return 1;
+        }
+        return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "spirv_to_hlsl: %s: %s\n", argv[1], e.what());
         return 1;

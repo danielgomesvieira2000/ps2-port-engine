@@ -51,7 +51,23 @@ How it maps:
 - the display's frame pacing thread (`PresentImageAt` presents at once);
 - the NVIDIA low-latency boost.
 
-**Speed:** the layer records closures and runs them at submit. A submission's host vertex ranges are uploaded once per buffer, and a stage's resources are bound again only when its sets or pipeline change. With both, scripted race_modern takes 47-48 s on Direct3D 11 against 46 s on Vulkan (RTX 4070); before them, a race took 83 s.
+**Speed** (the layer records closures and runs them at submit):
+- **What makes it fast:**
+  - host vertex ranges are uploaded once per submission, into DYNAMIC twins written with NO_OVERWRITE;
+  - push constants go to a ring of 256-byte blocks bound by offset (Direct3D 11.1);
+  - `vkCmdUpdateBuffer` and host-to-device copies go through an upload ring and a GPU copy;
+  - fences are Direct3D 11.4 fences, waited for asleep, so the rings are safe;
+  - a stage's resources are bound again only when its sets or pipeline change.
+- **gs.frag specialisation:** each pipeline's feature set (Vulkan's specialisation constant) is compiled from the embedded HLSL with D3DCompile and cached on disk (`d3d11_shaders/` beside the pipeline cache, else `%TEMP%/ps2gpu_d3d11`). fxc unrolls the whole shader into 490 KB of DXBC, which halved an integrated GPU's speed; a variant is 10-170 KB and compiles in 0.1-6 s. `PS2HOST_D3D11_WHOLE_SHADER` uses the whole shader, to compare.
+- **Measured** on a GS capture's replay (3 pictures, 150 passes):
+
+  | GPU | Direct3D 11 | Vulkan |
+  |---|---|---|
+  | Intel UHD | 10.4 ms a pass (26.2 before this work) | 10.2 |
+  | RTX 4070 | 6.7 | 6.1 |
+
+- **What is left:** the Intel D3D11 driver's own CPU per draw. The renderer's thread uses ~8.5 ms a pass against Vulkan's ~3.1.
+- **In play:** a real-time race on the Intel UHD holds 59.9 pictures a second on both.
 
 ## Where we start (checked in code)
 
