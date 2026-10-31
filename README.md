@@ -73,6 +73,12 @@ The same port, built for each from the same game directory:
 | Android 10+ (arm64, x86-64 emulator) | `tools/android.py` (the NDK; an APK) | Vulkan 1.1+ | on a phone |
 | Linux x86-64 (glibc 2.35+: Ubuntu 22.04, Debian 12, SteamOS, Fedora 36 and later; the C++ runtime linked in) | `tools/linux.py` (Docker, from Windows or Linux: Ubuntu 22.04, clang 19, SDL's X11/Wayland, Mesa) | Vulkan 1.1+ | `linux.py test`: the host's and the renderer's tests (on lavapipe) and the regressions with the software GS, as recorded on Windows |
 
+Not built yet: **Windows on ARM64** (Snapdragon). The code is the one
+Android's arm64 build runs (NEON through sse2neon) and clang-cl targets it
+(`--target=arm64-pc-windows-msvc`), but Visual Studio's ARM64 libraries are an
+installer component of their own ("MSVC ... ARM64 build tools"); the Windows
+SDK has its part.
+
 A port's own code is the same everywhere; what is the platform's is in
 `host/src/platform.cpp` (files, threads, timers) and SDL (windows, input,
 audio). A GPU without a feature the renderer would use (logic ops, extended
