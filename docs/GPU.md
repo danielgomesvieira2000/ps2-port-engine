@@ -21,6 +21,20 @@ higher frame rates), and is checked against it.
 * The software GS stays: it is the reference the GPU renderer is tested against,
   frame by frame, and the fallback without a GPU.
 
+## Backends (2026-10-31)
+
+One renderer (`gs_renderer.cpp`, with `effects.cpp`) draws on every backend.
+The order `renderer=auto` tries, and how each one draws:
+
+1. **Vulkan 1.3**.
+2. **Vulkan 1.2**. It needs `VK_EXT_extended_dynamic_state`. It draws with `VK_KHR_dynamic_rendering` where the driver has it, else with render passes. `vk_device.cpp` chooses; `PS2HOST_VK_LEGACY=1|2` forces either on a 1.3 GPU.
+3. **Direct3D 11** at feature level 11_0 (Windows). The same renderer runs on `d3d11_vulkan.cpp`, a layer that implements the Vulkan it calls with Direct3D 11. Its shaders are the same GLSL, as HLSL through SPIRV-Cross and fxc. The display is `d3d11_display.cpp`.
+4. **GDI** with the software GS.
+
+The window, its input and the screen's refresh are shared by the displays (`window_display.cpp`). `renderer=` in pc_settings.ini (or `PS2HOST_RENDERER`) picks one. Headless runs take `PS2HOST_RENDERER=d3d11` too.
+
+Checking all backends at once: `python engine/tools/backends_check.py --game games/<name> [--runs ...]` runs the renderer tests and the GPU regressions on each, and prints one table. BACKENDS_ROADMAP.md has the plan, the measurements and the known differences.
+
 ## Stage one (done): presentation
 
 `ps2gpu::Display` / `CreateVulkanDisplay`: an SDL3 window and a Vulkan swapchain.

@@ -46,7 +46,11 @@ How it maps:
 - **Not yet known:** whether this is rasterisation of a degenerate primitive or the layer.
 
 **Not done:**
-- D3D12 (X6): the layer approach would carry over, but it is a larger layer and brings no new GPUs;
+- **D3D12 (X6)**, decided against for now:
+  - **No new GPUs.** Every D3D12 GPU here also has Vulkan 1.2 or Direct3D 11.
+  - **Costly.** D3D12 has no dynamic depth test, write, compare or stencil ops. The renderer sets those per batch, so each pipeline would need baked variants for every combination drawn, made at draw time: hitches that Vulkan and D3D11 don't have.
+  - **The one case for it** is the Intel D3D11 driver's CPU cost per draw (above), on weak CPUs whose GPU has no Vulkan (Haswell has D3D12 at 11_1).
+  - **If wanted:** a `d3d12_vulkan.cpp` beside the D3D11 layer, plus a PSO cache keyed by the dynamic states;
 - GPU timestamps on Direct3D 11 (`PS2HOST_GPU_PROFILE`);
 - the display's frame pacing thread (`PresentImageAt` presents at once);
 - the NVIDIA low-latency boost.

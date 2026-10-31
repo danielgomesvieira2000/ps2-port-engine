@@ -42,6 +42,17 @@ VU tools document theirs (`engine/tools/pcsx2dump.py`, `PS2HOST_REPLAY_*`,
   that changes is a fix or a bug: find which before `--update`. The heaviest run
   (Burnout 3: `race`) is the real GPU test - lighter runs have passed while the
   race broke.
+- **Every GPU backend draws the same pictures.** A renderer, effect or
+  shader change is checked on Vulkan 1.3, Vulkan 1.2 (both paths) and
+  Direct3D 11:
+  `python engine/tools/backends_check.py --game games/<name> --runs <runs>`.
+  - Direct3D 11 runs the Vulkan renderer through `gpu/src/d3d11_vulkan.cpp`.
+  - A new Vulkan call, image format or descriptor kind in the renderer needs
+    the layer to do it too. Its log says `[d3d11] not done by the Vulkan
+    layer: ...`.
+  - A new shader needs its HLSL (`ps2gpu_hlsl` in gpu/CMakeLists.txt) and an
+    entry in the layer's shader table.
+  - `PS2HOST_D3D11_DEBUG=1` logs the debug layer's messages.
 - **Measure before and after, the same way.** A speed claim needs the same
   benchmark before and after (below), on a quiet machine, and the frame-time
   percentiles - not an impression, not one number.
