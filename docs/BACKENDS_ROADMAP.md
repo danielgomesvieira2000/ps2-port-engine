@@ -51,8 +51,6 @@ How it maps:
   - **Costly.** D3D12 has no dynamic depth test, write, compare or stencil ops. The renderer sets those per batch, so each pipeline would need baked variants for every combination drawn, made at draw time: hitches that Vulkan and D3D11 don't have.
   - **The one case for it** is the Intel D3D11 driver's CPU cost per draw (above), on weak CPUs whose GPU has no Vulkan (Haswell has D3D12 at 11_1).
   - **If wanted:** a `d3d12_vulkan.cpp` beside the D3D11 layer, plus a PSO cache keyed by the dynamic states;
-- GPU timestamps on Direct3D 11 (`PS2HOST_GPU_PROFILE`);
-- the display's frame pacing thread (`PresentImageAt` presents at once);
 - the NVIDIA low-latency boost.
 
 **Speed** (the layer records closures and runs them at submit):
@@ -62,16 +60,17 @@ How it maps:
   - `vkCmdUpdateBuffer` and host-to-device copies go through an upload ring and a GPU copy;
   - fences are Direct3D 11.4 fences, waited for asleep, so the rings are safe;
   - a stage's resources are bound again only when its sets or pipeline change.
-- **gs.frag specialisation:** each pipeline's feature set (Vulkan's specialisation constant) is compiled from the embedded HLSL with D3DCompile and cached on disk (`d3d11_shaders/` beside the pipeline cache, else `%TEMP%/ps2gpu_d3d11`). fxc unrolls the whole shader into 490 KB of DXBC, which halved an integrated GPU's speed; a variant is 10-170 KB and compiles in 0.1-6 s. `PS2HOST_D3D11_WHOLE_SHADER` uses the whole shader, to compare.
+- **gs.frag specialisation:** each pipeline's feature set (Vulkan's specialisation constant) is compiled from the embedded HLSL with D3DCompile and cached on disk (`d3d11_shaders/` beside the pipeline cache, else `%TEMP%/ps2gpu_d3d11`). fxc unrolls the whole shader into 490 KB of DXBC, which halved an integrated GPU's speed; a variant is 10-170 KB and compiles in 0.1-6 s. `PS2HOST_D3D11_WHOLE_SHADER` uses the whole shader, to compare. Keeping its tap and level loops as loops (`[[dont_unroll]]`, which SPIRV-Cross passes on as `[loop]`) left fxc's output byte for byte the same, so the size isn't the loops.
 - **Measured** on a GS capture's replay (3 pictures, 150 passes):
 
   | GPU | Direct3D 11 | Vulkan |
   |---|---|---|
-  | Intel UHD | 10.4 ms a pass (26.2 before this work) | 10.2 |
+  | Intel UHD | 10.2 ms a pass (26.2 before this work) | 10.2 |
   | RTX 4070 | 6.7 | 6.1 |
 
 - **What is left:** the Intel D3D11 driver's own CPU per draw. The renderer's thread uses ~8.5 ms a pass against Vulkan's ~3.1.
-- **In play:** a real-time race on the Intel UHD holds 59.9 pictures a second on both.
+- **GPU time:** timestamp queries, read with a disjoint query around each submission, give the overlay's GPU % and `PS2HOST_GPU_PROFILE` on Direct3D 11 too (car_select: GPU busy 8.3 s against Vulkan's 9.8; a profile window 260 ms against 264).
+- **In play:** a real-time race on the Intel UHD holds 59.9 pictures a second on both. The display paces its presents like Vulkan's (`PresentImageAt` on a thread of its own); jitter 0.27-0.41 ms.
 
 ## Where we start (checked in code)
 

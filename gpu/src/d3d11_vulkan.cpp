@@ -335,6 +335,19 @@ struct Readback {
 struct Exec;
 using Step = std::function<void(Exec&)>;
 
+/* Timestamps (GpuBusyNanoseconds, PS2HOST_GPU_PROFILE): a timestamp query
+   each, read with the disjoint query around its submission - its ticks a
+   second, and whether the GPU's clock held. Read as nanoseconds (the device's
+   timestampPeriod is 1). */
+struct Disjoint {
+    ID3D11Query* query = nullptr;
+    ~Disjoint() { if (query) query->Release(); }
+};
+struct QueryPool {
+    std::vector<ID3D11Query*> queries;
+    std::vector<std::shared_ptr<Disjoint>> of;      // each one's submission
+};
+
 struct CommandBuffer {
     std::vector<Step> steps;
     /* The host buffers its draws read, the part of each (lo, hi): copied to
@@ -818,6 +831,7 @@ struct Exec {
     UINT reference_bound = ~0u;
     D3D11_VIEWPORT viewport_bound{-1, -1, -1, -1, -1, -1};
     D3D11_RECT scissor_bound{-1, -1, -1, -1};
+    std::shared_ptr<Disjoint> disjoint;     // begun at the submission's first timestamp
 };
 
 ID3D11Buffer* g_push_buffer = nullptr;      // b0: the push constants
@@ -2270,7 +2284,27 @@ VKAPI_ATTR void VKAPI_CALL CmdClearDepthStencilImage(VkCommandBuffer cmd, VkImag
     });
 }
 
-VKAPI_ATTR void VKAPI_CALL CmdWriteTimestamp(VkCommandBuffer, VkPipelineStageFlagBits, VkQueryPool, std::uint32_t) {}
+VKAPI_ATTR void VKAPI_CALL CmdWriteTimestamp(VkCommandBuffer cmd, VkPipelineStageFlagBits, VkQueryPool pool,
+                                            std::uint32_t index) {
+    auto* p = reinterpret_cast<QueryPool*>(pool);
+    if (!p || index >= p->queries.size()) return;
+    Cmd(cmd).steps.push_back([p, index](Exec& x) {
+        ID3D11Device* device = g_gpu->device;
+        if (!x.disjoint) {
+            auto d = std::make_shared<Disjoint>();
+            D3D11_QUERY_DESC qd{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+            if (FAILED(device->CreateQuery(&qd, &d->query))) return;
+            g_gpu->context->Begin(d->query);
+            x.disjoint = std::move(d);
+        }
+        if (!p->queries[index]) {
+            D3D11_QUERY_DESC qd{D3D11_QUERY_TIMESTAMP, 0};
+            if (FAILED(device->CreateQuery(&qd, &p->queries[index]))) return;
+        }
+        g_gpu->context->End(p->queries[index]);
+        p->of[index] = x.disjoint;
+    });
+}
 VKAPI_ATTR void VKAPI_CALL CmdResetQueryPool(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t) {}
 
 VKAPI_ATTR VkResult VKAPI_CALL CreateFence(VkDevice, const VkFenceCreateInfo* ci, const VkAllocationCallbacks*,
@@ -2340,6 +2374,7 @@ VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit(VkQueue, std::uint32_t count, const V
                 Exec x;
                 x.readbacks = &readbacks;
                 for (Step& step : cb.steps) step(x);
+                if (x.disjoint) g_gpu->context->End(x.disjoint->query);
                 // (What the last pass drew into goes back to being read.)
                 g_gpu->context->OMSetRenderTargets(0, nullptr, nullptr);
             }
@@ -2370,15 +2405,65 @@ VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit(VkQueue, std::uint32_t count, const V
 
 VKAPI_ATTR VkResult VKAPI_CALL DeviceWaitIdle(VkDevice) { return VK_SUCCESS; }
 
-VKAPI_ATTR VkResult VKAPI_CALL GetQueryPoolResults(VkDevice, VkQueryPool, std::uint32_t, std::uint32_t, std::size_t,
-                                                  void*, VkDeviceSize, VkQueryResultFlags) {
-    return VK_NOT_READY;
+// (Asked for once the submission's fence is waited for: the queries are done
+// or about to be.)
+template <typename T>
+bool QueryData(ID3D11Query* q, T* out) {
+    for (int spins = 0; spins < 1000; ++spins) {
+        HRESULT hr;
+        {
+            std::lock_guard<std::mutex> hold(g_gpu->context_lock);
+            hr = g_gpu->context->GetData(q, out, sizeof *out, 0);
+        }
+        if (hr == S_OK) return true;
+        if (hr != S_FALSE) return false;
+        SwitchToThread();
+    }
+    return false;
 }
-VKAPI_ATTR VkResult VKAPI_CALL CreateQueryPool(VkDevice, const VkQueryPoolCreateInfo*, const VkAllocationCallbacks*,
-                                              VkQueryPool*) {
-    return VK_ERROR_FEATURE_NOT_PRESENT;
+
+VKAPI_ATTR VkResult VKAPI_CALL GetQueryPoolResults(VkDevice, VkQueryPool pool, std::uint32_t first, std::uint32_t count,
+                                                  std::size_t size, void* data, VkDeviceSize stride,
+                                                  VkQueryResultFlags flags) {
+    auto* p = reinterpret_cast<QueryPool*>(pool);
+    if (!p || first + count > p->queries.size() || !(flags & VK_QUERY_RESULT_64_BIT) ||
+        VkDeviceSize(count - 1) * stride + 8 > size)
+        return VK_NOT_READY;
+    Disjoint* checked = nullptr;
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT clock{};
+    for (std::uint32_t i = 0; i < count; ++i) {
+        ID3D11Query* q = p->queries[first + i];
+        Disjoint* d = p->of[first + i].get();
+        if (!q || !d) return VK_NOT_READY;
+        if (d != checked) {
+            if (!QueryData(d->query, &clock) || clock.Disjoint || clock.Frequency == 0) return VK_NOT_READY;
+            checked = d;
+        }
+        std::uint64_t ticks = 0;
+        if (!QueryData(q, &ticks)) return VK_NOT_READY;
+        // (In two parts: ticks * 1e9 overflows.)
+        const std::uint64_t ns = ticks / clock.Frequency * 1000000000ull +
+                                 ticks % clock.Frequency * 1000000000ull / clock.Frequency;
+        std::memcpy(static_cast<std::uint8_t*>(data) + i * stride, &ns, 8);
+    }
+    return VK_SUCCESS;
 }
-VKAPI_ATTR void VKAPI_CALL DestroyQueryPool(VkDevice, VkQueryPool, const VkAllocationCallbacks*) {}
+VKAPI_ATTR VkResult VKAPI_CALL CreateQueryPool(VkDevice, const VkQueryPoolCreateInfo* ci, const VkAllocationCallbacks*,
+                                              VkQueryPool* out) {
+    if (ci->queryType != VK_QUERY_TYPE_TIMESTAMP) return VK_ERROR_FEATURE_NOT_PRESENT;
+    auto* p = new QueryPool;
+    p->queries.assign(ci->queryCount, nullptr);     // (made as first written)
+    p->of.resize(ci->queryCount);
+    *out = reinterpret_cast<VkQueryPool>(p);
+    return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL DestroyQueryPool(VkDevice, VkQueryPool pool, const VkAllocationCallbacks*) {
+    auto* p = reinterpret_cast<QueryPool*>(pool);
+    if (!p) return;
+    for (ID3D11Query* q : p->queries)
+        if (q) q->Release();
+    delete p;
+}
 
 // The physical device the renderer asks about: what Direct3D 11 at 11_0 gives.
 VKAPI_ATTR void VKAPI_CALL GetPhysicalDeviceProperties(VkPhysicalDevice, VkPhysicalDeviceProperties* p) {
@@ -2391,7 +2476,7 @@ VKAPI_ATTR void VKAPI_CALL GetPhysicalDeviceProperties(VkPhysicalDevice, VkPhysi
     p->limits.maxPushConstantsSize = 256;
     p->limits.maxComputeWorkGroupCount[0] = p->limits.maxComputeWorkGroupCount[1] =
         p->limits.maxComputeWorkGroupCount[2] = 65535;
-    p->limits.timestampPeriod = 0.0f;
+    p->limits.timestampPeriod = 1.0f;          // (GetQueryPoolResults gives nanoseconds)
     p->limits.minStorageBufferOffsetAlignment = 16;
     p->limits.nonCoherentAtomSize = 64;
 }
@@ -2426,7 +2511,7 @@ VKAPI_ATTR void VKAPI_CALL GetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevi
     props[0] = VkQueueFamilyProperties{};
     props[0].queueFlags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
     props[0].queueCount = 1;
-    props[0].timestampValidBits = 0;        // (no GPU timestamps: MakeTimestamps makes none)
+    props[0].timestampValidBits = 64;
     *count = 1;
 }
 
