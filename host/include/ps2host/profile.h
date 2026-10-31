@@ -8,6 +8,7 @@
 #ifndef PS2HOST_PROFILE_H
 #define PS2HOST_PROFILE_H
 
+#include <cstdint>
 #include <string>
 
 namespace ps2host {

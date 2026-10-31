@@ -147,7 +147,7 @@ float Lerp(float a, float b, float t) { return a + (b - a) * t; }
    each was most of the blend's time). */
 thread_local int g_weight = 128;
 inline u32 LerpU(u32 a, u32 b, float) {
-    return u32(std::int64_t(a) + ((std::int64_t(b) - std::int64_t(a)) * g_weight + 128 >> 8));
+    return u32(std::int64_t(a) + (((std::int64_t(b) - std::int64_t(a)) * g_weight + 128) >> 8));
 }
 float AsFloat(u32 w) { float f; std::memcpy(&f, &w, 4); return f; }
 u32 AsWord(float f) { u32 w; std::memcpy(&w, &f, 4); return w; }

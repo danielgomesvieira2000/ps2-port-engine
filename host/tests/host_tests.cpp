@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -1963,7 +1964,11 @@ void LibnetSendsDatagrams() {
     libnet::Options options;
     options.address_env = "PS2HOST_TEST_LAN_IP";
     options.dump_env = nullptr;
+#ifdef _WIN32
     _putenv_s("PS2HOST_TEST_LAN_IP", "127.0.0.1");
+#else
+    setenv("PS2HOST_TEST_LAN_IP", "127.0.0.1", 1);
+#endif
     libnet::Register(client, options);
     ps2host::Memory& m = ps2host::GuestMemory();
     lifted::Context c{};
@@ -2119,7 +2124,7 @@ void CustomSongsScanAndName() {
     fs::create_directories(dir);
     for (const wchar_t* name : {L"b band - Second Song.mp3", L"A Band - First Song.MP3", L"Lonely.mp3", L"notes.txt",
                                 L"Caf\u00E9  Tacuba - Ojal\u00E1   que.mp3"})
-        std::fclose(_wfopen((dir / name).c_str(), L"wb"));
+        std::ofstream(dir / fs::path(name), std::ios::binary);
     const std::vector<ps2host::CustomSong> songs = ps2host::ScanCustomSongs(dir, 3, 12);
     Check(songs.size() == 3, "custom songs: MP3s alone, the first 3 by name");
     Check(songs[0].artist == u"A Band" && songs[0].title == u"First Song", "custom songs: Artist - Title, any case's .mp3");
