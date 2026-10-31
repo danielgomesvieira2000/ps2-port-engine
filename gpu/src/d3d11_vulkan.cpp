@@ -1337,6 +1337,29 @@ void FinishReadback(Readback& r) {
 
 std::mutex g_objects_lock;              // the descriptor pools' sets (made from more than one thread)
 
+/* PS2HOST_D3D11_DEBUG=1 (the device made with the SDK's debug layer): its
+   messages to the log at each submission, each once. */
+void SayDebugMessages() {
+    static ID3D11InfoQueue* queue = [] {
+        ID3D11InfoQueue* q = nullptr;
+        if (FAILED(g_gpu->device->QueryInterface(__uuidof(ID3D11InfoQueue), reinterpret_cast<void**>(&q)))) return q;
+        return q;
+    }();
+    if (!queue) return;
+    static std::set<std::string> said;
+    const UINT64 count = queue->GetNumStoredMessages();
+    for (UINT64 i = 0; i < count; ++i) {
+        SIZE_T bytes = 0;
+        queue->GetMessage(i, nullptr, &bytes);
+        std::vector<char> buffer(bytes);
+        auto* m = reinterpret_cast<D3D11_MESSAGE*>(buffer.data());
+        if (FAILED(queue->GetMessage(i, m, &bytes))) continue;
+        std::string text(m->pDescription, m->DescriptionByteLength ? m->DescriptionByteLength - 1 : 0);
+        if (said.size() < 200 && said.insert(text).second) std::fprintf(stderr, "[d3d11 debug] %s\n", text.c_str());
+    }
+    queue->ClearStoredMessages();
+}
+
 // --------------------------------------------------------- Vulkan's functions
 
 VKAPI_ATTR VkResult VKAPI_CALL CreateBuffer(VkDevice, const VkBufferCreateInfo* ci, const VkAllocationCallbacks*,
@@ -2311,6 +2334,8 @@ VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit(VkQueue, std::uint32_t count, const V
             if (f->done) g_gpu->context->End(f->done);
         }
         g_gpu->context->Flush();
+        static const bool debug = std::getenv("PS2HOST_D3D11_DEBUG") != nullptr;
+        if (debug) SayDebugMessages();
     }
     if (f) {
         f->readbacks = std::move(readbacks);
