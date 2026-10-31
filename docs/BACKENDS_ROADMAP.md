@@ -40,10 +40,10 @@ How it maps:
 - Burnout 3 GPU regressions on Direct3D 11 (`PS2HOST_RENDERER=d3d11`, headless): car_select 44/44, race_training 55/55, race 67/67, crash 77/77, road_rage 69/69, the same CRCs as Vulkan's. splitscreen is 50/52, the same two frames Vulkan misses. race_modern (2x, 120 fps, MODERN) matches its own set: 99.4% of pixels as Vulkan's.
 - The trap race_modern found: with dynamic vertex strides, binding a pipeline must keep the strides already bound. The renderer binds its sprite ranges at stride 0 and leaves them bound, so the layer's reset made 2x sprites read garbage: a dark sky, the paint unreflected.
 
-**Open: one difference in eliminator.** eliminator is 102/103 on Direct3D 11: frame 16200 has a blotch on the rock face above the tunnel. Vulkan is 103/103.
-- **Where it starts:** a capture of frames 16000-16202 (`PS2HOST_CAPTURE_FRAME=15999 PS2HOST_CAPTURE_FRAMES=202`, from a Vulkan run) replayed on both backends (`--gs-replay`, `PS2HOST_REPLAY_GPU=1`), and bisected with `PS2HOST_REPLAY_STOP_PRIM`. GS memory first differs after primitive 4,686,977 of the replay: a sub-pixel textured triangle-strip sliver (PSMT4, a CLUT load each primitive, blended) into the picture's tile at x 256-319, y 192-223. 12 pixels there differ: Vulkan has them near black, Direct3D 11 lit.
-- **How it grows:** the game's feedback blur spreads it over the next frames.
-- **Not yet known:** whether this is rasterisation of a degenerate primitive or the layer.
+**Fixed: the eliminator difference** (102/103 on Direct3D 11, frame 16200's blotch on the rock face above the tunnel; now 103/103).
+- **Found:** a capture of frames 16000-16202 (`PS2HOST_CAPTURE_FRAME=15999 PS2HOST_CAPTURE_FRAMES=202`) replayed on both backends (`--gs-replay`, `PS2HOST_REPLAY_GPU=1`) and bisected with `PS2HOST_REPLAY_STOP_PRIM` to one primitive. The software GS and Vulkan drew it; Direct3D 11 drew nothing of its batch.
+- **Cause:** the layer kept one set of push constants. The renderer pushes the target's size once for a run of draws; that batch's CLUT, loaded on the GPU each primitive, is a compute dispatch with push constants of its own, which overwrote the size. Vulkan keeps push constants by bind point, so the layer now keeps the graphics stages' and compute's apart.
+- **Also:** after a secondary command buffer, or the depth upload's own draw, the layer forgets what it had bound (`Exec::ForgetBound`); the push-constant ring's blocks are rewritten after it wraps.
 
 **Not done:**
 - **D3D12 (X6)**, decided against for now:

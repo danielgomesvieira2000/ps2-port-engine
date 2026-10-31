@@ -804,9 +804,15 @@ struct Exec {
     Pipeline* graphics = nullptr;
     Pipeline* compute = nullptr;
     DescriptorSet* sets[2][4] = {};         // [graphics, compute][set]
-    std::uint8_t push[256] = {};
-    bool push_dirty = true;
-    UINT push_offset = ~0u;                 // the push constants' block in the ring (PushRing)
+    /* The push constants, the graphics stages' [0] and compute's [1] apart:
+       Vulkan keeps them by stage, and the renderer pushes the target's size
+       once for a run of draws - a compute dispatch between them (a CLUT
+       loaded on the GPU) pushing its own must leave it. */
+    std::uint8_t push[2][256] = {};
+    bool push_dirty[2] = {true, true};
+    UINT push_offset[2] = {~0u, ~0u};       // each one's block in the ring (PushRing)...
+    std::uint64_t push_generation[2] = {};  // ...written in this pass of the ring
+    int push_buffer_holds = -1;             // (without the ring: which one the buffer holds)
     UINT push_bound_graphics = ~0u, push_bound_compute = ~0u;      // ...as bound to the stages
     struct VertexBinding { Buffer* buffer = nullptr; VkDeviceSize offset = 0; std::uint32_t stride = 0; } vbs[4];
     bool depth_test = false, depth_write = false, stencil_test = false;
@@ -832,6 +838,21 @@ struct Exec {
     D3D11_VIEWPORT viewport_bound{-1, -1, -1, -1, -1, -1};
     D3D11_RECT scissor_bound{-1, -1, -1, -1};
     std::shared_ptr<Disjoint> disjoint;     // begun at the submission's first timestamp
+    // The context set by something else (a secondary's steps, the depth
+    // upload's own draw): everything above set again at the next draw.
+    void ForgetBound() {
+        applied = nullptr;
+        push_bound_graphics = push_bound_compute = ~0u;
+        for (int i = 0; i < 2; ++i) {
+            vb_bound[i] = nullptr;
+            vb_offset[i] = vb_stride[i] = ~0u;
+        }
+        stage_pipeline = nullptr;
+        depth_bound = nullptr;
+        reference_bound = ~0u;
+        viewport_bound = D3D11_VIEWPORT{-1, -1, -1, -1, -1, -1};
+        scissor_bound = D3D11_RECT{-1, -1, -1, -1};
+    }
 };
 
 ID3D11Buffer* g_push_buffer = nullptr;      // b0: the push constants
@@ -846,6 +867,7 @@ constexpr UINT kPushRing = 256 * 1024;
 ID3D11Buffer* g_push_ring = nullptr;
 ID3D11DeviceContext1* g_context1 = nullptr;
 UINT g_push_at = kPushRing;                 // the next block's offset (kPushRing: wrap first)
+std::uint64_t g_push_generation = 0;        // the ring's wraps (each DISCARDs what was in it)
 bool g_push_ring_tried = false;
 
 bool PushRing() {
@@ -870,49 +892,58 @@ bool PushRing() {
 }
 
 void PushConstants(Exec& x, bool compute) {
+    const int k = compute ? 1 : 0;
+    const std::uint8_t* values = x.push[k];
+    constexpr UINT kBytes = sizeof x.push[0];
     if (PushRing()) {
         ID3D11DeviceContext1* c = g_context1;
-        if (x.push_dirty || x.push_offset == ~0u) {
-            const bool wrap = g_push_at + sizeof x.push > kPushRing;
-            if (wrap) g_push_at = 0;
+        // (A wrap's DISCARD loses every block written before it, any Exec's.)
+        if (x.push_dirty[k] || x.push_offset[k] == ~0u || x.push_generation[k] != g_push_generation) {
+            const bool wrap = g_push_at + kBytes > kPushRing;
+            if (wrap) {
+                g_push_at = 0;
+                ++g_push_generation;
+            }
             D3D11_MAPPED_SUBRESOURCE m;
             if (FAILED(c->Map(g_push_ring, 0, wrap ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &m)))
                 return;
-            std::memcpy(static_cast<std::uint8_t*>(m.pData) + g_push_at, x.push, sizeof x.push);
+            std::memcpy(static_cast<std::uint8_t*>(m.pData) + g_push_at, values, kBytes);
             c->Unmap(g_push_ring, 0);
-            x.push_offset = g_push_at;
-            g_push_at += sizeof x.push;
-            x.push_dirty = false;
-            x.push_bound_graphics = x.push_bound_compute = ~0u;
+            x.push_offset[k] = g_push_at;
+            x.push_generation[k] = g_push_generation;
+            g_push_at += kBytes;
+            x.push_dirty[k] = false;
+            if (wrap) x.push_bound_graphics = x.push_bound_compute = ~0u;
         }
         UINT& bound = compute ? x.push_bound_compute : x.push_bound_graphics;
-        if (bound == x.push_offset) return;
-        const UINT first = x.push_offset / 16, constants = sizeof x.push / 16;
+        if (bound == x.push_offset[k]) return;
+        const UINT first = x.push_offset[k] / 16, constants = kBytes / 16;
         if (compute) {
             c->CSSetConstantBuffers1(0, 1, &g_push_ring, &first, &constants);
         } else {
             c->VSSetConstantBuffers1(0, 1, &g_push_ring, &first, &constants);
             c->PSSetConstantBuffers1(0, 1, &g_push_ring, &first, &constants);
         }
-        bound = x.push_offset;
+        bound = x.push_offset[k];
         return;
     }
     if (!g_push_buffer) {
         D3D11_BUFFER_DESC d{};
-        d.ByteWidth = sizeof x.push;
+        d.ByteWidth = kBytes;
         d.Usage = D3D11_USAGE_DYNAMIC;
         d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         if (FAILED(g_gpu->device->CreateBuffer(&d, nullptr, &g_push_buffer))) return;
     }
     ID3D11DeviceContext* c = g_gpu->context;
-    if (x.push_dirty) {
+    if (x.push_dirty[k] || x.push_buffer_holds != k) {
         D3D11_MAPPED_SUBRESOURCE m;
         if (SUCCEEDED(c->Map(g_push_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-            std::memcpy(m.pData, x.push, sizeof x.push);
+            std::memcpy(m.pData, values, kBytes);
             c->Unmap(g_push_buffer, 0);
         }
-        x.push_dirty = false;
+        x.push_dirty[k] = false;
+        x.push_buffer_holds = k;
     }
     if (compute) {
         c->CSSetConstantBuffers(0, 1, &g_push_buffer);
@@ -1936,14 +1967,20 @@ VKAPI_ATTR void VKAPI_CALL CmdBindDescriptorSets(VkCommandBuffer cmd, VkPipeline
     });
 }
 
-VKAPI_ATTR void VKAPI_CALL CmdPushConstants(VkCommandBuffer cmd, VkPipelineLayout, VkShaderStageFlags,
+VKAPI_ATTR void VKAPI_CALL CmdPushConstants(VkCommandBuffer cmd, VkPipelineLayout, VkShaderStageFlags stages,
                                            std::uint32_t offset, std::uint32_t size, const void* values) {
     std::array<std::uint8_t, 256> bytes;
-    size = std::min<std::uint32_t>(size, 256 - std::min<std::uint32_t>(offset, 256));
+    offset = std::min<std::uint32_t>(offset, 256);
+    size = std::min<std::uint32_t>(size, 256 - offset);
     std::memcpy(bytes.data(), values, size);
-    Cmd(cmd).steps.push_back([offset, size, bytes](Exec& x) {
-        std::memcpy(x.push + offset, bytes.data(), size);
-        x.push_dirty = true;
+    const bool graphics = (stages & VK_SHADER_STAGE_ALL_GRAPHICS) != 0;
+    const bool compute = (stages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+    Cmd(cmd).steps.push_back([offset, size, bytes, graphics, compute](Exec& x) {
+        for (int k = 0; k < 2; ++k) {
+            if (!(k ? compute : graphics)) continue;
+            std::memcpy(x.push[k] + offset, bytes.data(), size);
+            x.push_dirty[k] = true;
+        }
     });
 }
 
@@ -2086,7 +2123,12 @@ VKAPI_ATTR void VKAPI_CALL CmdExecuteCommands(VkCommandBuffer cmd, std::uint32_t
             inner.colour = x.colour;
             inner.dsv = x.dsv;
             inner.colour_uint = x.colour_uint;
+            inner.disjoint = x.disjoint;    // (one timestamp clock a submission)
             for (Step& step : secondary->steps) step(inner);
+            x.disjoint = std::move(inner.disjoint);
+            // (Its draws left their own pipeline, push constants, vertices and
+            // states on the context: what x had bound isn't any more.)
+            x.ForgetBound();
         });
     }
 }
@@ -2168,12 +2210,7 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyBufferToImage(VkCommandBuffer cmd, VkBuffer sr
             if (img->depth) {
                 if (s->host()) UploadDepth(img, s->bytes() + r.bufferOffset, r);
                 else Unsupported("a GPU buffer copied into a depth buffer");
-                x.applied = nullptr;            // (its own shaders and states set)
-                x.stage_pipeline = nullptr;
-                x.depth_bound = nullptr;
-                x.reference_bound = ~0u;
-                x.viewport_bound = D3D11_VIEWPORT{-1, -1, -1, -1, -1, -1};
-                x.scissor_bound = D3D11_RECT{-1, -1, -1, -1};
+                x.ForgetBound();                // (its own shaders and states set)
                 continue;
             }
             if (!s->host()) {
