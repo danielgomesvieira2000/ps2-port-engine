@@ -1,10 +1,11 @@
 """Every GPU backend checked the same way: the renderer's tests, then a
 game's GPU regressions, on Vulkan 1.3, Vulkan 1.2 with dynamic rendering,
-Vulkan 1.2 with render passes (PS2HOST_VK_LEGACY=1, 2) and Direct3D 11
-(PS2HOST_RENDERER=d3d11) - one table at the end.
+Vulkan 1.2 with render passes (PS2HOST_VK_LEGACY=1, 2), render passes with
+the states made into pipelines (an older phone's way: PS2HOST_VK_BAKED=1)
+and Direct3D 11 (PS2HOST_RENDERER=d3d11) - one table at the end.
 
     python engine/tools/backends_check.py --game games/burnout3 [--runs car_select,race] [--gpu 4070]
-        [--backends vk13,vk12,vk12rp,d3d11] [--tests-only]
+        [--backends vk13,vk12,vk12rp,baked,d3d11] [--tests-only]
 
 Build first (port.py build). The regressions are regress.py's (--gpu), each
 compared with its recording: Direct3D 11 with a run's own <run>.d3d11.crc
@@ -25,6 +26,7 @@ BACKENDS = {
     "vk13": ("Vulkan 1.3", {}),
     "vk12": ("Vulkan 1.2 + dynamic rendering", {"PS2HOST_VK_LEGACY": "1"}),
     "vk12rp": ("Vulkan 1.2, render passes", {"PS2HOST_VK_LEGACY": "2"}),
+    "baked": ("Vulkan 1.1+, states in pipelines", {"PS2HOST_VK_LEGACY": "2", "PS2HOST_VK_BAKED": "1"}),
     "d3d11": ("Direct3D 11", {"PS2HOST_RENDERER": "d3d11"}),
 }
 

@@ -10,6 +10,13 @@ The goal is that every PC able to run the game's CPU side also draws on its GPU,
 
 **Vulkan 1.2** (`vk_device.cpp`): as planned. A 1.2 device needs `VK_EXT_extended_dynamic_state`; it draws with `VK_KHR_dynamic_rendering` where offered, else with render passes (`gs_renderer.cpp`'s `BeginRendering`). `PS2HOST_VK_LEGACY=1|2` takes either path on a 1.3 GPU. Every Burnout 3 GPU regression is the same picture for picture in all three paths.
 
+**Older devices (V5, and Vulkan 1.1):**
+- **Vulkan 1.1** draws too, with render passes. Every shader is SPIR-V 1.3 (`--target-env vulkan1.1`): none used anything of 1.4-1.5, and the renderer uses no 1.2 core feature (only 1.0 layouts and enums).
+- **Without `VK_EXT_extended_dynamic_state`** (older phones' drivers) the GS draws' depth test, write and comparison, their stencil and the ranges' stride are made into the pipeline (`BakedPipelineFor`: the key plus 7 bits of states), not set per batch. These pipelines are made as first drawn with: no worker, no list from the last run. `PS2HOST_VK_BAKED=1` takes this on any device, and backends_check's `baked` backend is render passes with it.
+- **Without logic ops** (`logicOp`: Mali, an older phone's GPU) a channel FBMSK masks in part was written whole: two renderer tests failed, as they always had on such GPUs. Now such a draw blends in the shader (`MaskedInShader`), which takes the bits FBMSK keeps from its copy of the target: exact, whatever the blend. `PS2HOST_GPU_NO_LOGIC_OP=1` takes this on any GPU: car_select, race_training, race and crash are then as recorded.
+- **Checked:** the renderer tests under the profiles layer posing as a 1.2 device without the extension, a 1.1 device with it, and a 1.1 phone (no extension, no logic ops, no BC), with the validation layer above: all pass, no messages. On the phone profile race_training and race are as recorded, again with no messages. backends_check's `baked` backend (render passes, `PS2HOST_VK_BAKED=1`) is as recorded on car_select, race_training, race, crash and race_modern.
+- **race_modern is flaky** on every path: a run now and then has one to six frames off, and the next is as recorded.
+
 **Direct3D 11: one renderer, not two.** X3 planned a second renderer, ported from `gs_renderer.cpp` part by part. What was built instead is a layer that implements the part of Vulkan the renderer uses with Direct3D 11 (`d3d11_vulkan.cpp`, ~1,900 lines: images, views, descriptor sets, pipelines, command buffers run at submit, copies, read-backs). The Vulkan renderer, its effects and `VulkanGpu` run on it unchanged.
 
 Why the change:
@@ -133,7 +140,7 @@ Which driver versions carry `VK_KHR_dynamic_rendering` on Kepler and GCN 1-3 is 
   - `vkCmdSetStencilOp` and the other dynamic-state calls at their `EXT` versions.
 
   The structures are the same (the `KHR` ones are aliases), so the renderer's code stays as it is.
-- **Logs:** the log says which path is in use: `Vulkan 1.3`, `Vulkan 1.2 + dynamic rendering` or `Vulkan 1.2, render passes`.
+- **Logs:** the log says which path is in use: `Vulkan 1.3`, `Vulkan 1.2 + dynamic rendering` or `Vulkan 1.1+, render passes`, with `, states in pipelines` where they are baked.
 - **Test switch:** `PS2HOST_VK_LEGACY=1|2` forces the 1.2 path (1 = with the extension, 2 = render passes) on a 1.3 GPU. The real driver then runs exactly what a 1.2 one would be asked for.
 
 ### V2. Shaders for SPIR-V 1.5 (about 1 h)
@@ -159,7 +166,7 @@ Which driver versions carry `VK_KHR_dynamic_rendering` on Kepler and GCN 1-3 is 
 4. **Android**: the same build on the phone, since Android shares this code.
 5. **A test build for the #24 reporter**, and any Kepler or GCN owner.
 
-**Not in Part 1:** devices without `VK_EXT_extended_dynamic_state`, which means baking those states into pipelines (about 4× the pipeline variants). No Windows GPU in the table needs it. Older Android phones would, so it's a later Android item (V5) if wanted.
+**Not in Part 1:** devices without `VK_EXT_extended_dynamic_state`, which means baking those states into pipelines (about 4× the pipeline variants). No Windows GPU in the table needs it. Older Android phones would, so it's a later Android item (V5) if wanted. (Done 2026-10-31: see Status.)
 
 ## Part 2: DirectX
 

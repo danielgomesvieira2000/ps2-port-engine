@@ -322,16 +322,18 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     vkEnumeratePhysicalDevices(instance_, &gpus, list.data());
     int best = -1;
     VkPath path = kVk13;
+    bool baked = false;
     std::string too_old;     // GPUs whose driver is older than Vulkan 1.2 (issue #24): named in the error
     for (VkPhysicalDevice candidate : list) {
-        // The GS renderer draws with Vulkan 1.3, or 1.2 with its extensions
-        // (vk_device.cpp): an older driver's device is passed over and the
-        // window draws with GDI.
+        // The GS renderer draws with Vulkan 1.3, 1.2 or 1.1 (vk_device.cpp):
+        // an older driver's device is passed over and the window draws with
+        // GDI.
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(candidate, &p);
         VkPath candidate_path;
+        bool candidate_baked = false;
         std::string why;
-        if (!VkDevicePath(candidate, &candidate_path, &why)) {
+        if (!VkDevicePath(candidate, &candidate_path, &candidate_baked, &why)) {
             too_old += std::string(too_old.empty() ? "" : ", ") + p.deviceName + " (" + why + ")";
             continue;
         }
@@ -349,13 +351,14 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
                 gpu_ = candidate;
                 family_ = f;
                 path = candidate_path;
+                baked = candidate_baked;
             }
             break;
         }
     }
     if (!gpu_) {
         error_ = too_old.empty() ? "no Vulkan device can draw and present to the window"
-                                 : "no Vulkan 1.2 GPU; passed over: " + too_old;
+                                 : "no Vulkan 1.1 GPU; passed over: " + too_old;
         return false;
     }
     VkPhysicalDeviceProperties p;
@@ -363,7 +366,7 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     char text[320];
     std::snprintf(text, sizeof text, "%s (Vulkan %u.%u.%u, driver %u; drawn with %s)", p.deviceName,
                   VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
-                  VK_API_VERSION_PATCH(p.apiVersion), p.driverVersion, VkPathName(path));
+                  VK_API_VERSION_PATCH(p.apiVersion), p.driverVersion, VkPathName(path, baked));
     describe_ = text;
 
     const float priority = 1.0f;
@@ -374,7 +377,7 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     // What the GS renderer needs, for when it draws on this device
     // (SharedGpu), and the window's own extensions.
     VkDeviceSetup setup;
-    setup.Fill(gpu_, path);
+    setup.Fill(gpu_, path, baked);
     setup.extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     dual_source_ = setup.supported.dualSrcBlend == VK_TRUE;
     if (setup.load_none) {
@@ -399,7 +402,7 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     dci.enabledExtensionCount = std::uint32_t(setup.extensions.size());
     dci.ppEnabledExtensionNames = setup.extensions.data();
     if (!Check(vkCreateDevice(gpu_, &dci, nullptr, &device_), "vkCreateDevice")) return false;
-    VkUseLegacyFunctions(path);
+    VkUseLegacyFunctions(path, baked);
     if (low_latency_) {
         set_sleep_mode_ = reinterpret_cast<PFN_vkSetLatencySleepModeNV>(
             vkGetDeviceProcAddr(device_, "vkSetLatencySleepModeNV"));

@@ -41,13 +41,15 @@ bool VulkanGpu::Init(std::string* error) {
     vkEnumeratePhysicalDevices(instance, &n, list.data());
     int best = -1;
     VkPath path = kVk13;
+    bool baked = false;
     std::string passed_over;
     for (VkPhysicalDevice candidate : list) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(candidate, &p);
         VkPath candidate_path;
+        bool candidate_baked = false;
         std::string why;
-        if (!VkDevicePath(candidate, &candidate_path, &why)) {
+        if (!VkDevicePath(candidate, &candidate_path, &candidate_baked, &why)) {
             passed_over += std::string(passed_over.empty() ? "" : ", ") + p.deviceName + " (" + why + ")";
             continue;
         }
@@ -63,18 +65,19 @@ bool VulkanGpu::Init(std::string* error) {
                 gpu = candidate;
                 family = f;
                 path = candidate_path;
+                baked = candidate_baked;
             }
             break;
         }
     }
     if (!gpu) {
-        if (error) *error = "no Vulkan 1.2 device with a graphics queue" + (passed_over.empty() ? std::string()
+        if (error) *error = "no Vulkan 1.1 device with a graphics queue" + (passed_over.empty() ? std::string()
                                                                          : "; passed over: " + passed_over);
         return false;
     }
     VkPhysicalDeviceProperties p;
     vkGetPhysicalDeviceProperties(gpu, &p);
-    describe_ = std::string(p.deviceName) + " (" + VkPathName(path) + ")";
+    describe_ = std::string(p.deviceName) + " (" + VkPathName(path, baked) + ")";
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -82,7 +85,7 @@ bool VulkanGpu::Init(std::string* error) {
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
     VkDeviceSetup setup;
-    setup.Fill(gpu, path);
+    setup.Fill(gpu, path, baked);
     dual_source = setup.supported.dualSrcBlend == VK_TRUE;
     logic_op = setup.supported.logicOp == VK_TRUE;
     bc = setup.supported.textureCompressionBC == VK_TRUE;
@@ -95,7 +98,7 @@ bool VulkanGpu::Init(std::string* error) {
     dci.ppEnabledExtensionNames = setup.extensions.data();
     if ((r = vkCreateDevice(gpu, &dci, nullptr, &device)) != VK_SUCCESS) return fail("vkCreateDevice", r);
     g_load_op_none = setup.load_none != nullptr;
-    VkUseLegacyFunctions(path);
+    VkUseLegacyFunctions(path, baked);
     // Device functions stay the loader's (volkLoadInstance): they dispatch by
     // handle, so the window's device and this one can live side by side. volk
     // keeps one global table; loading a device into it would point the other

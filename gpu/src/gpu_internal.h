@@ -46,19 +46,25 @@ inline WaitReason g_waits[16] = {};
 inline bool g_load_op_none = false;
 
 /* Which Vulkan the device draws with (vk_device.cpp): 1.3; 1.2 with
-   VK_KHR_dynamic_rendering; 1.2 with render passes (the renderer's BeginPass).
-   PS2HOST_VK_LEGACY=1|2 takes the second or third on a 1.3 GPU. */
+   VK_KHR_dynamic_rendering; 1.1 or 1.2 with render passes (the renderer's
+   BeginPass). PS2HOST_VK_LEGACY=1|2 takes the second or third on a 1.3 GPU. */
 enum VkPath { kVk13, kVk12Dynamic, kVk12RenderPass };
 inline VkPath g_vk_path = kVk13;
+/* Without VK_EXT_extended_dynamic_state (older phones' drivers): depth's test,
+   write and comparison, the stencil's and the ranges' stride made into the
+   GS draws' pipelines rather than set per batch (gs_renderer.cpp's
+   BakedPipelineFor). PS2HOST_VK_BAKED=1 takes it on any device. */
+inline bool g_vk_baked_states = false;
 /* VK_ATTACHMENT_STORE_OP_NONE can be used (1.3, dynamic rendering, or the
    load_store_op_none extensions). */
 inline bool g_store_op_none = true;
-const char* VkPathName(VkPath path);
+const char* VkPathName(VkPath path, bool baked = false);
 int VkLegacyForced();                       // PS2HOST_VK_LEGACY: 0, 1 or 2
 std::uint32_t VkInstanceVersion();          // 1.2 when the legacy path is forced, else 1.3
 int VkDeviceScore(const VkPhysicalDeviceProperties& p);      // PS2HOST_GPU's, then a discrete GPU
-/* Whether `gpu` can draw the GS, and on which path; why not, when not. */
-bool VkDevicePath(VkPhysicalDevice gpu, VkPath* path, std::string* why);
+/* Whether `gpu` can draw the GS, and on which path (`baked`: without extended
+   dynamic state); why not, when not. */
+bool VkDevicePath(VkPhysicalDevice gpu, VkPath* path, bool* baked, std::string* why);
 /* What a device on a path is made with: its features' chain (features, for
    VkDeviceCreateInfo::pNext) and its extensions, to which a caller adds its
    own. Not to be copied (the chain points into it). */
@@ -66,7 +72,7 @@ struct VkDeviceSetup {
     VkDeviceSetup() = default;
     VkDeviceSetup(const VkDeviceSetup&) = delete;
     VkDeviceSetup& operator=(const VkDeviceSetup&) = delete;
-    void Fill(VkPhysicalDevice gpu, VkPath path);
+    void Fill(VkPhysicalDevice gpu, VkPath path, bool baked);
     VkPhysicalDeviceFeatures supported{};
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
@@ -85,7 +91,7 @@ std::unique_ptr<GsRenderer> CreateD3D11GsRenderer(Gpu& gpu, std::string* error);
 
 /* After the device is made: the path taken, and on 1.2 the core names the
    renderer calls pointed at the extensions' entries. */
-void VkUseLegacyFunctions(VkPath path);
+void VkUseLegacyFunctions(VkPath path, bool baked);
 
 inline void CountWait(const char* why, double seconds) {
     for (WaitReason& w : g_waits) {

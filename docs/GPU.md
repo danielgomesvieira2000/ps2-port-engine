@@ -27,7 +27,7 @@ One renderer (`gs_renderer.cpp`, with `effects.cpp`) draws on every backend.
 The order `renderer=auto` tries, and how each one draws:
 
 1. **Vulkan 1.3**.
-2. **Vulkan 1.2**. It needs `VK_EXT_extended_dynamic_state`. It draws with `VK_KHR_dynamic_rendering` where the driver has it, else with render passes. `vk_device.cpp` chooses; `PS2HOST_VK_LEGACY=1|2` forces either on a 1.3 GPU.
+2. **Vulkan 1.2 or 1.1**. It draws with `VK_KHR_dynamic_rendering` where a 1.2 driver has it, else with render passes; with `VK_EXT_extended_dynamic_state` where offered, else with those states made into the pipelines (older phones). `vk_device.cpp` chooses; `PS2HOST_VK_LEGACY=1|2` forces either path on a 1.3 GPU, `PS2HOST_VK_BAKED=1` the states in pipelines.
 3. **Direct3D 11** at feature level 11_0 (Windows). The same renderer runs on `d3d11_vulkan.cpp`, a layer that implements the Vulkan it calls with Direct3D 11. Its shaders are the same GLSL, as HLSL through SPIRV-Cross and fxc. The display is `d3d11_display.cpp`.
 4. **GDI** with the software GS.
 

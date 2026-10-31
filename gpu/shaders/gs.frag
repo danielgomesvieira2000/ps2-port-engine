@@ -589,6 +589,14 @@ void main() {
     // A 16-bit target keeps the top five bits of each colour byte.
     if (Has(kSixteen) && ((p.blend_ops >> 16) & 1u) != 0u) c.rgb = floor(c.rgb / 8.0) * 8.0;
     colour = c / 255.0;
+#ifdef SHADER_BLEND
+    // What FBMSK keeps, from the target (a channel masked in part, on a GPU
+    // without logic ops: gs_renderer.cpp's MaskedInShader). Nothing where no
+    // channel is: a channel kept whole isn't written, one written whole keeps
+    // no bit.
+    if (p.logic == 0u && p.keep != 0u)
+        colour = unpackUnorm4x8((packUnorm4x8(dst / 255.0) & p.keep) | (packUnorm4x8(colour) & ~p.keep));
+#endif
     // A partly masked channel: the target ANDed with what FBMSK keeps, then
     // ORed with the rest of the source's bits (the pipelines' logic ops).
     if (Has(kLogic)) {
