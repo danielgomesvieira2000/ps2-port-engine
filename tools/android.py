@@ -42,7 +42,7 @@ from ps2decomp import game as game_config  # noqa: E402
 import port  # noqa: E402
 
 ENGINE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MIN_SDK = 29        # Android 10: Vulkan 1.1 at least in every device's driver (1.3 checked at run time)
+MIN_SDK = 29        # Android 10: Vulkan 1.1 at least in every device's driver (newer paths chosen at run time)
 TARGET_SDK = 35
 
 
@@ -174,8 +174,8 @@ def manifest(game, settings: dict) -> str:
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="{package}"
     android:installLocation="auto">
-    <!-- Vulkan 1.3 (the renderer's dynamic rendering, synchronization2) -->
-    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x403000" android:required="true" />
+    <!-- Vulkan 1.1: the renderer's oldest path (render passes, SPIR-V 1.3) -->
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-feature android:name="android.hardware.gamepad" android:required="false" />
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
