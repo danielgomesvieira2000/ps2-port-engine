@@ -58,7 +58,8 @@ Code finds the skills in `engine/.claude/skills`.
   faster on the VU and GS, the pictures the same; `PS2_COMPILER=msvc` builds
   with MSVC's own) - and with it, `port.py ... pgo`: a profile-guided build
   from the game's scripted runs (Burnout 3: 10-12% less CPU in a race)
-* For a port: a Vulkan 1.3 GPU, a processor with AVX2
+* For a port: a GPU with Vulkan 1.1 or later (1.3 preferred) or, on Windows, Direct3D 11
+  (feature level 11_0); a processor with AVX2
 * A disc image you own, for each game: an .iso, or a CD's raw .bin with its
   .cue (Mode 1 or Mode 2 sectors)
 
