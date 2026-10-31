@@ -2352,9 +2352,18 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateFence(VkDevice, const VkFenceCreateInfo* ci
     return VK_SUCCESS;
 }
 
+/* The fences submitted and not yet waited for: vkDeviceWaitIdle completes
+   them (their read-backs into host memory), as Vulkan's would have. */
+std::mutex g_pending_lock;
+std::set<Fence*> g_pending_fences;
+
 VKAPI_ATTR void VKAPI_CALL DestroyFence(VkDevice, VkFence fence, const VkAllocationCallbacks*) {
     auto* f = reinterpret_cast<Fence*>(fence);
     if (!f) return;
+    {
+        std::lock_guard<std::mutex> hold(g_pending_lock);
+        g_pending_fences.erase(f);
+    }
     std::lock_guard<std::mutex> hold(g_gpu->context_lock);
     for (Readback& r : f->readbacks) Release(r.staging);
     Release(f->done);
@@ -2368,6 +2377,10 @@ VKAPI_ATTR VkResult VKAPI_CALL ResetFences(VkDevice, std::uint32_t count, const 
 
 void CompleteFence(Fence* f) {
     if (!f || f->signaled) return;
+    {
+        std::lock_guard<std::mutex> hold(g_pending_lock);
+        g_pending_fences.erase(f);
+    }
     // The GPU past the submission: what it read of host memory's twins (the
     // vertex rings, written with NO_OVERWRITE) may be written again.
     if (f->value && g_fence && g_fence->GetCompletedValue() < f->value) {
@@ -2437,6 +2450,8 @@ VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit(VkQueue, std::uint32_t count, const V
     if (f) {
         f->readbacks = std::move(readbacks);
         f->signaled = false;
+        std::lock_guard<std::mutex> hold(g_pending_lock);
+        g_pending_fences.insert(f);
     } else {
         Fence done;
         done.readbacks = std::move(readbacks);
@@ -2445,7 +2460,15 @@ VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit(VkQueue, std::uint32_t count, const V
     return VK_SUCCESS;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL DeviceWaitIdle(VkDevice) { return VK_SUCCESS; }
+VKAPI_ATTR VkResult VKAPI_CALL DeviceWaitIdle(VkDevice) {
+    std::vector<Fence*> pending;
+    {
+        std::lock_guard<std::mutex> hold(g_pending_lock);
+        pending.assign(g_pending_fences.begin(), g_pending_fences.end());
+    }
+    for (Fence* f : pending) CompleteFence(f);
+    return VK_SUCCESS;
+}
 
 // (Asked for once the submission's fence is waited for: the queries are done
 // or about to be.)
