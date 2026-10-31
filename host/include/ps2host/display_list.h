@@ -55,6 +55,12 @@ struct ListBlendOptions {
     // in 22 minutes, a picture between two shots each; a still camera over
     // a room whose things come and go (a fire's) is no cut.
     float new_share = 0.5f, new_view = 0.3f;
+    // Lists with the same codes to their end (ListBlend::whole): each
+    // segment matched with the one in its place, not searched for - a game
+    // that draws its things in the same order every step (Mister Mosquito),
+    // where many things share their codes and the nearest values pick the
+    // wrong one.
+    bool in_place_when_whole = false;
 };
 
 struct ListBlend {
