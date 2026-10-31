@@ -587,9 +587,10 @@ private:
     VkPipeline PipelineFor(std::uint32_t key);
     /* Without extended dynamic state (g_vk_baked_states): a GS draw's
        pipeline with its depth and stencil states and the ranges' stride made
-       in - Baked's bits beside the key - rather than set per batch. Made as
-       first drawn with (no worker, no list from the last run's: these are
-       devices' that would rarely have one). */
+       in - Baked's bits beside the key - rather than set per batch. Known by
+       BakedId; made by the worker as the dynamic ones are (the whole shader's
+       with the same states standing in), the last runs' from the start
+       (gpu_pipelines_baked.txt). */
     static constexpr std::uint32_t kDynamicStates = ~0u;
     static constexpr std::uint32_t kBakedDepthTest = 1, kBakedDepthWrite = 2, kBakedRanges = 64;
     static std::uint32_t Baked(int depth_test, int depth_write, int compare, int stencil_test, bool ranges) {
@@ -597,7 +598,14 @@ private:
                std::uint32_t(stencil_test) << 4 | (ranges ? kBakedRanges : 0);
     }
     VkPipeline BakedPipelineFor(std::uint32_t key, std::uint32_t baked);
+    /* A pipeline's id for the worker and the lists: the key, and above it
+       its baked states + 1 (0: the dynamic pipeline). */
+    static std::uint64_t BakedId(std::uint32_t key, std::uint32_t baked) {
+        return (std::uint64_t(baked) + 1) << 32 | key;
+    }
+    void KeepBaked(std::uint64_t id, VkPipeline pipeline);
     std::unordered_map<std::uint64_t, VkPipeline> baked_pipelines_;
+    std::set<std::uint64_t> known_baked_;
     std::uint64_t last_baked_key_ = ~0ull;
     VkPipeline last_baked_ = VK_NULL_HANDLE;
     /* The pipeline cache (SetPipelineCacheDir): every pipeline is made
@@ -849,13 +857,13 @@ private:
     std::vector<std::thread> pipeline_workers_;
     std::mutex pipeline_lock_;
     std::condition_variable pipeline_wake_;
-    std::deque<std::uint32_t> pipeline_queue_;
-    std::vector<std::pair<std::uint32_t, VkPipeline>> pipelines_made_;
-    std::set<std::uint32_t> pipelines_asked_;
+    std::deque<std::uint64_t> pipeline_queue_;         // (keys, and BakedIds)
+    std::vector<std::pair<std::uint64_t, VkPipeline>> pipelines_made_;
+    std::set<std::uint64_t> pipelines_asked_;          // (keys, and BakedIds)
     std::atomic<bool> pipelines_ready_{false};
     bool pipeline_stop_ = false;
     VkPipeline MakePipeline(std::uint32_t key, std::uint32_t baked = kDynamicStates);
-    void AskWorker(std::uint32_t key, bool soon);
+    void AskWorker(std::uint64_t id, bool soon);
     std::size_t warm_left_ = 0;         // WarmPipelines' still to come
     std::chrono::steady_clock::time_point warm_began_{};
     void KeepPipeline(std::uint32_t key, VkPipeline pipeline, double ms);
@@ -2348,10 +2356,28 @@ void VulkanGsRenderer::OpenPipelineCache() {
    driver or shader, tens of milliseconds - seconds in all, which the start
    does not wait for) rather than when a race first needs one. */
 void VulkanGsRenderer::WarmPipelines() {
-    if (g_pipeline_cache_dir.empty() || g_vk_baked_states) return;
+    if (g_pipeline_cache_dir.empty()) return;
     async_pipelines_ = true;            // (a run that keeps a cache is a player's)
-    std::ifstream in(CacheFile("gpu_pipelines.txt"));
     std::string word;
+    if (g_vk_baked_states) {
+        // (The game's list is of dynamic pipelines: the last runs' alone.)
+        std::ifstream baked(CacheFile("gpu_pipelines_baked.txt"));
+        std::vector<std::uint64_t> ids;
+        while (baked && baked >> word) {
+            const std::uint64_t id = std::strtoull(word.c_str(), nullptr, 16);
+            if (!(id >> 32) || baked_pipelines_.count(id) || !pipelines_asked_.insert(id).second) continue;
+            known_baked_.insert(id);
+            ids.push_back(id);
+        }
+        if (ids.empty()) return;
+        warm_began_ = std::chrono::steady_clock::now();
+        warm_left_ = ids.size();
+        g_warm_made = 0;
+        g_warm_total = ids.size();
+        for (std::uint64_t id : ids) AskWorker(id, false);
+        return;
+    }
+    std::ifstream in(CacheFile("gpu_pipelines.txt"));
     std::vector<std::uint32_t> keys;
     while (in && in >> word) {
         const std::uint32_t key = std::uint32_t(std::strtoul(word.c_str(), nullptr, 16));
@@ -2373,7 +2399,7 @@ void VulkanGsRenderer::WarmPipelines() {
 
 /* A pipeline for the worker to make: a player's draw first (`soon`), the
    start's list after. */
-void VulkanGsRenderer::AskWorker(std::uint32_t key, bool soon) {
+void VulkanGsRenderer::AskWorker(std::uint64_t id, bool soon) {
     // Several workers: a first start (no cache: a driver compiling each
     // shader - a phone's tens of milliseconds and more) made in a fraction
     // of the time, the processors otherwise idle while it waits.
@@ -2386,13 +2412,14 @@ void VulkanGsRenderer::AskWorker(std::uint32_t key, bool soon) {
                 for (;;) {
                     pipeline_wake_.wait(hold, [this] { return pipeline_stop_ || !pipeline_queue_.empty(); });
                     if (pipeline_stop_) return;
-                    const std::uint32_t next = pipeline_queue_.front();
+                    const std::uint64_t next = pipeline_queue_.front();
                     pipeline_queue_.pop_front();
                     hold.unlock();
                     // PS2HOST_PIPELINE_SLOW_MS: each made that much slower (a cold driver, to test).
                     static const int slow_ms = std::getenv("PS2HOST_PIPELINE_SLOW_MS") ? std::atoi(std::getenv("PS2HOST_PIPELINE_SLOW_MS")) : 0;
                     if (slow_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(slow_ms));
-                    const VkPipeline made = MakePipeline(next);
+                    const VkPipeline made = MakePipeline(
+                        std::uint32_t(next), next >> 32 ? std::uint32_t((next >> 32) - 1) : kDynamicStates);
                     hold.lock();
                     pipelines_made_.emplace_back(next, made);
                     pipelines_ready_.store(true, std::memory_order_release);
@@ -2402,8 +2429,8 @@ void VulkanGsRenderer::AskWorker(std::uint32_t key, bool soon) {
     }
     {
         std::lock_guard<std::mutex> hold(pipeline_lock_);
-        if (soon) pipeline_queue_.push_front(key);
-        else pipeline_queue_.push_back(key);
+        if (soon) pipeline_queue_.push_front(id);
+        else pipeline_queue_.push_back(id);
     }
     pipeline_wake_.notify_one();
 }
@@ -2423,8 +2450,14 @@ void VulkanGsRenderer::SavePipelineCache() {
         std::snprintf(text, sizeof text, "%08X\n", unsigned(key));
         keys += text;
     }
+    std::string baked;
+    for (std::uint64_t id : known_baked_) {
+        char text[20];
+        std::snprintf(text, sizeof text, "%016llX\n", static_cast<unsigned long long>(id));
+        baked += text;
+    }
     cache_saving_ = true;
-    std::thread([this, device = g_.device, cache = cache_, keys = std::move(keys)] {
+    std::thread([this, device = g_.device, cache = cache_, keys = std::move(keys), baked = std::move(baked)] {
         std::size_t size = 0;
         std::vector<char> data;
         if (vkGetPipelineCacheData(device, cache, &size, nullptr) == VK_SUCCESS && size) {
@@ -2445,7 +2478,8 @@ void VulkanGsRenderer::SavePipelineCache() {
             std::rename((path + ".new").c_str(), path.c_str());
         };
         if (!data.empty()) write(CacheFile("gpu_pipeline_cache.bin"), data.data(), data.size());
-        write(CacheFile("gpu_pipelines.txt"), keys.data(), keys.size());
+        if (!keys.empty()) write(CacheFile("gpu_pipelines.txt"), keys.data(), keys.size());
+        if (!baked.empty()) write(CacheFile("gpu_pipelines_baked.txt"), baked.data(), baked.size());
         cache_saving_ = false;
     }).detach();
 }
@@ -2479,43 +2513,67 @@ VkPipeline VulkanGsRenderer::PipelineFor(std::uint32_t key) {
 }
 
 VkPipeline VulkanGsRenderer::BakedPipelineFor(std::uint32_t key, std::uint32_t baked) {
-    const std::uint64_t both = std::uint64_t(baked) << 32 | key;
-    if (both == last_baked_key_ && last_baked_) return last_baked_;
-    auto found = baked_pipelines_.find(both);
-    VkPipeline pipeline = found != baked_pipelines_.end() ? found->second : VK_NULL_HANDLE;
-    if (!pipeline) {
-        const auto began = std::chrono::steady_clock::now();
-        pipeline = MakePipeline(key, baked);
-        if (!pipeline) return VK_NULL_HANDLE;
-        baked_pipelines_[both] = pipeline;
-        static const bool log = std::getenv("PS2HOST_PIPELINE_LOG") != nullptr;
-        if (log)
-            std::fprintf(stderr, "[gpu] pipeline %08X, states %02X, made in %.1f ms\n", key, baked,
-                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count());
+    const std::uint64_t id = BakedId(key, baked);
+    if (id == last_baked_key_ && last_baked_) return last_baked_;
+    if (pipelines_ready_.load(std::memory_order_acquire)) TakeMadePipelines();
+    auto found = baked_pipelines_.find(id);
+    if (found != baked_pipelines_.end()) {
+        last_baked_key_ = id;
+        last_baked_ = found->second;
+        return found->second;
     }
-    last_baked_key_ = both;
+    // A kind of draw's own asked of the worker, the whole shader's with the
+    // same states meanwhile (PipelineFor's way).
+    if (async_pipelines_ && (key >> kFeatureShift)) {
+        const VkPipeline stand_in = BakedPipelineFor(key & ((1u << kFeatureShift) - 1), baked);
+        if (stand_in) {
+            if (pipelines_asked_.insert(id).second) AskWorker(id, true);
+            return stand_in;
+        }
+    }
+    const auto began = std::chrono::steady_clock::now();
+    const VkPipeline pipeline = MakePipeline(key, baked);
+    if (!pipeline) return VK_NULL_HANDLE;
+    KeepBaked(id, pipeline);
+    static const bool log = std::getenv("PS2HOST_PIPELINE_LOG") != nullptr;
+    if (log)
+        std::fprintf(stderr, "[gpu] pipeline %08X, states %02X, made in %.1f ms\n", key, baked,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count());
+    last_baked_key_ = id;
     last_baked_ = pipeline;
     return pipeline;
 }
 
+void VulkanGsRenderer::KeepBaked(std::uint64_t id, VkPipeline pipeline) {
+    baked_pipelines_[id] = pipeline;
+    if (known_baked_.insert(id).second) cache_dirty_ = true;
+}
+
 /* The worker's pipelines into the renderer's (the GS thread's) own. */
 void VulkanGsRenderer::TakeMadePipelines() {
-    std::vector<std::pair<std::uint32_t, VkPipeline>> made;
+    std::vector<std::pair<std::uint64_t, VkPipeline>> made;
     {
         std::lock_guard<std::mutex> hold(pipeline_lock_);
         made.swap(pipelines_made_);
         pipelines_ready_.store(false, std::memory_order_relaxed);
     }
-    for (const auto& [key, pipeline] : made) {
-        pipelines_asked_.erase(key);
+    for (const auto& [id, pipeline] : made) {
+        pipelines_asked_.erase(id);
         if (warm_left_ && --warm_left_ == 0)
             std::fprintf(stderr, "[gpu] the pipelines known from the start (the last runs', the game's) made ready in %.0f ms\n",
                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - warm_began_).count());
         if (!pipeline) continue;
+        if (id >> 32) {
+            if (baked_pipelines_.count(id)) vkDestroyPipeline(g_.device, pipeline, nullptr);
+            else KeepBaked(id, pipeline);
+            continue;
+        }
+        const std::uint32_t key = std::uint32_t(id);
         if (pipelines_.count(key)) vkDestroyPipeline(g_.device, pipeline, nullptr);
         else KeepPipeline(key, pipeline, -1.0);
     }
     last_pipeline_key_ = ~0u;           // (it may have been the whole shader's, standing in)
+    last_baked_key_ = ~0ull;
 }
 
 void VulkanGsRenderer::KeepPipeline(std::uint32_t key, VkPipeline pipeline, double ms) {
@@ -4095,8 +4153,10 @@ VulkanGsRenderer::~VulkanGsRenderer() {
         pipeline_wake_.notify_all();
         for (std::thread& worker : pipeline_workers_) worker.join();
     }
-    for (const auto& [key, pipeline] : pipelines_made_)
-        if (pipeline) pipelines_.emplace(key, pipeline);
+    for (const auto& [id, pipeline] : pipelines_made_)
+        if (pipeline && (id >> 32 ? !baked_pipelines_.emplace(id, pipeline).second
+                                  : !pipelines_.emplace(std::uint32_t(id), pipeline).second))
+            vkDestroyPipeline(g_.device, pipeline, nullptr);
     while (cache_saving_.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     g_.Submit();
     {
