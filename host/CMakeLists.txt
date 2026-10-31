@@ -30,6 +30,7 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/iop.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/sdk.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/hang_report.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/custom_songs.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/disc.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/cdvd.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/fileio.cpp

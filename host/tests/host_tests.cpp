@@ -19,6 +19,7 @@
 #include "ps2host/dma.h"
 #include "ps2host/gs.h"
 #include "ps2host/bindings.h"
+#include "ps2host/custom_songs.h"
 #include "ps2host/host.h"
 #include "ps2host/hud.h"
 #include "ps2host/libnet.h"
@@ -2110,6 +2111,26 @@ void BlanksLockToTheScreen() {
 #endif
 }
 
+void CustomSongsScanAndName() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "ps2host_custom_songs_test";
+    std::error_code ignored;
+    fs::remove_all(dir, ignored);
+    fs::create_directories(dir);
+    for (const wchar_t* name : {L"b band - Second Song.mp3", L"A Band - First Song.MP3", L"Lonely.mp3", L"notes.txt",
+                                L"Caf\u00E9  Tacuba - Ojal\u00E1   que.mp3"})
+        std::fclose(_wfopen((dir / name).c_str(), L"wb"));
+    const std::vector<ps2host::CustomSong> songs = ps2host::ScanCustomSongs(dir, 3, 12);
+    Check(songs.size() == 3, "custom songs: MP3s alone, the first 3 by name");
+    Check(songs[0].artist == u"A Band" && songs[0].title == u"First Song", "custom songs: Artist - Title, any case's .mp3");
+    Check(songs[1].artist == u"b band", "custom songs: by file name in any case");
+    Check(songs[2].artist == u"Cafe Tacuba" && songs[2].title == u"Ojala que", "custom songs: accents plain, spaces squeezed");
+    const ps2host::CustomSong alone = ps2host::CustomSongOf(dir / "Lonely.mp3", 12);
+    Check(alone.title == u"Lonely" && alone.artist == u"Unknown Artist", "custom songs: no dash, the name is the title");
+    Check(ps2host::CustomSongText(L"A Very Long Song Name", 12) == u"A Very Lo...", "custom songs: cut with ...");
+    fs::remove_all(dir, ignored);
+}
+
 void BindingsKeepAndSwap() {
     namespace b = ps2host::bindings;
     b::Table defaults{};
@@ -2142,6 +2163,7 @@ void BindingsKeepAndSwap() {
 int main() {
     BlanksLockToTheScreen();
     BindingsKeepAndSwap();
+    CustomSongsScanAndName();
     HudAnchorsAndPlaces();
     LibnetSendsDatagrams();
     OverlaysRunWhatIsLoaded();
