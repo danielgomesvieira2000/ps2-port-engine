@@ -23,14 +23,18 @@ struct Segment {
     u32 first, end; // its codes
 };
 
-/* A VIF code's data, in words after it. */
-u32 DataWords(u32 code) {
+/* A VIF code's data, in words after it. `cl`, `wl`: STCYCL's cycle - an
+   UNPACK writing more than it reads (WL > CL, filling: Mister Mosquito's)
+   reads CL vectors of each WL it writes. */
+u32 DataWords(u32 code, u32 cl, u32 wl) {
     const u32 cmd = (code >> 24) & 0x7F;
     const u32 num = (code >> 16) & 0xFF;
     const u32 imm = code & 0xFFFF;
-    if ((cmd & 0x60) == 0x60) {         // UNPACK: vn, vl - num vectors
+    if ((cmd & 0x60) == 0x60) {         // UNPACK: vn, vl - num vectors written
         const u32 vl = cmd & 3, vn = (cmd >> 2) & 3;
-        const u32 bits = (32u >> vl) * (vn + 1) * (num ? num : 256);
+        u32 vectors = num ? num : 256;
+        if (wl > cl) vectors = cl * (vectors / wl) + std::min(vectors % wl, cl);
+        const u32 bits = (32u >> vl) * (vn + 1) * vectors;
         return (bits + 31) / 32;
     }
     switch (cmd) {
@@ -47,11 +51,16 @@ bool Unpack(u32 code) { return ((code >> 24) & 0x60) == 0x60; }
 void Parse(const std::vector<u32>& w, std::vector<Code>& codes) {
     codes.clear();
     size_t i = 0;
+    u32 cl = 1, wl = 1;     // STCYCL's (the VIF's reset values are 0; 1/1 reads as written)
     while (i < w.size()) {
         const u32 code = w[i];
-        const u32 words = DataWords(code);
-        if (i + 1 + words > w.size()) break;
         const u32 cmd = (code >> 24) & 0x7F;
+        if (cmd == 0x01) {
+            cl = code & 0xFF;
+            wl = (code >> 8) & 0xFF;
+        }
+        const u32 words = DataWords(code, cl, wl);
+        if (i + 1 + words > w.size()) break;
         codes.push_back({u32(i), code, words, Unpack(code) && (cmd & 0x0F) == 0x0C});
         i += 1 + words;
     }
