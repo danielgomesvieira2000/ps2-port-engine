@@ -814,6 +814,10 @@ struct Exec {
     DescriptorSet* stage_sets[4] = {};      // the graphics stages' resources as bound from these
     Pipeline* stage_pipeline = nullptr;
     std::uint64_t stage_version = 0;
+    ID3D11DepthStencilState* depth_bound = nullptr;
+    UINT reference_bound = ~0u;
+    D3D11_VIEWPORT viewport_bound{-1, -1, -1, -1, -1, -1};
+    D3D11_RECT scissor_bound{-1, -1, -1, -1};
 };
 
 ID3D11Buffer* g_push_buffer = nullptr;      // b0: the push constants
@@ -1004,7 +1008,13 @@ void ApplyGraphics(Exec& x) {
         c->RSSetState(g_gpu->scissored);
         x.applied = p;
     }
-    c->OMSetDepthStencilState(DepthState(x, *p), p->dyn_stencil_values ? x.reference : p->front.reference);
+    ID3D11DepthStencilState* depth = DepthState(x, *p);
+    const UINT reference = p->dyn_stencil_values ? x.reference : p->front.reference;
+    if (depth != x.depth_bound || reference != x.reference_bound) {
+        c->OMSetDepthStencilState(depth, reference);
+        x.depth_bound = depth;
+        x.reference_bound = reference;
+    }
     PushConstants(x, false);
     const std::uint64_t version = g_descriptor_version.load(std::memory_order_relaxed);
     // The stages' resources, unless bound from the same sets, unwritten
@@ -1022,8 +1032,14 @@ void ApplyGraphics(Exec& x) {
                   [&](UINT reg, ID3D11ShaderResourceView* v) { c->PSSetShaderResources(reg, 1, &v); },
                   [&](UINT reg, ID3D11SamplerState* s) { c->PSSetSamplers(reg, 1, &s); }, nullptr, nullptr);
     }
-    c->RSSetViewports(1, &x.viewport);
-    c->RSSetScissorRects(1, &x.scissor);
+    if (std::memcmp(&x.viewport, &x.viewport_bound, sizeof x.viewport) != 0) {
+        c->RSSetViewports(1, &x.viewport);
+        x.viewport_bound = x.viewport;
+    }
+    if (std::memcmp(&x.scissor, &x.scissor_bound, sizeof x.scissor) != 0) {
+        c->RSSetScissorRects(1, &x.scissor);
+        x.scissor_bound = x.scissor;
+    }
     // The vertices (a host buffer's drawn part went to its GPU twin as the
     // command buffer was submitted: CommandBuffer::uploads).
     for (std::uint32_t i = 0; i < 2; ++i) {
@@ -2140,6 +2156,10 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyBufferToImage(VkCommandBuffer cmd, VkBuffer sr
                 else Unsupported("a GPU buffer copied into a depth buffer");
                 x.applied = nullptr;            // (its own shaders and states set)
                 x.stage_pipeline = nullptr;
+                x.depth_bound = nullptr;
+                x.reference_bound = ~0u;
+                x.viewport_bound = D3D11_VIEWPORT{-1, -1, -1, -1, -1, -1};
+                x.scissor_bound = D3D11_RECT{-1, -1, -1, -1};
                 continue;
             }
             if (!s->host()) {
