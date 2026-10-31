@@ -6,7 +6,7 @@ The goal is that every PC able to run the game's CPU side also draws on its GPU,
 
 ## Status (2026-10-31)
 
-**Done: Vulkan 1.2 (V1-V4) and Direct3D 11 (X0-X4).** The order of choice is as planned: `renderer=auto` takes Vulkan (1.3, else 1.2), then Direct3D 11, then GDI with the software GS.
+**Done: Vulkan 1.2 (V1-V4) and Direct3D 11 (X0-X4).** The order of choice is as planned: `renderer=auto` takes Vulkan (1.3, else 1.2), then Direct3D 11, then the software GS. Its window is SDL's 2D renderer (`sdl_display.cpp`, added 2026-10-31: the controllers, the overlay and every platform; car_select_window with `PS2HOST_RENDERER=sdl` is the headless software run's pictures, 44/44), and GDI only where SDL has no renderer either.
 
 **Vulkan 1.2** (`vk_device.cpp`): as planned. A 1.2 device needs `VK_EXT_extended_dynamic_state`; it draws with `VK_KHR_dynamic_rendering` where offered, else with render passes (`gs_renderer.cpp`'s `BeginRendering`). `PS2HOST_VK_LEGACY=1|2` takes either path on a 1.3 GPU. Every Burnout 3 GPU regression is the same picture for picture in all three paths.
 

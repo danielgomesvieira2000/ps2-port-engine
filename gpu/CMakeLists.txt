@@ -216,6 +216,7 @@ add_library(ps2gpu STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/d3d11_display.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/d3d11_renderer.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/d3d11_vulkan.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/sdl_display.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gpu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/vk_device.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gs_renderer.cpp

@@ -315,19 +315,25 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
     for (const wchar_t* p = title; *p; ++p) narrow += char(*p < 128 ? *p : '?');
     if (!GameTitle().empty()) narrow = GameTitle();
     g_title = narrow;
-    // The backend: the setting's, else Vulkan, then Direct3D 11 (Windows).
+    // The backend: the setting's, else Vulkan, then Direct3D 11 (Windows),
+    // then SDL's 2D renderer with the software GS (sdl: that one alone).
     std::string want = Setting("renderer", "auto");
     if (const char* forced = std::getenv("PS2HOST_RENDERER")) want = forced;
     std::string error, why_not;
     const char* api = "Vulkan";
-    if (want != "d3d11") g_display = ps2gpu::CreateVulkanDisplay(narrow.c_str(), width, height, &error);
+    if (want != "d3d11" && want != "sdl") g_display = ps2gpu::CreateVulkanDisplay(narrow.c_str(), width, height, &error);
 #ifdef _WIN32
-    if (!g_display && want != "vulkan") {
+    if (!g_display && want != "vulkan" && want != "sdl") {
         if (want != "d3d11") why_not = " (no Vulkan display: " + error + ")";
         g_display = ps2gpu::CreateD3D11Display(narrow.c_str(), width, height, &error);
         api = "Direct3D 11";
     }
 #endif
+    if (!g_display && want != "vulkan" && want != "d3d11") {
+        if (want != "sdl") why_not += " (no GPU display: " + error + ")";
+        g_display = ps2gpu::CreateSdlDisplay(narrow.c_str(), width, height, &error);
+        api = "SDL";
+    }
     if (g_display) {
         Note("window", std::string("window: ") + api + " on " + g_display->Describe() + why_not);
         g_display->SetVrr(SettingOn("vrr"));
@@ -573,6 +579,8 @@ std::function<bool(std::vector<u32>*, u32*, u32*)> g_picture_source;
 
 #ifdef PS2HOST_VULKAN
 ps2gpu::Gpu* WindowGpu() { return g_display ? g_display->SharedGpu() : nullptr; }
+// A window that shows pixels alone (SDL's 2D renderer: no GPU display to be had).
+bool WindowPixelsOnly() { return g_display && !g_display->SharedGpu(); }
 #endif
 
 void SetPictureSource(std::function<bool(std::vector<u32>*, u32*, u32*)> source) {

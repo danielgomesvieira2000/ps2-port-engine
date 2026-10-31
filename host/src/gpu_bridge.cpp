@@ -129,6 +129,7 @@ void SetGpuScaleRule(u32 fbp_begin, u32 fbp_end, u32 max_fbw) {
 #if PS2HOST_VULKAN
 
 ps2gpu::Gpu* WindowGpu();       // window.cpp: the window's device, when there is one
+bool WindowPixelsOnly();        // window.cpp: a window without one (SDL's renderer)
 
 namespace {
 
@@ -2415,6 +2416,11 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     static Bridge bridge;
     // On the window's device when there is a window: one Vulkan device for both.
     ps2gpu::Gpu* device = WindowGpu();
+    if (!device && WindowPixelsOnly()) {
+        // (Its pictures are pixels: the software GS's, not a device's images.)
+        *error = "the window has no GPU display: the software GS draws";
+        return false;
+    }
     if (!device) {
         // (Without a window, PS2HOST_RENDERER=d3d11 draws on a Direct3D 11
         // device of its own: a scripted run's regressions on that backend.)

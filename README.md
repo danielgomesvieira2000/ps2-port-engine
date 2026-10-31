@@ -69,9 +69,15 @@ The same port, built for each from the same game directory:
 
 | Platform | Built with | Draws with | Tested |
 |---|---|---|---|
-| Windows 10/11 x64 | `tools/port.py` (clang-cl or MSVC; an SSE4.1 build beside the AVX2 one) | Vulkan 1.3, 1.2 or 1.1; Direct3D 11; GDI and the software GS | the GPU regressions on each backend: `tools/backends_check.py` |
+| Windows 10/11 x64 | `tools/port.py` (clang-cl or MSVC; an SSE4.1 build beside the AVX2 one) | Vulkan 1.3, 1.2 or 1.1; Direct3D 11; SDL's 2D renderer and the software GS | the GPU regressions on each backend: `tools/backends_check.py` |
 | Android 10+ (arm64, x86-64 emulator) | `tools/android.py` (the NDK; an APK) | Vulkan 1.1+ | on a phone |
-| Linux x86-64 (glibc 2.35+: Ubuntu 22.04, Debian 12, SteamOS, Fedora 36 and later; the C++ runtime linked in) | `tools/linux.py` (Docker, from Windows or Linux: Ubuntu 22.04, clang 19, SDL's X11/Wayland, Mesa) | Vulkan 1.1+ | `linux.py test`: the host's and the renderer's tests (on lavapipe) and the regressions with the software GS, as recorded on Windows |
+| Linux x86-64 (glibc 2.35+: Ubuntu 22.04, Debian 12, SteamOS, Fedora 36 and later; the C++ runtime linked in) | `tools/linux.py` (Docker, from Windows or Linux: Ubuntu 22.04, clang 19, SDL's X11/Wayland, Mesa) | Vulkan 1.1+; SDL's 2D renderer (OpenGL) and the software GS | `linux.py test`: the host's and the renderer's tests (on lavapipe) and the regressions with the software GS, as recorded on Windows |
+
+Without a GPU display (no Vulkan driver, and off Windows no Direct3D 11),
+the window is drawn with SDL's own 2D renderer (`sdl_display.cpp`: OpenGL, or
+SDL's software renderer) and the GS on the CPU: slow, but the game plays,
+with its controllers. `renderer=sdl` (or `PS2HOST_RENDERER=sdl`) takes it on
+any PC.
 
 Not built yet: **Windows on ARM64** (Snapdragon). The code is the one
 Android's arm64 build runs (NEON through sse2neon) and clang-cl targets it

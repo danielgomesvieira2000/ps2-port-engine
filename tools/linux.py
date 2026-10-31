@@ -134,14 +134,18 @@ def build(game, jobs: int):
     print("built %s%s" % (os.path.join(out, target), " (ThinLTO)" if lto else ""))
 
 
-def test(game, runs: str, gpu: bool):
+def test(game, runs: str, gpu: bool, renderer: str = ""):
     root = root_of(game)
     target = port_target(game)
     steps = ["/build/%s/ps2host/ps2host_tests | tail -1" % target,
              "/build/%s/ps2gpu/ps2gpu_tests | tail -1" % target]
+    # A run with --window gets an X server of its own (Xvfb); PS2HOST_RENDERER
+    # picks its display (sdl: SDL's 2D renderer, as on a PC without Vulkan).
+    chosen = "PS2HOST_RENDERER=%s " % shlex.quote(renderer) if renderer else ""
     for r in [r for r in runs.split(",") if r]:
-        steps.append("python3 engine/tools/regress.py --game %s %s --exe /build/%s/%s%s | tail -1"
-                     % (shlex.quote(inside(root, game.directory)), r, target, target, " --gpu" if gpu else ""))
+        steps.append("%sxvfb-run -a python3 engine/tools/regress.py --game %s %s --exe /build/%s/%s%s | grep -E '^  [^ ]|recorded'"
+                     % (chosen, shlex.quote(inside(root, game.directory)), r, target, target,
+                        " --gpu" if gpu else ""))
     container(game, "set -o pipefail; " + " && ".join(steps))
 
 
@@ -151,6 +155,7 @@ def main(argv=None) -> int:
     parser.add_argument("action", nargs="?", default="build", choices=("build", "test", "shell"))
     parser.add_argument("--runs", default="", help="test: regress.py runs, by commas")
     parser.add_argument("--gpu", action="store_true", help="test: the runs with the GPU renderer (lavapipe)")
+    parser.add_argument("--renderer", default="", help="test: PS2HOST_RENDERER for the runs (sdl, vulkan)")
     parser.add_argument("--jobs", type=int, default=6, help="build: compile jobs (the container's memory: ~1 GB each)")
     args = parser.parse_args(argv)
     game = game_config.from_args(args)
@@ -158,7 +163,7 @@ def main(argv=None) -> int:
     if args.action == "build":
         build(game, args.jobs)
     elif args.action == "test":
-        test(game, args.runs, args.gpu)
+        test(game, args.runs, args.gpu, args.renderer)
     else:
         container(game, "", interactive=True)
     return 0

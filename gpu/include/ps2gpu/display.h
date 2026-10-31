@@ -258,6 +258,10 @@ std::unique_ptr<Display> CreateVulkanDisplay(const char* title, int width, int h
 /* A window drawn with Direct3D 11 (Windows; feature level 11_0): its device
    a Gpu of Api::kD3D11 (SharedGpu). Null, with `error`, when there is none. */
 std::unique_ptr<Display> CreateD3D11Display(const char* title, int width, int height, std::string* error);
+/* A window drawn with SDL's own 2D renderer (OpenGL, or its software one):
+   the last resort, without a GPU for the GS (SharedGpu null; Present's
+   pixels only). Null, with `error`, when SDL has no window or renderer. */
+std::unique_ptr<Display> CreateSdlDisplay(const char* title, int width, int height, std::string* error);
 
 /* On-screen controls (a touch screen's: Android's activity draws them, over
    the picture) as one more controller, a DualShock 2's: its state as they
