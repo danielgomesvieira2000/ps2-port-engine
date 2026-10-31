@@ -1,9 +1,16 @@
-"""A game's Windows release: the built port, its player README and the
-licences of what it is built with, in one zip - checked to carry nothing of
-the game's but its translated program, and nothing of the machine it was
-built on.
+"""A game's release: the built port, its player README and the licences of
+what it is built with, in one archive - checked to carry nothing of the
+game's but its translated program, and nothing of the machine it was built on.
 
-    python engine/tools/package.py --game games/<name>
+    python engine/tools/package.py --game games/<name>                    # Windows: a zip
+    python engine/tools/package.py --game games/<name> --platform linux   # Linux: a .tar.gz
+
+Linux: build first with engine/tools/linux.py (<game>/build/linux/<name>);
+the archive is <release name>-<version>-linux-x64.tar.gz, the program
+executable in it. Refused when it needs the C++ runtime installed
+(libstdc++, libgcc_s: linux.py links them in) or names a folder of the
+machine; the notices are the Windows build's (the same libraries'
+sources), so build that too.
 
 Build first (engine/tools/port.py --game games/<name> pgo for the
 profile-guided build - or build - then --sse4 build). Written to
@@ -102,6 +109,66 @@ def check_executable(build, exe, roots):
     return dlls
 
 
+def elf_needed(path):
+    """A Linux program's DT_NEEDED libraries (an ELF64 little-endian's dynamic section)."""
+    import struct
+    data = open(path, "rb").read()
+    if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        fail("%s is not a 64-bit little-endian ELF" % path)
+    phoff, = struct.unpack_from("<Q", data, 0x20)
+    phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+    loads, dynamic = [], None
+    for i in range(phnum):
+        p_type, _, p_offset, p_vaddr, _, p_filesz = struct.unpack_from("<IIQQQQ", data, phoff + i * phentsize)
+        if p_type == 1:
+            loads.append((p_vaddr, p_offset, p_filesz))
+        elif p_type == 2:
+            dynamic = (p_offset, p_filesz)
+    if not dynamic:
+        return []
+
+    def file_offset(vaddr):
+        for v, o, n in loads:
+            if v <= vaddr < v + n:
+                return o + vaddr - v
+        fail("%s: an address outside its segments" % path)
+
+    entries, strtab = [], None
+    for at in range(dynamic[0], dynamic[0] + dynamic[1], 16):
+        tag, value = struct.unpack_from("<qQ", data, at)
+        if tag == 0:
+            break
+        if tag == 1:
+            entries.append(value)
+        elif tag == 5:
+            strtab = file_offset(value)
+    names = []
+    for offset in entries:
+        end = data.index(b"\0", strtab + offset)
+        names.append(data[strtab + offset:end].decode())
+    return names
+
+
+def check_linux(exe, roots):
+    needed = elf_needed(exe)
+    runtime = [n for n in needed if n.startswith(("libstdc++", "libgcc_s"))]
+    if runtime:
+        fail("%s needs the C++ runtime installed (%s): build it with engine/tools/linux.py" %
+             (os.path.basename(exe), ", ".join(runtime)))
+    data = open(exe, "rb").read()
+    for folder in roots:
+        for form in (folder, folder.replace("\\", "/")):
+            if form.encode() in data:
+                fail("%s names a folder of this machine: %s" % (os.path.basename(exe), form))
+    # (linux.py's container: the repository at /src, the build at /build)
+    found = re.search(rb"/(?:src|build)/[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+", data)
+    if found:
+        fail("%s names a folder of the container it was built in: %s" % (os.path.basename(exe), found.group().decode()))
+    if re.search(rb"/(?:home|Users)/[^/\x00]{1,64}/", data):
+        fail("%s names a user's folder" % os.path.basename(exe))
+    return needed
+
+
 def notices(title, deps, headers):
     heading = "Third-party software in the %s PC port" % title
     lines = [heading, "=" * len(heading), ""]
@@ -126,6 +193,7 @@ def notices(title, deps, headers):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--game", required=True, help="the game's directory (with game.json)")
+    parser.add_argument("--platform", default="windows", choices=("windows", "linux"))
     args = parser.parse_args()
     game = os.path.abspath(args.game)
     root = os.path.normpath(os.path.join(ENGINE, ".."))
@@ -137,6 +205,8 @@ def main():
     release = spec.get("release") or {}
     build = os.path.join(game, "build")
     cmake = os.path.join(build, "port", "cmake")
+    if args.platform == "linux":
+        return package_linux(game, target, title, version, release, build, cmake, root)
     exe = os.path.join(cmake, target + ".exe")
     # The build for processors without AVX2 (port.py build --sse4), which the
     # main one starts on one (engine/host/src/cpu_check.cpp).
@@ -169,6 +239,43 @@ def main():
             with open(os.path.join(game, source), encoding="utf-8") as f:
                 z.writestr("%s/%s" % (name, inside), f.read().replace("\n", "\r\n"))
     print("package: %s (%.1f MB; imports %s)" % (out, os.path.getsize(out) / 1e6, ", ".join(dlls)))
+
+
+def package_linux(game, target, title, version, release, build, cmake, root):
+    import tarfile
+    import io
+    import time
+    exe = os.path.join(build, "linux", target)
+    if not os.path.exists(exe):
+        fail("no build at %s: build it (python engine/tools/linux.py --game %s build)" % (exe, game))
+    if os.path.exists(os.path.join(build, "port", "icon.ico")):
+        fail("build/port/icon.ico is the disc-made logo (the publisher's artwork): delete it, build again")
+    needed = check_linux(exe, {os.path.expanduser("~"), root})
+    text = notices(title, os.path.join(cmake, "_deps"), os.path.join(cmake, "ps2host", "third_party"))
+    with open(os.path.join(game, "port", "release", "README.txt"), encoding="utf-8") as f:
+        readme = f.read().replace("{version}", version)
+    name = "%s-%s" % (release.get("name") or re.sub(r"[^A-Za-z0-9]", "", title) + "-PC", version)
+    out_dir = os.path.join(build, "release")
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, "%s-linux-x64.tar.gz" % name)
+    now = time.time()
+
+    def add_bytes(tar, path, data, mode=0o644):
+        info = tarfile.TarInfo(path)
+        info.size = len(data)
+        info.mode = mode
+        info.mtime = now
+        tar.addfile(info, io.BytesIO(data))
+
+    with tarfile.open(out, "w:gz", compresslevel=9) as tar:
+        with open(exe, "rb") as f:
+            add_bytes(tar, "%s/%s" % (name, target), f.read(), 0o755)
+        add_bytes(tar, "%s/README.txt" % name, readme.encode("utf-8"))
+        add_bytes(tar, "%s/THIRD-PARTY-NOTICES.txt" % name, text.replace("\r\n", "\n").encode("utf-8"))
+        for inside, source in (release.get("extras") or {}).items():
+            with open(os.path.join(game, source), encoding="utf-8") as f:
+                add_bytes(tar, "%s/%s" % (name, inside), f.read().encode("utf-8"))
+    print("package: %s (%.1f MB; needs %s)" % (out, os.path.getsize(out) / 1e6, ", ".join(needed)))
 
 
 if __name__ == "__main__":
