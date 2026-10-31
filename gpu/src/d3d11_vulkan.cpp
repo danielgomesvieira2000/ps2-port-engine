@@ -2407,6 +2407,11 @@ VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit(VkQueue, std::uint32_t count, const V
         for (std::uint32_t i = 0; i < count; ++i)
             for (std::uint32_t k = 0; k < submits[i].commandBufferCount; ++k) {
                 CommandBuffer& cb = Cmd(submits[i].pCommandBuffers[k]);
+                // The pixel shaders' samplers as a Vulkan command buffer finds
+                // them: none of another's (a window's display shares this
+                // context and had left its own in slot 0).
+                ID3D11SamplerState* no_samplers[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
+                g_gpu->context->PSSetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, no_samplers);
                 for (const auto& [b, range] : cb.uploads) Upload(b, range.first, range.second - range.first);
                 Exec x;
                 x.readbacks = &readbacks;

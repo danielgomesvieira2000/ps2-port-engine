@@ -89,7 +89,8 @@ def build(game, jobs: int):
     os.makedirs(out, exist_ok=True)
     script = " && ".join([
         "cmake -S %s -B /build/%s -G Ninja -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 "
-        "-DCMAKE_BUILD_TYPE=Release -DPS2_GENERATED_DIR=%s -DPS2HOST_LTO_JOBS=%d > /build/configure.log"
+        "-DCMAKE_BUILD_TYPE=Release -DPS2_GENERATED_DIR=%s -DPS2HOST_LTO_JOBS=%d "
+        "'-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc' > /build/configure.log"
         % (inside(root, game.path("port")), target, inside(root, generated), jobs),
         "cmake --build /build/%s -j %d" % (target, jobs),
         "cp /build/%s/%s %s/" % (target, target, inside(root, out)),

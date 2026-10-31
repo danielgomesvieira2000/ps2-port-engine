@@ -59,6 +59,11 @@ How it maps:
 
 **Feature level 11_0** (Haswell's, Kepler's: `PS2HOST_D3D11_LEVEL=11_0` caps the device at it): on the RTX 4070, car_select, race_training, race and crash are as recorded. On WARP (Microsoft's software adapter, taken when named: `PS2HOST_GPU=basic`) at 11_0 the renderer tests pass; car_select's pictures differ from the NVIDIA ones by small amounts (no pixel more than 32 levels off, a few thousand pixels a picture: WARP's own filtering), nothing missing.
 
+**Open: Direct3D 11 in a window, now and then.** Headless Direct3D 11 runs are as recorded; with `--window` (the display's device, shared with the renderer) some are not, a different number of pictures each run:
+- Mister Mosquito's keys_w and keys_ref (the only windowed runs of either game until 2026-10-31): 45-48 of 55, a sprite (the cat in the menu's scene) drawn black from frame 4,400, and at frame 1,000 a whole picture's alpha 0 where Vulkan's is 0x80 (the colours the same). Burnout 3's `car_select_window`: 1 run in 4 at 26 of 44 under load (the frontend's words and logo gone from the title on), else 44 of 44.
+- The renderer does the same (its per-frame counts are Vulkan's), so it is the layer or the device's sharing. Not it: the GPU's timing (every submission waited for: the same), the present thread (presents on the caller's: the same), the renderer's thread (`PS2HOST_GPU_THREAD=0`: the same), the scale (1x both), the mouse. `ClearState` at each submission made one run 54 of 55; the pixel shaders' samplers alone once 55 - and now a submission starts with none bound and the display unbinds its own, but keys_w stays 46-55.
+- Next: a capture of the windowed run replayed headless is as Vulkan's - so a windowed run's own capture (`PS2HOST_CAPTURE_FRAME`) with its memory card beside the run's settings, the run itself bisected by its submissions.
+
 **Intel UHD, Vulkan against Direct3D 11** (its pictures differ from the NVIDIA recordings on both APIs alike, so compared with each other): car_select 42/44 the same, race 52/67. A frame that differs has 14-106 scattered pixels (at most 0.04%), on cars' coplanar parts and edges: the two Intel drivers' interpolation of depth and edges, not the layer (NVIDIA's pictures are the same on both).
 
 **Not done:**

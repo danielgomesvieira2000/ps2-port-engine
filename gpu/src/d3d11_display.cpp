@@ -387,8 +387,11 @@ bool D3D11Display::Show(ID3D11ShaderResourceView* picture, std::uint32_t width, 
     c->PSSetSamplers(0, 1, &linear_);
     c->Draw(3, 0);
     DrawOverlay(back_width_, back_height_);
+    // (What it bound unbound: the GS renderer draws on this context too.)
     ID3D11ShaderResourceView* none = nullptr;
+    ID3D11SamplerState* no_sampler = nullptr;
     c->PSSetShaderResources(0, 1, &none);
+    c->PSSetSamplers(0, 1, &no_sampler);
     const bool sync = vsync_.load();
     const HRESULT hr = swapchain_->Present(sync ? 1 : 0, !sync && tearing_ && !Fullscreen() ? DXGI_PRESENT_ALLOW_TEARING
                                                                                               : 0);
@@ -485,8 +488,12 @@ void D3D11Display::Dispatch(ID3D11ComputeShader* shader, std::initializer_list<I
     c->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
     ID3D11ShaderResourceView* none[3] = {};
     ID3D11UnorderedAccessView* no_uav = nullptr;
+    ID3D11SamplerState* no_samplers[3] = {};
+    ID3D11Buffer* no_params = nullptr;
     c->CSSetShaderResources(0, 3, none);
     c->CSSetUnorderedAccessViews(uav_slot, 1, &no_uav, nullptr);
+    c->CSSetSamplers(0, 3, no_samplers);
+    c->CSSetConstantBuffers(0, 1, &no_params);
 }
 
 bool D3D11Display::Smooth(ID3D11ShaderResourceView** picture, std::uint32_t* width, std::uint32_t* height,

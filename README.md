@@ -71,7 +71,7 @@ The same port, built for each from the same game directory:
 |---|---|---|---|
 | Windows 10/11 x64 | `tools/port.py` (clang-cl or MSVC; an SSE4.1 build beside the AVX2 one) | Vulkan 1.3, 1.2 or 1.1; Direct3D 11; GDI and the software GS | the GPU regressions on each backend: `tools/backends_check.py` |
 | Android 10+ (arm64, x86-64 emulator) | `tools/android.py` (the NDK; an APK) | Vulkan 1.1+ | on a phone |
-| Linux x86-64 | `tools/linux.py` (Docker, from Windows or Linux: clang 19, SDL's X11/Wayland, Mesa) | Vulkan 1.1+ | `linux.py test`: the host's and the renderer's tests (on lavapipe) and the regressions with the software GS, as recorded on Windows |
+| Linux x86-64 (glibc 2.35+: Ubuntu 22.04, Debian 12, SteamOS, Fedora 36 and later; the C++ runtime linked in) | `tools/linux.py` (Docker, from Windows or Linux: Ubuntu 22.04, clang 19, SDL's X11/Wayland, Mesa) | Vulkan 1.1+ | `linux.py test`: the host's and the renderer's tests (on lavapipe) and the regressions with the software GS, as recorded on Windows |
 
 A port's own code is the same everywhere; what is the platform's is in
 `host/src/platform.cpp` (files, threads, timers) and SDL (windows, input,
