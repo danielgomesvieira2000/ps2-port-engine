@@ -38,9 +38,11 @@
 #include <initializer_list>
 #include <cmath>
 #include <cstdio>
+#include <condition_variable>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include "d3d11_gpu.h"
 #ifdef PS2GPU_D3D11
@@ -83,6 +85,14 @@ public:
     bool Init(const char* title, int width, int height);
     bool Present(const std::uint32_t* pixels, std::uint32_t width, std::uint32_t height) override;
     bool PresentImage(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height) override;
+    bool PresentImageAt(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height,
+                        std::uint64_t due_ns) override;
+    int HoldImage(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height) override;
+    void ShowHeld(int slot, std::uint64_t due_ns) override;
+    void SetPresentObserver(PresentObserver observer) override {
+        std::lock_guard<std::mutex> hold(paced_lock_);
+        observer_ = std::move(observer);
+    }
     void SetVsync(bool on) override { vsync_ = on; }
     bool Vsync() const override { return vsync_; }
     void SetVrr(bool on) override { vrr_ = on; }
@@ -151,6 +161,28 @@ private:
     std::uint32_t overlay_texture_width_ = 0, overlay_texture_height_ = 0;
     std::uint64_t overlay_uploaded_ = 0;
     std::mutex present_lock_;
+    /* PresentImageAt's pictures: copies of the renderer's images (it may draw
+       over them next), shown by a thread of the display's at their time - the
+       newest winning: one still waiting when the next comes is dropped. One
+       held (HoldImage) until ShowHeld gives it its time. */
+    static constexpr int kPaced = 4;
+    struct Paced {
+        ID3D11Texture2D* texture = nullptr;
+        ID3D11ShaderResourceView* view = nullptr;
+        std::uint32_t width = 0, height = 0, texture_width = 0, texture_height = 0;
+        std::uint64_t due_ns = 0;
+    };
+    Paced paced_[kPaced];
+    std::mutex paced_lock_;                 // ready_, held_, taken_, stop_, observer_
+    std::condition_variable paced_wake_;
+    int ready_ = -1, held_ = -1, taken_ = -1;
+    bool stop_ = false;
+    std::thread present_thread_;
+    PresentObserver observer_;
+    /* The image copied into a free slot (-1: none): the caller holds present_lock_. */
+    int CopyPaced(std::uint64_t image, std::uint32_t width, std::uint32_t height);
+    void Ready(int slot, std::uint64_t due_ns);
+    void PresentLoop();
     // TakePacing's and PresentsPerSecond's.
     std::mutex pacing_lock_;
     std::chrono::steady_clock::time_point last_present_{};
@@ -551,6 +583,145 @@ bool D3D11Display::Smooth(ID3D11ShaderResourceView** picture, std::uint32_t* wid
 #endif
 }
 
+int D3D11Display::CopyPaced(std::uint64_t image, std::uint32_t width, std::uint32_t height) {
+    std::uint32_t texture_width = 0, texture_height = 0;
+    ID3D11ShaderResourceView* view = vk11::ImageSrv(image, &texture_width, &texture_height);
+    if (!view) return -1;
+    int slot = -1;
+    {
+        std::lock_guard<std::mutex> hold(paced_lock_);
+        for (int i = 0; i < kPaced && slot < 0; ++i)
+            if (i != ready_ && i != held_ && i != taken_) slot = i;
+    }
+    if (slot < 0) return -1;
+    Paced& p = paced_[slot];
+    if (!p.texture || p.texture_width != width || p.texture_height != height) {
+        Release(p.view);
+        Release(p.texture);
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = width;
+        td.Height = height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(gpu_.device->CreateTexture2D(&td, nullptr, &p.texture)) ||
+            FAILED(gpu_.device->CreateShaderResourceView(p.texture, nullptr, &p.view))) {
+            Release(p.texture);
+            return -1;
+        }
+        p.texture_width = width;
+        p.texture_height = height;
+    }
+    ID3D11Resource* source = nullptr;
+    view->GetResource(&source);
+    const D3D11_BOX box{0, 0, 0, std::min(width, texture_width), std::min(height, texture_height), 1};
+    {
+        std::lock_guard<std::mutex> context(gpu_.context_lock);
+        gpu_.context->CopySubresourceRegion(p.texture, 0, 0, 0, 0, source, 0, &box);
+    }
+    source->Release();
+    p.width = width;
+    p.height = height;
+    if (!present_thread_.joinable()) present_thread_ = std::thread([this] { PresentLoop(); });
+    return slot;
+}
+
+void D3D11Display::Ready(int slot, std::uint64_t due_ns) {
+    PresentObserver observer;
+    std::uint64_t dropped_due = 0;
+    {
+        std::lock_guard<std::mutex> hold(paced_lock_);
+        if (ready_ >= 0) {                  // (the newest wins)
+            dropped_due = paced_[ready_].due_ns;
+            observer = observer_;
+        }
+        paced_[slot].due_ns = due_ns;
+        ready_ = slot;
+    }
+    if (observer) observer(dropped_due, 0, true);
+    paced_wake_.notify_all();
+}
+
+bool D3D11Display::PresentImageAt(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height,
+                                  std::uint64_t due_ns) {
+    if (!width || !height || !image) return !closed_;
+    const int slot = CopyPaced(image, width, height);
+    if (slot < 0) return PresentImage(image, layout, width, height);
+    Ready(slot, due_ns);
+    return !closed_;
+}
+
+int D3D11Display::HoldImage(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height) {
+    (void)layout;
+    if (!width || !height || !image) return -1;
+    const int slot = CopyPaced(image, width, height);
+    if (slot >= 0) {
+        std::lock_guard<std::mutex> hold(paced_lock_);
+        held_ = slot;
+    }
+    return slot;
+}
+
+void D3D11Display::ShowHeld(int slot, std::uint64_t due_ns) {
+    if (slot < 0 || slot >= kPaced) return;
+    {
+        std::lock_guard<std::mutex> hold(paced_lock_);
+        if (held_ == slot) held_ = -1;
+    }
+    Ready(slot, due_ns);
+}
+
+void D3D11Display::PresentLoop() {
+    using Clock = std::chrono::steady_clock;
+    // Each picture shown at its time: the highest priority (asleep almost always).
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    for (;;) {
+        std::uint64_t due_ns;
+        {
+            std::unique_lock<std::mutex> hold(paced_lock_);
+            paced_wake_.wait(hold, [&] { return stop_ || ready_ >= 0; });
+            if (stop_) return;
+            due_ns = paced_[ready_].due_ns;
+        }
+        // Asleep until just before it is due, the last moment spun (Windows'
+        // sleeps end a millisecond or more late).
+        const Clock::time_point due = std::min(Clock::time_point{std::chrono::nanoseconds(due_ns)},
+                                               Clock::now() + std::chrono::milliseconds(50));
+        if (Clock::now() + std::chrono::microseconds(1500) < due)
+            std::this_thread::sleep_until(due - std::chrono::microseconds(1200));
+        while (Clock::now() < due) std::this_thread::yield();
+        int slot;
+        PresentObserver observer;
+        {
+            std::lock_guard<std::mutex> hold(paced_lock_);
+            if (stop_) return;
+            if (ready_ < 0) continue;
+            slot = ready_;
+            ready_ = -1;
+            taken_ = slot;
+            observer = observer_;
+        }
+        {
+            std::lock_guard<std::mutex> hold(present_lock_);
+            std::lock_guard<std::mutex> context(gpu_.context_lock);
+            const Paced& p = paced_[slot];
+            Show(p.view, p.width, p.height, p.texture_width, p.texture_height);
+        }
+        if (observer)
+            observer(paced_[slot].due_ns,
+                     std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch())
+                                       .count()),
+                     false);
+        {
+            std::lock_guard<std::mutex> hold(paced_lock_);
+            taken_ = -1;
+        }
+    }
+}
+
 void D3D11Display::CountPresent() {
     const auto now = std::chrono::steady_clock::now();
     {
@@ -589,6 +760,16 @@ Display::Pacing D3D11Display::TakePacing() {
 }
 
 D3D11Display::~D3D11Display() {
+    {
+        std::lock_guard<std::mutex> hold(paced_lock_);
+        stop_ = true;
+    }
+    paced_wake_.notify_all();
+    if (present_thread_.joinable()) present_thread_.join();
+    for (Paced& p : paced_) {
+        Release(p.view);
+        Release(p.texture);
+    }
     if (gpu_.context) {
         gpu_.context->ClearState();
         gpu_.context->Flush();
