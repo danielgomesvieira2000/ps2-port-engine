@@ -55,6 +55,11 @@ struct ListBlendOptions {
     // in 22 minutes, a picture between two shots each; a still camera over
     // a room whose things come and go (a fire's) is no cut.
     float new_share = 0.5f, new_view = 0.3f;
+    // The double buffer's data (UNPACK with FLG) blended too, as any thing's:
+    // for a game that writes vertices it moved itself there (Mister
+    // Mosquito's bodies, deformed by the EE each step). Off: a batch's own
+    // data may be read as other than coordinates (Outbreak's decal CLUTs).
+    bool blend_flg = false;
 };
 
 struct ListBlend {

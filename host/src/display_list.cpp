@@ -126,8 +126,8 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
         // model-space vertices, the same each step, and where not, values
         // the program reads as other than coordinates: Outbreak's decal
         // under a character took its CLUT from one, blended a black, then a
-        // white square on the floor.)
-        if (!y.floats || !y.words || (y.code & 0x8000)) continue;
+        // white square on the floor. ListBlendOptions::blend_flg: blended.)
+        if (!y.floats || !y.words || ((y.code & 0x8000) && !o.blend_flg)) continue;
         if (std::memcmp(&a[x.at + 1], &b[y.at + 1], y.words * 4) == 0) continue;
         float scale[4] = {0, 0, 0, 0};
         for (u32 k = 0; k < y.words; ++k) {
