@@ -45,6 +45,8 @@ How it maps:
 - **Cause:** the layer kept one set of push constants. The renderer pushes the target's size once for a run of draws; that batch's CLUT, loaded on the GPU each primitive, is a compute dispatch with push constants of its own, which overwrote the size. Vulkan keeps push constants by bind point, so the layer now keeps the graphics stages' and compute's apart.
 - **Also:** after a secondary command buffer, or the depth upload's own draw, the layer forgets what it had bound (`Exec::ForgetBound`); the push-constant ring's blocks are rewritten after it wraps.
 
+**Intel UHD, Vulkan against Direct3D 11** (its pictures differ from the NVIDIA recordings on both APIs alike, so compared with each other): car_select 42/44 the same, race 52/67. A frame that differs has 14-106 scattered pixels (at most 0.04%), on cars' coplanar parts and edges: the two Intel drivers' interpolation of depth and edges, not the layer (NVIDIA's pictures are the same on both).
+
 **Not done:**
 - **D3D12 (X6)**, decided against for now:
   - **No new GPUs.** Every D3D12 GPU here also has Vulkan 1.2 or Direct3D 11.
