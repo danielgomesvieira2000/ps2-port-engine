@@ -283,14 +283,10 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
                                                     (best > expected ? best - expected : expected - best));
             if (nearer) { best = i; best_d = d; best_words = words; }
         };
-        if (o.in_place_when_whole && r.whole && jb < sa.size()) {
-            try_one(jb);
-        } else {
-            int n = 0;
-            for (auto p = at; p != hi && n < 16; ++p, ++n) try_one(p->second);
-            n = 0;
-            for (auto p = at; p != lo && n < 16; ++n) try_one((--p)->second);
-        }
+        int n = 0;
+        for (auto p = at; p != hi && n < 16; ++p, ++n) try_one(p->second);
+        n = 0;
+        for (auto p = at; p != lo && n < 16; ++n) try_one((--p)->second);
         // Out of its place, only a near match: one far (a thing whose own
         // match drew with other codes this step - more batches, its detail -
         // paired with another of the codes it now has) is not one. (The
