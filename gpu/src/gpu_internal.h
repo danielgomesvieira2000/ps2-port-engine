@@ -58,6 +58,23 @@ inline bool g_vk_baked_states = false;
 /* VkImageFormatListCreateInfo may be chained (1.2, or VK_KHR_image_format_list
    enabled: VkDeviceSetup::Fill). */
 inline bool g_image_format_list = true;
+/* PS2HOST_VK_LABELS=1: VK_EXT_debug_utils on the instance (VkDebugExtensions
+   adds it, VkDebugStart takes the validation layer's messages and prints
+   them with the labels around them) - the renderer's batches each a labelled
+   region (what they draw into and with), for the layer's messages and for
+   RenderDoc's captures. Off, it costs a test a batch. */
+inline bool g_vk_labels = false;
+void VkDebugExtensions(std::vector<const char*>* extensions);
+void VkDebugStart(VkInstance instance);
+inline void VkLabelBegin(VkCommandBuffer cmd, const char* text) {
+    if (!g_vk_labels) return;
+    VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+    label.pLabelName = text;
+    vkCmdBeginDebugUtilsLabelEXT(cmd, &label);
+}
+inline void VkLabelEnd(VkCommandBuffer cmd) {
+    if (g_vk_labels) vkCmdEndDebugUtilsLabelEXT(cmd);
+}
 /* VK_ATTACHMENT_STORE_OP_NONE can be used (1.3, dynamic rendering, or the
    load_store_op_none extensions). */
 inline bool g_store_op_none = true;

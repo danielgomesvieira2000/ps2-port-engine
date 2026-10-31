@@ -162,6 +162,48 @@ void VkDeviceSetup::Fill(VkPhysicalDevice gpu, VkPath path, bool baked) {
     if (load_none) extensions.push_back(load_none);
 }
 
+namespace {
+VkBool32 VKAPI_PTR DebugMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT,
+                                const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
+    std::string where;
+    for (std::uint32_t i = data->cmdBufLabelCount; i-- > 0;)
+        where += std::string(" < ") + (data->pCmdBufLabels[i].pLabelName ? data->pCmdBufLabels[i].pLabelName : "?");
+    std::fprintf(stderr, "[vulkan] %s: %s%s%s\n", severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "error" : "warning",
+                 data->pMessage ? data->pMessage : "", where.empty() ? "" : "\n[vulkan]   in", where.c_str());
+    return VK_FALSE;
+}
+}  // namespace
+
+void VkDebugExtensions(std::vector<const char*>* extensions) {
+    const char* want = std::getenv("PS2HOST_VK_LABELS");
+    if (!want || want[0] != '1') return;
+    std::uint32_t count = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> offered(count);
+    vkEnumerateInstanceExtensionProperties(nullptr, &count, offered.data());
+    offered.resize(count);
+    for (const char* e : *extensions)
+        if (std::strcmp(e, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) return;
+    if (!Offers(offered, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+        std::fprintf(stderr, "[vulkan] PS2HOST_VK_LABELS: no VK_EXT_debug_utils\n");
+        return;
+    }
+    extensions->push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    g_vk_labels = true;
+}
+
+void VkDebugStart(VkInstance instance) {
+    if (!g_vk_labels || !vkCreateDebugUtilsMessengerEXT) return;
+    static VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
+    if (messenger) return;
+    VkDebugUtilsMessengerCreateInfoEXT ci{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+    ci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+    ci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                     VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+    ci.pfnUserCallback = DebugMessage;
+    vkCreateDebugUtilsMessengerEXT(instance, &ci, nullptr, &messenger);
+}
+
 void VkUseLegacyFunctions(VkPath path, bool baked) {
     g_vk_path = path;
     g_vk_baked_states = baked;

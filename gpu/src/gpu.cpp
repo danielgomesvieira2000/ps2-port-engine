@@ -32,8 +32,13 @@ bool VulkanGpu::Init(std::string* error) {
     app.apiVersion = VkInstanceVersion();
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    std::vector<const char*> instance_extensions;
+    VkDebugExtensions(&instance_extensions);
+    ici.enabledExtensionCount = std::uint32_t(instance_extensions.size());
+    ici.ppEnabledExtensionNames = instance_extensions.data();
     if ((r = vkCreateInstance(&ici, nullptr, &instance)) != VK_SUCCESS) return fail("vkCreateInstance", r);
     volkLoadInstance(instance);
+    VkDebugStart(instance);
 
     std::uint32_t n = 0;
     vkEnumeratePhysicalDevices(instance, &n, nullptr);

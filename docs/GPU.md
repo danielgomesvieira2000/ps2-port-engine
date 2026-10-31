@@ -33,6 +33,8 @@ The order `renderer=auto` tries, and how each one draws:
 
 The window, its input and the screen's refresh are shared by the displays (`window_display.cpp`). `renderer=` in pc_settings.ini (or `PS2HOST_RENDERER`) picks one. Headless runs take `PS2HOST_RENDERER=d3d11` too.
 
+**Validation:** run under the Khronos validation layer with `PS2HOST_VK_LABELS=1`: the instance takes VK_EXT_debug_utils, the renderer's batches are labelled regions (the target, the texture, DATE, the shader's blend, a copy), and the layer's messages are printed to the log as `[vulkan] error: ...` with the regions they came in - the same labels show in RenderDoc. Give the layer's own `log_filename` an absolute path if it is set: `stderr` there is a file of that name.
+
 Checking all backends at once: `python engine/tools/backends_check.py --game games/<name> [--runs ...]` runs the renderer tests and the GPU regressions on each, and prints one table. BACKENDS_ROADMAP.md has the plan, the measurements and the known differences.
 
 ## Stage one (done): presentation

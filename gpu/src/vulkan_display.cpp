@@ -306,10 +306,13 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     app.apiVersion = VkInstanceVersion();     // the GS renderer draws on this device too
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = count;
-    ici.ppEnabledExtensionNames = extensions;
+    std::vector<const char*> instance_extensions(extensions, extensions + count);
+    VkDebugExtensions(&instance_extensions);
+    ici.enabledExtensionCount = std::uint32_t(instance_extensions.size());
+    ici.ppEnabledExtensionNames = instance_extensions.data();
     if (!Check(vkCreateInstance(&ici, nullptr, &instance_), "vkCreateInstance")) return false;
     volkLoadInstance(instance_);
+    VkDebugStart(instance_);
     if (!SDL_Vulkan_CreateSurface(window_, instance_, nullptr, &surface_)) {
         error_ = std::string("SDL_Vulkan_CreateSurface: ") + SDL_GetError();
         return false;

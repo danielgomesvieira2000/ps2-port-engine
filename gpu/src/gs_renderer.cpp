@@ -2790,6 +2790,11 @@ void VulkanGsRenderer::WriteTextureSet(VkDescriptorSet set, VkSampler sampler, c
 
 void VulkanGsRenderer::DateSetup(VkCommandBuffer cmd, Image& target, Image& depth, std::uint32_t datm) {
     if (!SampledSet(target)) return;
+    if (g_vk_labels) {
+        char label[64];
+        std::snprintf(label, sizeof label, "DATE setup of %p", (void*)target.image);
+        VkLabelBegin(cmd, label);
+    }
     Transition(cmd, target, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
     Transition(cmd, depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -2822,6 +2827,7 @@ void VulkanGsRenderer::DateSetup(VkCommandBuffer cmd, Image& target, Image& dept
     vkCmdDraw(cmd, 3, 1, 0, 0);
     g_.Mark(cmd, kProfDate);
     EndRendering(cmd);
+    VkLabelEnd(cmd);
 }
 
 VkDescriptorSet VulkanGsRenderer::SetFor(Texture& texture, int sampler) {
@@ -3800,10 +3806,15 @@ void VulkanGsRenderer::Flush() {
                 g_.Mark(cmd, kProfFeedback);
                 Transition(cmd, *feedback_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-            } else if (source) {
+            }
+            // Another target read as the texture: a texture's layout - also
+            // when the copy above is the blend's in the shader, not this one
+            // (it was left a target's, read as it was being drawn as one:
+            // NVIDIA drew it right, the validation layer and a stricter
+            // driver not).
+            if (source && source != t)
                 Transition(cmd, *source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-            }
             if (!open_target_) {
             Transition(cmd, *t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
@@ -3957,6 +3968,15 @@ void VulkanGsRenderer::Flush() {
             // PABE splits each pass again: blended where As >= 0x80 (the shader's
             // pabe 1), not blended below (pabe 2, the pipeline without blending).
             const bool split = state_.blend && state_.pabe;
+            char label[160] = "";
+            if (g_vk_labels) {
+                std::snprintf(label, sizeof label, "batch: FBP %X PSM %X into %p; texture %s %X; DATE %d, shader blend %d, copy %d",
+                              unsigned(state_.fbp), unsigned(state_.psm), (void*)t->image,
+                              !state_.textured ? "none" : state_.texture_target ? "a target" : "memory",
+                              unsigned(state_.texture_target ? state_.tex_fbp : 0), int(state_.date), int(shader_blend),
+                              int(copy_first));
+                VkLabelBegin(cmd, label);
+            }
             for (const Pass& pass : passes) {
                 for (std::uint32_t half = split ? 1 : 0; half <= (split ? 2u : 0u); ++half) {
                     std::uint32_t key = (PipelineKey(state_) & ~(0xFu << 9)) | ((~pass.write_mask & 0xFu) << 9);
@@ -4006,6 +4026,7 @@ void VulkanGsRenderer::Flush() {
                     }
                 }
             }
+            if (label[0]) VkLabelEnd(cmd);
         });
     }
     pending_.clear();
