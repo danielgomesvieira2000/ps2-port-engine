@@ -945,6 +945,49 @@ def render_body(derivation) -> list:
 EXPECTATIONS = {}
 
 
+class SpilledRecords:
+    """EXPECTATIONS kept on disk, one file a function, read back as each is
+    checked: a whole game's records held at once in the process collecting them
+    grew past 10 GB (Blood Will Tell's, 14 processes deriving). A folder of its
+    own in the system's temporary one, removed at exit. PS2_DERIVE_SPILL=0
+    keeps them in memory, as before."""
+
+    def __init__(self):
+        import atexit
+        import shutil
+        import tempfile
+        self.folder = tempfile.mkdtemp(prefix="ps2_derive_records_")
+        self.addresses = set()
+        atexit.register(shutil.rmtree, self.folder, True)
+
+    def _path(self, address):
+        return os.path.join(self.folder, "%08X.pickle" % address)
+
+    def __setitem__(self, address, record):
+        import pickle
+        with open(self._path(address), "wb") as f:
+            pickle.dump(record, f, protocol=pickle.HIGHEST_PROTOCOL)
+        self.addresses.add(address)
+
+    def __getitem__(self, address):
+        import pickle
+        if address not in self.addresses:
+            raise KeyError(address)
+        with open(self._path(address), "rb") as f:
+            return pickle.load(f)
+
+    def __contains__(self, address):
+        return address in self.addresses
+
+    def pop(self, address, default=None):
+        if address not in self.addresses:
+            return default
+        record = self[address]
+        self.addresses.discard(address)
+        os.remove(self._path(address))
+        return record
+
+
 def derive_function(image, base, func, known, parameters):
     """Derive one function, escalating only when the plain derivation explodes.
 
@@ -1128,6 +1171,10 @@ def collect_parallel(database: dict, image: bytes, base: int, machine: Machine,
     by_address = {f["addr"]: f for f in candidates}
     callees = {f["addr"]: direct_callees(image, base, f) for f in candidates}
 
+    # (The workers' own records go to this process at once: kept here, on disk.)
+    global EXPECTATIONS
+    if os.environ.get("PS2_DERIVE_SPILL", "1") != "0":
+        EXPECTATIONS = SpilledRecords()
     context = multiprocessing.get_context("spawn")
     workers = []
     for _ in range(jobs):
