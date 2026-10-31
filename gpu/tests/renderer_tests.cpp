@@ -372,6 +372,21 @@ void TargetFromMemory(ps2gpu::GsRenderer& renderer) {
           "drawing over it keeps the rest");
 }
 
+// Memory patched on the GPU between two draws on one target (a CLUT's words,
+// a primitive at a time): a compute dispatch with push constants of its own.
+// The second draw's target size, pushed for the first, must still be there
+// (Direct3D 11's layer once shared one set between compute and drawing:
+// Burnout 3's eliminator).
+void ComputeBetweenDraws(ps2gpu::GsRenderer& renderer) {
+    ps2gpu::GsDrawState state = Target(0x96);
+    Rect(renderer, state, 0, 0, 8, 8, Rgba(0x80, 0, 0, 0x80));
+    const std::uint32_t patch[3] = {0x3000 * 64, 0x12345678, 0xFFFFFFFF};    // (word, value, mask)
+    renderer.MemoryPatch(patch, 1);
+    Rect(renderer, state, 40, 40, 48, 48, Rgba(0, 0x80, 0, 0x80));
+    Check(Pixel(renderer, 0x96, 4, 4) == Rgba(0x80, 0, 0, 0x80) && Pixel(renderer, 0x96, 44, 44) == Rgba(0, 0x80, 0, 0x80),
+          "a draw after memory patched on the GPU lands where it should");
+}
+
 void PerPixelBlending(ps2gpu::GsRenderer& renderer) {
     ps2gpu::GsDrawState state = Target(0x7E);
     Rect(renderer, state, 0, 0, 64, 64, Rgba(0xFF, 0xFF, 0xFF, 0x80));
@@ -440,6 +455,7 @@ int main() {
     RenderToTexture(*renderer);
     TargetFromMemory(*renderer);
     PartlyMaskedChannels(*renderer);
+    ComputeBetweenDraws(*renderer);
     if (g_failures) std::printf("gpu renderer tests: %d failed\n", g_failures);
     else std::printf("gpu renderer tests: all passed (%s)\n", gpu->Describe().c_str());
     return g_failures ? EXIT_FAILURE : EXIT_SUCCESS;
