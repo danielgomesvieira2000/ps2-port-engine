@@ -23,6 +23,12 @@
 
 namespace ps2gpu {
 
+namespace {
+bool g_use_controllers = true;      // UseControllers'
+}  // namespace
+
+void UseControllers(bool use) { g_use_controllers = use; }
+
 std::uint64_t SteadyNs() {
     return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                              std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -110,7 +116,9 @@ bool SdlWindowDisplay::OpenWindow(const char* title, int width, int height, SDL_
     // PS2HOST_PAD_FOCUS=1, only while this window has it: two instances on
     // one PC each take the pad in turn.
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, std::getenv("PS2HOST_PAD_FOCUS") ? "0" : "1");
-    if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
+    if (!g_use_controllers) {
+        std::fprintf(stderr, "[window] the PC's controllers not read (a scripted run)\n");
+    } else if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         std::fprintf(stderr, "[window] no game controllers: %s\n", SDL_GetError());
     } else {
         int joysticks = 0, gamepads = 0;

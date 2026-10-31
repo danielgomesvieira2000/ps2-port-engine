@@ -267,6 +267,11 @@ std::unique_ptr<Display> CreateSdlDisplay(const char* title, int width, int heig
    the picture) as one more controller, a DualShock 2's: its state as they
    hold it, and whether they are shown - listed among the controllers
    (Controllers, id kTouchPadId, PlayStation marks) only then. */
+/* Whether a window reads the PC's controllers (the default). A scripted
+   run's does not: a controller the player is using for something else would
+   press in it. Before the window opens. */
+void UseControllers(bool use);
+
 constexpr std::uint32_t kTouchPadId = 0x7F000001u;
 void SetTouchPad(const Display::PadState& state);
 void ShowTouchPad(bool shown);

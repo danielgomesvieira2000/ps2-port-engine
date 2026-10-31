@@ -319,6 +319,9 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
     // then SDL's 2D renderer with the software GS (sdl: that one alone).
     std::string want = Setting("renderer", "auto");
     if (const char* forced = std::getenv("PS2HOST_RENDERER")) want = forced;
+    // A scripted run (--virtual-time) takes only its own presses: not those
+    // of a controller in use on the PC (PS2HOST_REAL_PADS=1: it reads them).
+    ps2gpu::UseControllers(!VirtualClock() || std::getenv("PS2HOST_REAL_PADS") != nullptr);
     std::string error, why_not;
     const char* api = "Vulkan";
     if (want != "d3d11" && want != "sdl") g_display = ps2gpu::CreateVulkanDisplay(narrow.c_str(), width, height, &error);
