@@ -60,18 +60,29 @@ def inside(root: str, path: str) -> str:
     return "/src/" + rel.replace(os.sep, "/")
 
 
-def docker_up(wait_s: int = 90):
-    """Docker's engine answering - Docker Desktop's resource saver stops its
-    machine when idle, and the first requests after fail: asked again for
-    up to `wait_s`, then told how to start it."""
+def _answers() -> bool:
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def docker_up(wait_s: int = 30):
+    """Docker's engine answering. Docker Desktop's engine stops answering now
+    and then (idle, its resource saver; or the machine short of memory) and
+    does not come back by itself: after `wait_s`, `docker desktop restart`
+    once (Docker Desktop's own command), then told how to start it."""
     for attempt in range(max(1, wait_s // 5)):
-        try:
-            if subprocess.run(["docker", "info"], capture_output=True, timeout=30).returncode == 0:
-                return
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        if _answers():
+            return
         if attempt == 0:
             print("linux: waiting for Docker's engine...", flush=True)
+        time.sleep(5)
+    print("linux: restarting Docker Desktop (docker desktop restart)", flush=True)
+    subprocess.run(["docker", "desktop", "restart"], capture_output=True, timeout=300)
+    for _ in range(24):
+        if _answers():
+            return
         time.sleep(5)
     raise SystemExit("linux: Docker's engine does not answer: start Docker Desktop (or `docker desktop restart`)")
 

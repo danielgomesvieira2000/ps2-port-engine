@@ -53,6 +53,17 @@ build beside it with the same command line, or says what is needed
 builds with a compiler per 2.5 GB of memory: a file of compiled VU code
 takes one 2 GB and more.
 
+**Other platforms**, from the same game directory (README.md's Platforms):
+`tools/linux.py --game games/<g> build | test | shell` (Linux x86-64 in
+Docker: clang 19 on Ubuntu 22.04, Mesa's lavapipe for the renderer's tests),
+`tools/android.py --game games/<g> build | apk | install` (the NDK). What
+breaks first on them is what MSVC lets through: an include a header leaned
+on (`<cstdint>`, `<cmath>`), a Windows call outside `_WIN32` (`_wfopen`,
+`_putenv_s`), `%x` for a `u64` (it is `unsigned long` on Linux), `RC` named as
+a language in the port's CMakeLists (the template has it on Windows alone),
+and in lifted code a `goto` past a declaration - lifted by today's lift.py,
+clang takes it.
+
 Options for finding out why boot stops, passed after `run --`:
 
 | option | what it shows |

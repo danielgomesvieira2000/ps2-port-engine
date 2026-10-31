@@ -82,6 +82,13 @@ rewriting published history is their decision.
    notice) and the third-party licences. It refuses a build with the disc-made
    logo, one that imports the Visual C++ runtime, or one that names a folder of
    the build machine. Don't bypass a refusal: fix its cause.
+   **Linux** (when the release has one): `python engine/tools/linux.py --game
+   games/<name> build`, `... test --runs car_select` (the software GS's
+   pictures as recorded on Windows), then `package.py --game games/<name>
+   --platform linux`: `build/release/<Name>-PC-<version>-linux-x64.tar.gz`,
+   refused when it needs the C++ runtime installed or names a folder of the
+   machine or the build container. It needs glibc 2.35+ (Ubuntu 22.04, Debian
+   12, SteamOS); say so in the README.
 6. **Test it as a player would**: unzip into an empty folder, start it with no
    arguments (a `pc_settings.ini` with `disc=` beside it, for an unattended
    check: the picker otherwise waits for a person), check the log (version,
