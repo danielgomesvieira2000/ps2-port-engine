@@ -1210,7 +1210,7 @@ bool VulkanGsRenderer::MakeImage(Image& t, std::uint32_t width, std::uint32_t he
     formats.pViewFormats = both;
     if (words) {
         ici.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-        ici.pNext = &formats;
+        if (g_image_format_list) ici.pNext = &formats;
     }
     if (vkCreateImage(g_.device, &ici, nullptr, &t.image) != VK_SUCCESS) return false;
     VkMemoryRequirements req;
@@ -4202,6 +4202,17 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (shuffle_pipeline_) vkDestroyPipeline(g_.device, shuffle_pipeline_, nullptr);
     if (shuffle_layout_) vkDestroyPipelineLayout(g_.device, shuffle_layout_, nullptr);
     if (shuffle_) vkDestroyShaderModule(g_.device, shuffle_, nullptr);
+    // The swizzle and decode to and from images, the memory patch, depth out and back.
+    for (VkPipeline p : {swizzle_image_pipeline_, decode_image_pipeline_, patch_pipeline_, swizzle_depth_pipeline_,
+                         depth_load_pipeline_})
+        if (p) vkDestroyPipeline(g_.device, p, nullptr);
+    for (VkPipelineLayout l : {swizzle_image_layout_, patch_layout_, swizzle_depth_layout_, depth_load_layout_})
+        if (l) vkDestroyPipelineLayout(g_.device, l, nullptr);
+    for (VkShaderModule m : {swizzle_image_, decode_image_, patch_, swizzle_depth_, depth_load_vert_, depth_load_frag_})
+        if (m) vkDestroyShaderModule(g_.device, m, nullptr);
+    for (VkDescriptorSetLayout l : {image_set_layout_, depth_set_layout_})
+        if (l) vkDestroyDescriptorSetLayout(g_.device, l, nullptr);
+    if (storage_pool_) vkDestroyDescriptorPool(g_.device, storage_pool_, nullptr);
     for (auto& format : swizzle_image_specialised_)
         for (auto& direction : format)
             for (VkPipeline pipeline : direction)

@@ -55,6 +55,9 @@ inline VkPath g_vk_path = kVk13;
    GS draws' pipelines rather than set per batch (gs_renderer.cpp's
    BakedPipelineFor). PS2HOST_VK_BAKED=1 takes it on any device. */
 inline bool g_vk_baked_states = false;
+/* VkImageFormatListCreateInfo may be chained (1.2, or VK_KHR_image_format_list
+   enabled: VkDeviceSetup::Fill). */
+inline bool g_image_format_list = true;
 /* VK_ATTACHMENT_STORE_OP_NONE can be used (1.3, dynamic rendering, or the
    load_store_op_none extensions). */
 inline bool g_store_op_none = true;

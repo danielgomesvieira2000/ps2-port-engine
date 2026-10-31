@@ -80,6 +80,17 @@ bool VkDevicePath(VkPhysicalDevice gpu, VkPath* path, bool* baked, std::string* 
     vkGetPhysicalDeviceProperties(gpu, &p);
     const int forced = VkLegacyForced();
     *baked = BakedForced();
+    const std::vector<VkExtensionProperties> offered = Extensions(gpu);
+#ifdef _WIN32
+    // A Vulkan that is a layer over Direct3D 12 (Microsoft's, beside the
+    // GPU's own driver) says so with VK_KHR_portability_subset: passed over -
+    // Direct3D 11 draws natively on that GPU, without what such a layer
+    // lacks.
+    if (Offers(offered, "VK_KHR_portability_subset")) {
+        if (why) *why = "a Vulkan layered over another API";
+        return false;
+    }
+#endif
     if (p.apiVersion >= VK_API_VERSION_1_3 && !forced) {
         *path = kVk13;
         return true;
@@ -91,7 +102,6 @@ bool VkDevicePath(VkPhysicalDevice gpu, VkPath* path, bool* baked, std::string* 
         if (why) *why = text;
         return false;
     }
-    const std::vector<VkExtensionProperties> offered = Extensions(gpu);
     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT dynamic_state{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
     VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamic_rendering{
@@ -134,6 +144,18 @@ void VkDeviceSetup::Fill(VkPhysicalDevice gpu, VkPath path, bool baked) {
             *chain = &dynamic_rendering;
         }
     }
+    // An image's view formats named (the GS renderer's): core in 1.2, else its extension's.
+    VkPhysicalDeviceProperties p;
+    vkGetPhysicalDeviceProperties(gpu, &p);
+    g_image_format_list = p.apiVersion >= VK_API_VERSION_1_2;
+    if (!g_image_format_list && Offers(offered, VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME)) {
+        extensions.push_back(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME);
+        g_image_format_list = true;
+    }
+    // A device that is a layer over another API (on Metal: Windows passes
+    // them over, VkDevicePath) says what it lacks this way, and must have it
+    // enabled.
+    if (Offers(offered, "VK_KHR_portability_subset")) extensions.push_back("VK_KHR_portability_subset");
     // A pass's attachment it never reads, not loaded (the GS renderer's deferred passes: a tiler's).
     if (Offers(offered, "VK_KHR_load_store_op_none")) load_none = "VK_KHR_load_store_op_none";
     else if (Offers(offered, "VK_EXT_load_store_op_none")) load_none = "VK_EXT_load_store_op_none";

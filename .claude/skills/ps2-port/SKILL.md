@@ -188,7 +188,8 @@ widescreen (the game's camera and its 2D, with per-element anchors - Burnout
 targets (the game's menu objects), the window title and version
 (`game.json`), an original icon (`port/icon.ico`), button prompts for the
 keyboard and mouse (Burnout 3's `port/prompts.cpp`: its button textures
-overridden while those are used). Art the port ships is
+overridden while those are used, the marks drawn with the engine's
+`ps2host/prompt_art.h`: key caps, DualShock and Xbox marks, a mouse). Art the port ships is
 original (a script draws it: `port/tools/make_cursor.py`, `make_icon_art.py`,
 `make_prompts.py`),
 never the game's.

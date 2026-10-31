@@ -57,6 +57,7 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/libnet.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/logitech.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/bindings.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/prompt_art.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/timeline.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gs.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gs_thread.cpp
