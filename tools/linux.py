@@ -22,6 +22,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path[:0] = [HERE, os.path.dirname(HERE)]
@@ -59,8 +60,25 @@ def inside(root: str, path: str) -> str:
     return "/src/" + rel.replace(os.sep, "/")
 
 
+def docker_up(wait_s: int = 90):
+    """Docker's engine answering - Docker Desktop's resource saver stops its
+    machine when idle, and the first requests after fail: asked again for
+    up to `wait_s`, then told how to start it."""
+    for attempt in range(max(1, wait_s // 5)):
+        try:
+            if subprocess.run(["docker", "info"], capture_output=True, timeout=30).returncode == 0:
+                return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if attempt == 0:
+            print("linux: waiting for Docker's engine...", flush=True)
+        time.sleep(5)
+    raise SystemExit("linux: Docker's engine does not answer: start Docker Desktop (or `docker desktop restart`)")
+
+
 def image():
     """The image, made (or brought up to date: Docker's cache) from tools/linux."""
+    docker_up()
     run(["docker", "build", "-q", "-t", IMAGE, os.path.join(HERE, "linux")], stdout=subprocess.DEVNULL)
 
 

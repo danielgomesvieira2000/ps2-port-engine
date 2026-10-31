@@ -2,7 +2,10 @@
 # dispatch table and drives this file. (From engine/templates/game.)
 
 cmake_minimum_required(VERSION 3.20)
-project(@TARGET@_port LANGUAGES CXX RC)     # RC: the icon and version
+project(@TARGET@_port LANGUAGES CXX)
+if(WIN32)
+    enable_language(RC)                     # the icon and version (Windows' resources)
+endif()
 
 set(PS2_GENERATED_DIR "" CACHE PATH "dispatch.cpp, from engine/tools/port.py")
 
@@ -24,6 +27,11 @@ if(MSVC)
     else()
         add_compile_options("/d1trimfile:${repo_root_native}")
     endif()
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    # clang (Android's NDK, Linux: engine/tools/android.py, linux.py) or GCC:
+    # the same paths taken off and no multiply-add fused.
+    get_filename_component(repo_root ${CMAKE_CURRENT_LIST_DIR}/../../.. ABSOLUTE)
+    add_compile_options("-ffile-prefix-map=${repo_root}/=" -ffp-contract=off)
 endif()
 
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../../engine/host ${CMAKE_BINARY_DIR}/ps2host)
