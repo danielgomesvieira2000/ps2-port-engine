@@ -55,6 +55,9 @@ struct OverlayEntry {
     const u32* checks;
 };
 void RegisterOverlays(const OverlayEntry* overlays, std::size_t count);
+/* Whether the overlay named `name` is translated into this build: a port's
+   way into code not every build has yet (a menu entry offered once it is). */
+bool HasOverlay(const char* name);
 
 /* The program changed its code (FlushCache): calls are looked up afresh, so a
    call into an overlay finds the one now loaded. */

@@ -55,6 +55,7 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/settings.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/hud.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/libnet.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/networks.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/logitech.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/bindings.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/prompt_art.cpp
@@ -184,6 +185,7 @@ if(MSVC)
 endif()
 if(WIN32)
     target_link_libraries(ps2host PRIVATE ws2_32)         # the IOP's inet (iop_inet.cpp)
+    target_link_libraries(ps2host PRIVATE iphlpapi)       # this PC's networks (networks.cpp)
 endif()
 if(NOT MSVC)
     # clang or GCC (Android's NDK): translated code throws lifted::Abort; no

@@ -787,8 +787,9 @@ void GpuMemorySwizzlesAsTheGs() {
         for (u32 y = 0; y < h && back.size() == w * h; ++y)
             for (u32 x = 0; x < w; ++x) {
                 const u32 raw = reference.Read(base * 32, fbw, x, y, f.psm);
-                // Depth goes through a float (Z / 2^32): exact up to 24 bits.
-                const u32 want = f.depth ? (raw >= 0xFFFFFF80u ? 0xFFFFFFFFu : u32(float(raw)))
+                // Depth goes through a float (gs_depth.glsl): Z / 2^33, exact
+                // to 24 bits, below FF800000; each Z its own from there up.
+                const u32 want = f.depth ? (raw >= 0xFF800000u ? raw : u32(float(raw)))
                                          : sixteen ? from16(raw) : raw;
                 if (back[y * w + x] != want) ++wrong;
             }

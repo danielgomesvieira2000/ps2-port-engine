@@ -16,6 +16,12 @@
  *                     0x004  -                     (the answer: start result)
  *                     0x008  path, 252 bytes ("cdrom0:\\IOP\\USBD.IRX;1")
  *                     0x104  arguments, 252 bytes
+ *   procedure 6     load a module from IOP memory (its address at 0x000)
+ *   procedure 9     find a loaded module by its name (sceSifSearchModuleByName:
+ *                   the name at 0x008; the answer at 0x000 its module ID, or
+ *                   negative): a module from IOP memory by the name its
+ *                   .iopmod gives, one from a path by the file's name
+ *                   ("cdrom0:\\IOP\\MODULES\\DEV9.IRX;1" is "dev9")
  * Any other procedure is noted and fails.
  */
 
@@ -23,6 +29,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "ps2host/disc.h"
@@ -40,6 +47,27 @@ namespace {
 char g_version[4] = {'2', '8', '0', '0'};
 constexpr s32 kNoSuchProcedure = -1;
 constexpr u32 kResidentEnd = 0;     // a module's start result: started, stays loaded
+constexpr s32 kNoSuchModule = -200;   // the IOP kernel's KE_UNKNOWN_MODULE
+
+// The modules loaded, by name (lower case) - for procedure 9.
+std::vector<std::pair<std::string, s32>>& Loaded() {
+    static std::vector<std::pair<std::string, s32>> loaded;
+    return loaded;
+}
+
+std::string Lower(std::string text) {
+    for (char& ch : text)
+        if (ch >= 'A' && ch <= 'Z') ch = char(ch - 'A' + 'a');
+    return text;
+}
+
+/* A module's name from its path: the file's, less its extension and version. */
+std::string NameFromPath(const std::string& path) {
+    std::size_t from = path.find_last_of("\\/:");
+    from = from == std::string::npos ? 0 : from + 1;
+    const std::size_t to = path.find_first_of(".;", from);
+    return Lower(path.substr(from, to == std::string::npos ? std::string::npos : to - from));
+}
 
 std::vector<u8> Words(s32 first, u32 second) {
     std::vector<u8> out(8);
@@ -121,6 +149,7 @@ std::vector<u8> LoadFile(u32 procedure, const std::vector<u8>& data) {
         const char* begin = reinterpret_cast<const char*>(&data[8]);
         const std::string path(begin, strnlen(begin, 252));
         const s32 id = next_id++;
+        Loaded().push_back({NameFromPath(path), id});
         if (iop::RunsModule(path)) return RunFromDisc(id, path, data);
         Note("module " + path, "IOP: module " + path + " loaded as " + std::to_string(id) +
                                    " (its services are the host's)");
@@ -142,6 +171,7 @@ std::vector<u8> LoadFile(u32 procedure, const std::vector<u8>& data) {
             return Words(-1, 0);
         }
         const s32 id = next_id++;
+        Loaded().push_back({Lower(name), id});
         if (iop::RunsModule(name)) {
             std::vector<u8> args;
             if (arg_length > 0 && data.size() >= 0x104 + std::size_t(arg_length))
@@ -155,6 +185,14 @@ std::vector<u8> LoadFile(u32 procedure, const std::vector<u8>& data) {
                                    " from IOP memory at " + Hex(address) + " loaded as " +
                                    std::to_string(id) + " (its services are the host's)");
         return Words(id, kResidentEnd);
+    }
+    if (procedure == 9 && data.size() >= 9) {
+        const char* begin = reinterpret_cast<const char*>(&data[8]);
+        const std::string name = Lower(std::string(begin, strnlen(begin, std::min<std::size_t>(0xFC, data.size() - 8))));
+        for (const auto& [loaded, id] : Loaded())
+            if (loaded == name) return Words(id, 0);
+        Note("search " + name, "IOP: no module named " + name + " is loaded");
+        return Words(kNoSuchModule, 0);
     }
     Note("loadfile " + std::to_string(procedure),
          "IOP: loadfile procedure " + std::to_string(procedure) + " is not implemented (failed)");

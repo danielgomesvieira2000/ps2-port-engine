@@ -378,6 +378,12 @@ void WaitForGpuPipelines();
    the window opens with); and whether it is. */
 void SetWindowFullscreen(bool on);
 bool WindowFullscreen();
+/* How fullscreen takes the screen (the "fullscreen_mode" setting):
+   "borderless", the default - the screen's own mode, no switch, another
+   screen clicked without losing the picture - or "exclusive": a mode 60
+   divides evenly (120 Hz on a 144 Hz screen: no judder at 60), taken by
+   switching the screen. */
+void SetWindowFullscreenMode(const std::string& mode);
 /* The refresh rate of the screen the window is on, in Hz (0 when not known,
    or no window). */
 float WindowRefreshRate();
@@ -438,6 +444,20 @@ void SetWindowStatus(const std::string& status);
 /* A panel of text over the picture (a game's tool, its menu): the lines,
    the first a heading, one starting with '>' picked out; none when empty. */
 void SetWindowOverlay(const std::vector<std::string>& lines);
+/* A loading screen in place of the game's picture (a port running the
+   game's own screens unseen behind it): its lines, the first the heading,
+   the second under it; the game's picture again when empty. Or a picture
+   (SetLoadingPicture: the game's own loading screen, as ShownPicture gave
+   it, scaled to 640 x 448; none when empty). The picture shown is
+   LoadingScreen's (640 x 448), false when there is none; the game's sound
+   is silent meanwhile (LoadingScreenShown). */
+void SetLoadingScreen(const std::vector<std::string>& lines);
+void SetLoadingPicture(const std::vector<u32>& pixels, u32 width, u32 height);
+bool LoadingScreen(std::vector<u32>* pixels);
+bool LoadingScreenShown();
+/* The picture the game shows now - its displayed frame buffer, the GPU
+   renderer's written back to the GS's memory first. */
+bool ShownPicture(std::vector<u32>* pixels, u32* width, u32* height);
 /* The PC settings panel (pc_menu.cpp): F1, or L3 + R3 on a controller, over
    any game - resolution, aspect, fullscreen, v-sync, frame pacing, the
    texture pack. UpdatePcMenu reads its keys (PumpWindow calls it); while it

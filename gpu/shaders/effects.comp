@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // The PC's effects on a game's picture (GsRenderer::RunEffect, effects.cpp):
 // each pass of each effect, chosen by PASS at build time. Every pass sees
 // the same bindings - the target (the game's picture, RGBA8, its alpha the
@@ -7,7 +8,7 @@
 // that image's size, and the effect's parameters as the game's port sent
 // them (gs_renderer.h's GsEffect).
 //
-// Depth: the depth buffer holds the GS's Z / 2^32; the port gives the
+// Depth: the depth buffer holds the GS's Z (as gs_depth.glsl maps it); the port gives the
 // camera's mapping, Z = a / w + b (RenderWare's zScale and zShift), so the
 // view-space distance is a / (Z - b). The view window's half extents (at
 // distance 1) place a pixel in view space.
@@ -70,7 +71,7 @@ layout(push_constant) uniform Params {
 #define PASS_SSR_APPLY 14
 #define PASS_AO_DEPTH 15
 
-const float kTwoTo32 = 4294967296.0;
+#include "gs_depth.glsl"
 
 // ---------------------------------------------------------------- depth and place
 
@@ -78,7 +79,7 @@ ivec2 TargetSize() { return textureSize(target_tex, 0); }
 
 // View-space distance of a depth sample (0: the sky - nothing drawn, Z 0).
 float ViewZ(float d) {
-    const float z = d * kTwoTo32;
+    const float z = ZOfDepthF(d);
     return z > PC(1) + 0.5 ? PC(0) / (z - PC(1)) : 1e9;
 }
 

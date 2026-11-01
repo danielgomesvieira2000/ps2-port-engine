@@ -71,6 +71,7 @@ foreach(shader gs.vert gs.frag date.vert date.frag swizzle.comp decode.comp dept
                 -I${CMAKE_CURRENT_LIST_DIR}/third_party/smaa
                 -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader}
         DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
+                ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl
                 ${CMAKE_CURRENT_LIST_DIR}/shaders/smaa_common.glsl ${CMAKE_CURRENT_LIST_DIR}/third_party/smaa/SMAA.glsl
                 ${GLSLANG}
         COMMENT "glslang ${shader}")
@@ -82,7 +83,7 @@ set(out ${PS2GPU_SHADER_DIR}/gs_frag_single.h)
 add_custom_command(OUTPUT ${out}
     COMMAND ${GLSLANG} -V --target-env vulkan1.1 -DSINGLE_OUTPUT --vn spirv_gs_frag_single
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag
-    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag ${GLSLANG}
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl ${GLSLANG}
     COMMENT "glslang gs.frag (single output)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # The swizzle straight to and from a colour target (a storage image).
@@ -91,6 +92,7 @@ add_custom_command(OUTPUT ${out}
     COMMAND ${GLSLANG} -V --target-env vulkan1.1 -DIMAGE --vn spirv_swizzle_image_comp
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp
     DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
+            ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl
             ${GLSLANG}
     COMMENT "glslang swizzle.comp (a target's image)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
@@ -109,6 +111,7 @@ add_custom_command(OUTPUT ${out}
     COMMAND ${GLSLANG} -V --target-env vulkan1.1 -DDEPTH_IMAGE --vn spirv_swizzle_depth_comp
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp
     DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
+            ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl
             ${GLSLANG}
     COMMENT "glslang swizzle.comp (a depth buffer)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
@@ -117,7 +120,7 @@ set(out ${PS2GPU_SHADER_DIR}/gs_frag_blend.h)
 add_custom_command(OUTPUT ${out}
     COMMAND ${GLSLANG} -V --target-env vulkan1.1 -DSHADER_BLEND --vn spirv_gs_frag_blend
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag
-    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag ${GLSLANG}
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl ${GLSLANG}
     COMMENT "glslang gs.frag (blending in the shader)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # The PC's effects (effects.cpp): effects.comp once for each pass.
@@ -126,7 +129,7 @@ foreach(pass RANGE 0 15)
     add_custom_command(OUTPUT ${out}
         COMMAND ${GLSLANG} -V --target-env vulkan1.1 -DPASS=${pass} --vn spirv_effects_${pass}
                 -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/effects.comp
-        DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/effects.comp ${GLSLANG}
+        DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/effects.comp ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl ${GLSLANG}
         COMMENT "glslang effects.comp (pass ${pass})")
     list(APPEND PS2GPU_SHADER_HEADERS ${out})
 endforeach()
@@ -178,6 +181,7 @@ if(PS2GPU_D3D11)
             COMMAND ps2gpu_spirv_to_hlsl ${spv} ${hlsl} ${PS2GPU_SHADER_DIR}/${name}_hlsl.h ${name}
             COMMAND ${PS2GPU_FXC} /nologo /O3 /T ${profile} /E main /Fh ${out} /Vn dxbc_${name} ${hlsl}
             DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${source} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
+                    ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl
                     ${CMAKE_CURRENT_LIST_DIR}/shaders/smaa_common.glsl ${CMAKE_CURRENT_LIST_DIR}/third_party/smaa/SMAA.glsl
                     ${CMAKE_CURRENT_LIST_DIR}/tools/spirv_to_hlsl.cpp ${GLSLANG} ps2gpu_spirv_to_hlsl
             COMMENT "HLSL ${name} (${source})")

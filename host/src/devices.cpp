@@ -393,6 +393,27 @@ void SetVif1ChainFilter(std::function<void(Vif1Chain&)> filter) { g_vif1_filter 
 
 namespace {
 std::string g_frames_dir;
+
+/* A 640 x 448 picture (LoadingScreen's) as a frame dump, as Gs::WriteBmp writes the GS's. */
+bool WriteCoverBmp(const std::string& path, const std::vector<u32>& pixels) {
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    const u32 w = 640, h = 448, data = w * h * 4;
+    u8 header[54] = {'B', 'M'};
+    auto put32 = [&](int at, u32 v) { std::memcpy(header + at, &v, 4); };
+    put32(2, 54 + data);
+    put32(10, 54);
+    put32(14, 40);
+    put32(18, w);
+    put32(22, u32(-s32(h)));                   // negative: top-down rows
+    header[26] = 1;
+    header[28] = 32;
+    put32(34, data);
+    std::fwrite(header, 1, 54, f);
+    std::fwrite(pixels.data(), 4, pixels.size(), f);
+    std::fclose(f);
+    return true;
+}
 int g_frames_every = 30, g_frames_limit = 100, g_frames_written = 0;
 u64 g_frames_from = 0;
 }  // namespace
@@ -684,7 +705,9 @@ void FrameDone(u64 frame) {
     if (!dump) return;
     char name[64];
     std::snprintf(name, sizeof name, "/frame_%06llu.bmp", static_cast<unsigned long long>(frame));
-    if (gs::TheGs().WriteBmp(g_frames_dir + name)) ++g_frames_written;
+    std::vector<u32> cover;             // a port's loading screen, as shown in the game's place
+    if (LoadingScreen(&cover) ? WriteCoverBmp(g_frames_dir + name, cover) : gs::TheGs().WriteBmp(g_frames_dir + name))
+        ++g_frames_written;
     // VU1's memories beside the picture, for engine/tools/vudis.py.
     for (const auto& [file, span] : {std::make_pair("/vu1_micro.bin", Vu1().micro), std::make_pair("/vu1_data.bin", Vu1().data)})
         if (FILE* out = std::fopen((g_frames_dir + file).c_str(), "wb")) {

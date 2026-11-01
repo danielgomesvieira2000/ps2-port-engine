@@ -197,6 +197,26 @@ struct Image {
 // Depth with stencil: the stencil carries the destination alpha test.
 constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
 
+// The GS's Z as the depth images hold it, and back: gs_depth.glsl's mapping
+// (Z / 2^33 below FF800000, each Z from there its own float 2^-24 apart -
+// Z / 2^32 told the top's apart to 256 only), the same on the CPU.
+constexpr std::uint32_t kDepthTop = 0xFF800000u;
+constexpr double kDepthTopAt = 0.4990234375;    // kDepthTop / 2^33
+
+float DepthOfZ(std::uint32_t z) {
+    return z < kDepthTop ? float(double(z) / 8589934592.0) : float(kDepthTopAt + double(z - kDepthTop) / 16777216.0);
+}
+
+// (Rounded to the nearest.)
+std::uint32_t ZOfDepth(float depth) {
+    const double d = depth;
+    if (d < kDepthTopAt) {
+        const double v = d * 8589934592.0 + 0.5;
+        return v <= 0.0 ? 0u : std::uint32_t(v);
+    }
+    return kDepthTop + std::uint32_t(std::min((d - kDepthTopAt) * 16777216.0 + 0.5, 8388607.0));
+}
+
 struct Texture {
     Image image;
     VkDescriptorSet sets[28] = {};      /* by sampler (samplers_, then replacement_samplers_) */
@@ -3254,7 +3274,7 @@ void VulkanGsRenderer::UploadDepth(std::uint32_t zbp, std::uint32_t width, std::
     void* mapped = Staging(bytes, &buffer, &offset);
     if (!mapped) return;
     float* out = static_cast<float*>(mapped);
-    for (std::size_t i = 0; i < std::size_t(width) * height; ++i) out[i] = float(double(z[i]) / 4294967296.0);
+    for (std::size_t i = 0; i < std::size_t(width) * height; ++i) out[i] = DepthOfZ(z[i]);
     g_.Record([&](VkCommandBuffer cmd) {
         Transition(cmd, *d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -4053,14 +4073,13 @@ bool VulkanGsRenderer::ReadDepth(std::uint32_t zbp, std::uint32_t width, std::ui
         vkCmdCopyImageToBuffer(cmd, d.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
         g_.Mark(cmd, kProfReadback);
     }, "a depth read-back");
-    // Z / 2^32 back to the GS's Z, a GS pixel each (the middle of each square).
+    // Back to the GS's Z, a GS pixel each (the middle of each square).
     const float* in = static_cast<const float*>(mapped);
     z->resize(std::size_t(width) * height);
     for (std::uint32_t y = 0; y < height; ++y)
-        for (std::uint32_t x = 0; x < width; ++x) {
-            const double v = double(in[std::size_t(y * d.scale + d.scale / 2) * d.pw() + x * d.scale + d.scale / 2]) * 4294967296.0 + 0.5;
-            (*z)[std::size_t(y) * width + x] = v <= 0.0 ? 0u : v >= 4294967295.0 ? 0xFFFFFFFFu : std::uint32_t(v);
-        }
+        for (std::uint32_t x = 0; x < width; ++x)
+            (*z)[std::size_t(y) * width + x] =
+                ZOfDepth(in[std::size_t(y * d.scale + d.scale / 2) * d.pw() + x * d.scale + d.scale / 2]);
     vkUnmapMemory(g_.device, memory);
     vkDestroyBuffer(g_.device, buffer, nullptr);
     vkFreeMemory(g_.device, memory, nullptr);

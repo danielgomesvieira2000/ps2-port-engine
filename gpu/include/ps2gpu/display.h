@@ -110,9 +110,10 @@ public:
 
     /* Fullscreen (borderless, the desktop's resolution) or a window. */
     virtual void SetFullscreen(bool on) { (void)on; }
-    /* Fullscreen at the desktop's own refresh (a high frame rate that
-       follows the screen: 144 Hz kept), not one that 60 divides evenly (120
-       Hz on a 144 Hz screen, the default); taken again now if fullscreen. */
+    /* Fullscreen at the desktop's own mode (borderless: 144 Hz kept), not
+       one that 60 divides evenly (120 Hz on a 144 Hz screen, taken by
+       switching the screen); taken again now if fullscreen. The host keeps
+       it on unless the player asks for exclusive fullscreen. */
     virtual void SetKeepRefresh(bool keep) { (void)keep; }
     virtual bool Fullscreen() const { return false; }
     /* The picture's shape on the screen, width over height: 4:3 as a

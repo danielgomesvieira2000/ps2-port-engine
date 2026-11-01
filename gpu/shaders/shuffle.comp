@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // A channel shuffle (GsRenderer::ChannelShuffle): sprites drawn into a
 // 16-bit view of a 32-bit target, its texels a 16-bit view of a depth
 // buffer - each 16-bit pixel a half of a 32-bit word. Burnout 3's fog puts
@@ -40,6 +41,8 @@ layout(push_constant) uniform Params {
     uint ta0, ta1, flags;               // TEXA; flags: 1 AEM, 2 FBA
     uint scale;
 } p;
+
+#include "gs_depth.glsl"
 
 const uint PSMCT16S = 0x0Au, PSMZ16 = 0x32u, PSMZ16S = 0x3Au;
 
@@ -119,8 +122,7 @@ void main() {
         const uvec2 z_pixel = PixelZ32(texel_half >> 1u, p.img_bp, p.src_bw);
         if (z_pixel.x >= p.img_w || z_pixel.y >= p.img_h) continue;
         const ivec2 z_at = min(ivec2(z_pixel * p.scale + sub), textureSize(depth, 0) - 1);
-        const float d = texelFetch(depth, z_at, 0).r;          // Z / 2^32
-        const uint z = d >= 1.0 ? 0xFFFFFFFFu : uint(d * 4294967296.0);
+        const uint z = ZOfDepth(texelFetch(depth, z_at, 0).r);
         const uint v16 = (z >> (16u * (texel_half & 1u))) & 0xFFFFu;
         // The texel as the GS expands it (TEXA), written back as 16-bit colour.
         const uint alpha = (v16 & 0x8000u) != 0u ? p.ta1

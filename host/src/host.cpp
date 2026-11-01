@@ -496,6 +496,12 @@ void RegisterOverlays(const OverlayEntry* overlays, std::size_t count) {
     CodeChanged();
 }
 
+bool HasOverlay(const char* name) {
+    for (std::size_t i = 0; i < g_overlay_count; ++i)
+        if (std::strcmp(g_overlays[i].name, name) == 0) return true;
+    return false;
+}
+
 void CodeChanged() {
     if (!g_overlay_count) return;           // the executable's code never moves
     for (CachedCall& line : g_call_cache) line = CachedCall{};

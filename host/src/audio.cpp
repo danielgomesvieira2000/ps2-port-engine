@@ -488,7 +488,10 @@ void AudioFrames(const short* frames, unsigned count) {
     (void)music_test;
     // The host's music mixed in (music.h): into a copy, the SPU2's own as it is.
     static thread_local std::vector<short> mixed;
-    if (MusicMixing()) {
+    if (LoadingScreenShown()) {             // a port's loading screen: the game behind it unheard
+        mixed.assign(2 * std::size_t(count), 0);
+        frames = mixed.data();
+    } else if (MusicMixing()) {
         mixed.assign(frames, frames + 2 * std::size_t(count));
         MusicMix(mixed.data(), count);
         frames = mixed.data();

@@ -100,6 +100,11 @@ const std::vector<Choice>& Choices() {
          [] { return OnOff(WindowFullscreen()); },
          [](const std::string& v) { SetWindowFullscreen(v == "on"); },
          "FULLSCREEN", {"OFF", "ON"}, "Play in a window or on the whole screen."},
+        {"Fullscreen mode", {"borderless", "exclusive"}, {"Borderless", "Exclusive (60/120 Hz)"},
+         [] { return Setting("fullscreen_mode", "borderless"); },
+         [](const std::string& v) { SetWindowFullscreenMode(v); },
+         "FULLSCREEN MODE", {"BORDERLESS", "EXCLUSIVE"},
+         "Borderless: no flicker, other screens usable. Exclusive: 60 or 120 Hz, no judder."},
         {"V-sync", {"off", "on"}, {"Off", "On"},
          [] { return OnOff(WindowVsync()); },
          [](const std::string& v) { SetWindowVsync(v == "on"); },
@@ -150,7 +155,7 @@ std::vector<int> Rows() {
         if (label == "Frame rate" && HighFpsOwnRate() != 30.0) continue;
         if (label == "Frame rate " && HighFpsOwnRate() != 60.0) continue;
         // A phone's screen: always the whole of it, synced, no VRR or GPU boost to ask for.
-        if (OnPhone() && (label == "Fullscreen" || label == "V-sync" || label == "VRR" || label == "GPU boost"))
+        if (OnPhone() && (label == "Fullscreen" || label == "Fullscreen mode" || label == "V-sync" || label == "VRR" || label == "GPU boost"))
             continue;
         if (label != "Texture pack" || texture_pack::Count()) rows.push_back(i);
     }

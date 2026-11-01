@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // The GS's per-pixel work, in its own terms (0-255, with 0x80 as 1.0 where it
 // multiplies): the texture function, then the alpha test. Blending is the
 // fixed-function blender's; the GS's factor - source alpha or FIX over 128 -
@@ -17,6 +18,8 @@ layout(set = 2, binding = 0) uniform sampler2D destination;
 // game's soft particles (blend_ops bit 21).
 layout(set = 2, binding = 0) uniform sampler2D scene_depth;
 #endif
+
+#include "gs_depth.glsl"
 
 layout(location = 0) in vec4 shade;
 layout(location = 1) noperspective in vec3 coordinate;
@@ -548,7 +551,7 @@ void main() {
         // A soft particle (a game's tag): faded as it nears what is behind
         // it, so smoke and fire meet the road and the cars without a seam.
         const vec4 scene = texelFetch(scene_depth, ivec2(gl_FragCoord.xy), 0);
-        const float z = gl_FragCoord.z * 4294967296.0;
+        const float z = ZOfDepthF(gl_FragCoord.z);
         if (scene.a > 0.5 && z > scene.b + 0.5) {
             const float mine = scene.g * 1024.0 / (z - scene.b);
             const float soft = 0.35 + 0.025 * mine;

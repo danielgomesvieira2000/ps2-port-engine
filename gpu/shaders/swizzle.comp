@@ -4,7 +4,7 @@
 // one 32-bit value a pixel) and the GS's swizzled layout (GS User's Manual,
 // chapter 8; the tables are engine/host/src/gs_memory.cpp's). One invocation
 // a pixel. Colour is RGBA8 as the targets hold it; depth is the depth image's
-// float, Z / 2^32.
+// float (gs_depth.glsl's).
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -48,6 +48,7 @@ layout(push_constant) uniform Params {
 } p;
 
 #include "gs_address.glsl"
+#include "gs_depth.glsl"
 layout(constant_id = 1) const uint specialized_direction = 0xFFFFFFFFu;
 layout(constant_id = 2) const uint specialized_scale = 0u;
 layout(constant_id = 3) const uint specialized_depth = 0xFFFFFFFFu;
@@ -95,7 +96,7 @@ void main() {
 #else
         uint v = lin[mid];
 #endif
-        if (depth == 1u) v = uint(clamp(uintBitsToFloat(v) * 4294967296.0, 0.0, 4294967040.0));
+        if (depth == 1u) v = ZOfDepth(uintBitsToFloat(v));
         if (Is16()) {
             if(paired) {
 #ifdef IMAGE
@@ -105,7 +106,7 @@ void main() {
 #else
                 uint other=lin[mid+8u*k];
 #endif
-                if(depth==1u) other=uint(clamp(uintBitsToFloat(other)*4294967296.0,0.0,4294967040.0));
+                if(depth==1u) other=ZOfDepth(uintBitsToFloat(other));
                 const uint low=depth==1u?(v&0xFFFFu):To16(v);
                 const uint high=depth==1u?(other&0xFFFFu):To16(other);
                 mem[word]=low|(high<<16);
@@ -130,7 +131,7 @@ void main() {
         } else {
             v = z24 ? (w & 0xFFFFFFu) : w;
         }
-        const uint value = depth == 1u ? floatBitsToUint(float(v) * (1.0 / 4294967296.0)) : v;
+        const uint value = depth == 1u ? floatBitsToUint(DepthOfZ(v)) : v;
 #ifdef IMAGE
         // Memory differing from the square's middle (what went to memory) in
         // alpha alone: each pixel keeps its colour, takes memory's alpha.

@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <functional>
@@ -42,6 +43,16 @@
 #endif
 
 namespace ps2host {
+
+#ifdef PS2HOST_VULKAN
+// Fullscreen keeps the screen's own mode (borderless) unless the player asks
+// for "exclusive" (the "fullscreen_mode" setting): a mode 60 divides evenly,
+// taken by switching the screen - a black flicker, and lost on a click on
+// another screen. Always the screen's own for DISPLAY's frame rate and VRR.
+static bool KeepRefresh(bool display_rate) {
+    return display_rate || SettingOn("vrr") || Setting("fullscreen_mode", "borderless") != "exclusive";
+}
+#endif
 
 std::atomic<std::uint64_t> g_late_pictures{0};    // LatePictures
 
@@ -341,7 +352,7 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
         Note("window", std::string("window: ") + api + " on " + g_display->Describe() + why_not);
         g_display->SetVrr(SettingOn("vrr"));
         g_display->SetGpuBoost(SettingOn("gpu_boost", true));      // (the GPU's clocks kept up)
-        g_display->SetKeepRefresh(Setting("frame_rate", "60") == "display" || SettingOn("vrr"));
+        g_display->SetKeepRefresh(KeepRefresh(Setting("frame_rate", "60") == "display"));
         if (SettingOn("fullscreen")) g_display->SetFullscreen(true);
         ApplyCursorArt();
         g_display->SetPresentObserver([](std::uint64_t due_ns, std::uint64_t shown_ns, bool dropped) {
@@ -890,7 +901,7 @@ bool WindowFullscreen() {
 void SetWindowKeepRefresh(bool keep) {
 #ifdef PS2HOST_VULKAN
     // (On a VRR screen, always: its own refresh is the most it can follow.)
-    if (g_display) g_display->SetKeepRefresh(keep || SettingOn("vrr"));
+    if (g_display) g_display->SetKeepRefresh(KeepRefresh(keep));
 #endif
     (void)keep;
 }
@@ -900,12 +911,19 @@ void SetWindowVrr(bool on) {
 #ifdef PS2HOST_VULKAN
     if (g_display) {
         g_display->SetVrr(on);
-        g_display->SetKeepRefresh(on || Setting("frame_rate", "60") == "display");
+        g_display->SetKeepRefresh(KeepRefresh(Setting("frame_rate", "60") == "display"));
     }
 #endif
 }
 
 bool WindowVrr() { return SettingOn("vrr"); }
+
+void SetWindowFullscreenMode(const std::string& mode) {
+    SetSetting("fullscreen_mode", mode);
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetKeepRefresh(KeepRefresh(Setting("frame_rate", "60") == "display"));
+#endif
+}
 
 void SetWindowGpuBoost(bool on) {
     SetSettingOn("gpu_boost", on);
@@ -955,14 +973,16 @@ ps2gpu::Display* WindowDisplay() {
 #ifdef PS2HOST_VULKAN
 namespace {
 
-/* `text` into a 640 x 448 picture (R in the low byte), centred on `y`,
-   stb_easy_font's strokes `scale` times. */
-void PictureText(std::vector<u32>& picture, const char* text, int y, int scale, u32 colour) {
+/* `text` into a 640 x 448 picture (R in the low byte), centred on `y`
+   (as if it were `centred_as`, when given), stb_easy_font's strokes `scale`
+   times. */
+void PictureText(std::vector<u32>& picture, const char* text, int y, int scale, u32 colour,
+                 const char* centred_as = nullptr) {
     std::vector<float> quads(4 * 1024 * 4);
     unsigned char unused[4] = {255, 255, 255, 255};
     const int n = stb_easy_font_print(0, 0, const_cast<char*>(text), unused, quads.data(),
                                       int(quads.size() * sizeof(float)));
-    const int x0 = (640 - stb_easy_font_width(const_cast<char*>(text)) * scale) / 2;
+    const int x0 = (640 - stb_easy_font_width(const_cast<char*>(centred_as ? centred_as : text)) * scale) / 2;
     for (int q = 0; q < n; ++q) {
         const float* v = &quads[std::size_t(q) * 16];
         const int left = x0 + int(v[0] * scale), top = y + int(v[1] * scale);
@@ -1044,6 +1064,63 @@ void WaitForGpuPipelines() {
 #endif
 }
 
+namespace {
+std::mutex g_loading_mutex;
+std::vector<std::string> g_loading_lines;      // SetLoadingScreen's
+std::vector<u32> g_loading_picture;            // SetLoadingPicture's, 640 x 448
+std::atomic<bool> g_loading_shown{false};
+}  // namespace
+
+void SetLoadingScreen(const std::vector<std::string>& lines) {
+    std::lock_guard<std::mutex> lock(g_loading_mutex);
+    g_loading_lines = lines;
+    g_loading_picture.clear();
+    g_loading_shown = !lines.empty();
+}
+
+void SetLoadingPicture(const std::vector<u32>& pixels, u32 width, u32 height) {
+    std::vector<u32> scaled;
+    if (width && height && pixels.size() >= std::size_t(width) * height) {
+        scaled.resize(640 * 448);
+        for (u32 y = 0; y < 448; ++y)
+            for (u32 x = 0; x < 640; ++x)
+                scaled[std::size_t(y) * 640 + x] = pixels[std::size_t(y * height / 448) * width + x * width / 640];
+    }
+    std::lock_guard<std::mutex> lock(g_loading_mutex);
+    g_loading_lines.clear();
+    g_loading_picture = std::move(scaled);
+    g_loading_shown = !g_loading_picture.empty();
+}
+
+bool LoadingScreenShown() { return g_loading_shown; }
+
+bool LoadingScreen(std::vector<u32>* pixels) {
+#ifdef PS2HOST_VULKAN
+    std::vector<std::string> lines;
+    {
+        std::lock_guard<std::mutex> lock(g_loading_mutex);
+        if (!g_loading_picture.empty()) {
+            *pixels = g_loading_picture;
+            return true;
+        }
+        if (g_loading_lines.empty()) return false;
+        lines = g_loading_lines;
+    }
+    pixels->assign(640 * 448, 0xFF000000u);
+    // The heading, its dots counting the time (that it is not hung).
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const std::string heading = lines[0] + std::string(std::size_t(ms / 400 % 4), '.');
+    PictureText(*pixels, heading.c_str(), 190, 4, 0xFFFFFFFFu, (lines[0] + "...").c_str());   // (still as they count)
+    for (std::size_t i = 1; i < lines.size(); ++i)
+        PictureText(*pixels, lines[i].c_str(), 240 + int(i - 1) * 24, 2, 0xFFB0B0B0u);
+    return true;
+#else
+    (void)pixels;
+    return false;
+#endif
+}
+
 void PresentFrame() {
 #ifdef PS2HOST_VULKAN
     if (g_display) {
@@ -1054,7 +1131,9 @@ void PresentFrame() {
         KeepFullscreenSetting();
         std::vector<u32> pixels;
         u32 w = 0, h = 0;
-        const bool got = (g_picture_source && g_picture_source(&pixels, &w, &h)) || gs::TheGs().Picture(&pixels, &w, &h);
+        bool got = LoadingScreen(&pixels);          // a port's loading screen in the game's place
+        if (got) w = 640, h = 448;
+        else got = (g_picture_source && g_picture_source(&pixels, &w, &h)) || gs::TheGs().Picture(&pixels, &w, &h);
         if (got && !g_display->Present(pixels.data(), w, h)) {
             std::fprintf(stderr, "[window] a picture could not be shown: the window closed\n");
             g_closed = true;

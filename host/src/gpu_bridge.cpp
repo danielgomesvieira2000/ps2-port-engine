@@ -2303,7 +2303,21 @@ void RescaleRule(Bridge& b, u32 fbp_begin, u32 fbp_end, u32 max_fbw) {
     ++g_mutations;
 }
 
+bool ShownPicture(std::vector<u32>* pixels, u32* width, u32* height) {
+    u32 fbp = 0, fbw = 0, psm = 0;
+    if (g_bridge && gs::TheGs().Displayed(&fbp, &fbw, &psm)) {
+        auto found = g_bridge->owned.find(std::make_tuple(fbp, fbw, psm, false));
+        if (found != g_bridge->owned.end() && found->second.gpu_newer) WriteBack(*g_bridge, found->second);
+    }
+    return gs::TheGs().Picture(pixels, width, height);
+}
+
 void PresentGpuPicture(ps2gpu::Display& display, u64 due_ns) {
+    std::vector<u32> cover;
+    if (LoadingScreen(&cover)) {                // a port's loading screen in its place
+        display.Present(cover.data(), 640, 448);
+        return;
+    }
     u32 fbp = 0, fbw = 0, psm = 0;
     if (g_bridge && gs::TheGs().Displayed(&fbp, &fbw, &psm)) {
         auto found = g_bridge->owned.find(std::make_tuple(fbp, fbw, psm, false));
@@ -2548,7 +2562,8 @@ void PresentWaiting() {
         // (Its blank, for the GPU's done time: the locked blanks' lead, NoteGpuDone.)
         if (!pace && !VirtualClock()) display->SetPresentTag(FrameEndedNs(g_present_frame));
         const u64 due = pace ? FrameDue(g_present_frame) : 0;
-        if (g_held >= 0) {
+        std::vector<u32> cover;
+        if (g_held >= 0 && !LoadingScreen(&cover)) {
             // Copied as the frame ended (MakeBetween), before the picture
             // between was drawn over it: the shown buffer holds that one now.
             display->ShowHeld(g_held, due);
@@ -2750,6 +2765,9 @@ bool StartGpuRenderer(std::string* error, GpuMode, bool) {
 void GpuSetScale(u32) {}
 void GpuShadowFrame(gs::u64, const std::string&) {}
 std::string GpuShadowSummary() { return ""; }
+bool ShownPicture(std::vector<u32>* pixels, u32* width, u32* height) {
+    return gs::TheGs().Picture(pixels, width, height);
+}
 
 #endif
 
