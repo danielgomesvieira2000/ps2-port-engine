@@ -444,6 +444,10 @@ void SetWindowStatus(const std::string& status);
 /* A panel of text over the picture (a game's tool, its menu): the lines,
    the first a heading, one starting with '>' picked out; none when empty. */
 void SetWindowOverlay(const std::vector<std::string>& lines);
+/* A few words at the top right, in yellow (a game's state the player should
+   see at a glance - Resident Evil Outbreak's LAN skip vote); hidden while a
+   panel (SetWindowOverlay) is up; none when empty. */
+void SetWindowBadge(const std::string& text);
 /* A loading screen in place of the game's picture (a port running the
    game's own screens unseen behind it): its lines, the first the heading,
    the second under it; the game's picture again when empty. Or a picture

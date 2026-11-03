@@ -134,6 +134,9 @@ public:
     virtual void SetOverlay(std::vector<std::uint32_t> pixels, std::uint32_t width, std::uint32_t height) {
         (void)pixels, (void)width, (void)height;
     }
+    /* The overlay at the top right (a badge: a game's few words) instead of
+       the top left (a panel); kept until set again. */
+    virtual void SetOverlayRight(bool right) { (void)right; }
     /* The window's title (taken up by the window's own thread, in Pump). */
     virtual void SetTitle(const std::string& title) { (void)title; }
     /* F12, or L3 with R3 on a controller, since the last call: a capture asked for. */

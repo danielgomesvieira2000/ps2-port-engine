@@ -696,6 +696,8 @@ void SetWindowFullscreen(bool on) {
 namespace {
 
 std::vector<std::string> g_overlay_lines;      // SetWindowOverlay's: the panel's, a notice's
+std::string g_badge;                            // SetWindowBadge's: a few words at the top right
+constexpr char kYellow = '\x01';                // a line in yellow, the mark not drawn (the badge's)
 
 // Draws the lines as the window's overlay (none when empty).
 void DrawOverlay(const std::vector<std::string>& lines) {
@@ -722,7 +724,8 @@ void DrawOverlay(const std::vector<std::string>& lines) {
     int width = 0;
     for (const std::string& text : lines) {
         SIZE size{};
-        GetTextExtentPoint32A(dc, text.c_str(), int(text.size()), &size);
+        const int bare = !text.empty() && text[0] == kYellow ? 1 : 0;
+        GetTextExtentPoint32A(dc, text.c_str() + bare, int(text.size()) - bare, &size);
         width = std::max(width, int(size.cx));
     }
     width = std::min(1280, width + line);
@@ -745,9 +748,11 @@ void DrawOverlay(const std::vector<std::string>& lines) {
         DeleteObject(panel);
         SetBkMode(dc, TRANSPARENT);
         for (std::size_t i = 0; i < lines.size(); ++i) {
-            const bool chosen = !lines[i].empty() && lines[i][0] == '>';
+            const bool chosen = !lines[i].empty() && (lines[i][0] == '>' || lines[i][0] == kYellow);
+            const bool bare = !lines[i].empty() && lines[i][0] == kYellow;     // (its mark not drawn)
             SetTextColor(dc, chosen ? RGB(255, 210, 60) : i == 0 ? RGB(120, 190, 255) : RGB(235, 235, 235));
-            TextOutA(dc, line / 2, int(i) * line + line / 4, lines[i].c_str(), int(lines[i].size()));
+            TextOutA(dc, line / 2, int(i) * line + line / 4, lines[i].c_str() + (bare ? 1 : 0),
+                     int(lines[i].size()) - (bare ? 1 : 0));
         }
         GdiFlush();
         pixels.assign(static_cast<const std::uint32_t*>(bits), static_cast<const std::uint32_t*>(bits) + width * height);
@@ -825,9 +830,17 @@ void RefreshOverlay() {
         }
     }
 #endif
+    // A badge (a game's few words, at the top right) when no panel is up.
+    const bool badge = lines.empty() && !g_badge.empty();
+    if (badge) lines = {std::string(1, kYellow) + g_badge};
     static std::vector<std::string> shown;
-    if (lines == shown) return;                 // drawn again only when it changes
+    static bool shown_right = false;
+    if (lines == shown && badge == shown_right) return;     // drawn again only when it changes
     shown = lines;
+    shown_right = badge;
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetOverlayRight(badge);
+#endif
     DrawOverlay(lines);
 }
 
@@ -835,6 +848,12 @@ void RefreshOverlay() {
 
 void SetWindowOverlay(const std::vector<std::string>& lines) {
     g_overlay_lines = lines;
+    RefreshOverlay();
+}
+
+void SetWindowBadge(const std::string& text) {
+    if (text == g_badge) return;
+    g_badge = text;
     RefreshOverlay();
 }
 

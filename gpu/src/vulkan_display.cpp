@@ -723,6 +723,7 @@ void VulkanDisplay::DrawOverlay(VkImage target) {
     x = std::uint32_t(std::max(0, shown_x0_.load())) + 16;
     y = extent_.height / 9;
 #endif
+    if (overlay_right_.load() && extent_.width > overlay_width_ + 32) x = extent_.width - overlay_width_ - 16;
     if (x + 16 >= extent_.width) x = 16;
     if (y + 16 >= extent_.height) y = 16;
     const std::uint32_t w = std::min(overlay_width_, extent_.width > x ? extent_.width - x : 0u);

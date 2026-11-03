@@ -64,6 +64,7 @@ public:
         overlay_height_ = height;
         ++overlay_generation_;
     }
+    void SetOverlayRight(bool right) override { overlay_right_.store(right); }
     void SetTitle(const std::string& title) override {
         std::lock_guard<std::mutex> hold(title_lock_);
         title_ = title;
@@ -162,6 +163,7 @@ protected:
     std::vector<std::uint32_t> overlay_;
     std::uint32_t overlay_width_ = 0, overlay_height_ = 0;
     std::uint64_t overlay_generation_ = 1;      // a SetOverlay's
+    std::atomic<bool> overlay_right_{false};    // SetOverlayRight's: the top right
     std::shared_ptr<VblankWatch> vblank_watch_;     // RefreshTiming's (null: no such thread)
     std::atomic<std::int32_t> shown_x0_{0}, shown_y0_{0}, shown_w_{1}, shown_h_{1};
 

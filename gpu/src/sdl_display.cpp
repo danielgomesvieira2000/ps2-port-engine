@@ -112,7 +112,12 @@ private:
             SDL_UpdateTexture(overlay_texture_, nullptr, overlay_.data(), int(overlay_width_ * 4));
             overlay_uploaded_ = overlay_generation_;
         }
-        const SDL_FRect place{16.0f, 16.0f, float(overlay_width_), float(overlay_height_)};
+        float left = 16.0f;
+        int out_w = 0, out_h = 0;
+        if (overlay_right_.load() && SDL_GetCurrentRenderOutputSize(renderer_, &out_w, &out_h) &&
+            out_w > int(overlay_width_) + 32)
+            left = float(out_w - int(overlay_width_) - 16);
+        const SDL_FRect place{left, 16.0f, float(overlay_width_), float(overlay_height_)};
         SDL_RenderTexture(renderer_, overlay_texture_, nullptr, &place);
     }
     void CountPresent() {
