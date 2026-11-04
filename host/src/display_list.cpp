@@ -175,9 +175,15 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
             if (Plausible(fa)) scale[k & 3] = std::max(scale[k & 3], std::fabs(fa));
             if (Plausible(fb)) scale[k & 3] = std::max(scale[k & 3], std::fabs(fb));
         }
+        u32 row_skipped = 0;        // a row stepped alone: its words up to here left the newer step's
+        const auto steps_alone = [&](u32 row) {
+            for (const auto& r : o.step_rows)
+                if (r.words == y.words && row >= r.first_row && row < r.end_row) return true;
+            return false;
+        };
         for (u32 k = 0; k < y.words; ++k) {
             const u32 wa = a[x.at + 1 + k], wb = b[y.at + 1 + k];
-            if (wa == wb || skipped(y.at + 1 + k)) continue;
+            if (k < row_skipped || wa == wb || skipped(y.at + 1 + k)) continue;
             const float fa = Float(wa), fb = Float(wb);
             if (!Plausible(fa) || !Plausible(fb) || !(std::fabs(fb - fa) < o.cut)) continue;
             plan.changed.push_back({y.at + 1 + k, fb - fa});
@@ -212,6 +218,18 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
             (void)moving;
             const bool wraps = fa >= 0.0f && fa <= 1.0f && fb >= 0.0f && fb <= 1.0f && std::fabs(fb - fa) > 0.5f &&
                                had_before && (before > 0) != (fb - fa > 0) && std::fabs(before) < 0.5f;
+            if ((wraps || (!steady && std::fabs(fb - fa) > o.jump * scale[k & 3])) && steps_alone(k / 4)) {
+                // This row alone the newer step's (its words already planned taken back).
+                const u32 row_at = y.at + 1 + (k / 4) * 4;
+                while (plan.at.size() > mark && plan.at.back() >= row_at) {
+                    plan.at.pop_back();
+                    plan.from.pop_back();
+                    plan.to.pop_back();
+                    plan.segment.pop_back();
+                }
+                row_skipped = (k / 4 + 1) * 4;
+                continue;
+            }
             if (wraps || (!steady && std::fabs(fb - fa) > o.jump * scale[k & 3])) {
                 plan.at.resize(mark);
                 plan.from.resize(mark);

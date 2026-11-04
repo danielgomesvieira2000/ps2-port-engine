@@ -33,6 +33,8 @@
 
 #include "ps2host/run.h"
 
+#include <vector>
+
 namespace ps2host {
 
 struct ListBlendOptions {
@@ -67,6 +69,14 @@ struct ListBlendOptions {
     // Mosquito's bodies, deformed by the EE each step). Off: a batch's own
     // data may be read as other than coordinates (Outbreak's decal CLUTs).
     bool blend_flg = false;
+    // Rows (quadwords) a jump steps alone, the rest of the thing blended:
+    // UNPACKs of `words` words, rows first_row to end_row. Outbreak's things'
+    // 992-word headers have their lights at rows 14-23 (bones from 24): a
+    // light's slot given to another lamp stepped the whole character.
+    struct StepRows {
+        u32 words, first_row, end_row;
+    };
+    std::vector<StepRows> step_rows;
 };
 
 struct ListBlend {
