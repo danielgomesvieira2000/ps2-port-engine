@@ -52,7 +52,10 @@ struct ListBlendOptions {
     u32 skip_window = 8;
     // The segment that is the camera (its view's matrices: Outbreak's 1, the
     // first after the list's start): its jump the cut, and only it (a flash
-    // of light makes many things jump at once); -1: `cut_share` decides.
+    // of light makes many things jump at once); -1: `cut_share` decides; -2:
+    // never a cut (a list whose cut another list decides: Outbreak's others,
+    // their camera list 0's - File #2's characters' list's segment 1 is a
+    // tree, and its going unmatched cancelled the list's blend).
     int cut_segment = -1;
     // Its view: these rows (quadwords) of its first UNPACK of floats, each
     // turned or moved by more than `jump` of its own length the cut (not its

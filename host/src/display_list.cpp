@@ -505,7 +505,8 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
     }
     if (o.cut_segment >= 0 && r.view >= o.new_view && float(r.unmatched) >= o.new_share * float(r.segments))
         camera_cut = true;
-    if (o.cut_segment >= 0 ? camera_cut : matched && float(r.jumps + r.moved) > o.cut_share * float(matched)) {
+    if (o.cut_segment == -2 ? false
+                            : o.cut_segment >= 0 ? camera_cut : matched && float(r.jumps + r.moved) > o.cut_share * float(matched)) {
         r.cut = true;
         plan.at.clear();
         plan.from.clear();
