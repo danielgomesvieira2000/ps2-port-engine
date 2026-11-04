@@ -112,11 +112,23 @@ float Distance(const std::vector<u32>& a, const Code& ca, const std::vector<u32>
 /* A matched pair's words to blend, added to `plan` - false (none added) if
    one jumps. The newer list's words [skip_lo, skip_hi) are left out (the
    camera's view, planned apart: PlanCamera). */
+// The plan before's changes (ListBlendPlan::changed), by the older list's
+// word (the plan before's newer list): this step's PlanListBlend's.
+thread_local const std::vector<std::pair<u32, float>>* t_before = nullptr;
+
+bool ChangedBefore(u32 at, float* change) {
+    if (!t_before || t_before->empty()) return false;
+    const auto p = std::lower_bound(t_before->begin(), t_before->end(), std::make_pair(at, -1e30f));
+    if (p == t_before->end() || p->first != at) return false;
+    *change = p->second;
+    return true;
+}
+
 bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, const std::vector<u32>& b,
               const std::vector<Code>& cb, const Segment& s, const ListBlendOptions& o, ListBlendPlan& plan,
               const std::vector<u32>* moving, u32 skip_lo = 0, u32 skip_hi = 0, float* worst = nullptr,
               u32 segment = 0) {
-    const size_t mark = plan.at.size();
+    const size_t mark = plan.at.size(), changed_mark = plan.changed.size();
     float most = 0.0f;              // the largest move, as a share of its jump
     const auto skipped = [&](u32 at) { return at >= skip_lo && at < skip_hi; };
     for (u32 j = s.first; j < s.end; ++j) {
@@ -141,6 +153,19 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
             if (wa == wb || skipped(y.at + 1 + k)) continue;
             const float fa = Float(wa), fb = Float(wb);
             if (!Plausible(fa) || !Plausible(fb) || !(std::fabs(fb - fa) < o.cut)) continue;
+            plan.changed.push_back({y.at + 1 + k, fb - fa});
+            // A texture's cell (a multiple of 1/64 within 0-1 at both ends:
+            // an animated sprite's cell in its atlas, File #2's smoke, 0.25
+            // and 0.125 steps) is the newer step's: blended, half of two
+            // cells, and at the atlas's wrap an unrelated one. The rest of
+            // the thing blends on (the puff rising smoothly).
+            if (fa >= 0.0f && fa <= 1.0f && fb >= 0.0f && fb <= 1.0f && std::floor(fa * 64.0f) == fa * 64.0f &&
+                std::floor(fb * 64.0f) == fb * 64.0f)
+                continue;
+            // A value moving on as it moved the step before is motion, not a jump.
+            float before = 0.0f;
+            const bool steady = ChangedBefore(x.at + 1 + k, &before) && (before > 0) == (fb - fa > 0) &&
+                                std::fabs((fb - fa) - before) <= 0.25f * std::fabs(fb - fa);
             // (one word so is enough: a flickering light's billboard, its w
             // jumping, blended is a beam across the room). A value within 0-1
             // at both ends, moving the step before, that moves by more than
@@ -154,14 +179,26 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
             // apart for a picture.
             const bool wraps = fa >= 0.0f && fa <= 1.0f && fb >= 0.0f && fb <= 1.0f && std::fabs(fb - fa) > 0.5f &&
                                moving && std::binary_search(moving->begin(), moving->end(), x.at + 1 + k);
-            if (wraps || std::fabs(fb - fa) > o.jump * scale[k & 3]) {
+            if (wraps || (!steady && std::fabs(fb - fa) > o.jump * scale[k & 3])) {
                 plan.at.resize(mark);
                 plan.from.resize(mark);
                 plan.to.resize(mark);
                 plan.segment.resize(mark);
+                // (its changes kept all the same: the next step's steady test)
+                for (u32 q = j; q < s.end; ++q) {
+                    const Code& yq = cb[q];
+                    const Code& xq = ca[sa + (q - s.first)];
+                    if (!yq.floats || !yq.words || ((yq.code & 0x8000) && !o.blend_flg)) continue;
+                    for (u32 r = q == j ? k + 1 : 0; r < yq.words; ++r) {
+                        const float ga = Float(a[xq.at + 1 + r]), gb = Float(b[yq.at + 1 + r]);
+                        if (a[xq.at + 1 + r] != b[yq.at + 1 + r] && Plausible(ga) && Plausible(gb))
+                            plan.changed.push_back({yq.at + 1 + r, gb - ga});
+                    }
+                }
+                (void)changed_mark;
                 return false;
             }
-            if (scale[k & 3] > 0.0f) most = std::max(most, std::fabs(fb - fa) / (o.jump * scale[k & 3]));
+            if (scale[k & 3] > 0.0f && !steady) most = std::max(most, std::fabs(fb - fa) / (o.jump * scale[k & 3]));
             plan.at.push_back(y.at + 1 + k);
             plan.from.push_back(fa);
             plan.to.push_back(fb);
@@ -242,6 +279,15 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
     plan.from.clear();
     plan.to.clear();
     plan.segment.clear();
+    // The changes the plan before found (this plan's, a step ago) for its
+    // steady test, then this step's anew.
+    static thread_local std::vector<std::pair<u32, float>> before;
+    before.swap(plan.changed);
+    plan.changed.clear();
+    t_before = &before;
+    struct Forget {
+        ~Forget() { t_before = nullptr; }
+    } forget;
     ListBlend& r = plan.stats;
     r = ListBlend{};
     static thread_local std::vector<Code> ca, cb;
@@ -283,6 +329,14 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
                                                     (best > expected ? best - expected : expected - best));
             if (nearer) { best = i; best_d = d; best_words = words; }
         };
+        // The list's order first: the first unused one of its codes from where
+        // the last match left off, a few places on at most.
+        u32 in_order = ~0u;
+        for (auto p = at; p != hi && p->second <= expected + o.skip_window; ++p)
+            if (!used[p->second]) {
+                in_order = p->second;
+                break;
+            }
         int n = 0;
         for (auto p = at; p != hi && n < 16; ++p, ++n) try_one(p->second);
         n = 0;
@@ -291,8 +345,15 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
         // match drew with other codes this step - more batches, its detail -
         // paired with another of the codes it now has) is not one. (The
         // camera is one of a kind, and its lights may flash.)
-        if (best != ~0u && best != expected && !camera &&
-            best_d > o.moved_distance * float(std::max(1u, best_words)))
+        const auto near = [&](float d, u32 words) { return d <= o.moved_distance * float(std::max(1u, words)); };
+        if (in_order != ~0u && in_order != best) {
+            u32 words = 0;
+            const float d = Distance(a.words, ca[sa[in_order].first], b.words, cb[s.first], &words);
+            // In order wins, unless it is out of its place and far while a near one is elsewhere.
+            const bool near_elsewhere = best != ~0u && near(best_d, best_words);
+            if (in_order == expected || near(d, words) || !near_elsewhere) best = in_order, best_d = d, best_words = words;
+        }
+        if (best != ~0u && best != expected && best != in_order && !camera && !near(best_d, best_words))
             best = ~0u;
         if (best == ~0u) {
             ++r.unmatched;

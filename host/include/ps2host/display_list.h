@@ -41,6 +41,13 @@ struct ListBlendOptions {
     float jump = 0.5f;          // of a lane's largest value: a jump - the segment not blended
     float cut_share = 0.2f;     // segments jumping or moved, of those matched: the camera cut
     float moved_distance = 0.02f;   // a match out of its place: its first values this far a word at most
+    // A segment's match in the list's order first: the first unused one of its
+    // codes at most this many places on from where the last match left off
+    // (things come and go before it), whatever its values - the nearest
+    // values took another copy of the same model and lost the list's order
+    // for every thing after it (Outbreak File #2's street: 19 of 63 things
+    // stepped at once). Out of its place and far, a near one elsewhere wins.
+    u32 skip_window = 8;
     // The segment that is the camera (its view's matrices: Outbreak's 1, the
     // first after the list's start): its jump the cut, and only it (a flash
     // of light makes many things jump at once); -1: `cut_share` decides.
@@ -87,6 +94,14 @@ struct ListBlendPlan {
     std::vector<float> from, to;
     std::vector<u32> segment;   // each word's segment (the newer list's), in order
     ListBlend stats;
+    // Every value of a matched pair that changed (blended or not): the newer
+    // list's word and its change - the next plan's (the same plan planned
+    // again a step on) to tell steady motion from a jump. A value moving on
+    // as it moved (within a quarter of its change, the same way) is motion:
+    // a thing's translation passing through 0 as the camera pans steadily
+    // was a jump by its lane's largest, the thing stepped while the room
+    // blended (File #1's bar: props shaking at 30 a second).
+    std::vector<std::pair<u32, float>> changed;
 };
 
 /* The blend of `a` (older) into `b` (newer), planned. `moving`: the words of
