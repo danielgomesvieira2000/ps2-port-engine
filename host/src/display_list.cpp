@@ -21,7 +21,30 @@ struct Code {
 struct Segment {
     u64 key;        // its codes'
     u32 first, end; // its codes
+    // Its work alone: its UNPACKs, STCYCLs and microprogram calls (MSCAL,
+    // MSCALF, MSCNT), to its last call - not the next thing's set-up that
+    // may come at its end (its registers' DIRECT, a texture's DIRECTHL, an
+    // MPG with BASE and OFFSET, a last UNPACK), which changes its key from
+    // step to step though the thing is the same (File #1's floor items,
+    // lamp glows, shadows: unmatched, stepped while the room blended).
+    u64 work;
 };
+
+bool Unpack(u32 code);
+
+u64 WorkKey(const std::vector<Code>& codes, u32 first, u32 end) {
+    u32 last = end;
+    for (u32 j = first; j < end; ++j) {
+        const u32 cmd = (codes[j].code >> 24) & 0x7F;
+        if (cmd == 0x14 || cmd == 0x15 || cmd == 0x17) last = j + 1;
+    }
+    u64 key = 1469598103934665603ull;
+    for (u32 j = first; j < last; ++j) {
+        const u32 code = codes[j].code, cmd = (code >> 24) & 0x7F;
+        if (Unpack(code) || cmd == 0x01 || cmd == 0x14 || cmd == 0x15 || cmd == 0x17) key = (key ^ code) * 1099511628211ull;
+    }
+    return key;
+}
 
 /* A VIF code's data, in words after it. `cl`, `wl`: STCYCL's cycle - an
    UNPACK writing more than it reads (WL > CL, filling: Mister Mosquito's)
@@ -75,13 +98,13 @@ void Split(const std::vector<Code>& codes, int address, std::vector<Segment>& se
         // (an UNPACK's address with FLG set is the double buffer's: a batch of
         // vertices within a thing, not a thing's start)
         if (j > first && address >= 0 && Unpack(code) && !(code & 0x8000) && int(code & 0x3FF) == address) {
-            segments.push_back({key, first, j});
+            segments.push_back({key, first, j, WorkKey(codes, first, j)});
             first = j;
             key = 1469598103934665603ull;
         }
         key = (key ^ code) * 1099511628211ull;
     }
-    if (first < codes.size()) segments.push_back({key, first, u32(codes.size())});
+    if (first < codes.size()) segments.push_back({key, first, u32(codes.size()), WorkKey(codes, first, u32(codes.size()))});
 }
 
 bool Plausible(float v) { return v == 0.0f || (std::fabs(v) > 1e-6f && std::fabs(v) < 1e9f); }
@@ -127,13 +150,17 @@ bool ChangedBefore(u32 at, float* change) {
 bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, const std::vector<u32>& b,
               const std::vector<Code>& cb, const Segment& s, const ListBlendOptions& o, ListBlendPlan& plan,
               const std::vector<u32>* moving, u32 skip_lo = 0, u32 skip_hi = 0, float* worst = nullptr,
-              u32 segment = 0) {
+              u32 segment = 0, const std::vector<u32>* pairing = nullptr) {
+    // The older list's code for the newer's j: the same place in the
+    // segment, or `pairing`'s (~0u: none).
+    const auto older = [&](u32 j) { return pairing ? (*pairing)[j - s.first] : sa + (j - s.first); };
     const size_t mark = plan.at.size(), changed_mark = plan.changed.size();
     float most = 0.0f;              // the largest move, as a share of its jump
     const auto skipped = [&](u32 at) { return at >= skip_lo && at < skip_hi; };
     for (u32 j = s.first; j < s.end; ++j) {
+        if (older(j) == ~0u) continue;
         const Code& y = cb[j];
-        const Code& x = ca[sa + (j - s.first)];
+        const Code& x = ca[older(j)];
         // (Not an UNPACK to the double buffer, FLG: a batch's own data -
         // model-space vertices, the same each step, and where not, values
         // the program reads as other than coordinates: Outbreak's decal
@@ -154,6 +181,8 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
             const float fa = Float(wa), fb = Float(wb);
             if (!Plausible(fa) || !Plausible(fb) || !(std::fabs(fb - fa) < o.cut)) continue;
             plan.changed.push_back({y.at + 1 + k, fb - fa});
+            float before = 0.0f;
+            const bool had_before = ChangedBefore(x.at + 1 + k, &before);
             // A texture's cell (a multiple of 1/64 within 0-1 at both ends:
             // an animated sprite's cell in its atlas, File #2's smoke, 0.25
             // and 0.125 steps) is the newer step's: blended, half of two
@@ -163,8 +192,7 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
                 std::floor(fb * 64.0f) == fb * 64.0f)
                 continue;
             // A value moving on as it moved the step before is motion, not a jump.
-            float before = 0.0f;
-            const bool steady = ChangedBefore(x.at + 1 + k, &before) && (before > 0) == (fb - fa > 0) &&
+            const bool steady = had_before && (before > 0) == (fb - fa > 0) &&
                                 std::fabs((fb - fa) - before) <= 0.25f * std::fabs(fb - fa);
             // (one word so is enough: a flickering light's billboard, its w
             // jumping, blended is a beam across the room). A value within 0-1
@@ -177,8 +205,13 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
             // 1, in every lit thing's values): blended with the rest - stepped
             // in some things and blended in others, the layers of one wall
             // apart for a picture.
+            // (A wrap turns a small steady motion back - +1/24, then -23/24 - not
+            // any value of 0-1 that moved and moves by more than half: a bone's
+            // rotation, a light's direction, a prop's row moving fast stepped
+            // whole characters.)
+            (void)moving;
             const bool wraps = fa >= 0.0f && fa <= 1.0f && fb >= 0.0f && fb <= 1.0f && std::fabs(fb - fa) > 0.5f &&
-                               moving && std::binary_search(moving->begin(), moving->end(), x.at + 1 + k);
+                               had_before && (before > 0) != (fb - fa > 0) && std::fabs(before) < 0.5f;
             if (wraps || (!steady && std::fabs(fb - fa) > o.jump * scale[k & 3])) {
                 plan.at.resize(mark);
                 plan.from.resize(mark);
@@ -186,8 +219,9 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
                 plan.segment.resize(mark);
                 // (its changes kept all the same: the next step's steady test)
                 for (u32 q = j; q < s.end; ++q) {
+                    if (older(q) == ~0u) continue;
                     const Code& yq = cb[q];
-                    const Code& xq = ca[sa + (q - s.first)];
+                    const Code& xq = ca[older(q)];
                     if (!yq.floats || !yq.words || ((yq.code & 0x8000) && !o.blend_flg)) continue;
                     for (u32 r = q == j ? k + 1 : 0; r < yq.words; ++r) {
                         const float ga = Float(a[xq.at + 1 + r]), gb = Float(b[yq.at + 1 + r]);
@@ -311,6 +345,8 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
 
     u32 expected = 0, matched = 0;
     bool camera_cut = false;        // (options.cut_segment's)
+    static thread_local std::vector<std::pair<u32, u32>> unmatched;     // (newer segment, where its match was expected)
+    unmatched.clear();
     for (u32 jb = 0; jb < sb.size(); ++jb) {
         const Segment& s = sb[jb];
         const bool camera = int(jb) == o.cut_segment;
@@ -357,7 +393,8 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
             best = ~0u;
         if (best == ~0u) {
             ++r.unmatched;
-            camera_cut |= camera;
+            if (camera) camera_cut = true;
+            else unmatched.push_back({jb, expected});
             continue;
         }
         used[best] = true;
@@ -386,6 +423,67 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
         }
         if (worst > 0.5f) ++r.near;
         if (worst > r.worst) r.worst = worst, r.worst_segment = jb;
+    }
+    // Second: the things left unmatched by their work alone (Segment::work),
+    // among the unused near where each was expected - the nearest values,
+    // near enough - their UNPACKs paired in order.
+    static thread_local std::vector<u32> pairing, older_unpacks;
+    for (const auto& [jb, near_at] : unmatched) {
+        const Segment& s = sb[jb];
+        u32 best = ~0u, best_words = 0;
+        float best_d = 0.0f;
+        const u32 from = near_at > o.skip_window ? near_at - o.skip_window : 0;
+        for (u32 i = from; i < sa.size() && i <= near_at + o.skip_window; ++i) {
+            if (used[i] || sa[i].work != s.work || ca[sa[i].first].code != cb[s.first].code ||
+                ca[sa[i].first].words != cb[s.first].words || !cb[s.first].floats)
+                continue;
+            u32 words = 0;
+            const float d = Distance(a.words, ca[sa[i].first], b.words, cb[s.first], &words);
+            if (best == ~0u || d < best_d) best = i, best_d = d, best_words = words;
+        }
+        if (best == ~0u || best_d > 0.1f * float(std::max(1u, best_words))) continue;
+        older_unpacks.clear();
+        for (u32 i = sa[best].first; i < sa[best].end; ++i)
+            if (Unpack(ca[i].code)) older_unpacks.push_back(i);
+        pairing.assign(s.end - s.first, ~0u);
+        size_t n = 0;
+        for (u32 j = s.first; j < s.end && n < older_unpacks.size(); ++j) {
+            if (!Unpack(cb[j].code)) continue;
+            if (ca[older_unpacks[n]].code == cb[j].code && ca[older_unpacks[n]].words == cb[j].words)
+                pairing[j - s.first] = older_unpacks[n];
+            ++n;
+        }
+        used[best] = true;
+        ++matched;
+        ++r.moved;
+        --r.unmatched;
+        float worst = 0.0f;
+        if (!PlanPair(a.words, ca, sa[best].first, b.words, cb, s, o, plan, moving, 0, 0, &worst, jb, &pairing)) {
+            ++r.jumps;
+            continue;
+        }
+        if (worst > 0.5f) ++r.near;
+        if (worst > r.worst) r.worst = worst, r.worst_segment = jb;
+    }
+    if (!unmatched.empty()) {
+        // (the plan in the newer list's order again: its words, and its changes searched)
+        static thread_local std::vector<u32> order;
+        order.resize(plan.at.size());
+        for (u32 i = 0; i < order.size(); ++i) order[i] = i;
+        std::sort(order.begin(), order.end(), [&](u32 x, u32 y) { return plan.at[x] < plan.at[y]; });
+        ListBlendPlan sorted;
+        sorted.at.reserve(order.size());
+        for (u32 i : order) {
+            sorted.at.push_back(plan.at[i]);
+            sorted.from.push_back(plan.from[i]);
+            sorted.to.push_back(plan.to[i]);
+            sorted.segment.push_back(plan.segment[i]);
+        }
+        plan.at.swap(sorted.at);
+        plan.from.swap(sorted.from);
+        plan.to.swap(sorted.to);
+        plan.segment.swap(sorted.segment);
+        std::sort(plan.changed.begin(), plan.changed.end());
     }
     if (o.cut_segment >= 0 && r.view >= o.new_view && float(r.unmatched) >= o.new_share * float(r.segments))
         camera_cut = true;
