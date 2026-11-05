@@ -207,6 +207,22 @@ each blank from 0x0029FA08 by its own blank handler).
    as a jump and never blends the double buffer's (FLG) data. Hunt the rest
    with long wanders (the game's health cheat on, so the player survives),
    every picture scanned, the worst bisected word by word.
+   **Profile the motion, not only the pictures**: a judder is a thing that
+   moves on a step's picture and stands on the next. `ps2host::ListMotion`
+   (Outbreak's `RE_MOTION_TRACE=<file.csv>`) writes each picture's things'
+   moves as sent; `engine/tools/list_motion.py` ranks the things stepped or
+   uneven and the steps where all stepped (cuts). Pictures' phase
+   correlation is no measure in a dark scene - it locks on the player.
+   `PS2HOST_BLEND_JUMPS=1` logs why each thing jumped (its word, the values,
+   its lane's scale, its change the step before).
+   **A camera that turns** (Outbreak's RE4 style, behind the shoulder) broke
+   three rules made with fixed cameras: judge the view's axis rows together
+   (`view_axes_end` - a turn hands length from one row to another, a short
+   row's step read as a cut every 60 degrees); a screen matrix's
+   translations move 1e6 a step - past `cut`, blended only while steady
+   (`cut_steady`), or every prop shakes; and a cut by less than a cut's
+   length is a sudden move (`view_sudden`). Test with the camera turning on
+   the spot, not only walking.
 4. Configure `steps_per_blank = 0.5`, `default_rate = "30"`: the engine's
    rate, steps and picture time then work for 60, 120 and the screen's (the
    F9 panel's FRAME RATE row shows 30/60/120/screen for such a game). Set the

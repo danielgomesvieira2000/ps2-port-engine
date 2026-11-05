@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace ps2host {
@@ -185,10 +187,16 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
             const u32 wa = a[x.at + 1 + k], wb = b[y.at + 1 + k];
             if (k < row_skipped || wa == wb || skipped(y.at + 1 + k)) continue;
             const float fa = Float(wa), fb = Float(wb);
-            if (!Plausible(fa) || !Plausible(fb) || !(std::fabs(fb - fa) < o.cut)) continue;
-            plan.changed.push_back({y.at + 1 + k, fb - fa});
+            if (!Plausible(fa) || !Plausible(fb)) continue;
             float before = 0.0f;
             const bool had_before = ChangedBefore(x.at + 1 + k, &before);
+            const float change = fb - fa;
+            bool past_cut = !(std::fabs(change) < o.cut);
+            if (past_cut && o.cut_steady && had_before && (before > 0) == (change > 0) &&
+                std::fabs(before) * 3.0f >= std::fabs(change) && std::fabs(before) <= 3.0f * std::fabs(change))
+                past_cut = false;           // (moving on steadily: blended)
+            if (past_cut && !o.cut_steady) continue;
+            plan.changed.push_back({y.at + 1 + k, change});
             // A texture's cell (a multiple of 1/64 within 0-1 at both ends:
             // an animated sprite's cell in its atlas, File #2's smoke, 0.25
             // and 0.125 steps) is the newer step's: blended, half of two
@@ -218,7 +226,8 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
             (void)moving;
             const bool wraps = fa >= 0.0f && fa <= 1.0f && fb >= 0.0f && fb <= 1.0f && std::fabs(fb - fa) > 0.5f &&
                                had_before && (before > 0) != (fb - fa > 0) && std::fabs(before) < 0.5f;
-            if ((wraps || (!steady && std::fabs(fb - fa) > o.jump * scale[k & 3])) && steps_alone(k / 4)) {
+            const bool jumps = wraps || past_cut || (!steady && std::fabs(fb - fa) > o.jump * scale[k & 3]);
+            if (jumps && steps_alone(k / 4)) {
                 // This row alone the newer step's (its words already planned taken back).
                 const u32 row_at = y.at + 1 + (k / 4) * 4;
                 while (plan.at.size() > mark && plan.at.back() >= row_at) {
@@ -230,7 +239,11 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
                 row_skipped = (k / 4 + 1) * 4;
                 continue;
             }
-            if (wraps || (!steady && std::fabs(fb - fa) > o.jump * scale[k & 3])) {
+            if (jumps) {
+                static const bool jump_log = std::getenv("PS2HOST_BLEND_JUMPS") != nullptr;
+                if (jump_log)
+                    std::fprintf(stderr, "[jump] segment %u words %u word %u: %g -> %g (scale %g, before %g%s)%s%s\n", segment, y.words, k, fa, fb,
+                                 scale[k & 3], had_before ? before : 0.0f, had_before ? "" : " none", wraps ? " wraps" : "", past_cut ? " past the cut" : "");
                 plan.at.resize(mark);
                 plan.from.resize(mark);
                 plan.to.resize(mark);
@@ -282,7 +295,8 @@ void PlanCamera(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, 
             const u32 wa = a[x.at + (at - y.at)], wb = b[at];
             if (wa == wb) continue;
             const float fa = Float(wa), fb = Float(wb);
-            if (!Plausible(fa) || !Plausible(fb) || !(std::fabs(fb - fa) < o.cut)) continue;
+            // (with cut_steady, the view whatever its move: its cut is ViewJumps')
+            if (!Plausible(fa) || !Plausible(fb) || (!o.cut_steady && !(std::fabs(fb - fa) < o.cut))) continue;
             plan.at.push_back(at);
             plan.from.push_back(fa);
             plan.to.push_back(fb);
@@ -294,31 +308,41 @@ void PlanCamera(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, 
 }
 
 /* The camera's segment's view (rows `first` to `end` of its first UNPACK of
-   floats) turned or moved by more than `jump` of a row's own length: the
-   camera cut. Its lanes' largest are its translations' (a projection's reach
-   2e7), by which no turn is a jump - a cut from one corner of a room to
-   another blended through the walls. */
+   floats) turned or moved by more than `jump` of a row's own length - its
+   axes' rows (`first` to `axes_end`) by their length together: the camera
+   cut. Its lanes' largest are its translations' (a projection's reach 2e7),
+   by which no turn is a jump - a cut from one corner of a room to another
+   blended through the walls. */
 bool ViewJumps(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, const std::vector<u32>& b,
-               const std::vector<Code>& cb, const Segment& s, float jump, u32 first, u32 end, float* share) {
+               const std::vector<Code>& cb, const Segment& s, float jump, u32 first, u32 axes_end, u32 end,
+               float* share) {
     for (u32 j = s.first; j < s.end; ++j) {
         const Code& y = cb[j];
         const Code& x = ca[sa + (j - s.first)];
         if (!y.floats || !y.words || x.words != y.words) continue;
-        for (u32 k = first * 4; k + 4 <= y.words && k < end * 4; k += 4) {
+        bool cut = false;
+        // (rows of one group: the axes, then each row on alone)
+        const auto judge = [&](u32 from, u32 to) {
             float d = 0.0f, la = 0.0f, lb = 0.0f;
             bool plausible = true;
-            for (u32 l = 0; l < 4; ++l) {
-                const float fa = Float(a[x.at + 1 + k + l]), fb = Float(b[y.at + 1 + k + l]);
+            for (u32 k = from * 4; k < to * 4 && k < y.words; ++k) {
+                const float fa = Float(a[x.at + 1 + k]), fb = Float(b[y.at + 1 + k]);
                 plausible &= Plausible(fa) && Plausible(fb);
                 d += (fb - fa) * (fb - fa);
                 la += fa * fa;
                 lb += fb * fb;
             }
-            if (plausible && std::max(la, lb) > 1e-6f)
-                *share = std::max(*share, std::sqrt(d / std::max(la, lb)) / jump);
-            if (plausible && d > jump * jump * std::max(la, lb) && std::max(la, lb) > 1e-6f) return true;
+            if (!plausible || std::max(la, lb) <= 1e-6f) return;
+            *share = std::max(*share, std::sqrt(d / std::max(la, lb)) / jump);
+            if (d > jump * jump * std::max(la, lb)) cut = true;
+        };
+        u32 row = first;
+        if (axes_end > first) {
+            if (u32(axes_end) * 4 <= y.words) judge(first, std::min(axes_end, end));
+            row = std::min(axes_end, end);
         }
-        return false;
+        for (; row < end && (row + 1) * 4 <= y.words; ++row) judge(row, row + 1);
+        return cut;
     }
     return false;
 }
@@ -341,6 +365,7 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
         ~Forget() { t_before = nullptr; }
     } forget;
     ListBlend& r = plan.stats;
+    const float view_before = r.view;     // (this plan's a step ago: the camera's move then)
     r = ListBlend{};
     static thread_local std::vector<Code> ca, cb;
     static thread_local std::vector<Segment> sa, sb;
@@ -427,8 +452,8 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
             // still for a step, then on).
             // (Out of its place is no cut: a thing before it came or went -
             // the virus gauge.)
-            camera_cut |= ViewJumps(a.words, ca, sa[best].first, b.words, cb, s, o.jump, o.view_first, o.view_end,
-                                    &r.view);
+            camera_cut |= ViewJumps(a.words, ca, sa[best].first, b.words, cb, s, o.jump, o.view_first,
+                                    o.view_axes_end, o.view_end, &r.view);
             float worst = 0.0f;
             PlanCamera(a.words, ca, sa[best].first, b.words, cb, s, o, plan, moving, &worst, jb);
             if (worst > r.worst) r.worst = worst, r.worst_segment = jb;
@@ -505,6 +530,9 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
     }
     if (o.cut_segment >= 0 && r.view >= o.new_view && float(r.unmatched) >= o.new_share * float(r.segments))
         camera_cut = true;
+    if (o.cut_segment >= 0 && o.view_sudden > 0.0f && r.view >= o.view_sudden_least &&
+        r.view >= o.view_sudden * (view_before + 0.01f))
+        camera_cut = true;
     if (o.cut_segment == -2 ? false
                             : o.cut_segment >= 0 ? camera_cut : matched && float(r.jumps + r.moved) > o.cut_share * float(matched)) {
         r.cut = true;
@@ -558,6 +586,44 @@ void GsRegisterWrites(const std::vector<u32>& words, const std::vector<u32>& reg
             }
         }
     }
+}
+
+void ListMotion::Picture(const std::vector<u32>& words, size_t end, int segment_address, unsigned long long frame,
+                         float t, bool step, FILE* file) {
+    if (!file) return;
+    static thread_local std::vector<u32> part;
+    part.assign(words.begin(), words.begin() + std::min(end, words.size()));
+    static thread_local std::vector<Code> codes;
+    static thread_local std::vector<Segment> segments;
+    Parse(part, codes);
+    Split(codes, segment_address, segments);
+    std::unordered_map<u64, std::vector<float>> now;
+    std::unordered_map<u64, u32> copies;
+    for (u32 i = 0; i < segments.size(); ++i) {
+        const Segment& s = segments[i];
+        const u32 copy = copies[s.key]++;
+        const u64 id = s.key * 31 + copy;
+        const Code* first = nullptr;
+        for (u32 j = s.first; j < s.end && !first; ++j)
+            if (codes[j].floats && codes[j].words && !(codes[j].code & 0x8000)) first = &codes[j];
+        if (!first) continue;
+        std::vector<float>& v = now[id];
+        v.resize(first->words);
+        for (u32 k = 0; k < first->words; ++k) {
+            const float f = Float(part[first->at + 1 + k]);
+            v[k] = Plausible(f) && std::fabs(f) < 1e8f ? f : 0.0f;
+        }
+        const auto was = last_.find(id);
+        if (was == last_.end() || was->second.size() != v.size()) continue;
+        double d = 0.0, n = 0.0;
+        for (size_t k = 0; k < v.size(); ++k) {
+            d += double(v[k] - was->second[k]) * (v[k] - was->second[k]);
+            n += double(v[k]) * v[k];
+        }
+        std::fprintf(file, "%llu,%u,%016llx,%u,%u,%.6g,%.6g,%.3f,%d\n", frame, i, (unsigned long long)s.key, copy,
+                     first->words, std::sqrt(d), std::sqrt(n), t, step ? 1 : 0);
+    }
+    last_.swap(now);
 }
 
 ListBlend BlendVif1Chains(const Vif1Chain& a, const Vif1Chain& b, float t, float cut, Vif1Chain& out) {
