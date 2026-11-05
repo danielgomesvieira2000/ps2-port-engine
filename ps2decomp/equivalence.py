@@ -247,7 +247,10 @@ def _build(paths, work: str) -> str:
     all_sources = list(paths) + [os.path.join(runtime, name) for name in
                                  ("eefpu.cpp", "eeint.cpp", "lifted_support.cpp", "vu0.cpp")]
     cppcheck._BUILDS += 1
-    dll = os.path.join(work, "equivalence_%d_%d.dll" % (os.getpid(), cppcheck._BUILDS))
+    dll = os.path.join(work, "equivalence_%d_%d%s" % (os.getpid(), cppcheck._BUILDS, cppcheck.SHARED_SUFFIX))
+    if os.name != "nt":
+        cppcheck.compile_shared(all_sources, dll, [os.path.join(cppcheck.RUNTIME, "include")], work)
+        return dll
     # The sources go in a response file: a hundred and more paths are longer than
     # the 8,191 characters a cmd command line may be.
     response = os.path.join(work, "sources.rsp")
