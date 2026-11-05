@@ -481,6 +481,8 @@ bool TakeHostMouse(HostMouseState* state) {
         state->pressed = m.pressed;
         state->wheel = m.wheel;
         state->moved = m.moved;
+        state->dx = m.dx;
+        state->dy = m.dy;
         return true;
     }
 #endif
@@ -571,6 +573,13 @@ bool WindowDesktopArea(int* x, int* y, int* w, int* h) {
 #endif
     (void)x, (void)y, (void)w, (void)h;
     return false;
+}
+
+void SetMouseCaptured(bool on) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetMouseCaptured(on);
+#endif
+    (void)on;
 }
 
 void RaiseWindow() {
@@ -888,6 +897,13 @@ void SetWindowStatus(const std::string& status) {
 
 void SetWindowAspect(const std::string& aspect) {
     SetSetting("aspect", aspect);
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetAspect(SettingAspect());
+#endif
+}
+
+void RunWindowAspect(const std::string& aspect) {
+    RunSetting("aspect", aspect);
 #ifdef PS2HOST_VULKAN
     if (g_display) g_display->SetAspect(SettingAspect());
 #endif

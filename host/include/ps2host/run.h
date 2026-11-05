@@ -430,6 +430,8 @@ bool WindowGpuBoosted();
    window's own), shown so; and as width over height, for a game to draw it
    so - auto's the window's now. */
 void SetWindowAspect(const std::string& aspect);
+/* The same for this run alone (not written to the settings: a split screen's half). */
+void RunWindowAspect(const std::string& aspect);
 float PictureAspect();
 /* Anti-aliasing (the "antialiasing" setting): "off", the default; "fxaa"
    or "smaa" (SMAA 1x, gpu/third_party/smaa), the picture's edges smoothed
@@ -587,8 +589,13 @@ struct HostMouseState {
     u32 held = 0, pressed = 0;
     float wheel = 0.0f;
     bool moved = false;
+    float dx = 0.0f, dy = 0.0f;     // its moves since the last call, in pixels (captured too: SetMouseCaptured)
 };
 bool TakeHostMouse(HostMouseState* state);
+/* The mouse captured (hidden, held in the window, its moves alone read:
+   HostMouseState::dx, dy) - a game's mouse look; let go whenever the window
+   has not the focus. */
+void SetMouseCaptured(bool on);
 /* The window placed: its client area at x, y on the desktop, w x h pixels,
    framed or borderless (a split screen's half; out of fullscreen first) -
    at the window's next pump. WindowDesktopArea: the usable area of the

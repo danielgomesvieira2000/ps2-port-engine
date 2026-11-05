@@ -228,8 +228,13 @@ public:
         std::uint32_t held = 0, pressed = 0;
         float wheel = 0.0f;
         bool moved = false;
+        float dx = 0.0f, dy = 0.0f;     // its moves since the last TakeMouse, in pixels (captured too)
     };
     virtual bool TakeMouse(MouseState* state) { (void)state; return false; }
+    /* The mouse captured: hidden, held in the window, only its moves read
+       (a game's mouse look) - at the next Pump; let go while the window has
+       not the focus. */
+    virtual void SetMouseCaptured(bool on) { (void)on; }
     /* The game's own mouse pointer: RGBA pixels (rows top-down), the point
        that clicks at (hot_x, hot_y); scaled with the window. Shown while
        ShowGameCursor(true) - otherwise the system's (hidden in fullscreen). */

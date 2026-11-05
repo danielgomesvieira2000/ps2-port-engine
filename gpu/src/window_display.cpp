@@ -236,6 +236,13 @@ void SdlWindowDisplay::ApplyPlacement() {
         std::fprintf(stderr, "[window] placed at %d,%d, %dx%d%s\n", p.x, p.y, p.w, p.h, p.borderless ? ", borderless" : "");
     }
     if (raise_.exchange(false)) SDL_RaiseWindow(window_);
+    // The mouse captured while asked and the window has the focus (let go
+    // the moment it has not: another window's mouse is the player's).
+    const bool capture = capture_mouse_ && (SDL_GetWindowFlags(window_) & SDL_WINDOW_INPUT_FOCUS) != 0;
+    if (capture != mouse_captured_) {
+        mouse_captured_ = capture;
+        SDL_SetWindowRelativeMouseMode(window_, capture);
+    }
     if (desktop_age_++ % 120 == 0) {
         SDL_Rect r{};
         if (SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(window_), &r)) {
@@ -317,7 +324,14 @@ bool SdlWindowDisplay::Pump() {
                 SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_RIGHT_STICK))
                 capture_ = true;
         }
-        if (e.type == SDL_EVENT_MOUSE_MOTION) MouseAt(e.motion.x, e.motion.y);
+        if (e.type == SDL_EVENT_MOUSE_MOTION) {
+            {
+                std::lock_guard<std::mutex> hold(mouse_lock_);
+                mouse_.dx += e.motion.xrel;
+                mouse_.dy += e.motion.yrel;
+            }
+            if (!mouse_captured_) MouseAt(e.motion.x, e.motion.y);
+        }
         if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_UP) {
             MouseAt(e.button.x, e.button.y);
             const int bit = e.button.button == SDL_BUTTON_LEFT ? 0 : e.button.button == SDL_BUTTON_MIDDLE ? 1

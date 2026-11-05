@@ -81,6 +81,7 @@ public:
         return true;
     }
     void Raise() override { raise_ = true; }
+    void SetMouseCaptured(bool on) override { capture_mouse_ = on; }
     float WindowAspect() const override {
         int w = 0, h = 0;
         if (!window_ || !SDL_GetWindowSizeInPixels(window_, &w, &h) || w <= 0 || h <= 0) return 0.0f;
@@ -130,6 +131,7 @@ public:
         *state = mouse_;
         mouse_.pressed = 0;
         mouse_.wheel = 0.0f;
+        mouse_.dx = mouse_.dy = 0.0f;
         mouse_.moved = false;
         return true;
     }
@@ -171,6 +173,8 @@ protected:
     int desktop_[4] = {0, 0, 0, 0};         // the usable area, Pump's (DesktopArea)
     unsigned desktop_age_ = 0;
     std::atomic<bool> raise_{false};
+    std::atomic<bool> capture_mouse_{false};
+    bool mouse_captured_ = false;           // as SDL has it (Pump's)
     void ApplyPlacement();
     std::string describe_, error_;
     // Set by Pump (the main thread), read where pictures are presented (the
