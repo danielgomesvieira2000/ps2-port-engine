@@ -11,10 +11,12 @@ there, t 0.5) and the one between (all the way). A thing blended moves about
 as much in both; a thing left as the game steps it moves all of its step in
 the step's picture and stands in the other - it shakes against the rest.
 
-Judged step by step: each step's pair of pictures (the step's, the one
-after) where the thing moves (by more than --moving of its size), "stepped"
-when it moves in the step's picture and less than a fifth of that in the
-other, "uneven" when the two differ otherwise by more than half. Steps where
+Judged step by step: each step's pictures (the step's and those after it
+until the next step's: two at 60, four at 120) where the thing moves (by
+more than --moving of its size), "stepped" when it moves in the step's
+picture and less than a fifth of that in each other, "uneven" when its
+pictures' moves are otherwise unlike (the largest over twice the smallest,
+and apart by more than half of it). Steps where
 most moving things stepped are the camera's cuts (shown, not blended - as
 they should be), counted apart and left out of each thing's share.
 """
@@ -48,18 +50,21 @@ def main(argv=None) -> int:
         print("no pictures in range")
         return 1
     frames = sorted(pictures)
-    # Each step's pair: a step's picture and the next picture, not a step's.
+    # Each step's pictures: its own (the step's) and those after it until the
+    # next step's - two at 60, four at 120.
     pairs = []
-    for f in frames:
-        if f + 1 not in pictures:
-            continue
+    for i, f in enumerate(frames):
         for ident, (seg, change, size, step, words) in pictures[f].items():
-            if not step or ident not in pictures[f + 1]:
+            if not step:
                 continue
-            nxt = pictures[f + 1][ident]
-            if nxt[3]:
+            seq = [change]
+            g = f + 1
+            while g in pictures and ident in pictures[g] and not pictures[g][ident][3]:
+                seq.append(pictures[g][ident][1])
+                g += 1
+            if len(seq) < 2 or g not in pictures:
                 continue
-            pairs.append((f, ident, seg, change, nxt[1], size, words))
+            pairs.append((f, ident, seg, seq, size, words))
     by_step = collections.defaultdict(list)
     for pr in pairs:
         by_step[pr[0]].append(pr)
@@ -67,15 +72,19 @@ def main(argv=None) -> int:
     stepped_at = collections.Counter()
     verdicts = []
     for f, prs in by_step.items():
-        moving = [pr for pr in prs if max(pr[3], pr[4]) > a.moving * max(1e-9, pr[5])]
-        st = [pr for pr in moving if pr[4] < 0.2 * pr[3]]
+        moving = [pr for pr in prs if max(pr[3]) > a.moving * max(1e-9, pr[4])]
+        # stepped: all of the step's move on its own picture; uneven: its
+        # pictures' moves unlike (the largest over twice the smallest)
+        st = [pr for pr in moving if max(pr[3][1:]) < 0.2 * pr[3][0]]
         if moving and len(st) >= a.cut_share * len(moving) and len(moving) >= 5:
             cuts.add(f)
             continue
         for pr in moving:
-            s, b = pr[3], pr[4]
-            kind = "stepped" if b < 0.2 * s else "uneven" if abs(s - b) > 0.5 * max(s, b) else "even"
-            verdicts.append((pr[1], pr[2], pr[6], kind, f))
+            seq = pr[3]
+            kind = ("stepped" if max(seq[1:]) < 0.2 * seq[0]
+                    else "uneven" if max(seq) > 2.0 * max(1e-12, min(seq)) and max(seq) - min(seq) > 0.5 * max(seq)
+                    else "even")
+            verdicts.append((pr[1], pr[2], pr[5], kind, f))
             if kind == "stepped":
                 stepped_at[f] += 1
     things = collections.defaultdict(collections.Counter)

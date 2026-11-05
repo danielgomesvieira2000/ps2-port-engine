@@ -196,7 +196,8 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
                 std::fabs(before) * 3.0f >= std::fabs(change) && std::fabs(before) <= 3.0f * std::fabs(change))
                 past_cut = false;           // (moving on steadily: blended)
             if (past_cut && !o.cut_steady) continue;
-            plan.changed.push_back({y.at + 1 + k, change});
+            if (!plan.carry) plan.changed.push_back({y.at + 1 + k, change});
+            else if (had_before) plan.changed.push_back({y.at + 1 + k, before});
             // A texture's cell (a multiple of 1/64 within 0-1 at both ends:
             // an animated sprite's cell in its atlas, File #2's smoke, 0.25
             // and 0.125 steps) is the newer step's: blended, half of two
@@ -207,7 +208,7 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
                 continue;
             // A value moving on as it moved the step before is motion, not a jump.
             const bool steady = had_before && (before > 0) == (fb - fa > 0) &&
-                                std::fabs((fb - fa) - before) <= 0.25f * std::fabs(fb - fa);
+                                std::fabs((fb - fa) - before) <= o.steady * std::fabs(fb - fa);
             // (one word so is enough: a flickering light's billboard, its w
             // jumping, blended is a beam across the room). A value within 0-1
             // at both ends, moving the step before, that moves by more than
@@ -256,8 +257,10 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
                     if (!yq.floats || !yq.words || ((yq.code & 0x8000) && !o.blend_flg)) continue;
                     for (u32 r = q == j ? k + 1 : 0; r < yq.words; ++r) {
                         const float ga = Float(a[xq.at + 1 + r]), gb = Float(b[yq.at + 1 + r]);
-                        if (a[xq.at + 1 + r] != b[yq.at + 1 + r] && Plausible(ga) && Plausible(gb))
-                            plan.changed.push_back({yq.at + 1 + r, gb - ga});
+                        if (a[xq.at + 1 + r] == b[yq.at + 1 + r] || !Plausible(ga) || !Plausible(gb)) continue;
+                        float was = 0.0f;
+                        if (!plan.carry) plan.changed.push_back({yq.at + 1 + r, gb - ga});
+                        else if (ChangedBefore(xq.at + 1 + r, &was)) plan.changed.push_back({yq.at + 1 + r, was});
                     }
                 }
                 (void)changed_mark;

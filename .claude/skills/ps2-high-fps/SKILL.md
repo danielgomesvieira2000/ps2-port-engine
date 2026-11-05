@@ -221,8 +221,13 @@ each blank from 0x0029FA08 by its own blank handler).
    row's step read as a cut every 60 degrees); a screen matrix's
    translations move 1e6 a step - past `cut`, blended only while steady
    (`cut_steady`), or every prop shakes; and a cut by less than a cut's
-   length is a sudden move (`view_sudden`). Test with the camera turning on
-   the spot, not only walking.
+   length is a sudden move (`view_sudden`). A camera that eases changes its
+   move by ~20% a step: the steady test's quarter (`steady`) stepped its
+   things as it came to rest - a half. A snap the game knows of (a camera
+   pulled in at a wall) is best made a cut by the port, with
+   `ListBlendPlan::carry` so its moves are not the next step's history.
+   Test with the camera turning on the spot, not only walking, at 60 and
+   120 (list_motion.py judges a step's pictures however many).
 4. Configure `steps_per_blank = 0.5`, `default_rate = "30"`: the engine's
    rate, steps and picture time then work for 60, 120 and the screen's (the
    F9 panel's FRAME RATE row shows 30/60/120/screen for such a game). Set the

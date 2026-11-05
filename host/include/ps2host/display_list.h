@@ -51,6 +51,12 @@ struct ListBlendOptions {
     // while the room turned. A lamp's glow given another lamp's place moves
     // as far at once: left out alone, it was put between the two.
     bool cut_steady = false;
+    // A value moving on as it moved the step before - the same way, its
+    // change within this share of it of the change before - is motion, not
+    // a jump (ListBlendPlan::changed). A camera easing to a stop (Outbreak's
+    // RE4 camera, 0.8 of its move a step) changes by ~20% a step and more
+    // where it passes 0: a quarter stepped its things as it came to rest.
+    float steady = 0.25f;
     int segment_address = 0;    // a segment starts at each UNPACK to this VU address (-1: one segment)
     float jump = 0.5f;          // of a lane's largest value: a jump - the segment not blended
     float cut_share = 0.2f;     // segments jumping or moved, of those matched: the camera cut
@@ -143,6 +149,13 @@ struct ListBlendPlan {
     // was a jump by its lane's largest, the thing stepped while the room
     // blended (File #1's bar: props shaking at 30 a second).
     std::vector<std::pair<u32, float>> changed;
+    // Set before planning: this step's moves are not motion (a camera's snap
+    // the game told of, the step shown whole) - `changed` carries each
+    // value's change of the step before on, not this step's. Its moves as
+    // the next step's history, every thing moving on ordinarily after it was
+    // "unsteady" and stepped (Outbreak's RE4 camera pulled in at a hedge: 44
+    // things the step after).
+    bool carry = false;
 };
 
 /* The blend of `a` (older) into `b` (newer), planned. `moving`: the words of
