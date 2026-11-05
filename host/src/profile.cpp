@@ -31,6 +31,9 @@
 #else
 #include <pthread.h>
 #include <time.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 #endif
 
 namespace ps2host {
@@ -219,16 +222,35 @@ std::uint64_t RendererThreadCycles() {
 std::uint64_t RendererThreadCycles() { return std::uint64_t(RendererThreadCpuMs() * 1e6); }
 namespace {
 std::atomic<bool> g_renderer_noted{false};
+#ifdef __APPLE__
+mach_port_t g_renderer_thread = MACH_PORT_NULL;      // (macOS has no per-thread clock id to read from another thread)
+#else
 clockid_t g_renderer_clock;
+#endif
 }  // namespace
 void NoteRendererThread() {
     timeline::NameThread("GPU renderer");
+#ifdef __APPLE__
+    g_renderer_thread = mach_thread_self();
+    g_renderer_noted = true;
+#else
     if (pthread_getcpuclockid(pthread_self(), &g_renderer_clock) == 0) g_renderer_noted = true;
+#endif
 }
 double RendererThreadCpuMs() {
+#ifdef __APPLE__
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (!g_renderer_noted ||
+        thread_info(g_renderer_thread, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &count) != KERN_SUCCESS)
+        return 0;
+    auto ms = [](const time_value_t& t) { return double(t.seconds) * 1000.0 + double(t.microseconds) / 1000.0; };
+    return ms(info.user_time) + ms(info.system_time);
+#else
     timespec t{};
     if (!g_renderer_noted || clock_gettime(g_renderer_clock, &t) != 0) return 0;
     return double(t.tv_sec) * 1000.0 + double(t.tv_nsec) / 1e6;
+#endif
 }
 #endif
 void SetSampleRendererThread(bool on) {

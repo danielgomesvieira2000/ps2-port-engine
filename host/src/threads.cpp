@@ -436,7 +436,10 @@ std::atomic<u64> g_last_vblank_ns{0};       // LastVblankNs
    waitable timer (Windows 10 1803 on), not Sleep's millisecond steps that can
    overshoot by more; sleep_until where there is none. */
 void SleepUntil(std::chrono::steady_clock::time_point when) {
-#ifndef _WIN32
+#if defined(__APPLE__)
+    // (macOS has no clock_nanosleep: the library's own absolute sleep.)
+    std::this_thread::sleep_until(when);
+#elif !defined(_WIN32)
     // (POSIX: an absolute sleep on the monotonic clock steady_clock reads.)
     const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(when.time_since_epoch()).count();
     if (ns <= 0) return;
@@ -486,7 +489,7 @@ bool SpareCores() {
             cores = 0;
             for (DWORD_PTR m = process; m; m &= m - 1) ++cores;
         }
-#else
+#elif !defined(__APPLE__)       // (macOS has no affinity masks: every core counts)
         cpu_set_t set;
         if (sched_getaffinity(0, sizeof set, &set) == 0) cores = CPU_COUNT(&set);
 #endif
