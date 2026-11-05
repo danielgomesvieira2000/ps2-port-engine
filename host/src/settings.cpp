@@ -17,7 +17,8 @@ namespace ps2host {
 namespace {
 
 std::mutex g_lock;
-std::map<std::string, std::string> g_values;
+std::map<std::string, std::string> g_values;    // in effect: the file's, and a run's own (RunSetting)
+std::map<std::string, std::string> g_file;      // the file's: what is written
 std::string g_path;
 
 std::string Trim(const std::string& text) {
@@ -34,7 +35,7 @@ void Write() {
         return;
     }
     out << "# The PC port's settings (PC SETTINGS in the main menu).\n";
-    for (const auto& [key, value] : g_values) out << key << '=' << value << '\n';
+    for (const auto& [key, value] : g_file) out << key << '=' << value << '\n';
 }
 
 }  // namespace
@@ -43,13 +44,14 @@ void LoadSettings(const std::string& path) {
     std::lock_guard<std::mutex> hold(g_lock);
     g_path = path;
     g_values.clear();
+    g_file.clear();
     std::ifstream in(path);
     std::string line;
     while (std::getline(in, line)) {
         const auto equals = line.find('=');
         if (line.empty() || line[0] == '#' || equals == std::string::npos) continue;
         const std::string key = Trim(line.substr(0, equals));
-        if (!key.empty()) g_values[key] = Trim(line.substr(equals + 1));
+        if (!key.empty()) g_values[key] = g_file[key] = Trim(line.substr(equals + 1));
     }
 }
 
@@ -68,8 +70,9 @@ bool SettingOn(const std::string& key, bool fallback) {
 
 void SetSetting(const std::string& key, const std::string& value) {
     std::lock_guard<std::mutex> hold(g_lock);
-    if (g_values.count(key) && g_values[key] == value) return;
     g_values[key] = value;
+    if (g_file.count(key) && g_file[key] == value) return;
+    g_file[key] = value;
     Write();
 }
 
@@ -77,7 +80,7 @@ void SetSettingOn(const std::string& key, bool on) { SetSetting(key, on ? "on" :
 
 void RunSetting(const std::string& key, const std::string& value) {
     std::lock_guard<std::mutex> hold(g_lock);
-    g_values[key] = value;
+    g_values[key] = value;          // (not the file's: --setting was written with the next change of any)
 }
 
 namespace {

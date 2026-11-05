@@ -217,6 +217,34 @@ void SdlWindowDisplay::SetFullscreen(bool on) {
     stale_ = true;
 }
 
+/* Pump's: a placement asked for (SetPlacement), and the desktop's usable
+   area now and then (DesktopArea). */
+void SdlWindowDisplay::ApplyPlacement() {
+    if (!window_) return;
+    Placement p;
+    {
+        std::lock_guard<std::mutex> hold(placement_lock_);
+        p = placement_;
+        placement_.pending = false;
+    }
+    if (p.pending) {
+        if (Fullscreen()) SDL_SetWindowFullscreen(window_, false);
+        SDL_SetWindowBordered(window_, !p.borderless);
+        if (p.w > 0 && p.h > 0) SDL_SetWindowSize(window_, p.w, p.h);
+        SDL_SetWindowPosition(window_, p.x, p.y);
+        stale_ = true;
+        std::fprintf(stderr, "[window] placed at %d,%d, %dx%d%s\n", p.x, p.y, p.w, p.h, p.borderless ? ", borderless" : "");
+    }
+    if (raise_.exchange(false)) SDL_RaiseWindow(window_);
+    if (desktop_age_++ % 120 == 0) {
+        SDL_Rect r{};
+        if (SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(window_), &r)) {
+            std::lock_guard<std::mutex> hold(placement_lock_);
+            desktop_[0] = r.x, desktop_[1] = r.y, desktop_[2] = r.w, desktop_[3] = r.h;
+        }
+    }
+}
+
 bool SdlWindowDisplay::Fullscreen() const {
     return window_ && (SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN) != 0;
 }
@@ -268,6 +296,7 @@ bool SdlWindowDisplay::Pump() {
             }
         }
     }
+    ApplyPlacement();
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
@@ -555,7 +584,8 @@ std::vector<Display::ControllerInfo> SdlWindowDisplay::Controllers() const {
         std::lock_guard<std::mutex> hold(pads_lock_);
         for (const Gamepad& g : pads_) {
             const char* name = SDL_GetGamepadName(g.pad);
-            list.push_back({g.id, name ? name : "Controller", FamilyOf(g.pad)});
+            const char* path = SDL_GetGamepadPath(g.pad);
+            list.push_back({g.id, name ? name : "Controller", FamilyOf(g.pad), path ? path : ""});
         }
     }
     std::lock_guard<std::mutex> hold(g_touch_lock);

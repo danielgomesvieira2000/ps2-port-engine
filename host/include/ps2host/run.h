@@ -552,6 +552,7 @@ struct HostDevice {
     u32 id = kKeyboardDevice;
     std::string name;           // "Keyboard", the controller's own name
     ControllerFamily family = ControllerFamily::kOther;
+    std::string path;           // a controller's device path: the same in every process (ids are not)
 };
 std::vector<HostDevice> HostDevices();
 bool HostDevicePad(u32 id, HostPadState* state);
@@ -588,6 +589,14 @@ struct HostMouseState {
     bool moved = false;
 };
 bool TakeHostMouse(HostMouseState* state);
+/* The window placed: its client area at x, y on the desktop, w x h pixels,
+   framed or borderless (a split screen's half; out of fullscreen first) -
+   at the window's next pump. WindowDesktopArea: the usable area of the
+   screen it is on (false: not known yet). RaiseWindow: it to the front, the
+   keyboard's. */
+void SetWindowPlacement(int x, int y, int w, int h, bool borderless);
+bool WindowDesktopArea(int* x, int* y, int* w, int* h);
+void RaiseWindow();
 /* The game's own pointer (RGBA pixels, rows top-down, clicking at hot_x,
    hot_y), scaled with the window; shown while ShowHostCursor(true), the
    system's otherwise (hidden in fullscreen). */
@@ -627,6 +636,14 @@ InputDevice LastInputDevice(u64* frame = nullptr);
    each time the pad is read (once a frame, on the EE's thread, at the
    vertical blank): what the mouse means, say. */
 void SetPadHook(u16 (*hook)());
+/* The game given no input while on (a port's own screen over the game - a
+   split screen's controller choice - reading the devices itself), as while
+   the PC settings panel is up. */
+void SetGameInputHeld(bool on);
+/* Buttons the game is not given (bit n: input n, libpad's order), whatever
+   holds them - a port that takes one for itself (a split screen's Select,
+   its pause). 0: none. */
+void SetGameButtonsMasked(u16 mask);
 /* --press: hold `button` (cross, start, up, ...) for 6 frames from `frame` -
    the player's, on port 0; `padN:button` scripted controller N's (from 1), a
    device of its own (HostDevices) a game can give a port (SetPortDevices). */

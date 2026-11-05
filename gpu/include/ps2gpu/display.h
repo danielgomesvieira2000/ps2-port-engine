@@ -139,6 +139,14 @@ public:
     virtual void SetOverlayRight(bool right) { (void)right; }
     /* The window's title (taken up by the window's own thread, in Pump). */
     virtual void SetTitle(const std::string& title) { (void)title; }
+    /* The window placed (applied at the next Pump): its client area at x, y
+       on the desktop, w x h pixels, framed or borderless - a split screen's
+       half. Out of fullscreen first. */
+    virtual void SetPlacement(int x, int y, int w, int h, bool borderless) { (void)x, (void)y, (void)w, (void)h, (void)borderless; }
+    /* The usable area (the taskbar left out) of the screen the window is on. */
+    virtual bool DesktopArea(int* x, int* y, int* w, int* h) const { (void)x, (void)y, (void)w, (void)h; return false; }
+    /* The window brought to the front, the keyboard's (at the next Pump). */
+    virtual void Raise() {}
     /* F12, or L3 with R3 on a controller, since the last call: a capture asked for. */
     virtual bool TakeCapture() { return false; }
     /* Tab since the last call: the texture pack turned on or off. */
@@ -172,6 +180,7 @@ public:
         std::uint32_t id = 0;
         std::string name;
         std::uint8_t family = 0;
+        std::string path;       // its device's path: the same in every process (a split screen's copies)
     };
     virtual std::vector<ControllerInfo> Controllers() const { return {}; }
     virtual bool PadOf(std::uint32_t id, PadState* state) const { (void)id, (void)state; return false; }

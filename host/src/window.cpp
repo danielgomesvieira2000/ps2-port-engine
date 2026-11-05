@@ -553,9 +553,30 @@ std::vector<HostDevice> WindowControllers() {
     std::vector<HostDevice> list;
 #ifdef PS2HOST_VULKAN
     if (g_display)
-        for (const auto& c : g_display->Controllers()) list.push_back({c.id, c.name, Family(c.family)});
+        for (const auto& c : g_display->Controllers()) list.push_back({c.id, c.name, Family(c.family), c.path});
 #endif
     return list;
+}
+
+void SetWindowPlacement(int x, int y, int w, int h, bool borderless) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetPlacement(x, y, w, h, borderless);
+#endif
+    (void)x, (void)y, (void)w, (void)h, (void)borderless;
+}
+
+bool WindowDesktopArea(int* x, int* y, int* w, int* h) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) return g_display->DesktopArea(x, y, w, h);
+#endif
+    (void)x, (void)y, (void)w, (void)h;
+    return false;
+}
+
+void RaiseWindow() {
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->Raise();
+#endif
 }
 
 bool WindowControllerPad(u32 id, HostPadState* state) {

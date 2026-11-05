@@ -70,6 +70,17 @@ public:
         title_ = title;
         title_changed_ = true;
     }
+    void SetPlacement(int x, int y, int w, int h, bool borderless) override {
+        std::lock_guard<std::mutex> hold(placement_lock_);
+        placement_ = {x, y, w, h, borderless, true};
+    }
+    bool DesktopArea(int* x, int* y, int* w, int* h) const override {
+        std::lock_guard<std::mutex> hold(placement_lock_);
+        if (desktop_[2] <= 0) return false;
+        *x = desktop_[0], *y = desktop_[1], *w = desktop_[2], *h = desktop_[3];
+        return true;
+    }
+    void Raise() override { raise_ = true; }
     float WindowAspect() const override {
         int w = 0, h = 0;
         if (!window_ || !SDL_GetWindowSizeInPixels(window_, &w, &h) || w <= 0 || h <= 0) return 0.0f;
@@ -151,6 +162,16 @@ protected:
     }
 
     SDL_Window* window_ = nullptr;
+    struct Placement {
+        int x = 0, y = 0, w = 0, h = 0;
+        bool borderless = false, pending = false;
+    };
+    mutable std::mutex placement_lock_;
+    Placement placement_;
+    int desktop_[4] = {0, 0, 0, 0};         // the usable area, Pump's (DesktopArea)
+    unsigned desktop_age_ = 0;
+    std::atomic<bool> raise_{false};
+    void ApplyPlacement();
     std::string describe_, error_;
     // Set by Pump (the main thread), read where pictures are presented (the
     // GS thread, when it presents): the window closed, or its swapchain to be

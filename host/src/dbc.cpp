@@ -35,6 +35,7 @@
  * profile FF FF FF FF 00.
  */
 
+#include <atomic>
 #include "ps2host/platform.h"      // the keys' names
 
 #include <algorithm>
@@ -52,6 +53,11 @@
 #include "ps2host/run.h"
 
 namespace ps2host {
+
+namespace {
+std::atomic<bool> g_input_held{false};     // SetGameInputHeld
+std::atomic<u16> g_masked{0};               // SetGameButtonsMasked
+}  // namespace
 
 namespace {
 
@@ -302,7 +308,12 @@ void PadData(u32 port, u8* data) {
         for (int i = 0; i < 16; ++i)
             if (hooked & (1u << i)) pressure[i] = 0xFF;
     }
-    if (PcMenuOpen()) {                     // the PC settings panel has the keys
+    if (const u16 masked = g_masked) {      // (a port's own: SetGameButtonsMasked)
+        buttons |= masked;
+        for (int i = 0; i < 16; ++i)
+            if (masked & (1u << i)) pressure[i] = 0;
+    }
+    if (PcMenuOpen() || g_input_held) {     // the PC settings panel has the keys (or a port's own screen)
         buttons = 0xFFFF;
         pad = HostPadState{};
         std::fill(std::begin(pressure), std::end(pressure), u8(0));
@@ -579,12 +590,16 @@ bool ScriptPress(const std::string& spec, u64 from, u64 to, u8 pressure) {
     return false;
 }
 
+void SetGameInputHeld(bool on) { g_input_held = on; }
+void SetGameButtonsMasked(u16 mask) { g_masked = mask; }
+
 std::vector<HostDevice> HostDevices() {
     std::vector<HostDevice> list;
     list.push_back({kKeyboardDevice, "Keyboard", ControllerFamily::kOther});
     for (const HostDevice& d : WindowControllers()) list.push_back(d);
     for (u32 n : ScriptedDevices())
-        list.push_back({kScriptedDevice + n, "Scripted controller " + std::to_string(n), ControllerFamily::kOther});
+        list.push_back({kScriptedDevice + n, "Scripted controller " + std::to_string(n), ControllerFamily::kOther,
+                        "scripted:" + std::to_string(n)});
     return list;
 }
 
