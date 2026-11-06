@@ -237,11 +237,11 @@ void SetGsNativeDraws(bool on);
 /* The player's NATIVE RENDERER (PC SETTINGS; the setting native_renderer, on by default): native draws on where
    the renderer draws meshes, now (PS2HOST_NATIVE_DRAW=0 off whatever it says). */
 void ApplyNativeRendererSetting();
-/* GRAPHICS' LIGHTING and GEOMETRY (the settings "lighting": "game" or "pixel", "geometry": "game" or
-   "precise"; PS2HOST_ENHANCE=<bits> a test's): the native draws' enhancements (ps2gpu::SetMeshEnhancements:
-   1 lit per pixel, 2 precise places), now. NativeEnhancements: their bits where native draws are drawn - a
-   game's native programs then send what they need (the kept vertices' places and lighting: the headers'
-   ext, gs_mesh_enhanced.glsl). */
+/* The native draws' enhancements (ps2gpu::SetMeshEnhancements: 1 lit per pixel, 2 precise places): always,
+   with the native renderer - but a scripted run on its virtual clock draws the GS's picture to the pixel (its
+   recorded pictures; PS2HOST_ENHANCE=<bits> a test's, either way). NativeEnhancements: their bits for a draw
+   made now, where the renderer draws them - a game's native programs then send what they need (the kept
+   vertices' places and lighting: the headers' ext, gs_mesh_enhanced.glsl). */
 void ApplyGraphicsEnhancements();
 u32 NativeEnhancements();
 void GsPrivileged(u32 address, u64 value);
@@ -524,8 +524,8 @@ struct PortOption {
     void (*set)(int) = nullptr;
 };
 void AddPortOptions(const std::vector<PortOption>& options);
-/* The engine's graphics rows for a port's page (its GRAPHICS): LIGHTING and GEOMETRY (the native renderer's
-   enhancements: ApplyGraphicsEnhancements), ANTI-ALIASING (OFF, FXAA, SMAA: SetWindowAntiAliasing). */
+/* The engine's graphics rows for a port's page (its GRAPHICS): ANTI-ALIASING (OFF, FXAA, SMAA:
+   SetWindowAntiAliasing). */
 std::vector<PortOption> EnhancedGraphicsOptions(const std::string& page);
 /* Their values for a preset: the game's look (all off), or each at its best. */
 void SetEnhancedGraphics(bool on);

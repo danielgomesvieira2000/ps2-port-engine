@@ -3258,14 +3258,20 @@ void ApplyNativeRendererSetting() {
     SetGsNativeDraws(g_meshes_drawn && !(native && std::string(native) == "0") && SettingOn("native_renderer", true));
 }
 
+bool g_enhance_forced = false;           // (PS2HOST_ENHANCE: a test's, on the virtual clock too)
+
 void ApplyGraphicsEnhancements() {
-    u32 bits = 0;
-    if (Setting("lighting", "game") == "pixel") bits |= ps2gpu::kMeshLitPixels;
-    if (Setting("geometry", "game") == "precise") bits |= ps2gpu::kMeshPrecise;
-    if (const char* test = std::getenv("PS2HOST_ENHANCE")) bits = u32(std::strtoul(test, nullptr, 0));
+    u32 bits = ps2gpu::kMeshLitPixels | ps2gpu::kMeshPrecise;
+    const char* test = std::getenv("PS2HOST_ENHANCE");
+    g_enhance_forced = test != nullptr;
+    if (test) bits = u32(std::strtoul(test, nullptr, 0));
     ps2gpu::SetMeshEnhancements(bits);
 }
 
-u32 NativeEnhancements() { return GsNativeDraws() && g_enhanced_drawn ? ps2gpu::MeshEnhancements() : 0u; }
+u32 NativeEnhancements() {
+    if (!GsNativeDraws() || !g_enhanced_drawn) return 0u;
+    if (!g_enhance_forced && VirtualClock()) return 0u;      // (a scripted run's recorded pictures: the GS's)
+    return ps2gpu::MeshEnhancements();
+}
 
 }  // namespace ps2host

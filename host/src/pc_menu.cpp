@@ -161,7 +161,7 @@ const std::vector<Choice>& Choices() {
              SetSettingOn("native_renderer", v == "on");
              ApplyNativeRendererSetting();
          },
-         "NATIVE RENDERER", {"ON", "OFF"}, "The GPU draws rooms and characters itself: the same picture, less CPU."},
+         "NATIVE RENDERER", {"ON", "OFF"}, "The GPU draws rooms and characters itself: lit per pixel, less CPU."},
     };
     return choices;
 }
@@ -757,28 +757,6 @@ int AntiAliasingNow() {
 
 std::vector<PortOption> EnhancedGraphicsOptions(const std::string& page) {
     std::vector<PortOption> options;
-    PortOption lighting;
-    lighting.page = page;
-    lighting.name = "LIGHTING";
-    lighting.help = "PER PIXEL: the game's own lights on every pixel, not only at the corners (NATIVE RENDERER)";
-    lighting.values = {"GAME'S", "PER PIXEL"};
-    lighting.now = [] { return Setting("lighting", "game") == "pixel" ? 1 : 0; };
-    lighting.set = [](int i) {
-        SetSetting("lighting", i == 1 ? "pixel" : "game");
-        ApplyGraphicsEnhancements();
-    };
-    options.push_back(lighting);
-    PortOption geometry;
-    geometry.page = page;
-    geometry.name = "GEOMETRY";
-    geometry.help = "PRECISE: 3D placed to the screen's own pixels - no shimmer at high resolutions (NATIVE RENDERER)";
-    geometry.values = {"GAME'S", "PRECISE"};
-    geometry.now = [] { return Setting("geometry", "game") == "precise" ? 1 : 0; };
-    geometry.set = [](int i) {
-        SetSetting("geometry", i == 1 ? "precise" : "game");
-        ApplyGraphicsEnhancements();
-    };
-    options.push_back(geometry);
     PortOption aa;
     aa.page = page;
     aa.name = "ANTI-ALIASING";
@@ -790,20 +768,11 @@ std::vector<PortOption> EnhancedGraphicsOptions(const std::string& page) {
     return options;
 }
 
-void SetEnhancedGraphics(bool on) {
-    SetSetting("lighting", on ? "pixel" : "game");
-    SetSetting("geometry", on ? "precise" : "game");
-    ApplyGraphicsEnhancements();
-    SetWindowAntiAliasing(on ? "smaa" : "off");
-}
+void SetEnhancedGraphics(bool on) { SetWindowAntiAliasing(on ? "smaa" : "off"); }
 
-bool EnhancedGraphicsAll() {
-    return Setting("lighting", "game") == "pixel" && Setting("geometry", "game") == "precise" && AntiAliasingNow() == 2;
-}
+bool EnhancedGraphicsAll() { return AntiAliasingNow() == 2; }
 
-bool EnhancedGraphicsNone() {
-    return Setting("lighting", "game") == "game" && Setting("geometry", "game") == "game" && AntiAliasingNow() == 0;
-}
+bool EnhancedGraphicsNone() { return AntiAliasingNow() == 0; }
 
 namespace bindings {
 void AddPanelPage(const PanelPage& page) { PanelPages().push_back(page); }
