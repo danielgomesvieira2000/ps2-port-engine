@@ -69,6 +69,26 @@ python engine/tools/port.py --game games/<name> build    # build only
 games/<name>/build/port/cmake/<name>.exe <elf> --disc <iso> --window --gpu --audio --timeout 600
 ```
 
+On an Apple silicon Mac the same loop is `engine/tools/macos.py` (docs/MACOS.md):
+
+```sh
+python3 engine/tools/macos.py --game games/<name> all -- --window --gpu --audio --timeout 600   # build, run, again until no new code
+python3 engine/tools/macos.py --game games/<name> build         # build only: games/<name>/build/macos/<name>/<name>
+python3 engine/tools/macos.py --game games/<name> run -- <the port's options>   # run what is built
+python3 engine/tools/macos.py --game games/<name> app [--icon FILE_OR_URL]      # a double-clickable .app
+```
+
+Run the program through `macos.py run` (it sets `DYLD_FALLBACK_LIBRARY_PATH`
+and `VK_ICD_FILENAMES` for the Vulkan loader and MoltenVK) or set them
+yourself. What to know there: a crash report is in
+`~/Library/Logs/DiagnosticReports` (read the faulting thread's frames); a
+`brk #1` trap in generated code is clang compiling an undefined shift
+(a constant shift of a 32-bit value by 32 or more) - fix the emitter, not the
+compiler flags; the window's surface must be made by the same Vulkan loader as
+the instance (`SDL_VULKAN_LIBRARY`); `app` bundles the loader and MoltenVK and
+its icon is the player's (`--icon`, or the disc's logo): never commit a
+game's artwork, and never add a default URL for it.
+
 Each run ends with a report: why it stopped, the guest call stack, the kernel
 services and device registers it used. That names the next thing to provide:
 

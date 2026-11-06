@@ -192,7 +192,17 @@ Each of these has already produced plausible wrong output once:
   arguments (`$f12`-`$f19`). Liveness decides which ones a function reads.
 - In emitted C++, operator precedence and store order are where bugs hide. The
   tree can be right while the printed C means something else. This is why the
-  compiled check exists; never skip it when MSVC is available.
+  compiled check exists; never skip it when a compiler is available (MSVC on
+  Windows; clang++ on a Mac, where `derive`, `lift` and the equivalence check
+  build their check libraries with it, and `derive` first runs clang's
+  `-fsyntax-only` over the emitted source so a function that does not compile
+  is dropped in seconds, not after a full optimising build).
+- Emitted C++ must be defined under clang as well as MSVC: a constant shift of
+  a 32-bit value by 32 or more compiles to a trap (`brk #1`) under clang -O3.
+  The PS2's shifts of that kind are 64-bit (`dsll`, `dsra32`), so the emitter
+  widens the operand to `u64`; the syntax pre-pass makes
+  `-Wshift-count-overflow` an error. A crash (`Trace/BPT trap`) in the compiled
+  check on a Mac is this until shown otherwise.
 
 ## Working practices that paid off
 
