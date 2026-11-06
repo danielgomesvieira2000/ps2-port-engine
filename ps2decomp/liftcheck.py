@@ -154,7 +154,7 @@ def build(sources, work_dir: str, parallel: int = 8) -> str:
 
 
 def _build(sources, work_dir: str, parallel: int) -> str:
-    vcvars = cppcheck.find_vcvars()
+    vcvars = cppcheck.find_vcvars() if os.name == "nt" else cppcheck.find_compiler()
     # Absolute: the build script changes into it, and a relative path (from a
     # relative --game) would then name a directory inside itself.
     work_dir = os.path.abspath(work_dir)
@@ -171,7 +171,10 @@ def _build(sources, work_dir: str, parallel: int) -> str:
         harness, os.path.join(runtime, "eefpu.cpp"), os.path.join(runtime, "lifted_support.cpp"),
         os.path.join(runtime, "vu0.cpp")]
     cppcheck._BUILDS += 1
-    dll = os.path.join(work_dir, "lifted_%d_%d.dll" % (os.getpid(), cppcheck._BUILDS))
+    dll = os.path.join(work_dir, "lifted_%d_%d%s" % (os.getpid(), cppcheck._BUILDS, cppcheck.SHARED_SUFFIX))
+    if os.name != "nt":
+        cppcheck.compile_shared(all_sources, dll, [os.path.join(cppcheck.RUNTIME, "include")], work_dir)
+        return dll
     script = os.path.join(work_dir, "lift_build.bat")
     with open(script, "w", encoding="utf-8") as handle:
         handle.write("@echo off\n")

@@ -58,6 +58,8 @@ Code finds the skills in `engine/.claude/skills`.
   faster on the VU and GS, the pictures the same; `PS2_COMPILER=msvc` builds
   with MSVC's own) - and with it, `port.py ... pgo`: a profile-guided build
   from the game's scripted runs (Burnout 3: 10-12% less CPU in a race)
+* macOS: Apple silicon, 14.4 or later, Xcode's command line tools, and
+  `brew install cmake ninja molten-vk vulkan-loader` (docs/MACOS.md)
 * For a port: a GPU with Vulkan 1.1 or later (1.3 preferred) or, on Windows, Direct3D 11
   (feature level 11_0); a processor with AVX2
 * A disc image you own, for each game: an .iso, or a CD's raw .bin with its
@@ -72,6 +74,7 @@ The same port, built for each from the same game directory:
 | Windows 10/11 x64 | `tools/port.py` (clang-cl or MSVC; an SSE4.1 build beside the AVX2 one) | Vulkan 1.3, 1.2 or 1.1; Direct3D 11; SDL's 2D renderer and the software GS | the GPU regressions on each backend: `tools/backends_check.py` |
 | Android 10+ (arm64, x86-64 emulator) | `tools/android.py` (the NDK; an APK) | Vulkan 1.1+ | on a phone |
 | Linux x86-64 (glibc 2.35+: Ubuntu 22.04, Debian 12, SteamOS, Fedora 36 and later; the C++ runtime linked in) | `tools/linux.py` (Docker, from Windows or Linux: Ubuntu 22.04, clang 19, SDL's X11/Wayland, Mesa) | Vulkan 1.1+; SDL's 2D renderer (OpenGL) and the software GS | `linux.py test`: the host's and the renderer's tests (on lavapipe) and the regressions with the software GS, as recorded on Windows |
+| macOS 14.4+ (Apple silicon) | `tools/macos.py` (Apple clang, CMake and Ninja; an `.app`) | Vulkan through MoltenVK | Burnout 3 on an M1 Max: the verification, the host's tests, the game at about full speed; docs/MACOS.md |
 
 Without a GPU display (no Vulkan driver, and off Windows no Direct3D 11),
 the window is drawn with SDL's own 2D renderer (`sdl_display.cpp`: OpenGL, or

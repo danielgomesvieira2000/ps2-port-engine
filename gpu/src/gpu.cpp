@@ -34,6 +34,23 @@ bool VulkanGpu::Init(std::string* error) {
     ici.pApplicationInfo = &app;
     std::vector<const char*> instance_extensions;
     VkDebugExtensions(&instance_extensions);
+
+#ifdef __APPLE__
+    // MoltenVK is a portability driver: the loader lists it only for an
+    // instance that asks for portability enumeration.
+    {
+        std::uint32_t count = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> offered(count);
+        vkEnumerateInstanceExtensionProperties(nullptr, &count, offered.data());
+        for (const VkExtensionProperties& e : offered) {
+            if (std::strcmp(e.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) != 0) continue;
+            instance_extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+            ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+            break;
+        }
+    }
+#endif
     ici.enabledExtensionCount = std::uint32_t(instance_extensions.size());
     ici.ppEnabledExtensionNames = instance_extensions.data();
     if ((r = vkCreateInstance(&ici, nullptr, &instance)) != VK_SUCCESS) return fail("vkCreateInstance", r);

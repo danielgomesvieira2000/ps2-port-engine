@@ -524,9 +524,11 @@ class Binary(Expr):
             if self.op == "shr" and not fits_u32(self.left):
                 # `srl` shifts the low word only; the upper half must not shift in.
                 left = "(%s & 0xFFFFFFFF)" % self.left.render()
-            if self.op in ("dshl", "dshr") and _narrow_in_cpp(self.left):
-                # A float or VU helper returns u32, and so does a mask of one: a
-                # 64-bit shift of it in C++ would shift at 32 bits and lose it.
+            if self.op in ("dshl", "dshr") and (_narrow_in_cpp(self.left) or isinstance(self.left, Binary)):
+                # A float or VU helper returns u32, and so does a mask of one, and
+                # so does arithmetic on either: a 64-bit shift of it in C++ would
+                # shift at 32 bits and lose it - or, by 32 or more, be undefined,
+                # which an optimiser is free to turn into a trap (clang does).
                 left = "(u64)%s" % _wrap(self.left, ATOM_PRECEDENCE)
             return "%s %s %s" % (left, self._SYMBOL[self.op], _shift_amount(self.right, bits))
         left = _wrap(self.left, level)

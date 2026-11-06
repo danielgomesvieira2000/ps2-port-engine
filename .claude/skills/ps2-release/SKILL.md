@@ -89,6 +89,11 @@ rewriting published history is their decision.
    refused when it needs the C++ runtime installed or names a folder of the
    machine or the build container. It needs glibc 2.35+ (Ubuntu 22.04, Debian
    12, SteamOS); say so in the README.
+   **macOS** is not a release: `macos.py app` makes an `.app` for the player's
+   own Mac (ad hoc signed, plays from their disc image; docs/MACOS.md). Its
+   icon is the disc's logo or a picture the player gives with `--icon`; never
+   put a publisher's artwork, or a default link to it, in a repository or a
+   package.
 6. **Test it as a player would**: unzip into an empty folder, start it with no
    arguments (a `pc_settings.ini` with `disc=` beside it, for an unattended
    check: the picker otherwise waits for a person), check the log (version,

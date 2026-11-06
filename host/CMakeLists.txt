@@ -242,6 +242,29 @@ if(NOT MSVC)
             target_compile_options(ps2rt PUBLIC "-fprofile-instr-use=${PS2HOST_PGO}" -Wno-profile-instr-unprofiled
                                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
         endif()
+    elseif(APPLE)
+        # macOS (engine/tools/macos.py; Apple's clang calls itself AppleClang,
+        # so the branch below is not it): the translated code's every frame
+        # without a stack canary or a stack probe (both on by default there),
+        # its symbols hidden so the game's calls to its own functions are
+        # direct. ThinLTO (Apple's ld reads it) and a profile-guided build
+        # (the .profdata macos.py's pgo merges), as the other platforms'.
+        target_compile_options(ps2rt PUBLIC -fvisibility=hidden -fvisibility-inlines-hidden
+                               -fno-stack-protector -fno-stack-check)
+        option(PS2HOST_LTO "ThinLTO (Apple's clang and ld)" OFF)
+        set(PS2HOST_PGO "" CACHE STRING "Profile-guided build: \"generate\", or the .profdata to build with")
+        if(PS2HOST_LTO)
+            target_compile_options(ps2rt PUBLIC -flto=thin)
+            target_link_options(ps2rt PUBLIC -flto=thin)
+        endif()
+        if(PS2HOST_PGO STREQUAL "generate")
+            target_compile_options(ps2rt PUBLIC -fprofile-instr-generate)
+            target_link_options(ps2rt PUBLIC -fprofile-instr-generate)
+            target_compile_definitions(ps2rt PUBLIC PS2HOST_PGO_GENERATE=1)     # main.cpp writes the profile
+        elseif(PS2HOST_PGO)
+            target_compile_options(ps2rt PUBLIC "-fprofile-instr-use=${PS2HOST_PGO}" -Wno-profile-instr-unprofiled
+                                   -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+        endif()
     elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         # Linux's clang (engine/tools/linux.py): ThinLTO with lld where the
         # game asks for it (game.json's "lto", as port.py's) - the host's

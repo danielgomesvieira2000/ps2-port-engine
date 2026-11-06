@@ -2006,6 +2006,10 @@ void VulkanGsRenderer::MemoryPatch(const std::uint32_t* words, std::size_t count
     if (!count || !patch_pipeline_) return;
     Flush();
     g_.Record([&](VkCommandBuffer cmd) {
+        // The patch's push constants (its own, through its own layout) may share
+        // the draws' - MoltenVK keeps one block - so the draws after it push their
+        // own again, as after the other compute passes.
+        drawn_ = DrawState{};
         MemoryBarrier(cmd);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, patch_pipeline_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, patch_layout_, 0, 1, &swizzle_set_, 0, nullptr);

@@ -12,16 +12,23 @@ together with a dispatch table and memory helpers that call back into Python,
 and every function is run on the same cases the derivation was verified on,
 against the interpreter. A function only counts if its *compiled* form agrees.
 
-The compiler is MSVC, found through vswhere. Where none is installed the check
-reports itself unavailable rather than passing.
+The compiler is MSVC, found through vswhere, on Windows, and clang++ elsewhere
+($CXX names another). Where none is installed the check reports itself
+unavailable rather than passing.
 """
 
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
+import platform
 import re
+import shutil
 import subprocess
+import sys
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 # The runtime rounds floats as the console does (toward zero, denormals
 # flushed: eefpu.cpp, vu0.cpp); the interpreter it is compared against rounds
@@ -72,6 +79,128 @@ class CompilerUnavailable(Exception):
 
 class CompileError(Exception):
     pass
+
+
+# A check library: a DLL on Windows, a shared library elsewhere.
+SHARED_SUFFIX = ".dll" if os.name == "nt" else ".dylib" if sys.platform == "darwin" else ".so"
+
+# Outside Windows the check libraries are compiled as the port is: no
+# multiply-add fused into one rounding (engine/host/CMakeLists.txt), and -O3
+# as /O2 is MSVC's - the optimiser gets the same chance at undefined
+# behaviour here as in the port. The harnesses spell their exports
+# __declspec(dllexport), which this makes a visible symbol.
+CLANG_FLAGS = ["-std=c++17", "-O3", "-fPIC", "-fexceptions", "-ffp-contract=off", "-w", "-ferror-limit=0",
+               "-D__declspec(x)=__attribute__((visibility(\"default\")))"]
+
+_CLANG_ERROR = re.compile(r"^(.*?):(\d+):\d+: (?:fatal )?error: (.*)$")
+
+
+# On Arm the runtime's SSE intrinsics are NEON's, through sse2neon (MIT) behind
+# the x86 headers' names: the same file, by hash, as engine/host/CMakeLists.txt.
+SSE2NEON_URL = "https://raw.githubusercontent.com/DLTcollab/sse2neon/v1.8.0/sse2neon.h"
+SSE2NEON_SHA256 = "07723c9f9457dd4316f1fde3dd4eb6f31dd67d9955f6c21f4e609ac1698be48a"
+X86_HEADERS = ("immintrin.h", "emmintrin.h", "xmmintrin.h", "pmmintrin.h", "tmmintrin.h", "smmintrin.h", "nmmintrin.h")
+
+
+def sse2neon_include() -> str:
+    """The folder of sse2neon and the x86 header names that include it, kept
+    in the user's cache and fetched once; the empty string where the processor
+    is not Arm."""
+    if platform.machine().lower() not in ("arm64", "aarch64"):
+        return ""
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    folder = os.path.join(cache, "ps2-port-engine", "sse2neon-" + SSE2NEON_SHA256[:12])
+    header = os.path.join(folder, "sse2neon.h")
+    if not os.path.exists(header):
+        os.makedirs(folder, exist_ok=True)
+        with urllib.request.urlopen(SSE2NEON_URL, timeout=60) as response:
+            data = response.read()
+        if hashlib.sha256(data).hexdigest() != SSE2NEON_SHA256:
+            raise CompilerUnavailable("sse2neon.h from %s is not the pinned file" % SSE2NEON_URL)
+        with open(header, "wb") as handle:
+            handle.write(data)
+    for name in X86_HEADERS:
+        shim = os.path.join(folder, name)
+        if not os.path.exists(shim):
+            with open(shim, "w") as handle:
+                handle.write('#pragma once\n#include "sse2neon.h"\n')
+    return folder
+
+
+def find_compiler() -> str:
+    """clang++ (or $CXX) outside Windows; CompilerUnavailable where there is none."""
+    found = shutil.which(os.environ.get("CXX") or "clang++")
+    if not found:
+        raise CompilerUnavailable("no clang++ on the path (or in $CXX)")
+    return found
+
+
+def compile_shared(sources, out: str, include_dirs, work_dir: str) -> None:
+    """Outside Windows: `sources` built into the shared library `out`, a
+    compiler each side by side. Errors are raised as CompileError in MSVC's
+    spelling, `file(line) : error : text`, which the callers read to drop the
+    functions that do not compile. A harness (its dispatch switch of thousands
+    of cases) is built unoptimised, as its MSVC build is."""
+    clang = find_compiler()
+    work_dir = os.path.abspath(work_dir)
+    objects_dir = os.path.join(work_dir, "objects_" + os.path.splitext(os.path.basename(out))[0])
+    os.makedirs(objects_dir, exist_ok=True)
+    includes = ["-I" + os.path.abspath(path) for path in include_dirs]
+    neon = sse2neon_include()
+    if neon:
+        includes = ["-isystem", neon] + includes
+
+    def compile_one(item):
+        number, source = item
+        stem = os.path.basename(source)
+        obj = os.path.join(objects_dir, "%03d_%s.o" % (number, stem))
+        optimise = ["-O0"] if "harness" in stem else []
+        result = subprocess.run([clang, "-c"] + CLANG_FLAGS + optimise + includes + [source, "-o", obj],
+                                capture_output=True, text=True)
+        return obj, result
+
+    jobs = max(1, min(os.cpu_count() or 4, 8))
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        compiled = list(pool.map(compile_one, enumerate(os.path.abspath(path) for path in sources)))
+    errors, other = [], []
+    for _obj, result in compiled:
+        if result.returncode == 0:
+            continue
+        for line in (result.stderr or "").splitlines():
+            match = _CLANG_ERROR.match(line)
+            if match:
+                errors.append("%s(%s) : error : %s" % match.groups())
+            elif "error" in line:
+                other.append(line)
+    if errors or other:
+        raise CompileError("\n".join(errors + other) or "the compiler failed")
+    link = subprocess.run([clang, "-shared", "-o", out] + [obj for obj, _ in compiled],
+                          capture_output=True, text=True)
+    if link.returncode != 0 or not os.path.exists(out):
+        raise CompileError("link: error : " + (link.stderr or "the link failed")[-3000:])
+
+
+def syntax_check(source: str, include_dirs) -> None:
+    """Outside Windows: the front end alone over `source` (seconds, where the
+    optimised build is minutes), raising CompileError in MSVC's spelling for
+    every error. A caller that drops what does not compile, and rebuilds, then
+    pays for the optimiser once instead of once per round."""
+    includes = ["-I" + os.path.abspath(path) for path in include_dirs]
+    neon = sse2neon_include()
+    if neon:
+        includes = ["-isystem", neon] + includes
+    # Undefined behaviour the front end can see is an error here: the optimiser
+    # turns a constant shift past the type's width into a trap (clang) and takes
+    # the whole check process with it, where a dropped function costs one verdict.
+    flags = [flag for flag in CLANG_FLAGS if flag not in ("-O3", "-fPIC", "-w")]
+    flags += ["-Wno-everything", "-Werror=shift-count-overflow", "-Werror=shift-count-negative"]
+    result = subprocess.run([find_compiler(), "-fsyntax-only"] + flags + includes + [os.path.abspath(source)],
+                            capture_output=True, text=True)
+    if result.returncode == 0:
+        return
+    errors = ["%s(%s) : error : %s" % match.groups()
+              for match in map(_CLANG_ERROR.match, (result.stderr or "").splitlines()) if match]
+    raise CompileError("\n".join(errors) or (result.stderr or "the compiler failed")[-2000:])
 
 
 def find_vcvars() -> str:
@@ -213,7 +342,7 @@ def harness_source(functions, typed: bool, externs=()) -> str:
 
 def build(generated_path: str, runtime_sources, include_dir: str, work_dir: str) -> tuple:
     """Compile the generated file into a DLL; returns (dll path, functions)."""
-    vcvars = find_vcvars()
+    vcvars = find_vcvars() if os.name == "nt" else find_compiler()
     # Absolute: the build script changes into work_dir before compiling, so a
     # relative path (a relative --game) would name a file that is not there.
     work_dir = os.path.abspath(work_dir)
@@ -232,13 +361,17 @@ def build(generated_path: str, runtime_sources, include_dir: str, work_dir: str)
     # the same process under the same name would fail.
     global _BUILDS
     _BUILDS += 1
-    dll = os.path.join(work_dir, "generated_check_%d_%d.dll" % (os.getpid(), _BUILDS))
+    dll = os.path.join(work_dir, "generated_check_%d_%d%s" % (os.getpid(), _BUILDS, SHARED_SUFFIX))
     sources = [os.path.abspath(generated_path), harness] + [
         os.path.abspath(path) for path in runtime_sources
     ]
     # /O2 on purpose: an optimiser is what turns undefined behaviour into wrong
     # answers, so checking an unoptimised build would hide exactly the problems
     # this exists to find.
+    if os.name != "nt":
+        syntax_check(generated_path, [include_dir, generated_dir])
+        compile_shared(sources, dll, [include_dir, generated_dir], work_dir)
+        return dll, functions
     script = os.path.join(work_dir, "build.bat")
     with open(script, "w", encoding="utf-8") as handle:
         handle.write("@echo off\n")
