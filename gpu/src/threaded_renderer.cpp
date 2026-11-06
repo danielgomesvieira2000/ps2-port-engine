@@ -86,20 +86,7 @@ public:
         // (The last ones kept: a draw's target and depth buffer are nearly
         // always the last draw's, and the sets' hashing for each was 5% of
         // the GS thread in splitscreen.)
-        if (n >= 3) {
-            const std::uint64_t target = TargetKey(state.fbp, state.fbw, state.psm);
-            if (target != last_target_) {
-                last_made_ = Made(state.fbp, state.fbw, state.psm, state.width, state.height);
-                last_target_ = target;
-            }
-            if (state.depth) {
-                const std::uint64_t depth = DepthKey(state.zbp, last_made_.w, std::min(last_made_.h, kDepthRows));
-                if (depth != last_depth_) {
-                    depths_.insert(depth);
-                    last_depth_ = depth;
-                }
-            }
-        }
+        if (n >= 3) Track(state);
         if (has_last_ && std::memcmp(&state, &last_, sizeof state) == 0) {
             Same(vertices, n);
             return;
@@ -121,6 +108,34 @@ public:
         Same(vertices, std::uint32_t(count));
     }
     void Flush() override { Op(kFlush, 0); End(); }
+    bool DrawsMeshes() const override { return inner_->DrawsMeshes(); }
+    void UploadMesh(std::uint64_t key, const void* quads, std::size_t quad_count, const std::uint32_t* indices,
+                    std::size_t index_count) override {
+        const std::uint64_t q = quad_count, i = index_count;
+        Op(kUploadMesh, 24 + q * 16 + i * 4);
+        Put(&key, 8);
+        Put(&q, 8);
+        Put(&i, 8);
+        Put(quads, q * 16);
+        Put(indices, i * 4);
+        End();
+    }
+    void ReleaseMesh(std::uint64_t key) override {
+        Op(kReleaseMesh, 8);
+        Put(&key, 8);
+        End();
+    }
+    void DrawMesh(const GsDrawState& state, std::uint64_t key, const float* header) override {
+        Track(state);
+        // (the state the next DrawTrianglesAgain's is compared with, here and on the renderer's thread)
+        std::memcpy(&last_, &state, sizeof state);
+        has_last_ = true;
+        Op(kDrawMesh, sizeof state + 8 + kMeshHeaderFloats * 4);
+        Put(&state, sizeof state);
+        Put(&key, 8);
+        Put(header, kMeshHeaderFloats * 4);
+        End();
+    }
     void Kick() override {
         Op(kKick, 0);
         End();
@@ -426,7 +441,27 @@ private:
         kReleaseTexture, kMemoryWrite, kMemoryPatch, kTargetFromMemory, kDepthFromMemory, kTextureFromMemory,
         kClutFromMemory, kClutRows, kReloadKeepsColour, kTargetRowsFromMemory, kDepthRowsFromMemory,
         kTargetToMemory, kDepthToMemory, kChannelShuffle, kRunEffect, kUploadReplacement,
+        kUploadMesh, kReleaseMesh, kDrawMesh,
     };
+    // The images a draw makes (VulkanGsRenderer::Flush): its target, and its
+    // depth buffer as large as the target was made.
+    // (The last ones kept: a draw's target and depth buffer are nearly
+    // always the last draw's, and the sets' hashing for each was 5% of
+    // the GS thread in splitscreen.)
+    void Track(const GsDrawState& state) {
+        const std::uint64_t target = TargetKey(state.fbp, state.fbw, state.psm);
+        if (target != last_target_) {
+            last_made_ = Made(state.fbp, state.fbw, state.psm, state.width, state.height);
+            last_target_ = target;
+        }
+        if (state.depth) {
+            const std::uint64_t depth = DepthKey(state.zbp, last_made_.w, std::min(last_made_.h, kDepthRows));
+            if (depth != last_depth_) {
+                depths_.insert(depth);
+                last_depth_ = depth;
+            }
+        }
+    }
     // UploadReplacement's queued and not yet seen made, by id (the GS
     // thread's alone); the device's block compression, asked once.
     mutable std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> queued_replacements_;
@@ -577,6 +612,24 @@ private:
                     break;
                 }
                 case kReleaseTexture: r.ReleaseTexture(Take<std::uint64_t>(at)); break;
+                case kUploadMesh: {
+                    const auto key = Take<std::uint64_t>(at);
+                    const auto q = Take<std::uint64_t>(at), i = Take<std::uint64_t>(at);
+                    const std::uint8_t* quads = at;
+                    indices_.resize(std::size_t(i));
+                    std::memcpy(indices_.data(), at + q * 16, std::size_t(i) * 4);
+                    r.UploadMesh(key, quads, std::size_t(q), indices_.data(), std::size_t(i));
+                    break;
+                }
+                case kReleaseMesh: r.ReleaseMesh(Take<std::uint64_t>(at)); break;
+                case kDrawMesh: {
+                    std::memcpy(&played_, at, sizeof played_), at += sizeof played_;
+                    const auto key = Take<std::uint64_t>(at);
+                    float header[kMeshHeaderFloats];
+                    std::memcpy(header, at, sizeof header);
+                    r.DrawMesh(played_, key, header);
+                    break;
+                }
                 case kMemoryWrite: {
                     const auto b = Take<std::uint32_t>(at), e = Take<std::uint32_t>(at);
                     r.MemoryWrite(b, e, at);
@@ -690,6 +743,7 @@ private:
     // The renderer's thread.
     GsDrawState played_;
     std::vector<GsVertex> vertices_;
+    std::vector<std::uint32_t> indices_;     // (kUploadMesh's, aligned)
     std::vector<std::uint32_t> words_;
     std::uint32_t clut_[256] = {};
     std::thread thread_;

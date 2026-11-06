@@ -294,6 +294,26 @@ public:
                                  std::size_t prims) {
         for (std::size_t i = 0; i < prims; ++i) DrawTriangles(state, vertices + i * per, per);
     }
+    /* Native microprograms' meshes (docs/NATIVE_RENDERER.md, the GPU's way):
+       the game's own vertices kept on the GPU and drawn through a vertex
+       program (gs_mesh.vert: Outbreak's room) with, each draw, the header the
+       microprogram would have been given. Whether this renderer draws them: */
+    virtual bool DrawsMeshes() const { return false; }
+    /* A mesh under `key` (again: replaced): `quads` its vertices, 16 bytes a
+       quadword, four a vertex (gs_mesh.vert's); `indices` its triangles,
+       three each, into them. */
+    virtual void UploadMesh(std::uint64_t key, const void* quads, std::size_t quad_count,
+                            const std::uint32_t* indices, std::size_t index_count) {
+        (void)key, (void)quads, (void)quad_count, (void)indices, (void)index_count;
+    }
+    virtual void ReleaseMesh(std::uint64_t key) { (void)key; }
+    /* The mesh's triangles drawn in `state`, in turn with DrawTriangles';
+       `header` kMeshHeaderFloats floats (gs_mesh.vert's Header: VU1 data
+       rows 0-23, vf11-vf17, XYOFFSET). */
+    static constexpr std::size_t kMeshHeaderFloats = 128;
+    virtual void DrawMesh(const GsDrawState& state, std::uint64_t key, const float* header) {
+        (void)state, (void)key, (void)header;
+    }
     /* Runs what has been drawn. */
     virtual void Flush() = 0;
     /* Hands what has been recorded to the GPU without waiting for it (once a

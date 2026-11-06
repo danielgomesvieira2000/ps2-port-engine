@@ -522,6 +522,11 @@ public:
     void UploadTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, const std::uint32_t* pixels,
                       std::uint32_t width, std::uint32_t height) override;
     void ReleaseTexture(std::uint64_t key) override;
+    bool DrawsMeshes() const override { return mesh_vert_ && mesh_pool_; }
+    void UploadMesh(std::uint64_t key, const void* quads, std::size_t quad_count, const std::uint32_t* indices,
+                    std::size_t index_count) override;
+    void ReleaseMesh(std::uint64_t key) override;
+    void DrawMesh(const GsDrawState& state, std::uint64_t key, const float* header) override;
     bool HasTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm) const override {
         return targets_.count(Key{fbp, fbw, psm}) != 0;
     }
@@ -859,6 +864,23 @@ private:
        with yet. */
     VkShaderModule mesh_vert_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout mesh_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool mesh_pool_ = VK_NULL_HANDLE;
+    struct Mesh {
+        VkBuffer vertices = VK_NULL_HANDLE, indices = VK_NULL_HANDLE;
+        VkDeviceMemory vertex_memory = VK_NULL_HANDLE, index_memory = VK_NULL_HANDLE;
+        std::uint32_t index_count = 0;
+        // Set 3 by the vertex ring's chunk its header is in (a dynamic offset within it).
+        std::vector<std::pair<VkBuffer, VkDescriptorSet>> sets;
+    };
+    std::unordered_map<std::uint64_t, Mesh> meshes_;
+    void RetireMesh(Mesh mesh);
+    // The mesh Flush draws instead of pending_ (DrawMesh's, for its one Flush).
+    struct MeshDraw {
+        const Mesh* mesh = nullptr;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        std::uint32_t offset = 0;
+    };
+    MeshDraw mesh_draw_;
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     bool keep_colour_ = false;      /* ReloadKeepsColour */
@@ -1098,7 +1120,9 @@ private:
 };
 
 void* VulkanGsRenderer::Vertices(VkDeviceSize bytes, VkBuffer* buffer, VkDeviceSize* offset) {
-    return RingAlloc(vertex_rings_, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, bytes, buffer, offset);
+    // (and a mesh draw's header: read as a storage buffer)
+    return RingAlloc(vertex_rings_, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, bytes,
+                     buffer, offset);
 }
 
 void* VulkanGsRenderer::Staging(VkDeviceSize bytes, VkBuffer* buffer, VkDeviceSize* offset) {
@@ -1416,11 +1440,21 @@ bool VulkanGsRenderer::Init(std::string* error) {
     // Set 3: a native mesh draw's mesh and header (gs_mesh.vert).
     VkDescriptorSetLayoutBinding mesh_bindings[2] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
-        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr}};
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr}};
     VkDescriptorSetLayoutCreateInfo mli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     mli.bindingCount = 2;
     mli.pBindings = mesh_bindings;
     vkCreateDescriptorSetLayout(g_.device, &mli, nullptr, &mesh_set_layout_);
+    if (mesh_vert_) {
+        VkDescriptorPoolSize mesh_sizes[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 4096}};
+        VkDescriptorPoolCreateInfo mpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        mpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        mpi.maxSets = 4096;
+        mpi.poolSizeCount = 2;
+        mpi.pPoolSizes = mesh_sizes;
+        vkCreateDescriptorPool(g_.device, &mpi, nullptr, &mesh_pool_);
+    }
     const VkDescriptorSetLayout set_layouts[4] = {set_layout_, clut_set_layout_, set_layout_, mesh_set_layout_};
     lci.setLayoutCount = 4;
     lci.pSetLayouts = set_layouts;
@@ -3231,6 +3265,94 @@ void VulkanGsRenderer::ReleaseTexture(std::uint64_t key) {
     RetireTexture(texture);
 }
 
+void VulkanGsRenderer::UploadMesh(std::uint64_t key, const void* quads, std::size_t quad_count,
+                                  const std::uint32_t* indices, std::size_t index_count) {
+    if (!DrawsMeshes() || !quad_count || !index_count) return;
+    ReleaseMesh(key);
+    Mesh mesh;
+    void* at = nullptr;
+    if (!Buffer(quad_count * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &mesh.vertices, &mesh.vertex_memory, &at)) {
+        RetireMesh(mesh);
+        return;
+    }
+    std::memcpy(at, quads, quad_count * 16);
+    if (!Buffer(index_count * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &mesh.indices, &mesh.index_memory, &at)) {
+        RetireMesh(mesh);
+        return;
+    }
+    std::memcpy(at, indices, index_count * 4);
+    mesh.index_count = std::uint32_t(index_count);
+    meshes_[key] = std::move(mesh);
+}
+
+void VulkanGsRenderer::ReleaseMesh(std::uint64_t key) {
+    auto found = meshes_.find(key);
+    if (found == meshes_.end()) return;
+    Flush();
+    Mesh mesh = std::move(found->second);
+    meshes_.erase(found);
+    RetireMesh(std::move(mesh));
+}
+
+void VulkanGsRenderer::RetireMesh(Mesh mesh) {
+    // Recorded draws may still read it: it goes after they have run.
+    VkDevice device = g_.device;
+    VkDescriptorPool pool = mesh_pool_;
+    g_.AfterSubmit([device, pool, mesh]() mutable {
+        for (auto& [chunk, set] : mesh.sets)
+            if (set) vkFreeDescriptorSets(device, pool, 1, &set);
+        if (mesh.vertices) vkDestroyBuffer(device, mesh.vertices, nullptr);
+        if (mesh.indices) vkDestroyBuffer(device, mesh.indices, nullptr);
+        if (mesh.vertex_memory) vkFreeMemory(device, mesh.vertex_memory, nullptr);
+        if (mesh.index_memory) vkFreeMemory(device, mesh.index_memory, nullptr);
+    });
+}
+
+void VulkanGsRenderer::DrawMesh(const GsDrawState& state, std::uint64_t key, const float* header) {
+    auto found = meshes_.find(key);
+    if (found == meshes_.end() || !DrawsMeshes()) return;
+    Mesh& mesh = found->second;
+    RecordShuffle();
+    Flush();                            // (what was drawn before it, first)
+    // The header into the vertex ring (as a storage buffer), set 3 for its chunk.
+    VkBuffer chunk = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    void* at = Vertices(kMeshHeaderFloats * 4, &chunk, &offset);
+    if (!at) return;
+    std::memcpy(at, header, kMeshHeaderFloats * 4);
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    for (const auto& [buffer, s] : mesh.sets)
+        if (buffer == chunk) set = s;
+    if (!set) {
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = mesh_pool_;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &mesh_set_layout_;
+        if (vkAllocateDescriptorSets(g_.device, &ai, &set) != VK_SUCCESS) return;
+        const VkDescriptorBufferInfo vertices{mesh.vertices, 0, VK_WHOLE_SIZE};
+        const VkDescriptorBufferInfo head{chunk, 0, kMeshHeaderFloats * 4};
+        VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        writes[0].dstSet = set;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[0].pBufferInfo = &vertices;
+        writes[1] = writes[0];
+        writes[1].dstBinding = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+        writes[1].pBufferInfo = &head;
+        vkUpdateDescriptorSets(g_.device, 2, writes, 0, nullptr);
+        mesh.sets.emplace_back(chunk, set);
+    }
+    // One batch of its own, through Flush (its target, pass, states as a batch of triangles'). What it
+    // reads of its own target (feedback, the shader's blending): all of it - its place is the GPU's.
+    state_ = state;
+    read_all_ = true;
+    mesh_draw_ = MeshDraw{&mesh, set, std::uint32_t(offset)};
+    Flush();
+    mesh_draw_ = MeshDraw{};
+}
+
 void VulkanGsRenderer::RetireTexture(Texture texture) {
     texture.replacement = 0;
     // Recorded draws may still sample it: it goes after they have run - into
@@ -3634,17 +3756,20 @@ void VulkanGsRenderer::Flush() {
     const bool read_all = read_all_ || !read_any_;
     const int read_x0 = read_x0_, read_y0 = read_y0_, read_x1 = read_x1_, read_y1 = read_y1_;
     read_any_ = read_all_ = false;
-    if (pending_.empty()) return;
+    const Mesh* mesh = mesh_draw_.mesh;      // (DrawMesh's: its mesh, not pending_)
+    if (pending_.empty() && !mesh) return;
     const VkDeviceSize bytes = pending_.size() * sizeof(PackedVertex);
     VkBuffer vertex_buffer = VK_NULL_HANDLE;
     VkDeviceSize vertex_offset = 0;
-    void* vertex_data = Vertices(bytes, &vertex_buffer, &vertex_offset);
-    if (!vertex_data) {
-        pending_.clear();
-        ranges_.clear();
-        return;
+    if (!mesh) {
+        void* vertex_data = Vertices(bytes, &vertex_buffer, &vertex_offset);
+        if (!vertex_data) {
+            pending_.clear();
+            ranges_.clear();
+            return;
+        }
+        std::memcpy(vertex_data, pending_.data(), bytes);
     }
-    std::memcpy(vertex_data, pending_.data(), bytes);
     Image* t = TargetFor(state_);
     // The ranges (gs.vert): read only on a target drawn larger (gs.frag's
     // snap) - there the batch's own, or the one that keeps nothing in for
@@ -3653,7 +3778,7 @@ void VulkanGsRenderer::Flush() {
     // chunk of the ring as before.
     VkBuffer range_buffer = vertex_buffer;      // (stride 0: one for all)
     VkDeviceSize range_offset = 0;
-    const bool ranges_read = state_.textured && t->scale > 1;
+    const bool ranges_read = !mesh && state_.textured && t->scale > 1;
     const bool own_ranges = ranges_read && !ranges_.empty() && ranges_.size() == pending_.size();
     if (own_ranges) {
         const VkDeviceSize range_bytes = ranges_.size() * sizeof(VertexRange);
@@ -3813,7 +3938,7 @@ void VulkanGsRenderer::Flush() {
     if ((state_.tag & 4u) && !ShaderBlend(state_) && SceneDepthSet())
         params.blend_ops |= 1u << 21;                           // gs.frag: a soft particle
     params.blend_ops |= std::uint32_t(Blender16(state_)) << 17;     // gs.frag: S for the blender
-    const std::uint32_t count = std::uint32_t(pending_.size());
+    const std::uint32_t count = mesh ? mesh->index_count : std::uint32_t(pending_.size());
     static int complaints = 0;
     if (!set && complaints < 5) {
         ++complaints;
@@ -3996,7 +4121,13 @@ void VulkanGsRenderer::Flush() {
             // the batch by its first vertex. With them: the batch's vertices
             // and ranges each where they are (the ranges' stride dynamic).
             std::uint32_t first = 0;
-            if (!own_ranges) {
+            if (mesh) {
+                // The mesh's vertices and header (set 3), its triangles by index.
+                d.vertices = d.ranges = VK_NULL_HANDLE;
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 3, 1, &mesh_draw_.set, 1,
+                                        &mesh_draw_.offset);
+                vkCmdBindIndexBuffer(cmd, mesh->indices, 0, VK_INDEX_TYPE_UINT32);
+            } else if (!own_ranges) {
                 if (d.vertices != vertex_buffer || d.ranges != range_buffer) {
                     d.vertices = vertex_buffer;
                     d.ranges = range_buffer;
@@ -4044,7 +4175,8 @@ void VulkanGsRenderer::Flush() {
                         // PS2HOST_GPU_UBERSHADER=1: every draw with the whole shader.
                         static const bool whole = std::getenv("PS2HOST_GPU_UBERSHADER") != nullptr;
                         const std::uint32_t full_key =
-                            whole ? op_key : op_key | ((~Features(params) & kFeatureBits) << kFeatureShift);
+                            (whole ? op_key : op_key | ((~Features(params) & kFeatureBits) << kFeatureShift)) |
+                            (mesh ? kMeshVertices : 0u);
                         const int depth_write = pass.depth_write && op != 1 ? 1 : 0;
                         const VkPipeline chosen =
                             baked ? BakedPipelineFor(full_key, Baked(depth_test, depth_write, compare, stencil_test, own_ranges))
@@ -4071,7 +4203,10 @@ void VulkanGsRenderer::Flush() {
                         // primitives' drawing recorded (a software device, as
                         // SwiftShader, then times the CPU's side, not its own).
                         static const bool no_draw = std::getenv("PS2HOST_GPU_NO_DRAW") != nullptr;
-                        if (!no_draw) vkCmdDraw(cmd, count, 1, first, 0);
+                        if (!no_draw) {
+                            if (mesh) vkCmdDrawIndexed(cmd, count, 1, 0, 0, 0);
+                            else vkCmdDraw(cmd, count, 1, first, 0);
+                        }
                         g_.MarkDraw(cmd, tag);
                     }
                 }
@@ -4266,6 +4401,13 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (set_layout_) vkDestroyDescriptorSetLayout(g_.device, set_layout_, nullptr);
     if (clut_set_layout_) vkDestroyDescriptorSetLayout(g_.device, clut_set_layout_, nullptr);
     if (mesh_set_layout_) vkDestroyDescriptorSetLayout(g_.device, mesh_set_layout_, nullptr);
+    for (auto& [key, mesh] : meshes_) {
+        vkDestroyBuffer(g_.device, mesh.vertices, nullptr);
+        vkDestroyBuffer(g_.device, mesh.indices, nullptr);
+        vkFreeMemory(g_.device, mesh.vertex_memory, nullptr);
+        vkFreeMemory(g_.device, mesh.index_memory, nullptr);
+    }
+    if (mesh_pool_) vkDestroyDescriptorPool(g_.device, mesh_pool_, nullptr);
     if (layout_) vkDestroyPipelineLayout(g_.device, layout_, nullptr);
     if (vert_) vkDestroyShaderModule(g_.device, vert_, nullptr);
     if (mesh_vert_) vkDestroyShaderModule(g_.device, mesh_vert_, nullptr);

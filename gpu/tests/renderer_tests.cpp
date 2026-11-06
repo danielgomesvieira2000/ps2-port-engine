@@ -427,6 +427,52 @@ void Fogged(ps2gpu::GsRenderer& renderer) {
 
 }  // namespace
 
+/* A native mesh (gs_mesh.vert): a square of the room program's vertices, its
+   header placing them as they are - drawn as DrawTriangles would draw the same
+   square; and culled where all of a triangle is out past the guard band. */
+void Meshes(ps2gpu::GsRenderer& renderer) {
+    if (!renderer.DrawsMeshes()) {
+        std::printf("meshes: not drawn by this renderer (skipped)\n");
+        return;
+    }
+    // Four vertices, four quadwords each: place, normal, colour, texture coordinates.
+    const float quads[4][16] = {
+        {8, 8, 1, 0, 0, 0, 1, 0, 100, 50, 25, 128, 0, 0, 1, 0},
+        {24, 8, 1, 0, 0, 0, 1, 0, 100, 50, 25, 128, 1, 0, 1, 0},
+        {8, 24, 1, 0, 0, 0, 1, 0, 100, 50, 25, 128, 0, 1, 1, 0},
+        {24, 24, 1, 0, 0, 0, 1, 0, 100, 50, 25, 128, 1, 1, 1, 0}};
+    const std::uint32_t indices[6] = {0, 1, 2, 1, 3, 2};
+    renderer.UploadMesh(7, quads, 16, indices, 6);
+    float header[ps2gpu::GsRenderer::kMeshHeaderFloats] = {};
+    auto row = [&](int r, float x, float y, float z, float w) {
+        header[r * 4] = x, header[r * 4 + 1] = y, header[r * 4 + 2] = z, header[r * 4 + 3] = w;
+    };
+    row(0, 1, 1, 1, 0);             // the colour's own share
+    row(1, 1, 1, 1, 1);             // ...times 1
+    row(3, 1, 0, 0, 0), row(4, 0, 1, 0, 0), row(5, 0, 0, 1, 0), row(6, 0, 0, 0, 1);    // the view: as it is
+    row(7, 0.01f, 0, 0, 0), row(8, 0, 0.01f, 0, 0), row(9, 0, 0, 0.01f, 0), row(10, 0, 0, 0, 1);    // a wide guard band
+    row(15, 1, 0, 0, 0), row(16, 0, 1, 0, 0);
+    row(24, 1, 0, 0, 0);            // vf11: the fog (none)
+    row(28, 0, 0, 0, 0), row(29, 0, 0, 0, 0), row(30, 10, 0, 0, 0);     // vf15-vf17: the light, its strength 0
+    ps2gpu::GsDrawState state = Target(0x1C0);
+    renderer.DrawMesh(state, 7, header);
+    Check(Pixel(renderer, 0x1C0, 16, 16) == Rgba(100, 50, 25, 128), "a mesh draws its vertices' colour");
+    Check(Pixel(renderer, 0x1C0, 4, 4) == 0, "...and nothing outside it");
+    Rect(renderer, state, 40, 8, 56, 24, Rgba(100, 50, 25, 128));
+    Check(Pixel(renderer, 0x1C0, 8, 8) == Pixel(renderer, 0x1C0, 40, 8) &&
+              Pixel(renderer, 0x1C0, 23, 23) == Pixel(renderer, 0x1C0, 55, 23) &&
+              Pixel(renderer, 0x1C0, 24, 16) == Pixel(renderer, 0x1C0, 56, 16),
+          "...covering the pixels the same square of triangles covers");
+    // The guard band at the square's own size: every vertex out past x's plane (|x| > |w|) - culled.
+    row(7, 1, 0, 0, 0);
+    row(0, 0, 1, 0, 0);
+    ps2gpu::GsDrawState other = Target(0x1C1);
+    renderer.DrawMesh(other, 7, header);
+    Check(Pixel(renderer, 0x1C1, 16, 16) == 0, "a mesh's triangle all out past one plane of the guard band is culled");
+    renderer.ReleaseMesh(7);
+    renderer.DrawMesh(other, 7, header);
+}
+
 int main() {
     std::string error;
     // PS2HOST_RENDERER=d3d11: the same tests on Direct3D 11.
@@ -456,6 +502,7 @@ int main() {
     TargetFromMemory(*renderer);
     PartlyMaskedChannels(*renderer);
     ComputeBetweenDraws(*renderer);
+    Meshes(*renderer);
     if (g_failures) std::printf("gpu renderer tests: %d failed\n", g_failures);
     else std::printf("gpu renderer tests: all passed (%s)\n", gpu->Describe().c_str());
     return g_failures ? EXIT_FAILURE : EXIT_SUCCESS;
