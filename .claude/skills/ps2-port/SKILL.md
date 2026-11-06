@@ -75,6 +75,7 @@ On an Apple silicon Mac the same loop is `engine/tools/macos.py` (docs/MACOS.md)
 python3 engine/tools/macos.py --game games/<name> all -- --window --gpu --audio --timeout 600   # build, run, again until no new code
 python3 engine/tools/macos.py --game games/<name> build         # build only: games/<name>/build/macos/<name>/<name>
 python3 engine/tools/macos.py --game games/<name> run -- <the port's options>   # run what is built
+python3 engine/tools/macos.py --game games/<name> pgo         # a profile-guided build (about an hour); later builds use it
 python3 engine/tools/macos.py --game games/<name> app [--icon FILE_OR_URL]      # a double-clickable .app
 ```
 
@@ -87,7 +88,9 @@ yourself. What to know there: a crash report is in
 compiler flags; the window's surface must be made by the same Vulkan loader as
 the instance (`SDL_VULKAN_LIBRARY`); `app` bundles the loader and MoltenVK and
 its icon is the player's (`--icon`, or the disc's logo): never commit a
-game's artwork, and never add a default URL for it.
+game's artwork, and never add a default URL for it. Apple's clang is `AppleClang` to CMake, not `Clang`: a branch for clang
+must test `APPLE` too, or a Mac build misses its flags and ThinLTO. Measure with
+`tools/bench.py`, interleaving the builds: a busy Mac moves a run by 5%.
 
 Each run ends with a report: why it stopped, the guest call stack, the kernel
 services and device registers it used. That names the next thing to provide:
