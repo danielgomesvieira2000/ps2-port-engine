@@ -191,6 +191,16 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
             float before = 0.0f;
             const bool had_before = ChangedBefore(x.at + 1 + k, &before);
             const float change = fb - fa;
+            if (o.buffer_before) {
+                // (as the newer's buffer had it last: that buffer's own)
+                const std::vector<u32>& r = *o.buffer_before;
+                const size_t at = y.at + 1 + k;
+                if (at < r.size() && r[y.at] == b[y.at] && r[at] == wb) {
+                    if (!plan.carry) plan.changed.push_back({y.at + 1 + k, change});
+                    else if (had_before) plan.changed.push_back({y.at + 1 + k, before});
+                    continue;
+                }
+            }
             bool past_cut = !(std::fabs(change) < o.cut);
             if (past_cut && o.cut_steady && had_before && (before > 0) == (change > 0) &&
                 std::fabs(before) * 3.0f >= std::fabs(change) && std::fabs(before) <= 3.0f * std::fabs(change))
@@ -277,6 +287,58 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
     return true;
 }
 
+/* A matched pair's colours to blend (ListBlendOptions::blend_colors): in each
+   of its DIRECTs and DIRECTHLs, the same code in both, the GIF packets whose
+   tags are the same in both - their RGBAQ writes that differ (PACKED's
+   RGBAQ, its four words' low bytes; A+D's to RGBAQ, 0x01; REGLIST's, its
+   first word). */
+void PlanColors(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, const std::vector<u32>& b,
+                const std::vector<Code>& cb, const Segment& s, ListBlendPlan& plan) {
+    for (u32 j = s.first; j < s.end; ++j) {
+        const u32 older = sa + (j - s.first);
+        if (older >= ca.size()) break;
+        const Code& x = ca[older];
+        const Code& y = cb[j];
+        const u32 cmd = (y.code >> 24) & 0x7F;
+        if ((cmd != 0x50 && cmd != 0x51) || x.code != y.code || x.words != y.words) continue;
+        const auto color = [&](u32 ia, u32 ib, u32 bytes) {
+            if (a[ia] != b[ib]) plan.colors.push_back({ib, a[ia], b[ib], bytes});
+        };
+        u32 ia = x.at + 1, ib = y.at + 1;
+        const u32 end = y.at + 1 + y.words;
+        while (ib + 4 <= end) {
+            if (std::memcmp(&a[ia], &b[ib], 16) != 0) break;   // (another packet: no more of this code's)
+            const u64 tag = b[ib] | u64(b[ib + 1]) << 32;
+            const u64 regs = b[ib + 2] | u64(b[ib + 3]) << 32;
+            ia += 4;
+            ib += 4;
+            const u32 nloop = u32(tag & 0x7FFF), flg = u32(tag >> 58) & 3;
+            const u32 nreg = u32(tag >> 60) ? u32(tag >> 60) : 16;
+            if (flg == 0) {
+                for (u32 l = 0; l < nloop && ib + 4 <= end; ++l)
+                    for (u32 r = 0; r < nreg && ib + 4 <= end; ++r, ia += 4, ib += 4) {
+                        const u32 d = u32(regs >> (4 * r)) & 0xF;
+                        if (d == 0x1) {
+                            for (u32 k = 0; k < 4; ++k) color(ia + k, ib + k, 1);
+                        } else if (d == 0xE && (b[ib + 2] & 0xFF) == 0x01 && (a[ia + 2] & 0xFF) == 0x01) {
+                            color(ia, ib, 4);
+                        }
+                    }
+            } else if (flg == 1) {
+                const u32 n = nloop * nreg;
+                for (u32 r = 0; r < n && ib + 2 <= end; ++r, ia += 2, ib += 2)
+                    if (((regs >> (4 * (r % nreg))) & 0xF) == 0x1) color(ia, ib, 4);
+                const u32 pad = (n & 1) ? 2 : 0;    // (to the next quadword)
+                ia += pad;
+                ib += pad;
+            } else {
+                ia += nloop * 4;
+                ib += nloop * 4;
+            }
+        }
+    }
+}
+
 /* The camera's segment: its view (rows view_first to view_end of its first
    UNPACK of floats) blended whatever it does - its cut is judged apart
    (ViewJumps) - and the rest as any thing's, left as the game steps it where
@@ -358,6 +420,7 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
     plan.from.clear();
     plan.to.clear();
     plan.segment.clear();
+    plan.colors.clear();
     // The changes the plan before found (this plan's, a step ago) for its
     // steady test, then this step's anew.
     static thread_local std::vector<std::pair<u32, float>> before;
@@ -445,6 +508,7 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
         }
         used[best] = true;
         ++matched;
+        if (o.blend_colors) PlanColors(a.words, ca, sa[best].first, b.words, cb, s, plan);
         const bool moved = best != expected;
         if (moved) ++r.moved;
         expected = best + 1;
@@ -543,6 +607,7 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
         plan.from.clear();
         plan.to.clear();
         plan.segment.clear();
+        plan.colors.clear();
     }
     r.blended = plan.at.size();
     return r;
@@ -554,6 +619,17 @@ void ApplyListBlend(const ListBlendPlan& plan, float t, std::vector<u32>& words,
         if (at >= words.size()) continue;
         const float v = plan.from[i] + t * (plan.to[i] - plan.from[i]);
         std::memcpy(&words[at], &v, 4);
+    }
+    for (const ListBlendPlan::Color& c : plan.colors) {
+        const size_t at = offset + c.at;
+        if (at >= words.size()) continue;
+        u32 w = c.to;
+        for (u32 k = 0; k < c.bytes; ++k) {
+            const float from = float((c.from >> (8 * k)) & 0xFF), to = float((c.to >> (8 * k)) & 0xFF);
+            const u32 v = u32(std::lround(from + t * (to - from))) & 0xFF;
+            w = (w & ~(0xFFu << (8 * k))) | (v << (8 * k));
+        }
+        words[at] = w;
     }
 }
 
@@ -620,6 +696,10 @@ void ListMotion::Picture(const std::vector<u32>& words, size_t end, int segment_
         if (was == last_.end() || was->second.size() != v.size()) continue;
         double d = 0.0, n = 0.0;
         for (size_t k = 0; k < v.size(); ++k) {
+            // (a word 0 in either picture left out: a double buffer's
+            // leftovers, 0 in one half and not in the other - not drawn, but
+            // their change every step a "judder" at 144)
+            if (v[k] == 0.0f || was->second[k] == 0.0f) continue;
             d += double(v[k] - was->second[k]) * (v[k] - was->second[k]);
             n += double(v[k]) * v[k];
         }

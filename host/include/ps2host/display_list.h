@@ -114,6 +114,21 @@ struct ListBlendOptions {
         u32 words, first_row, end_row;
     };
     std::vector<StepRows> step_rows;
+    // The colours (RGBAQ's R, G, B and A) of a matched pair's GIF packets
+    // (its DIRECTs and DIRECTHLs, their tags the same in both) blended too:
+    // a fade is a sprite over the screen whose alpha the game steps (File
+    // #2's, 0x10 a step: the picture brightened at 30 a second at 120).
+    bool blend_colors = false;
+    // The two lists made in different buffers (a double buffer's halves, its
+    // memory each half's own): the last list made in the newer's buffer
+    // before it. A value the newer has as that one had it, at the same place
+    // under the same code, is the newer buffer's own - the newer's, neither
+    // blended nor a jump; the thing blends on. Outbreak's lists keep each
+    // half's leftovers in words the VU never reads (a character's 992-word
+    // header: 0 in one half, 128 in the other); at 144 a step's half
+    // alternated (4.8 pictures a step), and those words "jumped" every step:
+    // the characters, 19 of the 59 things, stepped at 30.
+    const std::vector<u32>* buffer_before = nullptr;
 };
 
 struct ListBlend {
@@ -156,6 +171,13 @@ struct ListBlendPlan {
     // "unsteady" and stepped (Outbreak's RE4 camera pulled in at a hedge: 44
     // things the step after).
     bool carry = false;
+    // The colours to blend (ListBlendOptions::blend_colors): the newer list's
+    // word, its value in each list, and its bytes blended (4: an RGBA word;
+    // 1: a PACKED RGBAQ's colour, its low byte).
+    struct Color {
+        u32 at, from, to, bytes;
+    };
+    std::vector<Color> colors;
 };
 
 /* The blend of `a` (older) into `b` (newer), planned. `moving`: the words of
