@@ -53,9 +53,11 @@ build took about 5 minutes.
 | `build` | generate the dispatch table and build: `<game>/build/macos/<name>/<name>` |
 | `run -- <options>` | run the built program (what follows `--` is the port's own options); sets what Vulkan needs: Homebrew's loader on the library path and MoltenVK's driver |
 | `all -- <options>` | build, run and build again until a run finds no more code copied at run time (`port.py`'s default action) |
+| `pgo` | the profile-guided build: a counting build, the game's scripted runs, `llvm-profdata`'s merge into `<game>/build/port/pgo.profdata`, and the build with it (below) |
 | `app [--icon FILE_OR_URL]` | `<game>/build/macos/<Title>.app` (below) |
 
-`--lto` (build, all, app): ThinLTO, a long link.
+A build is ThinLTO when the game's `game.json` says `"lto": true` (`--lto` / `--no-lto` /
+`PS2_LTO=off` override), and uses the profile `pgo` made when there is one (`--no-pgo`: without).
 
 ## Speed: the VU microprograms
 
@@ -73,6 +75,30 @@ python3 engine/tools/macos.py --game games/<name> build
 
 The report's `VU: ... (N compiled)` line says they are compiled. The manifest
 is the game's microcode: it stays in `build/`, never committed.
+
+## Performance
+
+Where the time goes (Burnout 3, a race): VU1 about 50-60% of the CPU, VU0 7-9%
+(the recorded microprograms, compiled ahead of time with the VU's own cycle
+accounting). What the build can do about it:
+
+* **ThinLTO** (`game.json` `"lto"`): Apple's `ld` reads it. The Mac's build was
+  not getting it before: the CMake branch for clang tested for `Clang`, and
+  Apple's compiler calls itself `AppleClang`.
+* **No stack canary or probe, hidden symbols** (`host/CMakeLists.txt`, the Apple
+  branch): Apple's clang turns on `-fstack-protector` and `-fstack-check` by
+  default, in every translated function's frame; Linux and Android already
+  built without them.
+* **A profile-guided build** (`macos.py pgo`, about an hour: the counting build's
+  link is slow, then the six scripted runs): the binary is also smaller (50 MB
+  against 119 MB with LTO alone).
+
+Measure with `tools/bench.py` (it finds the Mac's program) - and expect noise:
+the same binary took 467 s and 494 s on a busy Mac. Interleave the builds you
+compare, or time CPU rather than wall, and quit what else is running. In one
+interleaved pair of the `race` run, ThinLTO took about 9% less wall time and 3%
+less CPU than a build with neither; play-testing the profile-guided build felt
+smoother still.
 
 ## An app: `macos.py app`
 
@@ -101,6 +127,11 @@ never committed: a game's artwork is its publisher's. Delete
   with `VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR`. SDL has to make the
   window's surface with the same loader the instance came from
   (`SDL_VULKAN_LIBRARY`; the app's launcher sets it).
+* `gpu/src/gs_renderer.cpp`: `MemoryPatch` (a compute pass with push constants of
+  its own) now resets the draw-state cache as the other compute passes do:
+  MoltenVK keeps one block of push constants, so a draw after the patch could
+  keep a stale target size and land in the wrong place (the renderer test
+  `ComputeBetweenDraws` failed on MoltenVK because of it; it passes now).
 * `ps2decomp/cppcheck.py`, `liftcheck.py`, `equivalence.py`: the verification
   builds its check libraries with clang++ outside Windows. `derive` first runs
   clang's `-fsyntax-only` over the emitted source (seconds, where the
@@ -114,8 +145,13 @@ never committed: a game's artwork is its publisher's. Delete
 
 ## Known issues
 
-* The GPU test `ComputeBetweenDraws` fails on MoltenVK (the host's other
-  tests pass). It has not been looked into.
+* The software renderer's pictures match the recorded ones (`car_select`, 44 of
+  44) but the GPU renderer's differ in some: the car paint's reflection
+  highlights in the garage are weaker on the GPU (a few percent of a frame's
+  pixels, at most 112 levels out of 255) than the software GS draws them. It is
+  not the logic-op or the dynamic-state paths (`PS2HOST_GPU_NO_LOGIC_OP`,
+  `PS2HOST_VK_BAKED` change nothing); not looked into further, and not known
+  whether the Windows GPU path shows it too.
 * In a loop with several exits `derive` can emit the last exit's case with a
   loop variable the emitter never declared; clang rejects it and `derive`
   drops the function from its output (a few dozen in Burnout 3). The bug is
