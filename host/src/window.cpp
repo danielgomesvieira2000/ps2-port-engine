@@ -912,6 +912,20 @@ bool WindowPixelSize(u32* width, u32* height) {
 }
 
 bool TakePanelMouse(PanelMouseState* state) {
+    // --mouse in a run with a window: the panel's pointer too, its x and y
+    // the window's fractions (a test of the panel's tabs and rows)
+    HostMouseState scripted;
+    u32 ww = 0, wh = 0;
+    if (ScriptedMouse(&scripted) && WindowPixelSize(&ww, &wh)) {
+        state->over = scripted.over;
+        state->px = scripted.x * float(ww);
+        state->py = scripted.y * float(wh);
+        state->held = 0;
+        state->pressed = scripted.pressed;
+        state->wheel = scripted.wheel;
+        state->moved = scripted.moved;
+        return true;
+    }
 #ifdef PS2HOST_VULKAN
     ps2gpu::Display::PanelMouse m;
     if (g_display && g_display->TakePanelMouse(&m)) {
