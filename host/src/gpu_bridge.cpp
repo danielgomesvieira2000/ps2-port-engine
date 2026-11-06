@@ -2570,7 +2570,8 @@ bool OnNative(const gs::Gs::NativeCall& call) {
                     const float* q = reinterpret_cast<const float*>(m.data() + std::size_t(i) * 20);
                     const u32* w = m.data() + std::size_t(i) * 20;
                     ps2host::native_chars::Vertex nv;
-                    ps2host::native_chars::Make(h, q, q + 4, q + 8, w[12] & 0xFFFF, w[13] & 0xFFFF, true, &nv);
+                    (void)w;
+                    ps2host::native_chars::MakeVertex(h, q, true, &nv);
                     std::memcpy(stq, nv.stq, 12);
                     rgba[0] = nv.rgb[0], rgba[1] = nv.rgb[1], rgba[2] = nv.rgb[2], rgba[3] = alpha;
                     xyzf[0] = nv.xyz[0], xyzf[1] = nv.xyz[1], xyzf[2] = nv.xyz[2], xyzf[3] = nv.fog4;

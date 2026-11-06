@@ -46,7 +46,8 @@ layout(location = 1) noperspective out vec3 coordinate;
 layout(location = 2) noperspective out float fog_out;
 layout(location = 3) flat out vec4 range_out;
 
-vec4 Row(uint address) { return header.row[address - floatBitsToUint(header.misc.z)]; }
+// (misc.z: the first row's address in its low 16 bits; bit 16 a blended batch's - four matrices by weights)
+vec4 Row(uint address) { return header.row[address - (floatBitsToUint(header.misc.z) & 0xFFFFu)]; }
 
 void main() {
     if (gl_VertexIndex < 2) {
@@ -68,14 +69,34 @@ void main() {
     const vec4 nrm = mesh.quad[at + 1u];
     const vec4 tx = mesh.quad[at + 2u];
     const uvec4 matrices = floatBitsToUint(mesh.quad[at + 3u]);
-    const uint ma = matrices.x & 0xFFFFu, mb = matrices.y & 0xFFFFu;
-    const vec4 a0 = Row(ma), a1 = Row(ma + 1u), a2 = Row(ma + 2u), a3 = Row(ma + 3u);
-    const vec4 b0 = Row(mb), b1 = Row(mb + 1u), b2 = Row(mb + 2u);
+    const bool blended = ((floatBitsToUint(header.misc.z) >> 16) & 1u) != 0u;
+    vec4 a0, a1, a2, a3, b0, b1, b2;
+    if (blended) {
+        // four matrices by the vertex's weights (MULAX, MADDAY, MADDAZ, MADDW), for the place and the normal
+        const vec4 w = mesh.quad[at + 4u];
+        const uvec4 m = matrices & 0xFFFFu;
+        vec4 r[4];
+        for (uint i = 0u; i < 4u; ++i)
+            for (int l = 0; l < 4; ++l)
+                r[i][l] = Add(Add(Add(Mul(Row(m.x + i)[l], w.x), Mul(Row(m.y + i)[l], w.y)), Mul(Row(m.z + i)[l], w.z)),
+                              Mul(Row(m.w + i)[l], w.w));
+        a0 = r[0], a1 = r[1], a2 = r[2], a3 = r[3];
+        b0 = r[0], b1 = r[1], b2 = r[2];
+    } else {
+        const uint ma = matrices.x & 0xFFFFu, mb = matrices.y & 0xFFFFu;
+        a0 = Row(ma), a1 = Row(ma + 1u), a2 = Row(ma + 2u), a3 = Row(ma + 3u);
+        b0 = Row(mb), b1 = Row(mb + 1u), b2 = Row(mb + 2u);
+    }
     // the place through its matrix (MULAX, MADDAY, MADDAZ, MADDW), the normal through its own (three rows)
     vec4 p;
     vec3 n;
     for (int l = 0; l < 4; ++l) p[l] = Add(Add(Add(Mul(a0[l], pos.x), Mul(a1[l], pos.y)), Mul(a2[l], pos.z)), a3[l]);
     for (int l = 0; l < 3; ++l) n[l] = Add(Add(Mul(b0[l], nrm.x), Mul(b1[l], nrm.y)), Mul(b2[l], nrm.z));
+    if (blended) {
+        // the normal made unit length (MUL.xyz, ADDY.x, ADDZ.x, RSQRT, MULQ.xyz)
+        const float r = Rsqrt(Add(Add(Mul(n.x, n.x), Mul(n.y, n.y)), Mul(n.z, n.z)));
+        n = vec3(Mul(n.x, r), Mul(n.y, r), Mul(n.z, r));
+    }
     // the view (vf01-vf04)
     vec4 cp;
     for (int l = 0; l < 4; ++l)

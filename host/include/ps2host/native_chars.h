@@ -71,21 +71,31 @@ inline std::uint32_t Ftoi(float y) {
     return std::uint32_t(std::int32_t(y));
 }
 
-// The place and its guard band alone (the triangles' test), or everything (`full`).
-inline void Make(const float* h, const float* pos, const float* nrm, const float* tx, std::uint32_t ma, std::uint32_t mb,
-                 bool full, Vertex* out) {
-    auto vf = [&](int r, int l) { return h[r * 4 + l]; };
+// The header's first matrix row's address (misc.z's low 16 bits; bit 16: a blended batch's).
+inline std::uint32_t First(const float* h) {
     std::uint32_t first;
     std::memcpy(&first, h + 102, 4);
-    auto row = [&](std::uint32_t address, int l) { return h[(32 + (address - first)) * 4 + l]; };
+    return first & 0xFFFF;
+}
+inline bool Blended(const float* h) {
+    std::uint32_t first;
+    std::memcpy(&first, h + 102, 4);
+    return (first >> 16) & 1;
+}
+
+// The place and its guard band alone (the triangles' test), or everything (`full`), from the place's matrix rows
+// `m` (four, each four lanes) and the normal's `nm` (three); `normalise`: the normal made unit length (RSQRT).
+inline void MakeWith(const float* h, const float* pos, const float* nrm, const float* tx, const float (*m)[4],
+                     const float (*nm)[4], bool normalise, bool full, Vertex* out) {
+    auto vf = [&](int r, int l) { return h[r * 4 + l]; };
     float p[4], cp[4], g[4];
     for (int l = 0; l < 4; ++l) {
-        float a = row(ma, l) * pos[0];
-        float b = row(ma + 1, l) * pos[1];
+        float a = m[0][l] * pos[0];
+        float b = m[1][l] * pos[1];
         float ab = a + b;
-        float c = row(ma + 2, l) * pos[2];
+        float c = m[2][l] * pos[2];
         float abc = ab + c;
-        p[l] = abc + row(ma + 3, l);
+        p[l] = abc + m[3][l];
     }
     for (int l = 0; l < 4; ++l) {
         float a = vf(5, l) * p[0];
@@ -107,11 +117,18 @@ inline void Make(const float* h, const float* pos, const float* nrm, const float
     }
     float n[3];
     for (int l = 0; l < 3; ++l) {
-        float a = row(mb, l) * nrm[0];
-        float b = row(mb + 1, l) * nrm[1];
+        float a = nm[0][l] * nrm[0];
+        float b = nm[1][l] * nrm[1];
         float ab = a + b;
-        float c = row(mb + 2, l) * nrm[2];
+        float c = nm[2][l] * nrm[2];
         n[l] = ab + c;
+    }
+    if (normalise) {
+        // (MUL.xyz, ADDY.x, ADDZ.x, RSQRT, MULQ.xyz)
+        const float xx = n[0] * n[0], yy = n[1] * n[1], zz = n[2] * n[2];
+        const float xy = xx + yy;
+        const float r = Rsqrt(xy + zz);
+        for (int l = 0; l < 3; ++l) n[l] = n[l] * r;
     }
     const float q = cp[3] == 0.0f ? (std::signbit(cp[3]) ? -3.4028234663852886e38f : 3.4028234663852886e38f)
                                   : 1.0f / cp[3];
@@ -169,6 +186,45 @@ inline void Make(const float* h, const float* pos, const float* nrm, const float
         float c = std::min(float(acc), 128.0f) * vf(9, l);
         out->rgb[l] = Ftoi(c);
     }
+}
+
+// The rigid batch's vertex: a place matrix (four rows at `ma`), a normal one (three at `mb`).
+inline void Make(const float* h, const float* pos, const float* nrm, const float* tx, std::uint32_t ma, std::uint32_t mb,
+                 bool full, Vertex* out) {
+    const std::uint32_t first = First(h);
+    float m[4][4], nm[3][4];
+    std::memcpy(m, h + (32 + (ma - first)) * 4, sizeof m);
+    std::memcpy(nm, h + (32 + (mb - first)) * 4, sizeof nm);
+    MakeWith(h, pos, nrm, tx, m, nm, false, full, out);
+}
+
+// The blended batch's vertex: four matrices (at `mats`' four addresses) by its weights, for the place and the
+// normal (three rows of the same), the normal made unit length.
+inline void MakeBlended(const float* h, const float* pos, const float* nrm, const float* tx, const std::uint32_t* mats,
+                        const float* w, bool full, Vertex* out) {
+    const std::uint32_t first = First(h);
+    auto row = [&](std::uint32_t address, int r, int l) { return h[(32 + (address - first) + r) * 4 + l]; };
+    float m[4][4];
+    for (int r = 0; r < 4; ++r)
+        for (int l = 0; l < 4; ++l) {
+            // (MULAX, MADDAY, MADDAZ, MADDW: the weights x, y, z, w)
+            const float a = row(mats[0] & 0xFFFF, r, l) * w[0];
+            const float b = row(mats[1] & 0xFFFF, r, l) * w[1];
+            const float ab = a + b;
+            const float c = row(mats[2] & 0xFFFF, r, l) * w[2];
+            const float abc = ab + c;
+            const float d = row(mats[3] & 0xFFFF, r, l) * w[3];
+            m[r][l] = abc + d;
+        }
+    MakeWith(h, pos, nrm, tx, m, m, true, full, out);
+}
+
+// A vertex of either kind (the header's), its five quadwords `q`.
+inline void MakeVertex(const float* h, const float* q, bool full, Vertex* out) {
+    std::uint32_t idx[4];
+    std::memcpy(idx, q + 12, 16);
+    if (Blended(h)) MakeBlended(h, q, q + 4, q + 8, idx, q + 16, full, out);
+    else Make(h, q, q + 4, q + 8, idx[0] & 0xFFFF, idx[1] & 0xFFFF, full, out);
 }
 
 #pragma clang fp contract(on)
