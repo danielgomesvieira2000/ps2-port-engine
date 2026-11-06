@@ -68,6 +68,7 @@
 #include "ps2host/gs.h"
 #include "ps2host/gs_blend.h"
 #include "ps2host/profile.h"
+#include "ps2host/native_chars.h"
 #include "ps2host/run.h"
 #include "ps2host/timeline.h"
 #include "ps2host/settings.h"
@@ -2511,7 +2512,16 @@ bool OnNative(const gs::Gs::NativeCall& call) {
     {
         // (the CPU's copy of the mesh, for a draw declined with no packet after it, and the check)
         NativeVerify& nv = TheVerify();
-        if ((flags & 2) && !(flags & 0x100)) nv.meshes.clear();
+        if (flags & 2) {
+            const bool chars = (flags & 0x100) != 0;
+            for (auto it = nv.meshes.begin(); it != nv.meshes.end();)
+                it = (((it->first >> 63) != 0) == chars) ? nv.meshes.erase(it) : std::next(it);
+        }
+        if ((flags & 1) && (flags & 0x100)) {
+            const u32 quads = call.words[5], indices = call.words[6], at = 7 + quads * 4 + indices;
+            if (call.count >= at + 1 && call.count >= at + 1 + call.words[at] * 4)
+                nv.meshes[key].assign(call.words + at + 1, call.words + at + 1 + call.words[at] * 4);
+        }
         if ((flags & 1) && !(flags & 0x100) && call.count >= kNativeHead + 2) {
             const u32 quads = call.words[kNativeHead], indices = call.words[kNativeHead + 1];
             if (call.count >= kNativeHead + 2 + quads * 4 + indices)
@@ -2529,7 +2539,54 @@ bool OnNative(const gs::Gs::NativeCall& call) {
     g_native = &draw;
     OnDraw(gs::Gs::DrawCall{call.prim, call.context, call.texa, v, 3, call.fogcol, call.pabe, ~0ull - ++generation});
     g_native = nullptr;
-    if (!draw.drawn && no_packet) {
+    // PS2HOST_NATIVE_FALLBACK=1 (a test): every native draw with no packet after it drawn from the CPU's copy.
+    static const bool force_fallback = std::getenv("PS2HOST_NATIVE_FALLBACK") != nullptr;
+    if (no_packet && (flags & 0x100) && (!draw.drawn || force_fallback)) {
+        // The characters' declined: their triangles made on the CPU, from the payload (the vertices' CPU copy).
+        static std::vector<gs::Vertex> tris;
+        tris.clear();
+        auto found = TheVerify().meshes.find(key);
+        const u32 quads = call.words[5], indices = call.words[6];
+        if (found != TheVerify().meshes.end()) {
+            const float* h = reinterpret_cast<const float*>(call.words + 7);
+            const u32* index = call.words + 7 + quads * 4;
+            const std::vector<u32>& m = found->second;
+            const unsigned mode = _MM_GET_ROUNDING_MODE();
+            _MM_SET_ROUNDING_MODE(_MM_ROUND_TOWARD_ZERO);
+            u32 alpha;
+            std::memcpy(&alpha, h + 103, 4);
+            auto vertex = [&](u32 i) {
+                gs::Vertex v;
+                u32 stq[3], rgba[4], xyzf[4];
+                if (i < 2) {
+                    const u32* kq = reinterpret_cast<const u32*>(h + 104 + 12 * i);
+                    std::memcpy(stq, kq, 12), std::memcpy(rgba, kq + 4, 16), std::memcpy(xyzf, kq + 8, 16);
+                } else {
+                    const float* q = reinterpret_cast<const float*>(m.data() + std::size_t(i) * 20);
+                    const u32* w = m.data() + std::size_t(i) * 20;
+                    ps2host::native_chars::Vertex nv;
+                    ps2host::native_chars::Make(h, q, q + 4, q + 8, w[12] & 0xFFFF, w[13] & 0xFFFF, true, &nv);
+                    std::memcpy(stq, nv.stq, 12);
+                    rgba[0] = nv.rgb[0], rgba[1] = nv.rgb[1], rgba[2] = nv.rgb[2], rgba[3] = alpha;
+                    xyzf[0] = nv.xyz[0], xyzf[1] = nv.xyz[1], xyzf[2] = nv.xyz[2], xyzf[3] = nv.fog4;
+                }
+                v.x = (float(xyzf[0] & 0xFFFF) - float(call.ofx)) / 16.0f;
+                v.y = (float(xyzf[1] & 0xFFFF) - float(call.ofy)) / 16.0f;
+                v.z = (xyzf[2] >> 4) & 0xFFFFFF;
+                v.r = u8(rgba[0]), v.g = u8(rgba[1]), v.b = u8(rgba[2]), v.a = u8(rgba[3]);
+                std::memcpy(&v.s, &stq[0], 4), std::memcpy(&v.t, &stq[1], 4), std::memcpy(&v.q, &stq[2], 4);
+                v.fog = u8((xyzf[3] >> 4) & 0xFF);
+                return v;
+            };
+            for (u32 i = 0; i + 2 < indices; i += 3)
+                for (int j = 0; j < 3; ++j) tris.push_back(vertex(index[i + j]));
+            _MM_SET_ROUNDING_MODE(mode);
+        }
+        for (size_t i = 0; i + 2 < tris.size(); i += 3)
+            OnDraw(gs::Gs::DrawCall{call.prim, call.context, call.texa, &tris[i], 3, call.fogcol, call.pabe,
+                                    ~0ull - ++generation});
+        draw.drawn = true;
+    } else if (!draw.drawn && no_packet) {
         // Declined, and no packet after it: its triangles from the CPU's copy, each as the packet's would be.
         static std::vector<gs::Vertex> tris;
         bool open = false;
