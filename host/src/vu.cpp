@@ -2034,7 +2034,22 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     return pairs;
 }
 
+bool VuNativeRun(Vu& vu, Vu::u32 pc, Vu::u64 limit, Vu::u64* pairs, Vu::u64 generation, int* cache,
+                 Vu::u64* cache_generation);     // vu_native.cpp
+
 Vu::u64 Vu::RunTimed(u32 pc, u64 limit) {
+    if (data_mask_ == 0x3FF) {
+        Timed timed(Section::Vu1);
+        VuRounding rounding;                // (a native program's arithmetic as the VU's)
+        u64 pairs = 0;
+        if (VuNativeRun(*this, pc & u32(micro.size() - 1) & ~7u, limit, &pairs, micro_generation_, &native_cache_,
+                        &native_generation_))
+            return pairs;
+    }
+    return RunEmulated(pc, limit);
+}
+
+Vu::u64 Vu::RunEmulated(u32 pc, u64 limit) {
     Timed timed(data_mask_ == 0x3FF ? Section::Vu1 : Section::Vu0);
     VuRounding rounding;
     const int unit = data_mask_ == 0x3FF ? 1 : 0;

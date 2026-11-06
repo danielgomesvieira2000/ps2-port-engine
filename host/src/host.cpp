@@ -28,6 +28,7 @@
 #include "ps2host/iop_vm.h"
 #include "ps2host/vif.h"
 #include "ps2host/vu.h"
+#include "ps2host/vu_native.h"
 #include "ps2host/mc2.h"
 #include "ps2host/memory.h"
 #include "ps2host/profile.h"
@@ -719,6 +720,7 @@ void Report(const Options& options, const std::string& outcome) {
     std::printf("%s\n", gs::TheGs().Summary().c_str());
     std::printf("%s\n", ProfileSummary().c_str());
     VuProfileReport();
+    VuNativeReport();
     const std::string samples = SampleReport(std::getenv("PS2HOST_SAMPLE_TOP") ? std::atoi(std::getenv("PS2HOST_SAMPLE_TOP")) : 30);
     if (!samples.empty()) std::printf("%s", samples.c_str());
     if (!GpuShadowSummary().empty()) std::printf("%s\n", GpuShadowSummary().c_str());

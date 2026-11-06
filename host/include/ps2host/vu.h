@@ -83,6 +83,8 @@ public:
        returns the instruction pairs executed. Stops after `limit` regardless. */
     u64 Run(u32 pc, u64 limit = u64(1) << 24);
     u64 RunTimed(u32 pc, u64 limit);   // (Run's work; Run adds PS2HOST_VU_PROFILE's timing)
+    /* The microcode's run alone (RunTimed takes a native program first: vu_native.h). */
+    u64 RunEmulated(u32 pc, u64 limit);
 
     u64 pairs() const { return pairs_; }
     /* Of those, the pairs run compiled ahead of time (vu_core.h). */
@@ -161,6 +163,9 @@ private:
     // count when it was last found in memory: unchanged since, it still is
     // (2.3 million entries a race compared 4.4 GB of code otherwise).
     u64 micro_generation_ = 1;
+    int native_cache_ = -1;             // vu_native.cpp: the native program for this instruction memory
+    u64 native_generation_ = 0;         // ...found at this micro_generation_
+    friend struct VuNativeAccess;
     std::unordered_map<const void*, u64> held_at_;
     // The compiled program found at each pair address and its block table,
     // while instruction memory is as it was then (micro_generation_): a run
