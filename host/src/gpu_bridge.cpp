@@ -2785,8 +2785,10 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
             g.on_held = VerifyHeld;
             g.on_held_end = VerifyEnd;
         }
-        SetGsNativeDraws(std::getenv("PS2HOST_NATIVE_DRAW") && std::string(std::getenv("PS2HOST_NATIVE_DRAW")) == "1" &&
-                         bridge.renderer->DrawsMeshes());
+        // Native draws (docs/NATIVE_RENDERER.md): on where the renderer draws meshes - every scripted run of both
+        // Files' pictures as recorded with them; PS2HOST_NATIVE_DRAW=0 off.
+        const char* native = std::getenv("PS2HOST_NATIVE_DRAW");
+        SetGsNativeDraws(!(native && std::string(native) == "0") && bridge.renderer->DrawsMeshes());
     }
     g.on_effect = OnEffect;
     if (bridge.primary) {
