@@ -885,11 +885,25 @@ private:
     // Set 3's pools: another made when the last is full (a scene's meshes, each with a set per ring chunk its
     // headers were in - File #1's zombies: past 4,096 sets, and a mesh draw without one was dropped).
     std::vector<VkDescriptorPool> mesh_pools_;
+    // Mesh memory: blocks of 32 MB (host visible), meshes placed one after another; a block let go once the
+    // meshes in it are (the last, the one filled, kept).
+    struct MeshBlock {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        void* mapped = nullptr;
+        VkDeviceSize size = 0, used = 0;
+        std::uint32_t live = 0;
+    };
+    std::vector<MeshBlock*> mesh_blocks_;
+    MeshBlock* MeshPlace(VkDeviceSize bytes, VkDeviceSize* offset);
+    void MeshLetGo(MeshBlock* block);
     VkDescriptorPool MeshPool(bool another);
     VkDescriptorSet MeshSet(VkDescriptorPool* pool);
     struct Mesh {
-        VkBuffer vertices = VK_NULL_HANDLE, indices = VK_NULL_HANDLE;
-        VkDeviceMemory vertex_memory = VK_NULL_HANDLE, index_memory = VK_NULL_HANDLE;
+        // Its vertices and indices in a block of mesh memory (MeshBlock): one allocation a block, not two a mesh
+        // (a driver's allocations are a few thousand: a scene's meshes went past them).
+        struct MeshBlock* block = nullptr;
+        VkDeviceSize vertex_offset = 0, vertex_bytes = 0, index_offset = 0;
         std::uint32_t index_count = 0;
         // Set 3 by the vertex ring's chunk its header is in (a dynamic offset within it), and the header's size.
         struct Set { VkBuffer chunk; VkDescriptorSet set; VkDescriptorPool pool; };
@@ -3303,19 +3317,21 @@ void VulkanGsRenderer::UploadMesh(std::uint64_t key, const void* quads, std::siz
     if (!DrawsMeshes() || !quad_count) return;
     ReleaseMesh(key);
     Mesh mesh;
-    void* at = nullptr;
-    if (!Buffer(quad_count * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &mesh.vertices, &mesh.vertex_memory, &at)) {
-        RetireMesh(mesh);
+    // (the vertices, then the indices, in one place: 256-byte aligned, a storage buffer's offset)
+    const VkDeviceSize vertex_bytes = quad_count * 16, index_at = (vertex_bytes + 255) & ~VkDeviceSize(255);
+    VkDeviceSize offset = 0;
+    mesh.block = MeshPlace(index_at + index_count * 4, &offset);
+    if (!mesh.block) {
+        static int told = 0;
+        if (told++ < 5) std::fprintf(stderr, "[ps2gpu] a mesh not uploaded: no mesh memory (%zu meshes)\n", meshes_.size());
         return;
     }
-    std::memcpy(at, quads, quad_count * 16);
-    if (index_count) {
-        if (!Buffer(index_count * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &mesh.indices, &mesh.index_memory, &at)) {
-            RetireMesh(mesh);
-            return;
-        }
-        std::memcpy(at, indices, index_count * 4);
-    }
+    std::uint8_t* at = static_cast<std::uint8_t*>(mesh.block->mapped) + offset;
+    std::memcpy(at, quads, vertex_bytes);
+    if (index_count) std::memcpy(at + index_at, indices, index_count * 4);
+    mesh.vertex_offset = offset;
+    mesh.vertex_bytes = vertex_bytes;
+    mesh.index_offset = offset + index_at;
     mesh.index_count = std::uint32_t(index_count);
     meshes_[key] = std::move(mesh);
 }
@@ -3366,18 +3382,45 @@ VkDescriptorSet VulkanGsRenderer::MeshSet(VkDescriptorPool* pool) {
     return VK_NULL_HANDLE;
 }
 
+VulkanGsRenderer::MeshBlock* VulkanGsRenderer::MeshPlace(VkDeviceSize bytes, VkDeviceSize* offset) {
+    const VkDeviceSize aligned = (bytes + 255) & ~VkDeviceSize(255);
+    MeshBlock* block = mesh_blocks_.empty() ? nullptr : mesh_blocks_.back();
+    if (!block || block->used + aligned > block->size) {
+        block = new MeshBlock;
+        block->size = std::max<VkDeviceSize>(VkDeviceSize(32) << 20, aligned);
+        if (!Buffer(block->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &block->buffer,
+                    &block->memory, &block->mapped)) {
+            if (block->buffer) vkDestroyBuffer(g_.device, block->buffer, nullptr);
+            if (block->memory) vkFreeMemory(g_.device, block->memory, nullptr);
+            delete block;
+            return nullptr;
+        }
+        mesh_blocks_.push_back(block);
+    }
+    *offset = block->used;
+    block->used += aligned;
+    ++block->live;
+    return block;
+}
+
+// A mesh in `block` gone (its draws run): the block let go when none is left and it is not the one filled.
+void VulkanGsRenderer::MeshLetGo(MeshBlock* block) {
+    if (--block->live || block == mesh_blocks_.back()) return;
+    mesh_blocks_.erase(std::find(mesh_blocks_.begin(), mesh_blocks_.end(), block));
+    vkDestroyBuffer(g_.device, block->buffer, nullptr);
+    vkFreeMemory(g_.device, block->memory, nullptr);
+    delete block;
+}
+
 void VulkanGsRenderer::RetireMesh(Mesh mesh) {
     // Recorded draws may still read it: it goes after they have run.
     VkDevice device = g_.device;
-    g_.AfterSubmit([device, mesh]() mutable {
+    g_.AfterSubmit([this, device, mesh]() mutable {
         for (auto& e : mesh.sets)
             if (e.set) vkFreeDescriptorSets(device, e.pool, 1, &e.set);
         for (auto& e : mesh.large_sets)
             if (e.set) vkFreeDescriptorSets(device, e.pool, 1, &e.set);
-        if (mesh.vertices) vkDestroyBuffer(device, mesh.vertices, nullptr);
-        if (mesh.indices) vkDestroyBuffer(device, mesh.indices, nullptr);
-        if (mesh.vertex_memory) vkFreeMemory(device, mesh.vertex_memory, nullptr);
-        if (mesh.index_memory) vkFreeMemory(device, mesh.index_memory, nullptr);
+        if (mesh.block) MeshLetGo(mesh.block);
     });
 }
 
@@ -3410,7 +3453,7 @@ void VulkanGsRenderer::DrawMeshWith(const GsDrawState& state, std::uint64_t key,
             if (told++ < 5) std::fprintf(stderr, "[ps2gpu] a mesh draw dropped: no descriptor set (%zu meshes)\n", meshes_.size());
             return;
         }
-        const VkDescriptorBufferInfo vertices{mesh.vertices, 0, VK_WHOLE_SIZE};
+        const VkDescriptorBufferInfo vertices{mesh.block->buffer, mesh.vertex_offset, mesh.vertex_bytes};
         const VkDescriptorBufferInfo head{chunk, 0, range};
         VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
         writes[0].dstSet = set;
@@ -4221,7 +4264,7 @@ void VulkanGsRenderer::Flush() {
                 if (mesh_draw_.indices)
                     vkCmdBindIndexBuffer(cmd, mesh_draw_.indices, mesh_draw_.index_offset, VK_INDEX_TYPE_UINT32);
                 else
-                    vkCmdBindIndexBuffer(cmd, mesh->indices, 0, VK_INDEX_TYPE_UINT32);
+                    vkCmdBindIndexBuffer(cmd, mesh->block->buffer, mesh->index_offset, VK_INDEX_TYPE_UINT32);
             } else if (!own_ranges) {
                 if (d.vertices != vertex_buffer || d.ranges != range_buffer) {
                     d.vertices = vertex_buffer;
@@ -4496,11 +4539,10 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (set_layout_) vkDestroyDescriptorSetLayout(g_.device, set_layout_, nullptr);
     if (clut_set_layout_) vkDestroyDescriptorSetLayout(g_.device, clut_set_layout_, nullptr);
     if (mesh_set_layout_) vkDestroyDescriptorSetLayout(g_.device, mesh_set_layout_, nullptr);
-    for (auto& [key, mesh] : meshes_) {
-        if (mesh.vertices) vkDestroyBuffer(g_.device, mesh.vertices, nullptr);
-        if (mesh.indices) vkDestroyBuffer(g_.device, mesh.indices, nullptr);
-        if (mesh.vertex_memory) vkFreeMemory(g_.device, mesh.vertex_memory, nullptr);
-        if (mesh.index_memory) vkFreeMemory(g_.device, mesh.index_memory, nullptr);
+    for (MeshBlock* block : mesh_blocks_) {
+        vkDestroyBuffer(g_.device, block->buffer, nullptr);
+        vkFreeMemory(g_.device, block->memory, nullptr);
+        delete block;
     }
     for (VkDescriptorPool pool : mesh_pools_) vkDestroyDescriptorPool(g_.device, pool, nullptr);
     if (layout_) vkDestroyPipelineLayout(g_.device, layout_, nullptr);
