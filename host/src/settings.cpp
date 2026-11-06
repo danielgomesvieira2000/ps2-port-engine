@@ -18,6 +18,7 @@ namespace {
 
 std::mutex g_lock;
 std::map<std::string, std::string> g_values;
+std::map<std::string, std::string> g_session;     // SessionSetting: over g_values, never written
 std::string g_path;
 
 std::string Trim(const std::string& text) {
@@ -57,6 +58,8 @@ const std::string& SettingsPath() { return g_path; }
 
 std::string Setting(const std::string& key, const std::string& fallback) {
     std::lock_guard<std::mutex> hold(g_lock);
+    const auto session = g_session.find(key);
+    if (session != g_session.end()) return session->second;
     const auto found = g_values.find(key);
     return found == g_values.end() ? fallback : found->second;
 }
@@ -78,6 +81,16 @@ void SetSettingOn(const std::string& key, bool on) { SetSetting(key, on ? "on" :
 void RunSetting(const std::string& key, const std::string& value) {
     std::lock_guard<std::mutex> hold(g_lock);
     g_values[key] = value;
+}
+
+void SessionSetting(const std::string& key, const std::string& value) {
+    std::lock_guard<std::mutex> hold(g_lock);
+    g_session[key] = value;
+}
+
+void ClearSessionSettings() {
+    std::lock_guard<std::mutex> hold(g_lock);
+    g_session.clear();
 }
 
 namespace {
