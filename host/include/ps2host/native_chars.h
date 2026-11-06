@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <xmmintrin.h>
+#include <emmintrin.h>
 
 namespace ps2host {
 namespace native_chars {
@@ -217,6 +218,40 @@ inline void MakeBlended(const float* h, const float* pos, const float* nrm, cons
             m[r][l] = abc + d;
         }
     MakeWith(h, pos, nrm, tx, m, m, true, full, out);
+}
+
+// The guard band's place alone (the triangles' test), four lanes at once: the same operations in the same order
+// as MakeWith's (each product and sum rounded on its own, under the caller's rounding) - the same bits.
+inline void Guard(const float* h, const float* q, float* g) {
+    const std::uint32_t first = First(h);
+    std::uint32_t idx[4];
+    std::memcpy(idx, q + 12, 16);
+    auto row = [&](std::uint32_t address, int r) { return _mm_loadu_ps(h + (32 + (address - first) + r) * 4); };
+    __m128 m[4];
+    if (Blended(h)) {
+        const __m128 wx = _mm_set1_ps(q[16]), wy = _mm_set1_ps(q[17]), wz = _mm_set1_ps(q[18]), ww = _mm_set1_ps(q[19]);
+        for (int r = 0; r < 4; ++r) {
+            const __m128 a = _mm_mul_ps(row(idx[0] & 0xFFFF, r), wx);
+            const __m128 b = _mm_mul_ps(row(idx[1] & 0xFFFF, r), wy);
+            const __m128 ab = _mm_add_ps(a, b);
+            const __m128 c = _mm_mul_ps(row(idx[2] & 0xFFFF, r), wz);
+            const __m128 abc = _mm_add_ps(ab, c);
+            const __m128 d = _mm_mul_ps(row(idx[3] & 0xFFFF, r), ww);
+            m[r] = _mm_add_ps(abc, d);
+        }
+    } else {
+        for (int r = 0; r < 4; ++r) m[r] = row(idx[0] & 0xFFFF, r);
+    }
+    const __m128 px = _mm_set1_ps(q[0]), py = _mm_set1_ps(q[1]), pz = _mm_set1_ps(q[2]);
+    const __m128 p = _mm_add_ps(_mm_add_ps(_mm_add_ps(_mm_mul_ps(m[0], px), _mm_mul_ps(m[1], py)), _mm_mul_ps(m[2], pz)), m[3]);
+    alignas(16) float pl[4];
+    _mm_store_ps(pl, p);
+    const __m128 gx = _mm_set1_ps(pl[0]), gy = _mm_set1_ps(pl[1]), gz = _mm_set1_ps(pl[2]);
+    const __m128 gd = _mm_add_ps(
+        _mm_add_ps(_mm_add_ps(_mm_mul_ps(_mm_loadu_ps(h + 20), gx), _mm_mul_ps(_mm_loadu_ps(h + 24), gy)),
+                   _mm_mul_ps(_mm_loadu_ps(h + 28), gz)),
+        _mm_loadu_ps(h + 32));
+    _mm_storeu_ps(g, gd);
 }
 
 // A vertex of either kind (the header's), its five quadwords `q`.
