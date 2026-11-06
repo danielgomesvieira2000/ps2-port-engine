@@ -881,14 +881,20 @@ private:
        with yet. */
     VkShaderModule mesh_vert_ = VK_NULL_HANDLE, mesh_chars_vert_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout mesh_set_layout_ = VK_NULL_HANDLE;
-    VkDescriptorPool mesh_pool_ = VK_NULL_HANDLE;
+    VkDescriptorPool mesh_pool_ = VK_NULL_HANDLE;          // the first of mesh_pools_ (DrawsMeshes)
+    // Set 3's pools: another made when the last is full (a scene's meshes, each with a set per ring chunk its
+    // headers were in - File #1's zombies: past 4,096 sets, and a mesh draw without one was dropped).
+    std::vector<VkDescriptorPool> mesh_pools_;
+    VkDescriptorPool MeshPool(bool another);
+    VkDescriptorSet MeshSet(VkDescriptorPool* pool);
     struct Mesh {
         VkBuffer vertices = VK_NULL_HANDLE, indices = VK_NULL_HANDLE;
         VkDeviceMemory vertex_memory = VK_NULL_HANDLE, index_memory = VK_NULL_HANDLE;
         std::uint32_t index_count = 0;
         // Set 3 by the vertex ring's chunk its header is in (a dynamic offset within it), and the header's size.
-        std::vector<std::pair<VkBuffer, VkDescriptorSet>> sets;
-        std::vector<std::pair<VkBuffer, VkDescriptorSet>> large_sets;     // (the characters' headers)
+        struct Set { VkBuffer chunk; VkDescriptorSet set; VkDescriptorPool pool; };
+        std::vector<Set> sets;
+        std::vector<Set> large_sets;     // (the characters' headers)
     };
     std::unordered_map<std::uint64_t, Mesh> meshes_;
     void RetireMesh(Mesh mesh);
@@ -1480,6 +1486,7 @@ bool VulkanGsRenderer::Init(std::string* error) {
         mpi.poolSizeCount = 2;
         mpi.pPoolSizes = mesh_sizes;
         vkCreateDescriptorPool(g_.device, &mpi, nullptr, &mesh_pool_);
+        if (mesh_pool_) mesh_pools_.push_back(mesh_pool_);
     }
     const VkDescriptorSetLayout set_layouts[4] = {set_layout_, clut_set_layout_, set_layout_, mesh_set_layout_};
     lci.setLayoutCount = 4;
@@ -3322,15 +3329,51 @@ void VulkanGsRenderer::ReleaseMesh(std::uint64_t key) {
     RetireMesh(std::move(mesh));
 }
 
+VkDescriptorPool VulkanGsRenderer::MeshPool(bool another) {
+    if (!another && !mesh_pools_.empty()) return mesh_pools_.back();
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
+                                     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 4096}};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    pi.maxSets = 4096;
+    pi.poolSizeCount = 2;
+    pi.pPoolSizes = sizes;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    if (vkCreateDescriptorPool(g_.device, &pi, nullptr, &pool) != VK_SUCCESS) return VK_NULL_HANDLE;
+    mesh_pools_.push_back(pool);
+    return pool;
+}
+
+/* A set 3 from the mesh pools (the last one, or a new one when that is full; the earlier ones tried too - sets
+   freed there by meshes released). */
+VkDescriptorSet VulkanGsRenderer::MeshSet(VkDescriptorPool* pool) {
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &mesh_set_layout_;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    for (size_t i = mesh_pools_.size(); i-- > 0;) {
+        ai.descriptorPool = mesh_pools_[i];
+        if (vkAllocateDescriptorSets(g_.device, &ai, &set) == VK_SUCCESS) {
+            *pool = mesh_pools_[i];
+            return set;
+        }
+    }
+    ai.descriptorPool = MeshPool(true);
+    if (ai.descriptorPool && vkAllocateDescriptorSets(g_.device, &ai, &set) == VK_SUCCESS) {
+        *pool = ai.descriptorPool;
+        return set;
+    }
+    return VK_NULL_HANDLE;
+}
+
 void VulkanGsRenderer::RetireMesh(Mesh mesh) {
     // Recorded draws may still read it: it goes after they have run.
     VkDevice device = g_.device;
-    VkDescriptorPool pool = mesh_pool_;
-    g_.AfterSubmit([device, pool, mesh]() mutable {
-        for (auto& [chunk, set] : mesh.sets)
-            if (set) vkFreeDescriptorSets(device, pool, 1, &set);
-        for (auto& [chunk, set] : mesh.large_sets)
-            if (set) vkFreeDescriptorSets(device, pool, 1, &set);
+    g_.AfterSubmit([device, mesh]() mutable {
+        for (auto& e : mesh.sets)
+            if (e.set) vkFreeDescriptorSets(device, e.pool, 1, &e.set);
+        for (auto& e : mesh.large_sets)
+            if (e.set) vkFreeDescriptorSets(device, e.pool, 1, &e.set);
         if (mesh.vertices) vkDestroyBuffer(device, mesh.vertices, nullptr);
         if (mesh.indices) vkDestroyBuffer(device, mesh.indices, nullptr);
         if (mesh.vertex_memory) vkFreeMemory(device, mesh.vertex_memory, nullptr);
@@ -3357,14 +3400,16 @@ void VulkanGsRenderer::DrawMeshWith(const GsDrawState& state, std::uint64_t key,
     std::memcpy(at, call.header, floats * 4);
     auto& sets = large ? mesh.large_sets : mesh.sets;
     VkDescriptorSet set = VK_NULL_HANDLE;
-    for (const auto& [buffer, s] : sets)
-        if (buffer == chunk) set = s;
+    for (const auto& e : sets)
+        if (e.chunk == chunk) set = e.set;
     if (!set) {
-        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        ai.descriptorPool = mesh_pool_;
-        ai.descriptorSetCount = 1;
-        ai.pSetLayouts = &mesh_set_layout_;
-        if (vkAllocateDescriptorSets(g_.device, &ai, &set) != VK_SUCCESS) return;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        set = MeshSet(&pool);
+        if (!set) {
+            static int told = 0;
+            if (told++ < 5) std::fprintf(stderr, "[ps2gpu] a mesh draw dropped: no descriptor set (%zu meshes)\n", meshes_.size());
+            return;
+        }
         const VkDescriptorBufferInfo vertices{mesh.vertices, 0, VK_WHOLE_SIZE};
         const VkDescriptorBufferInfo head{chunk, 0, range};
         VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
@@ -3378,7 +3423,7 @@ void VulkanGsRenderer::DrawMeshWith(const GsDrawState& state, std::uint64_t key,
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
         writes[1].pBufferInfo = &head;
         vkUpdateDescriptorSets(g_.device, 2, writes, 0, nullptr);
-        sets.emplace_back(chunk, set);
+        sets.push_back(Mesh::Set{chunk, set, pool});
     }
     MeshDraw draw{&mesh, set, std::uint32_t(offset), call.program};
     if (call.indices) {
@@ -4457,7 +4502,7 @@ VulkanGsRenderer::~VulkanGsRenderer() {
         if (mesh.vertex_memory) vkFreeMemory(g_.device, mesh.vertex_memory, nullptr);
         if (mesh.index_memory) vkFreeMemory(g_.device, mesh.index_memory, nullptr);
     }
-    if (mesh_pool_) vkDestroyDescriptorPool(g_.device, mesh_pool_, nullptr);
+    for (VkDescriptorPool pool : mesh_pools_) vkDestroyDescriptorPool(g_.device, pool, nullptr);
     if (layout_) vkDestroyPipelineLayout(g_.device, layout_, nullptr);
     if (vert_) vkDestroyShaderModule(g_.device, vert_, nullptr);
     if (mesh_vert_) vkDestroyShaderModule(g_.device, mesh_vert_, nullptr);
