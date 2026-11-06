@@ -2250,7 +2250,8 @@ void OnDraw(const gs::Gs::DrawCall& call) {
    packet would have drawn (the GS's vertices, in order). */
 struct NativeVerify {
     std::vector<gs::Vertex> made, held;     // three a triangle
-    std::unordered_map<u64, std::vector<u32>> meshes;   // the payloads' quadwords and indices, by key
+    std::unordered_map<u64, std::vector<u32>> meshes;   // the payloads' quadwords and indices, by key (kept always:
+                                                        // a draw declined with no packet after it is drawn from them)
     u64 batches = 0, differ = 0, triangles = 0;
     bool open = false;
 };
@@ -2262,7 +2263,18 @@ const bool g_native_verify = std::getenv("PS2HOST_NATIVE_VERIFY") != nullptr;
 
 // (the VU's arithmetic: each product and sum rounded - nothing fused)
 #pragma clang fp contract(off)
+void MeshTriangles(const u32* words, u32 count, u32 ofx, u32 ofy, std::vector<gs::Vertex>* made, bool* open);
+
 void VerifyMake(const u32* words, u32 count, u32 ofx, u32 ofy) {
+    NativeVerify& nv = TheVerify();
+    nv.held.clear();
+    MeshTriangles(words, count, ofx, ofy, &nv.made, &nv.open);
+}
+
+/* A payload's meshes kept (uploaded, released), and its mesh's triangles made as the microcode's packet has
+   them - its vertices as gs::Vertex, three a triangle, culled as the shader culls (the caller under the VU's
+   rounding: toward zero). *open false: the mesh not known. */
+void MeshTriangles(const u32* words, u32 count, u32 ofx, u32 ofy, std::vector<gs::Vertex>* made_out, bool* open) {
     NativeVerify& nv = TheVerify();
     const u64 key = u64(words[1]) | u64(words[2]) << 32;
     if ((words[0] & 2)) nv.meshes.clear();
@@ -2271,12 +2283,12 @@ void VerifyMake(const u32* words, u32 count, u32 ofx, u32 ofy) {
         std::vector<u32> m(words + kNativeHead, words + kNativeHead + 2 + quads * 4 + indices);
         nv.meshes[key] = std::move(m);
     }
-    nv.made.clear();
-    nv.held.clear();
-    nv.open = false;
+    std::vector<gs::Vertex>& made = *made_out;
+    made.clear();
+    *open = false;
     auto found = nv.meshes.find(key);
     if (found == nv.meshes.end()) return;
-    nv.open = true;
+    *open = true;
     const std::vector<u32>& m = found->second;
     const u32 quads = m[0], indices = m[1];
     const float* q4 = reinterpret_cast<const float*>(m.data() + 2);
@@ -2364,7 +2376,7 @@ void VerifyMake(const u32* words, u32 count, u32 ofx, u32 ofy) {
         for (int d = 0; d < 6 && !culled; ++d)
             culled = vs[index[i]].cull[d] < 0 && vs[index[i + 1]].cull[d] < 0 && vs[index[i + 2]].cull[d] < 0;
         if (culled) continue;
-        for (int j = 0; j < 3; ++j) nv.made.push_back(vs[index[i + j]].v);
+        for (int j = 0; j < 3; ++j) made.push_back(vs[index[i + j]].v);
     }
 }
 
@@ -2436,7 +2448,6 @@ bool OnNative(const gs::Gs::NativeCall& call) {
             g_meshes.insert(key);
         }
     }
-    if (!g_meshes.count(key)) return false;
     const gs::Context& c = *call.context;
     // A triangle over the scissor (its bounds clamped to it and to the target).
     const float x0 = float(Bits(c.scissor, 0, 11)), y0 = float(Bits(c.scissor, 32, 11));
@@ -2446,6 +2457,17 @@ bool OnNative(const gs::Gs::NativeCall& call) {
     v[1].x = x0 + 2.0f * w, v[1].y = y0;
     v[2].x = x0, v[2].y = y0 + 2.0f * h;
     static u64 generation = 0;
+    const bool no_packet = (flags & 4) != 0;
+    {
+        // (the CPU's copy of the mesh, for a draw declined with no packet after it, and the check)
+        NativeVerify& nv = TheVerify();
+        if (flags & 2) nv.meshes.clear();
+        if ((flags & 1) && call.count >= kNativeHead + 2) {
+            const u32 quads = call.words[kNativeHead], indices = call.words[kNativeHead + 1];
+            if (call.count >= kNativeHead + 2 + quads * 4 + indices)
+                nv.meshes[key].assign(call.words + kNativeHead, call.words + kNativeHead + 2 + quads * 4 + indices);
+        }
+    }
     if (g_native_verify) {
         // (the VU's rounding: toward zero)
         const unsigned mode = _MM_GET_ROUNDING_MODE();
@@ -2457,6 +2479,23 @@ bool OnNative(const gs::Gs::NativeCall& call) {
     g_native = &draw;
     OnDraw(gs::Gs::DrawCall{call.prim, call.context, call.texa, v, 3, call.fogcol, call.pabe, ~0ull - ++generation});
     g_native = nullptr;
+    if (!draw.drawn && no_packet) {
+        // Declined, and no packet after it: its triangles from the CPU's copy, each as the packet's would be.
+        static std::vector<gs::Vertex> tris;
+        bool open = false;
+        const unsigned mode = _MM_GET_ROUNDING_MODE();
+        _MM_SET_ROUNDING_MODE(_MM_ROUND_TOWARD_ZERO);
+        MeshTriangles(call.words, call.count, call.ofx, call.ofy, &tris, &open);
+        _MM_SET_ROUNDING_MODE(mode);
+        for (size_t i = 0; i + 2 < tris.size(); i += 3)
+            OnDraw(gs::Gs::DrawCall{call.prim, call.context, call.texa, &tris[i], 3, call.fogcol, call.pabe,
+                                    ~0ull - ++generation});
+        draw.drawn = true;
+        static u64 fallbacks = 0;
+        if (++fallbacks % 10000 == 1)
+            std::fprintf(stderr, "[gpu] native draws: %llu declined with no packet, drawn from the CPU's copy\n",
+                         (unsigned long long)fallbacks);
+    }
     {
         // PS2HOST_NATIVE_DRAW_LOG=1: how many were drawn so, every 50,000.
         static const bool log = std::getenv("PS2HOST_NATIVE_DRAW_LOG") != nullptr;

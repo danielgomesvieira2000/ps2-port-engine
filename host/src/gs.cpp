@@ -202,6 +202,9 @@ void Gs::Native(const u32* words, u32 count) {
     hold_next_ = false;
     if (!on_native || count < 5) return;
     const u64 tag_prim = u64(words[3]) | u64(words[4]) << 32;
+    // (flag 4: no packet follows - the PRIM its tag would set, set here, as the tag's PRE would)
+    const bool no_packet = (words[0] & 4) != 0;
+    if (no_packet && tag_prim != ~0ull) WriteRegister(0x00, tag_prim);
     u64 prim = Prim();
     if (tag_prim != ~0ull) prim = (prmodecont_ & 1) ? tag_prim : ((tag_prim & 7) | (prmode_ & ~7ull));
     Finish();                           // (the renderer reads local memory as of now)
@@ -211,7 +214,8 @@ void Gs::Native(const u32* words, u32 count) {
     const bool field_mode = Bits(gif.smode2, 0, 1) && Bits(gif.smode2, 1, 1);
     const u32 ofx = Bits(xyoffset, 0, 16);
     const u32 ofy = field_mode && !half_offset ? Bits(xyoffset, 32, 16) & ~15u : Bits(xyoffset, 32, 16);
-    if (on_native(NativeCall{prim, &ctx_[(prim >> 9) & 1], texa_, fogcol_, (pabe_ & 1) != 0, words, count, ofx, ofy}))
+    if (on_native(NativeCall{prim, &ctx_[(prim >> 9) & 1], texa_, fogcol_, (pabe_ & 1) != 0, words, count, ofx, ofy}) &&
+        !no_packet)
         hold_next_ = true;
 }
 
