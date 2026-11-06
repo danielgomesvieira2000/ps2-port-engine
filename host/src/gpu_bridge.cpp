@@ -1400,6 +1400,9 @@ bool NativeCharacters(Bridge& s, const ps2gpu::GsDrawState& state, u32 x_offset,
 
 bool NativeMesh(Bridge& s, const ps2gpu::GsDrawState& state, u32 x_offset, u32 y_offset, const gs::Context& c) {
     const NativeDraw& n = *g_native;
+    // (a target sampled as the texture: the pages brought up to date are those the primitive's coordinates reach -
+    // the stand-in's are none of the mesh's)
+    if (state.texture_target) return false;
     if (n.words[0] & 0x100) return NativeCharacters(s, state, x_offset, y_offset);
     const u64 key = u64(n.words[1]) | u64(n.words[2]) << 32;
     if (!g_meshes.count(key) || !s.renderer->MeshDrawable(state)) return false;
