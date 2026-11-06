@@ -32,8 +32,10 @@ enum class Mode { kOff, kOn, kCheck };
 Mode NativeMode() {
     static const Mode mode = [] {
         const char* e = std::getenv("PS2HOST_VU_NATIVE");
-        const std::string v = e ? std::string(e) : Setting("vu_native", "off");
-        return v == "on" || v == "1" ? Mode::kOn : v == "check" ? Mode::kCheck : Mode::kOff;
+        // (on by default: each native program is exact - checked, PS2HOST_VU_NATIVE=check, in every
+        // scripted run before it was registered)
+        const std::string v = e ? std::string(e) : Setting("vu_native", "on");
+        return v == "off" || v == "0" ? Mode::kOff : v == "check" ? Mode::kCheck : Mode::kOn;
     }();
     return mode;
 }

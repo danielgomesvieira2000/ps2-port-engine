@@ -11,8 +11,8 @@
  * set - and returns true; or it declines (a case it does not do: a triangle for
  * the clipper), returning false with nothing changed, and the microcode runs.
  *
- * PS2HOST_VU_NATIVE (or the setting vu_native): off (the default: nothing
- * changes), on, or check - each run a native program takes is run both ways:
+ * PS2HOST_VU_NATIVE (or the setting vu_native): on (the default: a native
+ * program is registered once checked exact in every scripted run), off, or check - each run a native program takes is run both ways:
  * the native run's results kept apart, the VU put back as it was, the run
  * emulated (whose results stand), and the two compared: data memory, the
  * kicked words, the vector and integer registers, ACC, Q and the clip flags.
