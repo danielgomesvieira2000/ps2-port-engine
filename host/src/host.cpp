@@ -718,6 +718,7 @@ void Report(const Options& options, const std::string& outcome) {
                 static_cast<unsigned long long>(gs::TheGs().pixels_drawn()));
     std::printf("%s\n", gs::TheGs().Summary().c_str());
     std::printf("%s\n", ProfileSummary().c_str());
+    VuProfileReport();
     const std::string samples = SampleReport(std::getenv("PS2HOST_SAMPLE_TOP") ? std::atoi(std::getenv("PS2HOST_SAMPLE_TOP")) : 30);
     if (!samples.empty()) std::printf("%s", samples.c_str());
     if (!GpuShadowSummary().empty()) std::printf("%s\n", GpuShadowSummary().c_str());

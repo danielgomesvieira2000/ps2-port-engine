@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <unordered_map>
 #include <xmmintrin.h>
 #include <unordered_set>
@@ -25,6 +26,7 @@
 
 #include "ps2host/memory.h"
 #include "ps2host/profile.h"
+#include "ps2host/run.h"
 #include "ps2host/vu_core.h"
 #include "ps2rt/generated.h"
 #include "ps2rt/vu_math.h"
@@ -182,6 +184,78 @@ bool Holds(const Vu::Span& micro, const Vu::u32* code) {
         code += 2 + words;
     }
     return true;
+}
+
+// ---------------------------------------------------------------- the time by microprogram (PS2HOST_VU_PROFILE)
+//
+// PS2HOST_VU_PROFILE=1: each VU1 run's time and pairs, by the microcode it
+// starts in - a hash of the 32 pairs from its start (what a native program
+// would be known by: docs/NATIVE_RENDERER.md), and its start - written at the
+// run's end, the costliest first. PS2HOST_VU_PROFILE_FROM=<frame>: from then
+// on only (gameplay, not the boot's).
+
+struct ProgramTime {
+    std::uint64_t ns = 0, runs = 0, pairs = 0, interpreted = 0;
+    std::uint32_t pc = 0;
+};
+thread_local std::uint64_t t_interpreted = 0;     // (RunTimed's last run: its pairs the interpreter ran)
+
+struct ProgramTimes {
+    std::unordered_map<std::uint64_t, ProgramTime> by;
+    std::mutex lock;
+    void Report() {
+        std::lock_guard<std::mutex> hold(lock);
+        if (by.empty()) return;
+        std::vector<std::pair<std::uint64_t, ProgramTime>> all(by.begin(), by.end());
+        std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+        std::uint64_t total = 0, runs = 0;
+        for (const auto& [k, t] : all) total += t.ns, runs += t.runs;
+        std::fprintf(stderr, "[vu profile] VU1: %.1f ms in %llu runs, %zu microprograms (by their code at the start)\n",
+                     double(total) / 1e6, (unsigned long long)runs, all.size());
+        for (size_t i = 0; i < all.size() && i < 40; ++i) {
+            const auto& [k, t] = all[i];
+            std::fprintf(stderr, "[vu profile]  %016llX at 0x%04X: %5.1f%% %9.1f ms, %8llu runs, %11llu pairs (%llu a run), %.0f%% interpreted\n",
+                         (unsigned long long)k, unsigned(t.pc), 100.0 * double(t.ns) / double(std::max<std::uint64_t>(total, 1)),
+                         double(t.ns) / 1e6, (unsigned long long)t.runs, (unsigned long long)t.pairs,
+                         (unsigned long long)(t.pairs / std::max<std::uint64_t>(t.runs, 1)),
+                         100.0 * double(t.interpreted) / double(std::max<std::uint64_t>(t.pairs, 1)));
+        }
+    }
+};
+
+ProgramTimes* VuProfile() {
+    static ProgramTimes* times = [] {
+        const char* e = std::getenv("PS2HOST_VU_PROFILE");
+        return e && *e && *e != '0' ? new ProgramTimes : nullptr;
+    }();
+    return times;
+}
+
+}  // namespace
+
+void VuProfileReport() {
+    if (ProgramTimes* t = VuProfile()) t->Report();
+}
+
+namespace {
+
+unsigned long long VuProfileFrom() {
+    static const unsigned long long from = [] {
+        const char* e = std::getenv("PS2HOST_VU_PROFILE_FROM");
+        return e ? std::strtoull(e, nullptr, 10) : 0ull;
+    }();
+    return from;
+}
+
+std::uint64_t CodeHash(const Vu::Span& micro, Vu::u32 pc) {
+    std::uint64_t h = 1469598103934665603ull;
+    const Vu::u32 mask = Vu::u32(micro.size() - 1);
+    for (Vu::u32 i = 0; i < 32 * 8; i += 4) {
+        Vu::u32 w;
+        std::memcpy(&w, micro.data() + ((pc + i) & mask), 4);
+        h = (h ^ w) * 1099511628211ull;
+    }
+    return h;
 }
 
 // ---------------------------------------------------------------- recording (--vu-record)
@@ -1935,6 +2009,25 @@ int Vu::Speculate(const std::string& path, const std::string& spec) {
 }
 
 Vu::u64 Vu::Run(u32 pc, u64 limit) {
+    ProgramTimes* profile = data_mask_ == 0x3FF ? VuProfile() : nullptr;
+    if (profile && FrameNumber() < VuProfileFrom()) profile = nullptr;
+    if (!profile) return RunTimed(pc, limit);
+    const auto began = std::chrono::steady_clock::now();
+    const std::uint64_t key = CodeHash(micro, pc & u32(micro.size() - 1) & ~7u);
+    const u64 pairs = RunTimed(pc, limit);
+    const std::uint64_t ns = std::uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
+    std::lock_guard<std::mutex> hold(profile->lock);
+    ProgramTime& t = profile->by[key];
+    t.ns += ns;
+    ++t.runs;
+    t.pairs += pairs;
+    t.interpreted += t_interpreted;
+    t.pc = pc & u32(micro.size() - 1) & ~7u;
+    return pairs;
+}
+
+Vu::u64 Vu::RunTimed(u32 pc, u64 limit) {
     Timed timed(data_mask_ == 0x3FF ? Section::Vu1 : Section::Vu0);
     VuRounding rounding;
     const int unit = data_mask_ == 0x3FF ? 1 : 0;
@@ -1966,6 +2059,7 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     RunCompiled(state, limit);
     const u64 compiled = state.count;
     if (!state.done) Interpret(state, limit);
+    t_interpreted = state.count - compiled;
     LandAll();
     resume = state.pc;
     pairs_ += state.count;

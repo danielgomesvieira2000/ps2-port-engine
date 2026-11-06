@@ -82,6 +82,7 @@ public:
     /* Runs from instruction address `pc` (bytes) to the end of the program;
        returns the instruction pairs executed. Stops after `limit` regardless. */
     u64 Run(u32 pc, u64 limit = u64(1) << 24);
+    u64 RunTimed(u32 pc, u64 limit);   // (Run's work; Run adds PS2HOST_VU_PROFILE's timing)
 
     u64 pairs() const { return pairs_; }
     /* Of those, the pairs run compiled ahead of time (vu_core.h). */
@@ -227,6 +228,9 @@ private:
 Vu& Vu1();
 /* VU0, which VIF0 loads and the EE starts (vcallms) or VIF0 does. */
 Vu& Vu0();
+
+/* PS2HOST_VU_PROFILE's table (VU1's time by microprogram), written at the run's end. */
+void VuProfileReport();
 
 }  // namespace ps2host
 
