@@ -180,6 +180,25 @@ def compile_shared(sources, out: str, include_dirs, work_dir: str) -> None:
         raise CompileError("link: error : " + (link.stderr or "the link failed")[-3000:])
 
 
+def syntax_check(source: str, include_dirs) -> None:
+    """Outside Windows: the front end alone over `source` (seconds, where the
+    optimised build is minutes), raising CompileError in MSVC's spelling for
+    every error. A caller that drops what does not compile, and rebuilds, then
+    pays for the optimiser once instead of once per round."""
+    includes = ["-I" + os.path.abspath(path) for path in include_dirs]
+    neon = sse2neon_include()
+    if neon:
+        includes = ["-isystem", neon] + includes
+    flags = [flag for flag in CLANG_FLAGS if flag not in ("-O3", "-fPIC")]
+    result = subprocess.run([find_compiler(), "-fsyntax-only"] + flags + includes + [os.path.abspath(source)],
+                            capture_output=True, text=True)
+    if result.returncode == 0:
+        return
+    errors = ["%s(%s) : error : %s" % match.groups()
+              for match in map(_CLANG_ERROR.match, (result.stderr or "").splitlines()) if match]
+    raise CompileError("\n".join(errors) or (result.stderr or "the compiler failed")[-2000:])
+
+
 def find_vcvars() -> str:
     if not os.path.exists(VSWHERE):
         raise CompilerUnavailable("vswhere not found; no Visual Studio installed")
@@ -346,6 +365,7 @@ def build(generated_path: str, runtime_sources, include_dir: str, work_dir: str)
     # answers, so checking an unoptimised build would hide exactly the problems
     # this exists to find.
     if os.name != "nt":
+        syntax_check(generated_path, [include_dir, generated_dir])
         compile_shared(sources, dll, [include_dir, generated_dir], work_dir)
         return dll, functions
     script = os.path.join(work_dir, "build.bat")
