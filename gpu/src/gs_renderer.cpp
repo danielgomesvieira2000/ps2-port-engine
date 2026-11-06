@@ -523,6 +523,15 @@ public:
                       std::uint32_t width, std::uint32_t height) override;
     void ReleaseTexture(std::uint64_t key) override;
     bool DrawsMeshes() const override { return mesh_vert_ && mesh_pool_; }
+    bool MeshDrawable(const GsDrawState& state) const override {
+        // (DrawTriangles' cases for a batch of its own per overlapping primitive)
+        const bool feedback = state.textured && state.texture_target && state.tex_fbp == state.fbp &&
+                              state.tex_fbw == state.fbw;
+        const bool depth_written = state.depth && state.depth_write;
+        const bool two_pass = state.alpha_test && state.atst != 1 &&
+                              (((state.afail == 1 || state.afail == 2) && depth_written) || state.afail == 3);
+        return DrawsMeshes() && !feedback && !ShaderBlend(state) && !two_pass && !state.sprite;
+    }
     void UploadMesh(std::uint64_t key, const void* quads, std::size_t quad_count, const std::uint32_t* indices,
                     std::size_t index_count) override;
     void ReleaseMesh(std::uint64_t key) override;

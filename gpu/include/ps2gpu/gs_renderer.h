@@ -299,6 +299,10 @@ public:
        program (gs_mesh.vert: Outbreak's room) with, each draw, the header the
        microprogram would have been given. Whether this renderer draws them: */
     virtual bool DrawsMeshes() const { return false; }
+    /* Whether a mesh in `state` draws as its triangles one by one would: not
+       where each must see the one before it (a draw sampling its own target,
+       blending in the shader, an alpha test's two passes) - a mesh is one batch. */
+    virtual bool MeshDrawable(const GsDrawState& state) const { (void)state; return false; }
     /* A mesh under `key` (again: replaced): `quads` its vertices, 16 bytes a
        quadword, four a vertex (gs_mesh.vert's); `indices` its triangles,
        three each, into them. */

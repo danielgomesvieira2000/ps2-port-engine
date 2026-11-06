@@ -58,6 +58,8 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
+#include <xmmintrin.h>
 #include <vector>
 
 #define XXH_INLINE_ALL
@@ -1350,6 +1352,38 @@ void DrawOn(Bridge& s, const ps2gpu::GsDrawState& state, const ps2gpu::GsVertex*
     s.renderer->DrawTriangles(state, v, n);
 }
 
+/* A native draw going through OnDraw (OnNative's): OnDraw's state, target and
+   bookkeeping for it, its renderer call the mesh's. */
+struct NativeDraw {
+    const u32* words;
+    u32 count;
+    u32 ofx, ofy;           // XYOFFSET as the GS's decoding takes it
+    bool drawn;
+};
+NativeDraw* g_native = nullptr;
+std::unordered_set<u64> g_meshes;       // the meshes the renderer holds (UploadMesh), by key
+
+/* Its payload: [0] flags (1 a mesh to upload, 2 every mesh released first), [1-2] the key, [3-4] the tag's
+   PRIM, [5-128] the header (VU1 rows 0-23, vf11-vf17); with 1: [129] quadwords, [130] indices, the quadwords,
+   the indices. */
+constexpr u32 kNativeHeaderWords = 124, kNativeHead = 5 + kNativeHeaderWords;
+
+/* The mesh drawn in `state` (OnDraw's), its places moved as OnDraw moves a
+   primitive's (x_offset, y_offset: XYOFFSET less them). */
+bool NativeMesh(Bridge& s, const ps2gpu::GsDrawState& state, u32 x_offset, u32 y_offset, const gs::Context& c) {
+    const NativeDraw& n = *g_native;
+    const u64 key = u64(n.words[1]) | u64(n.words[2]) << 32;
+    if (!g_meshes.count(key) || !s.renderer->MeshDrawable(state)) return false;
+    float header[ps2gpu::GsRenderer::kMeshHeaderFloats] = {};
+    std::memcpy(header, n.words + 5, kNativeHeaderWords * 4);
+    (void)c;
+    header[124] = float(n.ofx) - 16.0f * float(x_offset);
+    header[125] = float(n.ofy) - 16.0f * float(y_offset);
+    ++g_draws;
+    s.renderer->DrawMesh(state, key, header);
+    return true;
+}
+
 /* A sprite's Z into its own colour target's memory (OnDraw's z_as_colour),
    drawn into that target itself: a Z format's page is a 32-bit colour
    page with its 32x16 quarters swapped (the block index's bits 3 and 4), so
@@ -1823,7 +1857,11 @@ void OnDraw(const gs::Gs::DrawCall& call) {
             for (std::size_t i = 0; i < n; ++i) v[i].t += float(fast.t_offset) * v[i].q / float(fast.th);
         // The renderer's last draw this state's (but for gouraud) when
         // nothing has drawn since the one before this.
-        if (fast.last_draw == g_draws) {
+        if (g_native) {
+            // (a texture moved within another target, a Z clamped below 24 bits: not the mesh's - the packet's)
+            if (fast.t_offset || fast.zmax < 0xFFFFFFu || !NativeMesh(s, st, 0, fast.y_offset, c)) return;
+            g_native->drawn = true;
+        } else if (fast.last_draw == g_draws) {
             ++g_draws;
             s.renderer->DrawTrianglesAgain(st, v, n);
         } else {
@@ -2114,10 +2152,16 @@ void OnDraw(const gs::Gs::DrawCall& call) {
         }
     }
 
-    for (std::size_t i = 0; i < n; ++i) v[i].z = std::min(v[i].z, zmax);
-    // Not timed apart: tens of millions of primitives a race, and a timer's
-    // two clock reads each cost as much as recording one.
-    DrawOn(s, state, v, n);
+    if (g_native) {
+        if (!s.primary || t_offset || z_as_colour || zmax < 0xFFFFFFu || !NativeMesh(s, state, x_offset, y_offset, c))
+            return;
+        g_native->drawn = true;
+    } else {
+        for (std::size_t i = 0; i < n; ++i) v[i].z = std::min(v[i].z, zmax);
+        // Not timed apart: tens of millions of primitives a race, and a timer's
+        // two clock reads each cost as much as recording one.
+        DrawOn(s, state, v, n);
+    }
     if (s.primary) {
         // FBMSK over every bit the format stores: the colour is not written.
         const u32 stored = state.psm == gs::PSMCT24 ? 0xFFFFFFu : Is16(state.psm) ? 0x80F8F8F8u : 0xFFFFFFFFu;
@@ -2199,6 +2243,230 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     e.y1 = std::max(e.y1, y1);
     u32& blocks = s.since_decode[state.fbp * 32];
     blocks = std::max(blocks, std::max(1u, state.fbw * 64 * e.y1 * PixelBits(state.psm) / 8 / 256));
+}
+
+/* PS2HOST_NATIVE_VERIFY=1: each native draw's triangles made on the CPU as
+   gs_mesh.vert makes them (culled as it culls), set against those its held
+   packet would have drawn (the GS's vertices, in order). */
+struct NativeVerify {
+    std::vector<gs::Vertex> made, held;     // three a triangle
+    std::unordered_map<u64, std::vector<u32>> meshes;   // the payloads' quadwords and indices, by key
+    u64 batches = 0, differ = 0, triangles = 0;
+    bool open = false;
+};
+NativeVerify& TheVerify() {
+    static NativeVerify* v = new NativeVerify;
+    return *v;
+}
+const bool g_native_verify = std::getenv("PS2HOST_NATIVE_VERIFY") != nullptr;
+
+// (the VU's arithmetic: each product and sum rounded - nothing fused)
+#pragma clang fp contract(off)
+void VerifyMake(const u32* words, u32 count, u32 ofx, u32 ofy) {
+    NativeVerify& nv = TheVerify();
+    const u64 key = u64(words[1]) | u64(words[2]) << 32;
+    if ((words[0] & 2)) nv.meshes.clear();
+    if ((words[0] & 1) && count >= kNativeHead + 2) {
+        const u32 quads = words[kNativeHead], indices = words[kNativeHead + 1];
+        std::vector<u32> m(words + kNativeHead, words + kNativeHead + 2 + quads * 4 + indices);
+        nv.meshes[key] = std::move(m);
+    }
+    nv.made.clear();
+    nv.held.clear();
+    nv.open = false;
+    auto found = nv.meshes.find(key);
+    if (found == nv.meshes.end()) return;
+    nv.open = true;
+    const std::vector<u32>& m = found->second;
+    const u32 quads = m[0], indices = m[1];
+    const float* q4 = reinterpret_cast<const float*>(m.data() + 2);
+    const u32* index = m.data() + 2 + quads * 4;
+    float h[31][4];
+    std::memcpy(h, words + 5, sizeof h);
+    const float (*k)[4] = h + 24;
+    auto ftoi = [](float y) -> u32 {
+        if (y >= 2147483648.0f) return 0x7FFFFFFFu;
+        if (y < -2147483648.0f) return 0x80000000u;
+        return u32(int32_t(y));
+    };
+    // (each product and sum rounded on its own, as the VU's: through memory, nothing fused)
+    auto M = [](float a, float b) { volatile float r = a * b; return float(r); };
+    auto A = [](float a, float b) { volatile float r = a + b; return float(r); };
+    auto D = [](float a, float b) { volatile float r = a / b; return float(r); };
+    auto dot4 = [&](const float* r0, const float* r1, const float* r2, const float* r3, const float* p, int l) {
+        return A(A(A(M(r0[l], p[0]), M(r1[l], p[1])), M(r2[l], p[2])), r3[l]);
+    };
+    struct Made { gs::Vertex v; float cull[6]; };
+    std::vector<Made> vs(quads / 4);
+    for (u32 i = 0; i < quads / 4; ++i) {
+        const float* p = q4 + i * 16;
+        const float *nrm = p + 4, *col = p + 8, *tx = p + 12;
+        float cp[4], g[4];
+        for (int l = 0; l < 4; ++l) {
+            cp[l] = dot4(h[3], h[4], h[5], h[6], p, l);
+            g[l] = dot4(h[7], h[8], h[9], h[10], p, l);
+        }
+        const float gw = std::fabs(g[3]);
+        const float cull[6] = {gw - g[0], gw + g[0], gw - g[1], gw + g[1], gw - g[2], gw + g[2]};
+        const float q = D(1.0f, cp[3]);
+        const float s = M(A(A(M(h[15][0], tx[0]), M(h[16][0], tx[1])), h[17][0]), q);
+        const float t = M(A(A(M(h[15][1], tx[0]), M(h[16][1], tx[1])), h[17][1]), q);
+        const float lx = k[4][0] - p[0], ly = k[5][0] - p[1], lz = k[6][0] - p[2];
+        const float d2 = A(A(M(lx, lx), M(ly, ly)), M(lz, lz));
+        float rs = float(1.0 / std::sqrt(double(d2)));     // (as Batch::Rsqrt)
+        // PS2HOST_NATIVE_VERIFY=shader: gs_mesh.vert's Rsqrt instead (nearest arithmetic, its exact errors)
+        static const bool shader_way = std::string(std::getenv("PS2HOST_NATIVE_VERIFY")) == "shader";
+        if (shader_way) {
+            const unsigned mode = _MM_GET_ROUNDING_MODE();
+            _MM_SET_ROUNDING_MODE(_MM_ROUND_NEAREST);
+            auto bits = [](float f) { u32 b; std::memcpy(&b, &f, 4); return b; };
+            auto of = [](u32 b) { float f; std::memcpy(&f, &b, 4); return f; };
+            auto past = [](float y, float x) {
+                volatile float p = y * y;
+                const float pe = std::fma(y, y, -float(p));
+                const float t = std::fma(float(p), x, -1.0f);
+                return std::fma(pe, x, t) > 0.0f;
+            };
+            volatile float y = 1.0f / std::sqrt(d2);
+            float yy = y;
+            for (int i = 0; i < 2; ++i)
+                if (past(yy, d2)) yy = of(bits(yy) - 1);
+            if (!past(of(bits(yy) + 1), d2)) yy = of(bits(yy) + 1);
+            _MM_SET_ROUNDING_MODE(mode);
+            static u64 differ = 0, all = 0;
+            ++all;
+            if (yy != rs && ++differ <= 5)
+                std::fprintf(stderr, "[gpu] native verify: Rsqrt(%08X) the VU's %08X, the shader's %08X (%llu of %llu)\n", bits(d2),
+                             bits(rs), bits(yy), (unsigned long long)differ, (unsigned long long)all);
+            rs = yy;
+        }
+        const float atten = std::min(k[1][0] * rs, 1.0f);
+        const float lambert = std::max((lx * rs) * nrm[0] + (ly * rs) * nrm[1] + (lz * rs) * nrm[2], 0.0f);
+        int c4[4];
+        for (int l = 0; l < 4; ++l) {
+            float c = col[l];
+            if (l < 3) c = (k[2][l] * lambert + k[3][l] * col[l]) * atten + h[0][l] * col[l];
+            c4[l] = int(std::min(c, 128.0f) * h[1][l]);
+        }
+        const float fog = std::max(std::min((k[0][0] - cp[3]) * k[0][1] * 255.0f, 255.0f), 0.0f);
+        gs::Vertex v;
+        v.x = (float(ftoi(cp[0] * q * 16.0f) & 0xFFFF) - float(ofx)) / 16.0f;
+        v.y = (float(ftoi(cp[1] * q * 16.0f) & 0xFFFF) - float(ofy)) / 16.0f;
+        v.z = (ftoi(cp[2] * q * 16.0f) >> 4) & 0xFFFFFF;
+        v.r = u8(c4[0]), v.g = u8(c4[1]), v.b = u8(c4[2]), v.a = u8(c4[3]);
+        v.s = s, v.t = t, v.q = M(tx[2], q);
+        v.fog = u8((ftoi(fog * 16.0f) >> 4) & 0xFF);
+        vs[i].v = v;
+        std::memcpy(vs[i].cull, cull, sizeof cull);
+    }
+    for (u32 i = 0; i + 2 < indices; i += 3) {
+        bool culled = false;
+        for (int d = 0; d < 6 && !culled; ++d)
+            culled = vs[index[i]].cull[d] < 0 && vs[index[i + 1]].cull[d] < 0 && vs[index[i + 2]].cull[d] < 0;
+        if (culled) continue;
+        for (int j = 0; j < 3; ++j) nv.made.push_back(vs[index[i + j]].v);
+    }
+}
+
+#pragma clang fp contract(on)
+
+void VerifyHeld(const gs::Gs::DrawCall& call) {
+    NativeVerify& nv = TheVerify();
+    if (!nv.open) return;
+    for (u32 i = 0; i < call.count && i < 3; ++i) nv.held.push_back(call.vertices[i]);
+}
+
+void VerifyEnd() {
+    NativeVerify& nv = TheVerify();
+    if (!nv.open) return;
+    nv.open = false;
+    ++nv.batches;
+    nv.triangles += nv.held.size() / 3;
+    auto same = [](const gs::Vertex& a, const gs::Vertex& b) {
+        return a.x == b.x && a.y == b.y && a.z == b.z && a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a &&
+               a.s == b.s && a.t == b.t && a.q == b.q && a.fog == b.fog;
+    };
+    bool ok = nv.made.size() == nv.held.size();
+    size_t at = 0;
+    // (a triangle's vertices in any order: the GS's queue holds a strip's turning round)
+    for (; ok && at < nv.made.size(); ++at) {
+        const size_t tri = at / 3 * 3;
+        bool found = false;
+        for (size_t j = tri; j < tri + 3 && !found; ++j) found = same(nv.made[at], nv.held[j]);
+        if (!found) ok = false;
+    }
+    if (!ok && ++nv.differ <= 8) {
+        std::fprintf(stderr, "[gpu] native verify: batch %llu differs - %zu vertices made, %zu held",
+                     (unsigned long long)nv.batches, nv.made.size(), nv.held.size());
+        if (at > 0 && at <= nv.made.size() && at + 1 <= nv.held.size() + 1) {
+            auto bits = [](float f) { u32 b; std::memcpy(&b, &f, 4); return b; };
+            auto show = [&](const char* what, const gs::Vertex& v) {
+                std::fprintf(stderr, "; %s %08X %08X z %X rgba %02X%02X%02X%02X stq %08X %08X %08X f %u", what, bits(v.x),
+                             bits(v.y), v.z, v.r, v.g, v.b, v.a, bits(v.s), bits(v.t), bits(v.q), v.fog);
+            };
+            show("made", nv.made[at - 1]);
+            const size_t tri = (at - 1) / 3 * 3;
+            for (size_t j = tri; j < tri + 3 && j < nv.held.size(); ++j) show("held", nv.held[j]);
+        }
+        std::fprintf(stderr, "\n");
+    }
+    if (nv.batches % 50000 == 0)
+        std::fprintf(stderr, "[gpu] native verify: %llu batches, %llu triangles, %llu batches different\n",
+                     (unsigned long long)nv.batches, (unsigned long long)nv.triangles, (unsigned long long)nv.differ);
+}
+
+/* A native draw (gs::Gs::Native): its meshes uploaded or released, then drawn
+   through OnDraw as a primitive covering the scissor would be - the state,
+   target and depth buffer made, the pages it may reach brought up to date and
+   marked drawn - its renderer call the mesh's. False: not drawn (the packet's). */
+bool OnNative(const gs::Gs::NativeCall& call) {
+    Bridge& s = *g_bridge;
+    if (!s.primary || call.count < kNativeHead) return false;
+    const u32 flags = call.words[0];
+    const u64 key = u64(call.words[1]) | u64(call.words[2]) << 32;
+    if (flags & 2) {
+        for (u64 k : g_meshes) s.renderer->ReleaseMesh(k);
+        g_meshes.clear();
+    }
+    if ((flags & 1) && call.count >= kNativeHead + 2) {
+        const u32 quads = call.words[kNativeHead], indices = call.words[kNativeHead + 1];
+        if (call.count >= kNativeHead + 2 + quads * 4 + indices && !g_meshes.count(key)) {
+            const u32* at = call.words + kNativeHead + 2;
+            s.renderer->UploadMesh(key, at, quads, at + quads * 4, indices);
+            g_meshes.insert(key);
+        }
+    }
+    if (!g_meshes.count(key)) return false;
+    const gs::Context& c = *call.context;
+    // A triangle over the scissor (its bounds clamped to it and to the target).
+    const float x0 = float(Bits(c.scissor, 0, 11)), y0 = float(Bits(c.scissor, 32, 11));
+    const float w = float(Bits(c.scissor, 16, 11)) + 1.0f - x0, h = float(Bits(c.scissor, 48, 11)) + 1.0f - y0;
+    gs::Vertex v[3];
+    v[0].x = x0, v[0].y = y0;
+    v[1].x = x0 + 2.0f * w, v[1].y = y0;
+    v[2].x = x0, v[2].y = y0 + 2.0f * h;
+    static u64 generation = 0;
+    if (g_native_verify) {
+        // (the VU's rounding: toward zero)
+        const unsigned mode = _MM_GET_ROUNDING_MODE();
+        _MM_SET_ROUNDING_MODE(_MM_ROUND_TOWARD_ZERO);
+        VerifyMake(call.words, call.count, call.ofx, call.ofy);
+        _MM_SET_ROUNDING_MODE(mode);
+    }
+    NativeDraw draw{call.words, call.count, call.ofx, call.ofy, false};
+    g_native = &draw;
+    OnDraw(gs::Gs::DrawCall{call.prim, call.context, call.texa, v, 3, call.fogcol, call.pabe, ~0ull - ++generation});
+    g_native = nullptr;
+    {
+        // PS2HOST_NATIVE_DRAW_LOG=1: how many were drawn so, every 50,000.
+        static const bool log = std::getenv("PS2HOST_NATIVE_DRAW_LOG") != nullptr;
+        static u64 drawn = 0, declined = 0;
+        ++(draw.drawn ? drawn : declined);
+        if (log && (drawn + declined) % 50000 == 0)
+            std::fprintf(stderr, "[gpu] native draws: %llu drawn, %llu left to their packets; %zu meshes held\n",
+                         (unsigned long long)drawn, (unsigned long long)declined, g_meshes.size());
+    }
+    return draw.drawn;
 }
 
 /* `alpha`: the pixels' own (else opaque). */
@@ -2472,6 +2740,15 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     bridge.targets_as_textures = mode == GpuMode::ShadowRtt;
     gs::Gs& g = gs::TheGs();
     g.on_draw = OnDraw;
+    if (bridge.primary) {
+        g.on_native = OnNative;
+        if (g_native_verify) {
+            g.on_held = VerifyHeld;
+            g.on_held_end = VerifyEnd;
+        }
+        SetGsNativeDraws(std::getenv("PS2HOST_NATIVE_DRAW") && std::string(std::getenv("PS2HOST_NATIVE_DRAW")) == "1" &&
+                         bridge.renderer->DrawsMeshes());
+    }
     g.on_effect = OnEffect;
     if (bridge.primary) {
         g.rasterize = false;

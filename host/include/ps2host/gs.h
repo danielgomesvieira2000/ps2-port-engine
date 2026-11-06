@@ -229,6 +229,27 @@ public:
         u64 generation;     // Apply's count of register writes: the same, no register changed
     };
     std::function<void(const DrawCall&)> on_draw;
+    /* A native draw (docs/NATIVE_RENDERER.md: a microprogram's batch drawn by
+       the GPU from its mesh and header): its payload, the PRIM its packet's
+       tag sets (or the PRIM as it is), the context that PRIM picks. True: drawn
+       - the next path-1 packet (the batch's own) then goes through the GS as
+       ever, its registers and vertices, but draws nothing. */
+    struct NativeCall {
+        u64 prim;
+        const Context* context;
+        u64 texa;
+        u64 fogcol;
+        bool pabe;
+        const u32* words;
+        u32 count;
+        u32 ofx, ofy;       // XYOFFSET as the decoding takes it (field mode: OFY on the whole pixel)
+    };
+    std::function<bool(const NativeCall&)> on_native;
+    /* (PS2HOST_NATIVE_VERIFY's) each primitive a held packet would have drawn, and the packet's end. */
+    std::function<void(const DrawCall&)> on_held;
+    std::function<void()> on_held_end;
+    /* The payload's words 3-4: the tag's PRIM (~0: none - PRIM as it is). */
+    void Native(const u32* words, u32 count);
     /* --gpu: the GS model draws nothing itself (rasterize false) and a second
        renderer draws instead; to keep its images and local memory in step it
        hears of every other access to local memory first - blocks
@@ -369,6 +390,8 @@ private:
     u64 clut_loads_ = 0;
     void LoadClut(u64 tex0);
     u64 Prim() const { return (prmodecont_ & 1) ? prim_ : ((prim_ & 7) | (prmode_ & ~7ull)); }
+    bool hold_next_ = false;        // Native drew: the next path-1 packet's primitives not drawn
+    bool hold_draws_ = false;       // ...that packet, going through
     const Context& Ctx() const { return ctx_[(Prim() >> 9) & 1]; }
 };
 
