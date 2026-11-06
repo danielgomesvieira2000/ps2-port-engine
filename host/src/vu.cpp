@@ -2100,6 +2100,15 @@ Vu::u64 Vu::RunEmulated(u32 pc, u64 limit) {
     return state.count;
 }
 
+/* Whether `program`'s block at `pc` knows fields clean from the ways into it
+   (compiled for them: entered another way, not exact). */
+bool KnowsAt(const VuCompiled* program, Vu::u32 pc) {
+    if (!program->knows) return false;
+    const Vu::u32* end = program->starts + program->block_count;
+    const Vu::u32* at = std::lower_bound(program->starts, end, pc);
+    return at != end && *at == pc && program->knows[at - program->starts];
+}
+
 bool Vu::RunCompiled(VuRunState& state, u64 limit) {
     if (!use_compiled || Compiled().empty()) return false;
     const int unit = data_mask_ == 0x3FF ? 1 : 0;
@@ -2116,9 +2125,25 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
         } else {
             const auto found = Compiled().find(std::uint64_t(unit) << 32 | state.pc);
             if (found == Compiled().end()) {
-                if (g_record && ran) RecordProgram(micro, unit, state.pc);
-                break;
+                // No program starts here: the one run last goes on, if a block
+                // of it starts here that knows nothing on entry (the
+                // interpreter took over in the middle of it - a jump to a
+                // register's address into a block that knows fields clean -
+                // and the run comes back at its next jump: 99% of a run of
+                // File #2's 72-word things was interpreted).
+                const VuCompiled* last = static_cast<const VuCompiled*>(last_program_);
+                const std::vector<VuBlock>* last_table = static_cast<const std::vector<VuBlock>*>(last_table_);
+                if (last && last_generation_ == micro_generation_ && last_fast_ == fast && state.pc < micro.size() &&
+                    (*last_table)[state.pc / 8] && !KnowsAt(last, state.pc)) {
+                    program = last;
+                    blocks = last_table;
+                    if (entered) *entered = Entered{program, blocks, micro_generation_, fast};
+                } else {
+                    if (g_record && ran) RecordProgram(micro, unit, state.pc);
+                    break;
+                }
             }
+            if (!program)
             for (const VuCompiled* candidate : found->second) {
                 u64& held_at = held_at_[candidate];
                 if (held_at == micro_generation_) { program = candidate; break; }
@@ -2137,6 +2162,10 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
             if (entered) *entered = Entered{program, blocks, micro_generation_, fast};
         }
         ++compiled_entries_;
+        last_program_ = program;
+        last_table_ = blocks;
+        last_generation_ = micro_generation_;
+        last_fast_ = fast;
         const std::vector<VuBlock>& table = *blocks;
         const u64 before = state.count;
         const u32 started = state.pc;
@@ -2286,6 +2315,7 @@ void Vu::Interpret(VuRunState& state, u64 limit) {
             state.count = count;
             state.delayed = delayed;
             state.stopping = stopping;
+            state.interpret = false;        // (compiled code may go on here: RunCompiled says where)
             if (RunCompiled(state, limit)) {
                 if (state.done) return;
                 pc = state.pc;

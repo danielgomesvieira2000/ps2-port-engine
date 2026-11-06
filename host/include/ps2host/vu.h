@@ -177,6 +177,13 @@ private:
         bool fast = false;
     };
     std::vector<Entered> entered_;
+    // The compiled program run last (and its blocks): where the interpreter
+    // took over in the middle of it, the run goes back to it at the next
+    // block that knows nothing on entry (RunCompiled).
+    const void* last_program_ = nullptr;
+    const void* last_table_ = nullptr;
+    u64 last_generation_ = 0;
+    bool last_fast_ = false;
 
     // Compiled code: the vector registers that may hold fields the model's
     // Clean would change (bit r for VF r) - loaded so, or not known; the FMAC
