@@ -600,6 +600,27 @@ void GsNative(const u32* words, u32 count) {
     g_feed->Publish(1 + count);
 }
 
+thread_local std::vector<u32> t_native_local;     // (GsNativeBegin's, with no GS thread)
+
+u32* GsNativeBegin(u32 count) {
+    if (!g_feed || count + 1 > kMaxRun) {
+        t_native_local.resize(count);
+        return t_native_local.data();
+    }
+    Producing producing;
+    u32* e = g_feed->Reserve(1 + count);
+    e[0] = Header(kNative, 1, count);
+    return e + 1;
+}
+
+void GsNativeEnd(u32 count) {
+    if (!g_feed || count + 1 > kMaxRun) {
+        if (!g_feed) gs::TheGs().Native(t_native_local.data(), count);
+        return;
+    }
+    g_feed->Publish(1 + count);
+}
+
 void SetGsFrameHandler(std::function<void(u64)> handler) { g_frame_handler = std::move(handler); }
 
 

@@ -227,6 +227,9 @@ void GsWords(int path, const u32* words, u32 count, u32 from = ~0u);
 /* A native draw's payload (gs::Gs::Native), in turn before the packet it
    stands for. Only where GsNativeDraws: not with the GS split. */
 void GsNative(const u32* words, u32 count);
+/* The same, written in place: GsNativeBegin's `count` words filled, then GsNativeEnd (nothing else sent between). */
+u32* GsNativeBegin(u32 count);
+void GsNativeEnd(u32 count);
 /* Whether native draws are drawn: the GPU bridge's renderer draws meshes and
    PS2HOST_NATIVE_DRAW=1 (SetGsNativeDraws, the bridge's). */
 bool GsNativeDraws();
