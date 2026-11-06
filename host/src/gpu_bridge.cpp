@@ -100,7 +100,12 @@ void SetGpuModernTextures(bool on) { g_modern_textures = on; }
 // SetGpuTextureFilter's: the filter (0 the game's) and the anisotropic taps'
 // log2 (GsDrawState::tag bits 8-10).
 std::atomic<int> g_texture_filter{0}, g_texture_taps{3};
+// (PS2HOST_NO_AUTO_LEVELS=1: a game's textures without levels drawn from level 0 alone, as before - to compare)
+const bool g_no_auto_levels = std::getenv("PS2HOST_NO_AUTO_LEVELS") != nullptr;
 void SetGpuTextureFilter(int filter, int taps) {
+    // (PS2HOST_TEXTURE_FILTER=<filter>: a test's, whatever the game sets - a scripted run's --setting comes after
+    // the game's start applied its own)
+    if (const char* test = std::getenv("PS2HOST_TEXTURE_FILTER")) filter = std::atoi(test), taps = 16;
     int log2 = 0;
     while (log2 < 4 && (2 << log2) <= taps) ++log2;
     g_texture_filter = filter;
@@ -1006,7 +1011,7 @@ bool Replace(Bridge& b, Cached& t) {
     return true;
 }
 
-u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
+u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th, u32 auto_levels = 1) {
     const u32 tbp = Bits(c.tex0, 0, 14), tbw = Bits(c.tex0, 14, 6), psm = Bits(c.tex0, 20, 6);
     // What decides the decoded texels: where and how it is stored (TBP0, TBW,
     // PSM, TW, TH), how a region mode wraps it (CLAMP), TEXA, the CLUT's
@@ -1019,6 +1024,7 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
     gs::MipLevels mips = gs::LevelsOf(c);
     if (!gs::MipMode(c)) mips.count = 1;        // levels never read: not decoded
     for (u32 n = 1; n < mips.count; ++n) key ^= (u64(mips.tbp[n]) << 6 | mips.tbw[n]) * (0x9E3779B97F4A7C15ull + n);
+    if (auto_levels > 1) key ^= u64(auto_levels) * 0xD6E8FEB86659FD93ull;     // (its levels made: another decode)
     Cached& t = b.textures[key];
     if (!t.renderer_key) {
         t.renderer_key = b.next_texture++;
@@ -1085,6 +1091,7 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
         d.ta1 = Bits(texa, 32, 8);
         d.csa = Bits(c.tex0, 56, 5);
         d.levels = mips.count;
+        d.auto_levels = auto_levels;
         for (u32 n = 0; n < mips.count; ++n) {
             d.level_tbp[n] = mips.tbp[n];
             d.level_tbw[n] = mips.tbw[n];
@@ -2081,9 +2088,20 @@ void OnDraw(const gs::Gs::DrawCall& call) {
             state.ta1 = Bits(call.texa, 32, 8);
             state.aem = Bits(call.texa, 15, 1) != 0;
         }
+        // TEXTURE FILTER trilinear or anisotropic on a 3D draw whose texture has no levels of its own (Outbreak's
+        // every one): levels made from it (GsTextureDecode::auto_levels) and filtered as a modern GPU would - not
+        // for a region mode's (an atlas: its neighbours would bleed in) or a small texture.
+        u32 auto_levels = 1;
+        if (s.primary && !state.texture_target && type != 6 && g_texture_filter.load(std::memory_order_relaxed) >= 3 &&
+            !gs::MipMode(c) && Bits(c.clamp, 0, 2) < 2 && Bits(c.clamp, 2, 2) < 2 && std::min(tw, th) >= 8 &&
+            s.renderer->MakesTextureLevels() && !g_no_auto_levels) {
+            u32 n = 0;
+            while ((2u << n) <= std::min(tw, th)) ++n;
+            auto_levels = std::min(7u, n + 1);
+        }
         if (!state.texture_target) {
             if (s.primary) {
-                state.texture = CachedTexture(s, c, call.texa, tw, th);
+                state.texture = CachedTexture(s, c, call.texa, tw, th, auto_levels);
             } else {
                 // Decoded again when the texture's registers change, local memory
                 // is uploaded into, or a draw since went into the texture's blocks.
@@ -2132,6 +2150,11 @@ void OnDraw(const gs::Gs::DrawCall& call) {
                 if (m && filter >= 3) state.tag |= 2u;
             }
             state.mip = m;
+            if (auto_levels > 1) {
+                // (its made levels: trilinear between them, MODERN's footprint - LCM, K 0: never the GS's LOD)
+                state.mip = 2u | (auto_levels - 1) << 2 | 5u << 5 | kMmag | 1u << 9;
+                state.tag |= 2u;
+            }
         }
         state.wms = Bits(c.clamp, 0, 2);
         state.wmt = Bits(c.clamp, 2, 2);

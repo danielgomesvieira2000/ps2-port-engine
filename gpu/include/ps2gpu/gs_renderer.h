@@ -173,6 +173,10 @@ struct GsTextureDecode {
        its left edge - the image tw wide, as tall as all of them. */
     std::uint32_t levels = 1;
     std::uint32_t level_tbp[7] = {}, level_tbw[7] = {};
+    /* A texture with no levels of its own (levels 1): this many made from
+       level 0 (2-7; mipgen.comp - each the four texels above it averaged), in
+       the same layout, where the renderer can (MakesTextureLevels). */
+    std::uint32_t auto_levels = 1;
     /* The CLUT as the GS model holds it, or null: the CLUT the GPU holds
        (ClutFromMemory, ClutRows) at this point of what is recorded. */
     const std::uint32_t* clut = nullptr;
@@ -306,6 +310,8 @@ public:
        program (gs_mesh.vert: Outbreak's room) with, each draw, the header the
        microprogram would have been given. Whether this renderer draws them: */
     virtual bool DrawsMeshes() const { return false; }
+    /* Whether a decode's auto_levels are made (GsTextureDecode). */
+    virtual bool MakesTextureLevels() const { return false; }
     /* ...and their enhanced draws (gs_mesh_enhanced.glsl: the device's clip distances) - a header whose ext asks
        for them (its y, the enhancements the game made it for) drawn so. */
     virtual bool DrawsEnhancedMeshes() const { return false; }

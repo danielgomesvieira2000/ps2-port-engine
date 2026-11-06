@@ -54,6 +54,7 @@
 #include "depth_load_frag.h"
 #include "decode_comp.h"
 #include "decode_image_comp.h"
+#include "mipgen_comp.h"
 #include "patch_comp.h"
 #include "shuffle_comp.h"
 
@@ -535,6 +536,7 @@ public:
                       std::uint32_t width, std::uint32_t height) override;
     void ReleaseTexture(std::uint64_t key) override;
     bool DrawsMeshes() const override { return mesh_vert_ && mesh_pool_; }
+    bool MakesTextureLevels() const override { return decode_image_pipeline_ && mipgen_pipeline_; }
     bool DrawsEnhancedMeshes() const override {
         return DrawsMeshes() && mesh_enh_vert_ && mesh_chars_enh_vert_ && frag_lit_ && frag_blend_lit_;
     }
@@ -1088,6 +1090,9 @@ private:
        swizzle's image layout), each texture's set from texture_storage_pool_;
        null where it would not build: the staging buffer and a copy then. */
     VkShaderModule decode_image_ = VK_NULL_HANDLE;
+    // (a texture's automatic levels, made in its image: mipgen.comp)
+    VkShaderModule mipgen_ = VK_NULL_HANDLE;
+    VkPipeline mipgen_pipeline_ = VK_NULL_HANDLE;
     VkPipeline decode_image_pipeline_ = VK_NULL_HANDLE;
     VkDescriptorPool texture_storage_pool_ = VK_NULL_HANDLE;
     VkDescriptorSet TextureStorageSet(Image& image);
@@ -1749,6 +1754,15 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         if (!decode_image_ ||
             vkCreateComputePipelines(g_.device, cache_, 1, &dp, nullptr, &decode_image_pipeline_) != VK_SUCCESS)
             decode_image_pipeline_ = VK_NULL_HANDLE;
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = sizeof spirv_mipgen_comp;
+        mi.pCode = spirv_mipgen_comp;
+        vkCreateShaderModule(g_.device, &mi, nullptr, &mipgen_);
+        VkComputePipelineCreateInfo mp = cpi;
+        mp.stage.module = mipgen_;
+        mp.layout = swizzle_image_layout_;
+        if (!mipgen_ || vkCreateComputePipelines(g_.device, cache_, 1, &mp, nullptr, &mipgen_pipeline_) != VK_SUCCESS)
+            mipgen_pipeline_ = VK_NULL_HANDLE;
         // A set for every texture there may be: the bridge's cache, the pool of
         // spare images, and room.
         VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8192};
@@ -3158,10 +3172,12 @@ Texture* VulkanGsRenderer::TextureImage(std::uint64_t key, std::uint32_t width, 
 
 void VulkanGsRenderer::TextureFromMemory(std::uint64_t key, const GsTextureDecode& d) {
     Flush();                        // what is pending may sample the old contents
-    // Mipmap levels below level 0, each at the left edge (gs.frag's Texel).
+    // Mipmap levels below level 0, each at the left edge (gs.frag's Texel); a texture without its own, the ones
+    // asked for made from level 0 (auto_levels: mipgen.comp, after the decode).
     const std::uint32_t levels = std::min(7u, std::max(1u, d.levels));
+    const std::uint32_t made = levels == 1 && MakesTextureLevels() ? std::min(7u, std::max(1u, d.auto_levels)) : 1u;
     std::uint32_t height = 0;
-    for (std::uint32_t n = 0; n < levels; ++n) height += std::max(1u, d.th >> n);
+    for (std::uint32_t n = 0; n < std::max(levels, made); ++n) height += std::max(1u, d.th >> n);
     Texture* texture = TextureImage(key, d.tw, height);
     if (!texture) return;
     // A deferred pass's draws sampled it already: they keep its image (and
@@ -3216,6 +3232,22 @@ void VulkanGsRenderer::TextureFromMemory(std::uint64_t key, const GsTextureDecod
                 vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
                 g_.Mark(cmd, kProfDecode);
                 y += h;
+            }
+            if (made > 1) {
+                // The levels made: each from the one above, written before it is read.
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, mipgen_pipeline_);
+                std::uint32_t src_row = 0;
+                for (std::uint32_t n = 1; n < made; ++n) {
+                    MemoryBarrier(cmd);
+                    const std::uint32_t sw = std::max(1u, d.tw >> (n - 1)), sh = std::max(1u, d.th >> (n - 1));
+                    const std::uint32_t mg[6] = {std::max(1u, d.tw >> n), std::max(1u, d.th >> n), src_row, src_row + sh,
+                                                 sw, sh};
+                    vkCmdPushConstants(cmd, swizzle_image_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof mg, mg);
+                    ++g_dispatches;
+                    vkCmdDispatch(cmd, (mg[0] + 7) / 8, (mg[1] + 7) / 8, 1);
+                    src_row += sh;
+                }
+                g_.Mark(cmd, kProfDecode);
             }
             Transition(cmd, t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
@@ -4591,12 +4623,12 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (shuffle_layout_) vkDestroyPipelineLayout(g_.device, shuffle_layout_, nullptr);
     if (shuffle_) vkDestroyShaderModule(g_.device, shuffle_, nullptr);
     // The swizzle and decode to and from images, the memory patch, depth out and back.
-    for (VkPipeline p : {swizzle_image_pipeline_, decode_image_pipeline_, patch_pipeline_, swizzle_depth_pipeline_,
-                         depth_load_pipeline_})
+    for (VkPipeline p : {swizzle_image_pipeline_, decode_image_pipeline_, mipgen_pipeline_, patch_pipeline_,
+                         swizzle_depth_pipeline_, depth_load_pipeline_})
         if (p) vkDestroyPipeline(g_.device, p, nullptr);
     for (VkPipelineLayout l : {swizzle_image_layout_, patch_layout_, swizzle_depth_layout_, depth_load_layout_})
         if (l) vkDestroyPipelineLayout(g_.device, l, nullptr);
-    for (VkShaderModule m : {swizzle_image_, decode_image_, patch_, swizzle_depth_, depth_load_vert_, depth_load_frag_})
+    for (VkShaderModule m : {swizzle_image_, decode_image_, mipgen_, patch_, swizzle_depth_, depth_load_vert_, depth_load_frag_})
         if (m) vkDestroyShaderModule(g_.device, m, nullptr);
     for (VkDescriptorSetLayout l : {image_set_layout_, depth_set_layout_})
         if (l) vkDestroyDescriptorSetLayout(g_.device, l, nullptr);

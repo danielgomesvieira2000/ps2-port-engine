@@ -1,0 +1,36 @@
+#version 450
+// A texture's mipmap level made from the one above it (TEXTURE FILTER's
+// automatic levels, GsTextureDecode::auto_levels: a game's texture with none
+// of its own - Outbreak's every one - filtered trilinear or anisotropic as a
+// modern GPU would, no shimmer in the distance). The levels are stacked in the
+// texture's image as the GS's own are (gs.frag's Texel: level n below level
+// n-1, at the left edge): each texel here the four above it averaged, the
+// colour weighted by alpha (a transparent texel's colour - often black - kept
+// out of its opaque neighbours' edge).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 1, binding = 0, rgba8) uniform image2D texels;
+
+layout(push_constant) uniform Params {
+    uint w, h;              // this level's size
+    uint src_row, dst_row;  // the level above's first row, this level's
+    uint src_w, src_h;      // the level above's size
+} p;
+
+void main() {
+    const uvec2 at = gl_GlobalInvocationID.xy;
+    if (at.x >= p.w || at.y >= p.h) return;
+    vec3 weighted = vec3(0.0), plain = vec3(0.0);
+    float alpha = 0.0;
+    for (uint dy = 0u; dy < 2u; ++dy)
+        for (uint dx = 0u; dx < 2u; ++dx) {
+            const ivec2 q = ivec2(int(min(at.x * 2u + dx, p.src_w - 1u)), int(p.src_row + min(at.y * 2u + dy, p.src_h - 1u)));
+            const vec4 c = imageLoad(texels, q);
+            weighted += c.rgb * c.a;
+            plain += c.rgb;
+            alpha += c.a;
+        }
+    const vec3 rgb = alpha > 0.0 ? weighted / alpha : plain * 0.25;
+    imageStore(texels, ivec2(int(at.x), int(p.dst_row + at.y)), vec4(rgb, alpha * 0.25));
+}
