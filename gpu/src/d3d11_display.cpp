@@ -429,6 +429,10 @@ void D3D11Display::DrawOverlay(std::uint32_t target_width, std::uint32_t target_
     }
     std::uint32_t x = 16, y = 16;
     if (overlay_right_.load() && target_width > overlay_width_ + 32) x = target_width - overlay_width_ - 16;
+    if (overlay_centred_.load() && target_width > overlay_width_ && target_height > overlay_height_) {
+        x = (target_width - overlay_width_) / 2;
+        y = (target_height - overlay_height_) / 2;
+    }
     if (x + 16 >= target_width) x = 16;
     if (y + 16 >= target_height) y = 16;
     const D3D11_VIEWPORT vp{float(x), float(y), float(overlay_width_), float(overlay_height_), 0.0f, 1.0f};

@@ -632,7 +632,7 @@ void SetPictureSource(std::function<bool(std::vector<u32>*, u32*, u32*)> source)
 }
 
 namespace {
-void RefreshOverlay();      // the overlay's lines and the FPS counter's, drawn
+void RefreshOverlay(bool force = false);      // the overlay's lines and the FPS counter's, drawn
 }  // namespace
 
 // Alt+Enter changes fullscreen in the display's Pump: saved as the setting.
@@ -722,6 +722,8 @@ void SetWindowFullscreen(bool on) {
     if (g_display) g_display->SetFullscreen(on);
 #endif
 }
+
+bool g_panel_shown = false;      // SetWindowPanel's picture is the overlay (RefreshOverlay leaves it)
 
 namespace {
 
@@ -829,7 +831,8 @@ void DrawOverlay(const std::vector<std::string>& lines) {
 
 // The FPS counter (F1, setting "fps_counter", off unless turned on): the
 // pictures shown a second, a line under whatever else the overlay says.
-void RefreshOverlay() {
+void RefreshOverlay(bool force) {
+    if (g_panel_shown) return;     // (the panel's picture over it)
     std::vector<std::string> lines = g_overlay_lines;
 #ifdef PS2HOST_VULKAN
     if (g_display && SettingOn("fps_counter", false)) {
@@ -865,7 +868,7 @@ void RefreshOverlay() {
     if (badge) lines = {std::string(1, kYellow) + g_badge};
     static std::vector<std::string> shown;
     static bool shown_right = false;
-    if (lines == shown && badge == shown_right) return;     // drawn again only when it changes
+    if (!force && lines == shown && badge == shown_right) return;     // drawn again only when it changes
     shown = lines;
     shown_right = badge;
 #ifdef PS2HOST_VULKAN
@@ -875,6 +878,56 @@ void RefreshOverlay() {
 }
 
 }  // namespace
+
+void SetWindowPanel(std::vector<u32> pixels, u32 width, u32 height) {
+#ifdef PS2HOST_VULKAN
+    if (!g_display) return;
+    if (pixels.empty()) {
+        if (!g_panel_shown) return;
+        g_panel_shown = false;
+        g_display->SetOverlayCentred(false);
+        g_display->SetOverlay({}, 0, 0);
+        RefreshOverlay(true);
+        return;
+    }
+    g_panel_shown = true;
+    g_display->SetOverlayCentred(true);
+    g_display->SetOverlayRight(false);
+    g_display->SetOverlay(std::move(pixels), width, height);
+#else
+    (void)pixels, (void)width, (void)height;
+#endif
+}
+
+bool WindowPixelSize(u32* width, u32* height) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) {
+        *width = g_display->PixelWidth();
+        *height = g_display->PixelHeight();
+        return *width && *height;
+    }
+#endif
+    (void)width, (void)height;
+    return false;
+}
+
+bool TakePanelMouse(PanelMouseState* state) {
+#ifdef PS2HOST_VULKAN
+    ps2gpu::Display::PanelMouse m;
+    if (g_display && g_display->TakePanelMouse(&m)) {
+        state->over = m.over;
+        state->px = m.px;
+        state->py = m.py;
+        state->held = m.held;
+        state->pressed = m.pressed;
+        state->wheel = m.wheel;
+        state->moved = m.moved;
+        return true;
+    }
+#endif
+    (void)state;
+    return false;
+}
 
 void SetWindowOverlay(const std::vector<std::string>& lines) {
     g_overlay_lines = lines;

@@ -470,6 +470,19 @@ bool ShownPicture(std::vector<u32>* pixels, u32* width, u32* height);
    is open the game gets no input (PcMenuOpen). */
 void UpdatePcMenu();
 bool PcMenuOpen();
+/* The panel's picture (BGRA, width x height) in the window's middle - none:
+   gone, the overlay's lines again; the window's size in pixels; the
+   pointer for it (in the window's pixels, its own clicks, not the game's). */
+struct PanelMouseState {
+    bool over = false;
+    float px = 0.0f, py = 0.0f;
+    u32 held = 0, pressed = 0;
+    float wheel = 0.0f;
+    bool moved = false;
+};
+void SetWindowPanel(std::vector<u32> pixels, u32 width, u32 height);
+bool WindowPixelSize(u32* width, u32* height);
+bool TakePanelMouse(PanelMouseState* state);
 /* The PC settings for a game's own menu (a port's PC SETTINGS screen): each
    one's short name and value in capitals (RESOLUTION, 2X) and a line of help;
    a texture pack's only when one is loaded. StepPcSetting changes the n-th to

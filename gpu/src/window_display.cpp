@@ -340,18 +340,24 @@ bool SdlWindowDisplay::Pump() {
             if (bit >= 0 && e.button.down) {
                 mouse_.held |= 1u << bit;
                 mouse_.pressed |= 1u << bit;
+                panel_mouse_.held |= 1u << bit;
+                panel_mouse_.pressed |= 1u << bit;
             } else if (bit >= 0) {
                 mouse_.held &= ~(1u << bit);
+                panel_mouse_.held &= ~(1u << bit);
             }
         }
         if (e.type == SDL_EVENT_MOUSE_WHEEL) {
             std::lock_guard<std::mutex> hold(mouse_lock_);
             mouse_.wheel += e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
+            panel_mouse_.wheel += e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
         }
         if (e.type == SDL_EVENT_WINDOW_MOUSE_LEAVE) {
             std::lock_guard<std::mutex> hold(mouse_lock_);
             mouse_.over = false;
             mouse_.held = 0;
+            panel_mouse_.over = false;
+            panel_mouse_.held = 0;
         }
         if (e.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
             std::lock_guard<std::mutex> hold(mouse_lock_);
@@ -390,6 +396,10 @@ void SdlWindowDisplay::MouseAt(float x, float y) {
     const float density = window_ ? SDL_GetWindowPixelDensity(window_) : 1.0f;
     const float px = x * (density > 0.0f ? density : 1.0f), py = y * (density > 0.0f ? density : 1.0f);
     std::lock_guard<std::mutex> hold(mouse_lock_);
+    if (px != panel_mouse_.px || py != panel_mouse_.py || !panel_mouse_.over) panel_mouse_.moved = true;
+    panel_mouse_.over = true;
+    panel_mouse_.px = px;
+    panel_mouse_.py = py;
     if (px != mouse_px_ || py != mouse_py_ || !mouse_.over) mouse_.moved = true;
     mouse_px_ = px;
     mouse_py_ = py;

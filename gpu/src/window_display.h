@@ -65,6 +65,20 @@ public:
         ++overlay_generation_;
     }
     void SetOverlayRight(bool right) override { overlay_right_.store(right); }
+    void SetOverlayCentred(bool centred) override { overlay_centred_.store(centred); }
+    std::uint32_t PixelWidth() const override {
+        int w = 0, h = 0;
+        if (!window_ || !SDL_GetWindowSizeInPixels(window_, &w, &h)) return 0;
+        return std::uint32_t(w > 0 ? w : 0);
+    }
+    bool TakePanelMouse(PanelMouse* state) override {
+        std::lock_guard<std::mutex> hold(mouse_lock_);
+        *state = panel_mouse_;
+        panel_mouse_.pressed = 0;
+        panel_mouse_.wheel = 0.0f;
+        panel_mouse_.moved = false;
+        return window_ != nullptr;
+    }
     void SetTitle(const std::string& title) override {
         std::lock_guard<std::mutex> hold(title_lock_);
         title_ = title;
@@ -189,6 +203,8 @@ protected:
     std::uint32_t overlay_width_ = 0, overlay_height_ = 0;
     std::uint64_t overlay_generation_ = 1;      // a SetOverlay's
     std::atomic<bool> overlay_right_{false};    // SetOverlayRight's: the top right
+    std::atomic<bool> overlay_centred_{false};  // SetOverlayCentred's: the middle
+    PanelMouse panel_mouse_;                    // TakePanelMouse's (mouse_lock_)
     std::shared_ptr<VblankWatch> vblank_watch_;     // RefreshTiming's (null: no such thread)
     std::atomic<std::int32_t> shown_x0_{0}, shown_y0_{0}, shown_w_{1}, shown_h_{1};
 

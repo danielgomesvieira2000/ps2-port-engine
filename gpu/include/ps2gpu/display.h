@@ -137,6 +137,20 @@ public:
     /* The overlay at the top right (a badge: a game's few words) instead of
        the top left (a panel); kept until set again. */
     virtual void SetOverlayRight(bool right) { (void)right; }
+    /* The overlay in the window's middle (the PC settings panel), not its corner. */
+    virtual void SetOverlayCentred(bool centred) { (void)centred; }
+    virtual std::uint32_t PixelWidth() const { return 0; }
+    /* The mouse for a panel over the game (its own clicks: not the game's
+       TakeMouse) - the pointer in the window's pixels, the buttons gone down
+       and the wheel turned since the last call. */
+    struct PanelMouse {
+        bool over = false;
+        float px = 0.0f, py = 0.0f;
+        std::uint32_t held = 0, pressed = 0;
+        float wheel = 0.0f;
+        bool moved = false;
+    };
+    virtual bool TakePanelMouse(PanelMouse* state) { (void)state; return false; }
     /* The window's title (taken up by the window's own thread, in Pump). */
     virtual void SetTitle(const std::string& title) { (void)title; }
     /* The window placed (applied at the next Pump): its client area at x, y

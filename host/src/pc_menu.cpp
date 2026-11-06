@@ -6,20 +6,29 @@
  * settings the host itself applies, changed while the game runs and saved
  * with the PC settings (settings.h). While it is open the game gets no input.
  *
- * A port's own settings (AddPortOptions) follow as pages, each row opening
- * one: its options, then Back. A port without controls of its own (no
- * SetKeyboardMapper) has the Keyboard page: each of the DualShock 2's
- * inputs and the key that holds it (bindings.h's GameKeys) - Enter, then the
- * key to bind (Esc leaves it as it was).
+ * Its tabs: DISPLAY (the engine's settings), each of a port's pages
+ * (AddPortOptions), each of its binding pages (bindings::AddPanelPage: a
+ * context's keys or buttons, rebound - Enter, then the key; DEFAULTS), and,
+ * for a port without controls of its own (no SetKeyboardMapper), KEYBOARD
+ * (the DualShock 2's inputs and their keys, bindings.h's GameKeys).
  *
- *   Up / Down          choose
- *   Left / Right       change (Enter or Cross too; on a page's row, open it)
- *   Esc, Circle        back from a page; close
- *   F9                 close
+ *   Up / Down             choose a row
+ *   Left / Right          change it (Enter or Cross: change, open, bind)
+ *   Page Up / Page Down,  the tab before / after (L1 / R1 on a controller)
+ *   Q / E
+ *   Esc, Circle           close (a binding waiting: leave it as it was)
+ *   F9                    close
+ *   the mouse             a tab or a row chosen by pointing, a click
+ *                         changes (its value's arrows: back or on), the
+ *                         wheel scrolls; a right click closes
+ *
+ * Drawn on Windows with its own font (Segoe UI) as a panel in the window's
+ * middle; elsewhere as the overlay's lines.
  */
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -31,6 +40,9 @@
 #include "ps2host/texture_pack.h"
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -40,13 +52,15 @@ namespace {
 
 bool g_open = false;
 bool g_releasing = false;                // closed, the game's input held back until the keys are let go
-int g_row = 0;
-int g_page = -1;                          // a port's page open (Pages()' index), -1 the first, kKeyboard
-constexpr int kKeyboard = -2;             // the Keyboard page (GameKeys)
-int g_binding = -1;                       // the input a key is awaited for (the Keyboard page), or -1
-bool g_binding_armed = false;             // ...every key let go since it began
+int g_tab = 0;                           // the tab shown (Tabs()' index)
+int g_row = 0;                           // its row chosen
+int g_scroll = 0;                        // its first row shown
+int g_binding = -1;                      // the row a key (or button) is awaited for, or -1
+bool g_binding_armed = false;            // ...every key let go since it began
+u64 g_binding_until = 0;                 // ...the panel's tick it gives up at
+u64 g_tick = 0;
 
-/* The Keyboard page's rows, in the order a player thinks of them. */
+/* The KEYBOARD tab's rows, in the order a player thinks of them. */
 constexpr int kKeyRows[] = {bindings::kUp,     bindings::kDown, bindings::kLeft,   bindings::kRight,
                             bindings::kCross,  bindings::kCircle, bindings::kSquare, bindings::kTriangle,
                             bindings::kL1,     bindings::kR1,   bindings::kL2,     bindings::kR2,
@@ -57,6 +71,11 @@ std::vector<PortOption>& PortOptions() {
     return options;
 }
 
+std::vector<bindings::PanelPage>& PanelPages() {
+    static std::vector<bindings::PanelPage> pages;
+    return pages;
+}
+
 /* The ports' pages, in the order first named. */
 std::vector<std::string> Pages() {
     std::vector<std::string> pages;
@@ -64,13 +83,6 @@ std::vector<std::string> Pages() {
         if (std::find(pages.begin(), pages.end(), o.page) == pages.end()) pages.push_back(o.page);
     return pages;
 }
-
-/* A row shown: the engine's setting, a page's link, a port's option, or the
-   last (Close; Back on a page). */
-struct Row {
-    enum Kind { kChoice, kPage, kOption, kKeyLink, kKey, kLast } kind;
-    int index;
-};
 
 struct Choice {
     const char* label;
@@ -162,116 +174,376 @@ std::vector<int> Rows() {
     return rows;
 }
 
-/* What the panel shows now: the first page's rows and the ports' pages, or
-   an open page's options. */
+
+// ------------------------------------------------------------------ tabs and rows
+
+struct Tab {
+    enum Kind { kDisplay, kPort, kBindings, kKeyboard } kind;
+    int index;                          // the port's page, or its binding page
+    std::string title;
+};
+
+std::vector<Tab> Tabs() {
+    std::vector<Tab> tabs = {{Tab::kDisplay, 0, "DISPLAY"}};
+    const std::vector<std::string> pages = Pages();
+    for (int i = 0; i < int(pages.size()); ++i) tabs.push_back({Tab::kPort, i, pages[std::size_t(i)]});
+    for (int i = 0; i < int(PanelPages().size()); ++i)
+        tabs.push_back({Tab::kBindings, i, PanelPages()[std::size_t(i)].title});
+    if (!bindings::PortMapsKeyboard() && KeyboardPresent()) tabs.push_back({Tab::kKeyboard, 0, "KEYBOARD"});
+    return tabs;
+}
+
+Tab CurrentTab() {
+    const std::vector<Tab> tabs = Tabs();
+    g_tab = std::clamp(g_tab, 0, int(tabs.size()) - 1);
+    return tabs[std::size_t(g_tab)];
+}
+
+/* A row shown: the engine's setting, a port's option, a binding, a KEYBOARD key, DEFAULTS. */
+struct Row {
+    enum Kind { kChoice, kOption, kBinding, kKey, kDefaults } kind;
+    int index;                          // the choice, the option, the binding page's row, the input
+};
+
 std::vector<Row> Shown() {
     std::vector<Row> rows;
-    if (g_page == -1) {
+    const Tab tab = CurrentTab();
+    if (tab.kind == Tab::kDisplay) {
         for (int i : Rows()) rows.push_back({Row::kChoice, i});
-        const int pages = int(Pages().size());
-        for (int p = 0; p < pages; ++p) rows.push_back({Row::kPage, p});
-        if (!bindings::PortMapsKeyboard() && KeyboardPresent()) rows.push_back({Row::kKeyLink, 0});
-    } else if (g_page == kKeyboard) {
-        for (int input : kKeyRows) rows.push_back({Row::kKey, input});
-    } else {
-        const std::string page = Pages()[std::size_t(g_page)];
+    } else if (tab.kind == Tab::kPort) {
+        const std::string page = Pages()[std::size_t(tab.index)];
         const auto& options = PortOptions();
         for (int i = 0; i < int(options.size()); ++i)
             if (options[std::size_t(i)].page == page) rows.push_back({Row::kOption, i});
+    } else if (tab.kind == Tab::kBindings) {
+        const bindings::PanelPage& page = PanelPages()[std::size_t(tab.index)];
+        for (int i = 0; i < int(page.rows.size()); ++i) rows.push_back({Row::kBinding, i});
+        rows.push_back({Row::kDefaults, 0});
+    } else {
+        for (int input : kKeyRows) rows.push_back({Row::kKey, input});
     }
-    rows.push_back({Row::kLast, -1});
     return rows;
 }
 
-std::string Padded(const std::string& label) {
-    return label + std::string(std::size_t(20) - std::min<std::size_t>(19, label.size()), ' ');
+bindings::Table PageTable(const bindings::PanelPage& page) {
+    return bindings::Load(page.device, page.context, page.defaults);
 }
 
-void Draw(bool force = false) {
-    // A phone's: PORT SETTINGS, closed as opened (L3 + R3: no F9 there).
-    const std::string title = OnPhone() ? "PORT SETTINGS" : "PC SETTINGS";
-    const std::string closes = OnPhone() ? "   (L3+R3 closes)" : "   (F9 closes)";
-    std::vector<std::string> lines = {g_page == kKeyboard ? title + " > Keyboard" + closes
-                                      : g_page < 0           ? title + closes
-                                      : title + " > " + Pages()[std::size_t(g_page)] + closes};
-    const std::vector<Row> rows = Shown();
-    std::string help;
-    for (int r = 0; r < int(rows.size()); ++r) {
-        std::string text;
-        const Row& row = rows[std::size_t(r)];
-        if (row.kind == Row::kLast) {
-            text = g_page == -1 ? "Close" : "Back";
-        } else if (row.kind == Row::kPage) {
-            text = Pages()[std::size_t(row.index)] + "  >";
-        } else if (row.kind == Row::kKeyLink) {
-            text = "Keyboard  >";
-        } else if (row.kind == Row::kKey) {
-            const int vk = bindings::GameKeys().physical[row.index];
-            const char* key = vk ? bindings::KeyName(vk) : nullptr;
-            text = Padded(bindings::ButtonName(row.index, bindings::Style::kPlayStation)) +
-                   (g_binding == row.index ? std::string("< press a key, Esc leaves it >")
-                                           : "< " + std::string(key ? key : "NONE") + " >");
-            if (r == g_row) help = "Enter, then the key for it";
-        } else if (row.kind == Row::kOption) {
-            const PortOption& o = PortOptions()[std::size_t(row.index)];
-            const int now = o.now ? o.now() : 0;
-            const std::string shown = now >= 0 && now < int(o.values.size()) ? o.values[std::size_t(now)] : "?";
-            text = Padded(o.name) + "< " + shown + " >";
-            if (r == g_row) help = o.help;
-        } else {
-            const Choice& c = Choices()[std::size_t(row.index)];
-            const std::string now = c.get();
-            std::string shown = now;
-            for (std::size_t i = 0; i < c.values.size(); ++i)
-                if (c.values[i] == now) shown = c.shown[i];
-            text = std::string(c.label) + std::string(16 - std::min<std::size_t>(15, std::string(c.label).size()), ' ') +
-                   "< " + shown + " >";
+/* A key's name as the player's keyboard labels it: a letter or a digit is a
+   place (a QWERTY's - the host's keys are scancodes), named by what this
+   layout has there (an AZERTY's W where a QWERTY has Z); the rest by the
+   engine's names. */
+std::string KeyLabel(int vk) {
+    const char* name = vk ? bindings::KeyName(vk) : nullptr;
+    if (!name) return "NONE";
+#ifdef _WIN32
+    static const unsigned char kLetters[26] = {0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17,
+                                               0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19, 0x10, 0x13,
+                                               0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C};
+    unsigned scan = 0;
+    if (vk >= 'A' && vk <= 'Z') scan = kLetters[vk - 'A'];
+    else if (vk >= '1' && vk <= '9') scan = 0x02 + unsigned(vk - '1');
+    else if (vk == '0') scan = 0x0B;
+    wchar_t text[32] = {};
+    if (scan && GetKeyNameTextW(LONG(scan << 16), text, 32) > 0) {
+        std::string out;
+        for (const wchar_t* p = text; *p; ++p) out += *p < 128 ? char(towupper(*p)) : '?';
+        if (!out.empty() && out.find('?') == std::string::npos) return out;
+    }
+#endif
+    return name;
+}
+
+std::string BindingName(const bindings::PanelPage& page, int physical) {
+    if (page.device == bindings::Device::kKeyboard) return KeyLabel(physical);
+    return physical >= 0 ? bindings::ButtonName(physical, bindings::Style::kPlayStation) : "NONE";
+}
+
+/* A row's words: its label, its value, its help. */
+struct RowText {
+    std::string label, value, help;
+    bool steps = false;                 // Left / Right change it (a value with arrows)
+};
+
+RowText TextOf(const Row& row) {
+    RowText t;
+    if (row.kind == Row::kChoice) {
+        const Choice& c = Choices()[std::size_t(row.index)];
+        const std::string now = c.get();
+        t.value = now;
+        for (std::size_t i = 0; i < c.values.size(); ++i)
+            if (c.values[i] == now) t.value = c.shown[i];
+        t.label = c.label;
+        t.help = c.help ? c.help : "";
+        t.steps = true;
+    } else if (row.kind == Row::kOption) {
+        const PortOption& o = PortOptions()[std::size_t(row.index)];
+        const int now = o.now ? o.now() : 0;
+        t.label = o.name;
+        t.value = now >= 0 && now < int(o.values.size()) ? o.values[std::size_t(now)] : "?";
+        t.help = o.help;
+        t.steps = true;
+    } else if (row.kind == Row::kBinding) {
+        const bindings::PanelPage& page = PanelPages()[std::size_t(CurrentTab().index)];
+        const auto& [input, what] = page.rows[std::size_t(row.index)];
+        t.label = what;
+        t.value = g_binding == row.index ? "PRESS A " + std::string(page.device == bindings::Device::kKeyboard ? "KEY" : "BUTTON")
+                                         : BindingName(page, PageTable(page).physical[input]);
+        t.help = page.device == bindings::Device::kKeyboard
+                     ? "Enter (or a click), then the key for it. Esc leaves it as it was; a key another action had swaps them."
+                     : "Cross (or a click), then the button for it.";
+    } else if (row.kind == Row::kKey) {
+        const int vk = bindings::GameKeys().physical[row.index];
+        t.label = bindings::ButtonName(row.index, bindings::Style::kPlayStation);
+        t.value = g_binding == row.index ? "PRESS A KEY" : KeyLabel(vk);
+        t.help = "Enter (or a click), then the key for it. Esc leaves it as it was.";
+    } else {
+        t.label = "Defaults";
+        t.value = "RESET";
+        t.help = "Every binding on this tab as it was at first.";
+    }
+    return t;
+}
+
+// ------------------------------------------------------------------ the picture
+
+/* The panel's layout in its own pixels, for the drawing and the mouse. */
+struct Layout {
+    int w = 0, h = 0;
+    float s = 1.0f;
+    int header = 0, tabs_w = 0, row_h = 0, help_h = 0, pad = 0;
+    int rows_y = 0, visible = 0;
+    int pill_w = 0;
+};
+
+Layout MakeLayout() {
+    Layout l;
+    u32 ww = 1920, wh = 1080;
+    WindowPixelSize(&ww, &wh);
+    l.s = std::clamp(float(wh) / 1080.0f, 0.7f, 1.4f);
+    l.w = std::min({1280, int(ww) - 32, int(1120 * l.s)});
+    l.h = std::min({720, int(wh) - 32, int(660 * l.s)});
+    l.header = int(72 * l.s);
+    l.tabs_w = int(250 * l.s);
+    l.row_h = int(48 * l.s);
+    l.help_h = int(92 * l.s);
+    l.pad = int(24 * l.s);
+    l.rows_y = l.header + int(12 * l.s);
+    l.visible = std::max(1, (l.h - l.rows_y - l.help_h) / l.row_h);
+    l.pill_w = int(300 * l.s);
+    return l;
+}
+
+void KeepRowShown(const Layout& l, int rows) {
+    if (g_row < g_scroll) g_scroll = g_row;
+    if (g_row >= g_scroll + l.visible) g_scroll = g_row - l.visible + 1;
+    g_scroll = std::clamp(g_scroll, 0, std::max(0, rows - l.visible));
+}
+
+#ifdef _WIN32
+COLORREF Rgb(int r, int g, int b) { return RGB(r, g, b); }
+
+void Fill(HDC dc, int x, int y, int w, int h, COLORREF colour, int round = 0) {
+    HBRUSH brush = CreateSolidBrush(colour);
+    if (round <= 0) {
+        const RECT r{x, y, x + w, y + h};
+        FillRect(dc, &r, brush);
+    } else {
+        HGDIOBJ old_brush = SelectObject(dc, brush);
+        HGDIOBJ old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+        RoundRect(dc, x, y, x + w + 1, y + h + 1, round, round);
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+    }
+    DeleteObject(brush);
+}
+
+HFONT Font(int px, int weight) {
+    return CreateFontW(-px, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                       CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+}
+
+std::wstring Wide(const std::string& s) {
+    std::wstring w;
+    for (unsigned char c : s) w += wchar_t(c);
+    return w;
+}
+
+void Text(HDC dc, HFONT font, COLORREF colour, const std::string& text, int x, int y, int w, int h, UINT format) {
+    HGDIOBJ old = SelectObject(dc, font);
+    SetTextColor(dc, colour);
+    RECT r{x, y, x + w, y + h};
+    const std::wstring t = Wide(text);
+    DrawTextW(dc, t.c_str(), int(t.size()), &r, format | DT_NOPREFIX);
+    SelectObject(dc, old);
+}
+
+/* The panel's picture. */
+bool DrawPanel(const Layout& l, std::vector<u32>* pixels) {
+    HDC dc = CreateCompatibleDC(nullptr);
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof info.bmiHeader;
+    info.bmiHeader.biWidth = l.w;
+    info.bmiHeader.biHeight = -l.h;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bitmap || !bits) {
+        DeleteDC(dc);
+        return false;
+    }
+    HGDIOBJ old_bitmap = SelectObject(dc, bitmap);
+    SetBkMode(dc, TRANSPARENT);
+    const float s = l.s;
+    const auto S = [&](float v) { return int(v * s); };
+    const COLORREF kBack = Rgb(22, 24, 29), kHead = Rgb(15, 16, 20), kTabs = Rgb(18, 20, 24),
+                   kTabOn = Rgb(40, 44, 54), kAccent = Rgb(206, 44, 48), kRowOn = Rgb(37, 41, 50),
+                   kPill = Rgb(48, 53, 64), kPillOn = Rgb(62, 68, 82), kText = Rgb(232, 233, 237),
+                   kDim = Rgb(150, 156, 168), kFaint = Rgb(108, 114, 126), kWait = Rgb(255, 196, 70);
+    HFONT title = Font(S(28), FW_SEMIBOLD), tab_font = Font(S(18), FW_SEMIBOLD), row_font = Font(S(19), FW_NORMAL),
+          value_font = Font(S(18), FW_SEMIBOLD), small_font = Font(S(15), FW_NORMAL);
+    // the card, its header
+    Fill(dc, 0, 0, l.w, l.h, kBack);
+    Fill(dc, 0, 0, l.w, l.header, kHead);
+    Fill(dc, 0, l.header - S(3), l.w, S(3), kAccent);
+    Text(dc, title, kText, OnPhone() ? "PORT SETTINGS" : "PC SETTINGS", l.pad, 0, l.w / 2, l.header,
+         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    Text(dc, small_font, kFaint, OnPhone() ? "L3 + R3 closes" : "F9 or Esc closes", l.w / 2, 0, l.w / 2 - l.pad, l.header,
+         DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    // the tabs
+    Fill(dc, 0, l.header, l.tabs_w, l.h - l.header, kTabs);
+    const std::vector<Tab> tabs = Tabs();
+    for (int i = 0; i < int(tabs.size()); ++i) {
+        const int y = l.header + S(12) + i * S(44);
+        if (y + S(44) > l.h - S(40)) break;
+        if (i == g_tab) {
+            Fill(dc, S(10), y, l.tabs_w - S(20), S(38), kTabOn, S(10));
+            Fill(dc, S(10), y + S(8), S(4), S(22), kAccent);
         }
-        lines.push_back((r == g_row ? "> " : "  ") + text);
+        Text(dc, tab_font, i == g_tab ? kText : kDim, tabs[std::size_t(i)].title, S(26), y, l.tabs_w - S(36), S(38),
+             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
-    lines.push_back("");
-    lines.push_back(help.empty() ? "Up/Down choose, Left/Right change" : help);
+    Text(dc, small_font, kFaint, "PgUp / PgDn: tabs", S(18), l.h - S(36), l.tabs_w - S(24), S(28),
+         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    // the rows
+    const std::vector<Row> rows = Shown();
+    const int x0 = l.tabs_w + l.pad, x1 = l.w - l.pad;
+    std::string help;
+    for (int r = g_scroll; r < int(rows.size()) && r < g_scroll + l.visible; ++r) {
+        const int y = l.rows_y + (r - g_scroll) * l.row_h;
+        const RowText t = TextOf(rows[std::size_t(r)]);
+        const bool on = r == g_row;
+        if (on) {
+            Fill(dc, x0 - S(10), y + S(3), x1 - x0 + S(20), l.row_h - S(6), kRowOn, S(12));
+            Fill(dc, x0 - S(10), y + S(12), S(4), l.row_h - S(24), kAccent);
+            help = t.help;
+        }
+        Text(dc, row_font, on ? kText : Rgb(205, 207, 214), t.label, x0 + S(8), y, x1 - x0 - l.pill_w - S(24), l.row_h,
+             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        const int px = x1 - l.pill_w, py = y + S(8), ph = l.row_h - S(16);
+        const bool waiting = g_binding == r;
+        Fill(dc, px, py, l.pill_w, ph, waiting ? Rgb(84, 64, 24) : on ? kPillOn : kPill, S(16));
+        if (t.steps) {
+            Text(dc, value_font, on ? kAccent : kFaint, "<", px + S(8), py, S(28), ph, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            Text(dc, value_font, on ? kAccent : kFaint, ">", px + l.pill_w - S(36), py, S(28), ph,
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        Text(dc, value_font, waiting ? kWait : kText, t.value, px + S(36), py, l.pill_w - S(72), ph,
+             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    // a scroll bar, when not all show
+    if (int(rows.size()) > l.visible) {
+        const int track_y = l.rows_y, track_h = l.visible * l.row_h;
+        const int bar_h = std::max(S(24), track_h * l.visible / int(rows.size()));
+        const int bar_y = track_y + (track_h - bar_h) * g_scroll / std::max(1, int(rows.size()) - l.visible);
+        Fill(dc, l.w - S(10), track_y, S(4), track_h, kPill, S(4));
+        Fill(dc, l.w - S(10), bar_y, S(4), bar_h, kDim, S(4));
+    }
+    // the help, the keys
+    const int hy = l.h - l.help_h;
+    Fill(dc, l.tabs_w, hy, l.w - l.tabs_w, S(1), kPill);
+    Text(dc, row_font, kDim, help, x0 + S(8), hy + S(10), x1 - x0 - S(8), S(46), DT_LEFT | DT_WORDBREAK);
+    Text(dc, small_font, kFaint, "Up/Down choose    Left/Right change    Enter select    Esc close    the mouse: point, click, scroll",
+         x0 + S(8), l.h - S(34), x1 - x0, S(28), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    GdiFlush();
+    pixels->assign(static_cast<const u32*>(bits), static_cast<const u32*>(bits) + std::size_t(l.w) * l.h);
+    for (u32& p : *pixels) p |= 0xFF000000u;
+    for (HFONT f : {title, tab_font, row_font, value_font, small_font}) DeleteObject(f);
+    SelectObject(dc, old_bitmap);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+    return true;
+}
+#endif
+
+/* The panel shown again (its picture, or the overlay's lines elsewhere). */
+void Draw(bool force = false) {
+    const Layout l = MakeLayout();
+    const std::vector<Row> rows = Shown();
+    g_row = std::clamp(g_row, 0, std::max(0, int(rows.size()) - 1));
+    KeepRowShown(l, int(rows.size()));
+#ifdef _WIN32
+    // (drawn again only when it changes: its words, the tab, the row)
+    std::string key = std::to_string(g_tab) + "/" + std::to_string(g_row) + "/" + std::to_string(g_scroll) + "/" +
+                      std::to_string(g_binding) + "/" + std::to_string(l.w) + "x" + std::to_string(l.h);
+    for (const Row& r : rows) {
+        const RowText t = TextOf(r);
+        key += "|" + t.value;
+    }
+    static std::string shown;
+    if (!force && key == shown) return;
+    shown = key;
+    std::vector<u32> pixels;
+    if (DrawPanel(l, &pixels)) SetWindowPanel(std::move(pixels), u32(l.w), u32(l.h));
+#else
+    std::vector<std::string> lines = {std::string(OnPhone() ? "PORT SETTINGS" : "PC SETTINGS") + " > " + CurrentTab().title};
+    for (int r = 0; r < int(rows.size()); ++r) {
+        const RowText t = TextOf(rows[std::size_t(r)]);
+        lines.push_back((r == g_row ? "> " : "  ") + t.label + "   < " + t.value + " >");
+    }
     static std::vector<std::string> shown;
-    if (force || lines != shown) SetWindowOverlay(lines);     // drawn again only when it changes
+    if (force || lines != shown) SetWindowOverlay(lines);
     shown = lines;
+#endif
 }
 
-/* Back from a page to the first (its row chosen), or the panel closed. */
-void Back() {
-    if (g_page >= 0 || g_page == kKeyboard) {
-        const int page = g_page;
-        g_page = -1;
-        g_row = page == kKeyboard ? int(Rows().size() + Pages().size()) : int(Rows().size()) + page;
-        return;
-    }
+void Close() {
     g_open = false;
+    g_binding = -1;
+#ifdef _WIN32
+    SetWindowPanel({}, 0, 0);
+#else
     SetWindowOverlay({});
+#endif
+}
+
+void SwitchTab(int step) {
+    const int count = int(Tabs().size());
+    g_tab = ((g_tab + step) % count + count) % count;
+    g_row = 0;
+    g_scroll = 0;
+    g_binding = -1;
+    std::fprintf(stderr, "[pc menu] tab %s\n", CurrentTab().title.c_str());
 }
 
 void Change(int step) {
     const std::vector<Row> rows = Shown();
-    const Row row = rows[std::size_t((std::min)(g_row, int(rows.size()) - 1))];
-    if (row.kind == Row::kLast) {
-        Back();
-        return;
-    }
-    if (row.kind == Row::kPage) {
-        g_page = row.index;
-        g_row = 0;
-        std::fprintf(stderr, "[pc menu] page %s\n", Pages()[std::size_t(g_page)].c_str());
-        return;
-    }
-    if (row.kind == Row::kKeyLink) {
-        g_page = kKeyboard;
-        g_row = 0;
-        std::fprintf(stderr, "[pc menu] page Keyboard\n");
-        return;
-    }
-    if (row.kind == Row::kKey) {
-        g_binding = row.index;
+    if (rows.empty()) return;
+    const Row row = rows[std::size_t(std::min(g_row, int(rows.size()) - 1))];
+    if (row.kind == Row::kBinding || row.kind == Row::kKey) {
+        g_binding = g_row;
         g_binding_armed = false;
-        std::fprintf(stderr, "[pc menu] keyboard: the key for %s?\n",
-                     bindings::ButtonName(row.index, bindings::Style::kPlayStation));
+        g_binding_until = g_tick + 5 * 60;
+        std::fprintf(stderr, "[pc menu] %s: waiting for its key\n", TextOf(row).label.c_str());
+        return;
+    }
+    if (row.kind == Row::kDefaults) {
+        const bindings::PanelPage& page = PanelPages()[std::size_t(CurrentTab().index)];
+        bindings::Save(page.device, page.context, page.defaults);
+        if (page.changed) page.changed();
+        std::fprintf(stderr, "[pc menu] %s: the defaults again\n", page.title.c_str());
         return;
     }
     if (row.kind == Row::kOption) {
@@ -296,7 +568,7 @@ void Change(int step) {
 }
 
 // Keys and buttons, each acting when it goes down.
-enum Input { kToggle, kUp, kDown, kLeft, kRight, kAccept, kBack, kInputs };
+enum Input { kToggle, kUp, kDown, kLeft, kRight, kAccept, kBack, kTabBefore, kTabAfter, kInputs };
 
 std::array<bool, kInputs> Held() {
     std::array<bool, kInputs> held{};
@@ -310,10 +582,12 @@ std::array<bool, kInputs> Held() {
     held[kRight] = key(VK_RIGHT);
     held[kAccept] = key(VK_RETURN);
     held[kBack] = key(VK_ESCAPE);
+    held[kTabBefore] = key(VK_PRIOR) || key('Q');
+    held[kTabAfter] = key(VK_NEXT) || key('E');
 #endif
     HostPadState pad;
     if (focused && HostPad(&pad)) {
-        // DualShock 2 order: 1 L3, 2 R3, 4 up, 5 right, 6 down, 7 left, 13 circle, 14 cross.
+        // DualShock 2 order: 1 L3, 2 R3, 4 up, 5 right, 6 down, 7 left, 10 L1, 11 R1, 13 circle, 14 cross.
         auto button = [&](int bit) { return (pad.buttons >> bit) & 1; };
         held[kToggle] = held[kToggle] || (button(1) && button(2));
         held[kUp] = held[kUp] || button(4);
@@ -322,8 +596,117 @@ std::array<bool, kInputs> Held() {
         held[kRight] = held[kRight] || button(5);
         held[kAccept] = held[kAccept] || button(14);
         held[kBack] = held[kBack] || button(13);
+        held[kTabBefore] = held[kTabBefore] || button(10);
+        held[kTabAfter] = held[kTabAfter] || button(11);
     }
     return held;
+}
+
+/* A key (or button) awaited for a binding row: the first one down once all
+   were let go; Esc, five seconds or a right click leave it as it was. */
+void AwaitBinding(bool cancel) {
+    const std::vector<Row> rows = Shown();
+    if (g_binding < 0 || g_binding >= int(rows.size())) {
+        g_binding = -1;
+        return;
+    }
+    const Row row = rows[std::size_t(g_binding)];
+    if (cancel || g_tick > g_binding_until) {
+        std::fprintf(stderr, "[pc menu] %s: left as it was\n", TextOf(row).label.c_str());
+        g_binding = -1;
+        return;
+    }
+    const bool keyboard =
+        row.kind == Row::kKey || PanelPages()[std::size_t(CurrentTab().index)].device == bindings::Device::kKeyboard;
+    if (keyboard) {
+        if (!(WindowFocused() || KeysScripted())) return;
+        if (!g_binding_armed) {
+            g_binding_armed = !bindings::AnyKeyDown();
+            return;
+        }
+#ifdef _WIN32
+        if (HostKeyDown(VK_ESCAPE)) {
+            std::fprintf(stderr, "[pc menu] %s: left as it was\n", TextOf(row).label.c_str());
+            g_binding = -1;
+            return;
+        }
+#endif
+        for (int vk : bindings::BindableKeys())
+            if (HostKeyDown(vk)) {
+                if (row.kind == Row::kKey) {
+                    bindings::SetGameKey(row.index, vk);
+                } else {
+                    const bindings::PanelPage& page = PanelPages()[std::size_t(CurrentTab().index)];
+                    bindings::Table t = PageTable(page);
+                    bindings::Bind(t, page.rows[std::size_t(row.index)].first, vk);
+                    bindings::Save(page.device, page.context, t);
+                    if (page.changed) page.changed();
+                }
+                std::fprintf(stderr, "[pc menu] %s: %s\n", TextOf(row).label.c_str(), KeyLabel(vk).c_str());
+                g_binding = -1;
+                return;
+            }
+        return;
+    }
+    // a controller's button (its DualShock 2 place)
+    HostPadState pad;
+    if (!HostPad(&pad)) return;
+    if (!g_binding_armed) {
+        g_binding_armed = pad.buttons == 0;
+        return;
+    }
+    for (int b = 0; b < bindings::kInputs; ++b)
+        if (pad.buttons & (1u << b)) {
+            const bindings::PanelPage& page = PanelPages()[std::size_t(CurrentTab().index)];
+            bindings::Table t = PageTable(page);
+            bindings::Bind(t, page.rows[std::size_t(row.index)].first, b);
+            bindings::Save(page.device, page.context, t);
+            if (page.changed) page.changed();
+            std::fprintf(stderr, "[pc menu] %s: %s\n", TextOf(row).label.c_str(),
+                         bindings::ButtonName(b, bindings::Style::kPlayStation));
+            g_binding = -1;
+            return;
+        }
+}
+
+/* The mouse over the panel: a tab or a row pointed at, a click, the wheel. */
+void PanelMouse() {
+    PanelMouseState m;
+    if (!TakePanelMouse(&m) || !m.over) return;
+    u32 ww = 0, wh = 0;
+    if (!WindowPixelSize(&ww, &wh)) return;
+    const Layout l = MakeLayout();
+    const float x = m.px - float((int(ww) - l.w) / 2), y = m.py - float((int(wh) - l.h) / 2);
+    if (m.pressed & 4) {            // a right click: as Esc
+        if (g_binding >= 0) AwaitBinding(true);
+        else Close();
+        return;
+    }
+    if (g_binding >= 0) return;
+    const std::vector<Row> rows = Shown();
+    if (m.wheel != 0.0f) {
+        g_scroll = std::clamp(g_scroll - int(m.wheel), 0, std::max(0, int(rows.size()) - l.visible));
+        g_row = std::clamp(g_row, g_scroll, std::min(int(rows.size()) - 1, g_scroll + l.visible - 1));
+    }
+    if (x < 0 || y < 0 || x >= float(l.w) || y >= float(l.h)) return;
+    if (x < float(l.tabs_w)) {
+        const int tab = int((y - float(l.header) - 12.0f * l.s) / (44.0f * l.s));
+        if ((m.pressed & 1) && y > float(l.header) && tab >= 0 && tab < int(Tabs().size()) && tab != g_tab) {
+            g_tab = tab;
+            g_row = g_scroll = 0;
+        }
+        return;
+    }
+    const int r = g_scroll + int((y - float(l.rows_y)) / float(l.row_h));
+    if (y < float(l.rows_y) || r < 0 || r >= int(rows.size()) || r >= g_scroll + l.visible) return;
+    if (m.moved) g_row = r;
+    if (m.pressed & 1) {
+        g_row = r;
+        const RowText t = TextOf(rows[std::size_t(r)]);
+        const float pill_x = float(l.w - l.pad - l.pill_w);
+        // the value's arrows: back on the left one, on elsewhere
+        Change(t.steps && x >= pill_x && x < pill_x + 44.0f * l.s ? -1 : +1);
+    }
 }
 
 }  // namespace
@@ -331,6 +714,10 @@ std::array<bool, kInputs> Held() {
 void AddPortOptions(const std::vector<PortOption>& options) {
     PortOptions().insert(PortOptions().end(), options.begin(), options.end());
 }
+
+namespace bindings {
+void AddPanelPage(const PanelPage& page) { PanelPages().push_back(page); }
+}  // namespace bindings
 
 std::vector<PcSetting> PcSettings() {
     std::vector<PcSetting> settings;
@@ -365,64 +752,46 @@ bool PcMenuOpen() { return g_open || g_releasing; }
 void OpenPcMenu() {
     if (g_open) return;
     g_open = true;
-    g_row = 0;
-    g_page = -1;
+    g_tab = g_row = g_scroll = 0;
+    g_binding = -1;
+    std::fprintf(stderr, "[pc menu] open\n");
     Draw(true);
 }
 
-/* A key awaited for the Keyboard page's input: the first one down once all
-   were let go, or Esc leaving it as it was. */
-void AwaitKey() {
-    if (!(WindowFocused() || KeysScripted())) return;
-    if (!g_binding_armed) {
-        g_binding_armed = !bindings::AnyKeyDown();
-        return;
-    }
-#ifdef _WIN32
-    if (HostKeyDown(VK_ESCAPE)) {
-        std::fprintf(stderr, "[pc menu] keyboard: %s left as it was\n",
-                     bindings::ButtonName(g_binding, bindings::Style::kPlayStation));
-        g_binding = -1;
-        return;
-    }
-#endif
-    for (int vk : bindings::BindableKeys())
-        if (HostKeyDown(vk)) {
-            bindings::SetGameKey(g_binding, vk);
-            std::fprintf(stderr, "[pc menu] keyboard: %s on %s\n",
-                         bindings::ButtonName(g_binding, bindings::Style::kPlayStation), bindings::KeyName(vk));
-            g_binding = -1;
-            return;
-        }
-}
-
 void UpdatePcMenu() {
+    ++g_tick;
     static std::array<bool, kInputs> before{};
     const std::array<bool, kInputs> now = Held();
     const bool was_open = g_open;
     auto went_down = [&](Input i) { return now[i] && !before[i]; };
     if (g_open && g_binding >= 0 && !went_down(kToggle)) {
-        // The keys are the binding's until it is made (Esc too: not Back).
-        AwaitKey();
+        // The keys are the binding's until it is made (Esc too: not a close).
+        PanelMouse();
+        if (g_binding >= 0) AwaitBinding(false);
         before = now;
-        Draw();
+        if (g_open) Draw();
         return;
     }
     g_binding = -1;
     if (went_down(kToggle)) {
-        g_open = !g_open;
-        g_row = 0;
-        g_page = -1;
-        if (!g_open) SetWindowOverlay({});
-        else Draw(true);
+        if (g_open) {
+            Close();
+        } else {
+            g_open = true;
+            g_tab = g_row = g_scroll = 0;
+            Draw(true);
+        }
     } else if (g_open && went_down(kBack)) {
-        Back();
+        Close();
     } else if (g_open) {
         const int rows = int(Shown().size());
-        if (went_down(kUp)) g_row = (g_row + rows - 1) % rows;
-        if (went_down(kDown)) g_row = (g_row + 1) % rows;
+        if (rows > 0 && went_down(kUp)) g_row = (g_row + rows - 1) % rows;
+        if (rows > 0 && went_down(kDown)) g_row = (g_row + 1) % rows;
         if (went_down(kLeft)) Change(-1);
         if (went_down(kRight) || went_down(kAccept)) Change(+1);
+        if (went_down(kTabBefore)) SwitchTab(-1);
+        if (went_down(kTabAfter)) SwitchTab(+1);
+        if (g_open) PanelMouse();
     }
     before = now;
     if (g_open != was_open) std::fprintf(stderr, "[pc menu] %s\n", g_open ? "open" : "closed");
