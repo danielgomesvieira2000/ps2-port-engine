@@ -189,7 +189,11 @@ def syntax_check(source: str, include_dirs) -> None:
     neon = sse2neon_include()
     if neon:
         includes = ["-isystem", neon] + includes
-    flags = [flag for flag in CLANG_FLAGS if flag not in ("-O3", "-fPIC")]
+    # Undefined behaviour the front end can see is an error here: the optimiser
+    # turns a constant shift past the type's width into a trap (clang) and takes
+    # the whole check process with it, where a dropped function costs one verdict.
+    flags = [flag for flag in CLANG_FLAGS if flag not in ("-O3", "-fPIC", "-w")]
+    flags += ["-Wno-everything", "-Werror=shift-count-overflow", "-Werror=shift-count-negative"]
     result = subprocess.run([find_compiler(), "-fsyntax-only"] + flags + includes + [os.path.abspath(source)],
                             capture_output=True, text=True)
     if result.returncode == 0:
