@@ -39,6 +39,7 @@
 #include "gs_frag_single.h"
 #include "gs_frag_blend.h"
 #include "gs_vert.h"
+#include "gs_mesh_vert.h"
 #include "date_frag.h"
 #include "date_vert.h"
 #include "swizzle_comp.h"
@@ -851,6 +852,10 @@ private:
 
     VulkanGpu& g_;
     VkShaderModule vert_ = VK_NULL_HANDLE, frag_ = VK_NULL_HANDLE, frag_blend_ = VK_NULL_HANDLE;
+    /* A native microprogram's mesh drawn (gs_mesh.vert; docs/NATIVE_RENDERER.md): its vertex stage, and set 3 -
+       the mesh and the header, storage buffers. Not drawn with yet (the module made then, where the device has shaderCullDistance). */
+    VkShaderModule mesh_vert_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout mesh_set_layout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     bool keep_colour_ = false;      /* ReloadKeepsColour */
@@ -1404,8 +1409,16 @@ bool VulkanGsRenderer::Init(std::string* error) {
     VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     // Set 2: the target's copy that blending in the shader reads (a texture's
     // layout, so a target's sampled set binds there too).
-    const VkDescriptorSetLayout set_layouts[3] = {set_layout_, clut_set_layout_, set_layout_};
-    lci.setLayoutCount = 3;
+    // Set 3: a native mesh draw's mesh and header (gs_mesh.vert).
+    VkDescriptorSetLayoutBinding mesh_bindings[2] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo mli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    mli.bindingCount = 2;
+    mli.pBindings = mesh_bindings;
+    vkCreateDescriptorSetLayout(g_.device, &mli, nullptr, &mesh_set_layout_);
+    const VkDescriptorSetLayout set_layouts[4] = {set_layout_, clut_set_layout_, set_layout_, mesh_set_layout_};
+    lci.setLayoutCount = 4;
     lci.pSetLayouts = set_layouts;
     lci.pushConstantRangeCount = 2;
     lci.pPushConstantRanges = push;
@@ -4235,8 +4248,10 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (pool_) vkDestroyDescriptorPool(g_.device, pool_, nullptr);
     if (set_layout_) vkDestroyDescriptorSetLayout(g_.device, set_layout_, nullptr);
     if (clut_set_layout_) vkDestroyDescriptorSetLayout(g_.device, clut_set_layout_, nullptr);
+    if (mesh_set_layout_) vkDestroyDescriptorSetLayout(g_.device, mesh_set_layout_, nullptr);
     if (layout_) vkDestroyPipelineLayout(g_.device, layout_, nullptr);
     if (vert_) vkDestroyShaderModule(g_.device, vert_, nullptr);
+    if (mesh_vert_) vkDestroyShaderModule(g_.device, mesh_vert_, nullptr);
     if (frag_) vkDestroyShaderModule(g_.device, frag_, nullptr);
     if (frag_blend_) vkDestroyShaderModule(g_.device, frag_blend_, nullptr);
     if (swizzle_pipeline_) vkDestroyPipeline(g_.device, swizzle_pipeline_, nullptr);

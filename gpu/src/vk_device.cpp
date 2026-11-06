@@ -127,6 +127,7 @@ void VkDeviceSetup::Fill(VkPhysicalDevice gpu, VkPath path, bool baked) {
     features.features.logicOp = supported.logicOp;              // FBMSK's partly masked channels
     features.features.textureCompressionBC = supported.textureCompressionBC;     // texture packs' DDS
     features.features.samplerAnisotropy = supported.samplerAnisotropy;           // texture packs' samplers
+    features.features.shaderCullDistance = supported.shaderCullDistance;         // gs_mesh.vert's guard band (ADC)
     if (path == kVk13) {
         v13.dynamicRendering = VK_TRUE;
         features.pNext = &v13;
