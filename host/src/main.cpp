@@ -183,6 +183,14 @@ std::filesystem::path PlayerFolder(const std::filesystem::path& program) {
 /* What the run says, to `log` (no terminal to read): opened once, shared, and
    given to both streams - their lines in the order they were written. */
 void LogTo(const std::string& log) {
+    // The run before's log kept as <name>.prev.log: a game that froze or
+    // crashed is started again at once, and its log was the one report of it.
+    {
+        std::error_code error;
+        std::filesystem::path prev(log);
+        prev.replace_extension(".prev.log");
+        if (std::filesystem::exists(log, error)) std::filesystem::rename(log, prev, error);
+    }
 #ifdef _WIN32
     std::FILE* stream = nullptr;
     freopen_s(&stream, "NUL", "w", stdout);    // streams with descriptors, in a windowed program
