@@ -1362,6 +1362,7 @@ struct NativeDraw {
     bool drawn;
 };
 NativeDraw* g_native = nullptr;
+bool g_meshes_drawn = false;            // the renderer draws meshes (the bridge's start)
 std::unordered_set<u64> g_meshes;       // the meshes the renderer holds (UploadMesh), by key
 
 /* Its payload: [0] flags (1 a mesh to upload, 2 every mesh released first), [1-2] the key, [3-4] the tag's
@@ -2899,9 +2900,9 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
             g.on_held_end = VerifyEnd;
         }
         // Native draws (docs/NATIVE_RENDERER.md): on where the renderer draws meshes - every scripted run of both
-        // Files' pictures as recorded with them; PS2HOST_NATIVE_DRAW=0 off.
-        const char* native = std::getenv("PS2HOST_NATIVE_DRAW");
-        SetGsNativeDraws(!(native && std::string(native) == "0") && bridge.renderer->DrawsMeshes());
+        // Files' pictures as recorded with them; PC SETTINGS' NATIVE RENDERER, PS2HOST_NATIVE_DRAW=0 off.
+        g_meshes_drawn = bridge.renderer->DrawsMeshes();
+        ApplyNativeRendererSetting();
     }
     g.on_effect = OnEffect;
     if (bridge.primary) {
@@ -3201,5 +3202,10 @@ bool ShownPicture(std::vector<u32>* pixels, u32* width, u32* height) {
 }
 
 #endif
+
+void ApplyNativeRendererSetting() {
+    const char* native = std::getenv("PS2HOST_NATIVE_DRAW");
+    SetGsNativeDraws(g_meshes_drawn && !(native && std::string(native) == "0") && SettingOn("native_renderer", true));
+}
 
 }  // namespace ps2host

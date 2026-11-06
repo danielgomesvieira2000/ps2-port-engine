@@ -231,6 +231,9 @@ void GsNative(const u32* words, u32 count);
    PS2HOST_NATIVE_DRAW=1 (SetGsNativeDraws, the bridge's). */
 bool GsNativeDraws();
 void SetGsNativeDraws(bool on);
+/* The player's NATIVE RENDERER (PC SETTINGS; the setting native_renderer, on by default): native draws on where
+   the renderer draws meshes, now (PS2HOST_NATIVE_DRAW=0 off whatever it says). */
+void ApplyNativeRendererSetting();
 void GsPrivileged(u32 address, u64 value);
 /* A GS register write, as A+D would (the replay's recorded registers). */
 void GsRegister(u32 address, u64 value);

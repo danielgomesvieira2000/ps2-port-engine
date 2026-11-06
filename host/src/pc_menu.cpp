@@ -152,6 +152,15 @@ const std::vector<Choice>& Choices() {
          [] { return OnOff(WindowGpuBoost()); },
          [](const std::string& v) { SetWindowGpuBoost(v == "on"); },
          "GPU BOOST", {"ON", "OFF"}, "The GPU's clocks kept up: no hitch at a new scene. Off saves battery."},
+        // NATIVE RENDERER (docs/NATIVE_RENDERER.md): the game's own meshes drawn by the GPU, not through the
+        // emulated VU1 and GS - the same picture, less of the CPU (on where the renderer can: Vulkan).
+        {"Native renderer", {"on", "off"}, {"On", "Off"},
+         [] { return OnOff(SettingOn("native_renderer", true)); },
+         [](const std::string& v) {
+             SetSettingOn("native_renderer", v == "on");
+             ApplyNativeRendererSetting();
+         },
+         "NATIVE RENDERER", {"ON", "OFF"}, "The GPU draws rooms and characters itself: the same picture, less CPU."},
     };
     return choices;
 }
