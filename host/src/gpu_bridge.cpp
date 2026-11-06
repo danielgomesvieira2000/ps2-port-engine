@@ -1370,6 +1370,17 @@ std::unordered_set<u64> g_meshes;       // the meshes the renderer holds (Upload
    the indices. */
 constexpr u32 kNativeHeaderWords = 124, kNativeHead = 5 + kNativeHeaderWords;
 
+/* A room payload's own triangles for this draw (flag 8: last, after the upload's place - a count, then the
+   indices), or none. */
+const u32* RoomDrawIndices(const u32* words, u32 count, u32* n) {
+    if (!(words[0] & 8) || (words[0] & 0x100)) return nullptr;
+    u32 at = kNativeHead;
+    if ((words[0] & 1) && count >= kNativeHead + 2) at += 2 + words[kNativeHead] * 4 + words[kNativeHead + 1];
+    if (count < at + 1 || count < at + 1 + words[at]) return nullptr;
+    *n = words[at];
+    return words + at + 1;
+}
+
 /* The mesh drawn in `state` (OnDraw's), its places moved as OnDraw moves a
    primitive's (x_offset, y_offset: XYOFFSET less them). */
 /* The characters' payload (flag 0x100): [0] flags, [1-2] the key, [3-4] the tag's PRIM, [5] the header's
@@ -1413,6 +1424,17 @@ bool NativeMesh(Bridge& s, const ps2gpu::GsDrawState& state, u32 x_offset, u32 y
     header[124] = float(n.ofx) - 16.0f * float(x_offset);
     header[125] = float(n.ofy) - 16.0f * float(y_offset);
     ++g_draws;
+    u32 draw_count = 0;
+    if (const u32* draw = RoomDrawIndices(n.words, n.count, &draw_count)) {
+        ps2gpu::GsRenderer::MeshCall mc;
+        mc.program = ps2gpu::GsRenderer::kMeshRoom;
+        mc.header = header;
+        mc.header_floats = ps2gpu::GsRenderer::kMeshHeaderFloats;
+        mc.indices = draw;
+        mc.index_count = draw_count;
+        if (draw_count) s.renderer->DrawMeshWith(state, key, mc);
+        return true;
+    }
     s.renderer->DrawMesh(state, key, header);
     return true;
 }
@@ -2297,6 +2319,7 @@ const bool g_native_verify = std::getenv("PS2HOST_NATIVE_VERIFY") != nullptr;
 // (the VU's arithmetic: each product and sum rounded - nothing fused)
 #pragma clang fp contract(off)
 void MeshTriangles(const u32* words, u32 count, u32 ofx, u32 ofy, std::vector<gs::Vertex>* made, bool* open);
+const u32* RoomDrawIndices(const u32* words, u32 count, u32* n);
 
 void VerifyMake(const u32* words, u32 count, u32 ofx, u32 ofy) {
     NativeVerify& nv = TheVerify();
@@ -2323,7 +2346,8 @@ void MeshTriangles(const u32* words, u32 count, u32 ofx, u32 ofy, std::vector<gs
     if (found == nv.meshes.end()) return;
     *open = true;
     const std::vector<u32>& m = found->second;
-    const u32 quads = m[0], indices = m[1];
+    const u32 quads = m[0];
+    u32 indices = m[1];
     const float* q4 = reinterpret_cast<const float*>(m.data() + 2);
     const u32* index = m.data() + 2 + quads * 4;
     float h[31][4];
@@ -2360,7 +2384,10 @@ void MeshTriangles(const u32* words, u32 count, u32 ofx, u32 ofy, std::vector<gs
         const float d2 = A(A(M(lx, lx), M(ly, ly)), M(lz, lz));
         float rs = float(1.0 / std::sqrt(double(d2)));     // (as Batch::Rsqrt)
         // PS2HOST_NATIVE_VERIFY=shader: gs_mesh.vert's Rsqrt instead (nearest arithmetic, its exact errors)
-        static const bool shader_way = std::string(std::getenv("PS2HOST_NATIVE_VERIFY")) == "shader";
+        static const bool shader_way = [] {
+            const char* e = std::getenv("PS2HOST_NATIVE_VERIFY");
+            return e && std::string(e) == "shader";
+        }();
         if (shader_way) {
             const unsigned mode = _MM_GET_ROUNDING_MODE();
             _MM_SET_ROUNDING_MODE(_MM_ROUND_NEAREST);
@@ -2404,6 +2431,8 @@ void MeshTriangles(const u32* words, u32 count, u32 ofx, u32 ofy, std::vector<gs
         vs[i].v = v;
         std::memcpy(vs[i].cull, cull, sizeof cull);
     }
+    u32 draw_count = 0;
+    if (const u32* draw = RoomDrawIndices(words, count, &draw_count)) index = draw, indices = draw_count;
     for (u32 i = 0; i + 2 < indices; i += 3) {
         bool culled = false;
         for (int d = 0; d < 6 && !culled; ++d)
@@ -2542,7 +2571,7 @@ bool OnNative(const gs::Gs::NativeCall& call) {
     NativeDraw draw{call.words, call.count, call.ofx, call.ofy, false};
     // PS2HOST_NATIVE_FALLBACK=1 (a test): every native draw with no packet after it drawn from the CPU's copy alone.
     static const bool force_fallback = std::getenv("PS2HOST_NATIVE_FALLBACK") != nullptr;
-    if (!(force_fallback && no_packet && (flags & 0x100))) {
+    if (!(force_fallback && no_packet)) {
         g_native = &draw;
         OnDraw(gs::Gs::DrawCall{call.prim, call.context, call.texa, v, 3, call.fogcol, call.pabe, ~0ull - ++generation});
         g_native = nullptr;
