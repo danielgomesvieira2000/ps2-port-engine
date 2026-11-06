@@ -204,6 +204,12 @@ public:
         Put(&id, 8);
         End();
     }
+    void UseMaterial(std::uint64_t id, std::uint64_t material) override {
+        Op(kUseMaterial, 16);
+        Put(&id, 8);
+        Put(&material, 8);
+        End();
+    }
     void UploadDepth(std::uint32_t zbp, std::uint32_t width, std::uint32_t height, const std::uint32_t* z) override {
         depths_.insert(DepthKey(zbp, width, height));
         const std::size_t bytes = std::size_t(width) * height * 4;
@@ -457,7 +463,7 @@ private:
         kReleaseTexture, kMemoryWrite, kMemoryPatch, kTargetFromMemory, kDepthFromMemory, kTextureFromMemory,
         kClutFromMemory, kClutRows, kReloadKeepsColour, kTargetRowsFromMemory, kDepthRowsFromMemory,
         kTargetToMemory, kDepthToMemory, kChannelShuffle, kRunEffect, kUploadReplacement,
-        kUploadMesh, kReleaseMesh, kDrawMesh, kDrawMeshWith,
+        kUploadMesh, kReleaseMesh, kDrawMesh, kDrawMeshWith, kUseMaterial,
     };
     // The images a draw makes (VulkanGsRenderer::Flush): its target, and its
     // depth buffer as large as the target was made.
@@ -609,6 +615,11 @@ private:
                 case kUseReplacement: {
                     const auto key = Take<std::uint64_t>(at);
                     r.UseReplacement(key, Take<std::uint64_t>(at));
+                    break;
+                }
+                case kUseMaterial: {
+                    const auto id = Take<std::uint64_t>(at);
+                    r.UseMaterial(id, Take<std::uint64_t>(at));
                     break;
                 }
                 case kUploadDepth: {

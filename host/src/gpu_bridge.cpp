@@ -1002,6 +1002,15 @@ bool Replace(Bridge& b, Cached& t) {
                                            image->data.data(), image->data.size()))
             return false;
     }
+    // ...and its surface detail (texture_pack.h's _n file), for the native renderer's lighting.
+    if (const auto& detail = image->material) {
+        if (!b.renderer->HasReplacement(detail->id) &&
+            b.renderer->UploadReplacement(detail->id, detail->format, detail->width, detail->height, detail->levels,
+                                          detail->data.data(), detail->data.size()))
+            b.renderer->UseMaterial(image->id, detail->id);
+        else if (b.renderer->HasReplacement(detail->id))
+            b.renderer->UseMaterial(image->id, detail->id);
+    }
     ++g_mutations;
     b.renderer->UseReplacement(t.renderer_key, image->id);
     t.replaced = true;
@@ -3289,6 +3298,11 @@ void ApplyGraphicsEnhancements() {
     g_enhance_forced = test != nullptr;
     if (test) bits = u32(std::strtoul(test, nullptr, 0));
     ps2gpu::SetMeshEnhancements(bits);
+    // MSAA (the setting "msaa": off, 2x, 4x, 8x; PS2HOST_MSAA=<samples> a test's)
+    const std::string msaa = Setting("msaa", "off");
+    u32 samples = msaa == "2x" ? 2 : msaa == "4x" ? 4 : msaa == "8x" ? 8 : 1;
+    if (const char* forced = std::getenv("PS2HOST_MSAA")) samples = u32(std::max(1, std::atoi(forced)));
+    ps2gpu::SetGpuMsaa(samples);
 }
 
 u32 NativeEnhancements() {

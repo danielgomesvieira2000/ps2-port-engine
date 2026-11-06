@@ -17,7 +17,14 @@
    same textures here.
 
    Files are read in the background, the first time their texture is drawn:
-   the texture as the game has it until then (a frame or two). */
+   the texture as the game has it until then (a frame or two).
+
+   A replacement's surface detail (the native renderer's per-pixel lighting,
+   gs.frag's LitShade): a file named as it is with _n after - <name>_n.png or
+   .dds - its RGB the surface's normal in the texture's own space (OpenGL's
+   way: green up; 128,128,255 flat), its alpha the shine (0 matte, 255 a
+   mirror's highlight). Read with its replacement; used where the GPU draws
+   the game's meshes itself. */
 
 #include <cstddef>
 #include <cstdint>
@@ -39,6 +46,7 @@ struct Image {
     std::uint64_t id = 0;
     std::uint32_t format = 0, width = 0, height = 0, levels = 1;
     std::vector<std::uint8_t> data;
+    std::shared_ptr<const Image> material;      // its _n file's, if it has one (above)
 };
 enum Format : std::uint32_t { kRgba8 = 0, kBc1 = 1, kBc2 = 2, kBc3 = 3, kBc7 = 4 };
 

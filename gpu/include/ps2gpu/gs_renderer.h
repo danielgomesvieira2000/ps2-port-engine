@@ -39,6 +39,12 @@ void SetGpuWaitObserver(GpuWaitObserver observer);
    default: the GS's picture to the pixel. Any thread: what a game's native program reads as it makes a draw
    (ps2host::NativeEnhancements), and writes into its header for the renderer - the draw made and drawn alike. */
 constexpr std::uint32_t kMeshLitPixels = 1, kMeshPrecise = 2;
+/* ANTI-ALIASING's MSAA: the samples a pixel of a game's frame buffers is drawn with (1: none, the default; 2, 4,
+   8 - at most the device's). Each large target drawn in 3D gets a multisampled copy its passes draw into and
+   resolve from (gs_renderer.cpp's twins); draws reading their own target, DATE's, draw single-sampled. Any
+   thread; the renderer takes it at its next frame. */
+void SetGpuMsaa(std::uint32_t samples);
+std::uint32_t GpuMsaa();
 void SetMeshEnhancements(std::uint32_t bits);
 std::uint32_t MeshEnhancements();
 /* Called on the renderer's own thread (a threaded renderer's) as it starts:
@@ -275,6 +281,10 @@ public:
        TW x TH (the draw's tw, th), sampled in its own texels at the same
        places. Until the key is uploaded or decoded again. */
     virtual void UseReplacement(std::uint64_t key, std::uint64_t id) { (void)key, (void)id; }
+    /* Replacement `id`'s surface detail: replacement `material` (uploaded as any is - its RGB a normal in the
+       texture's space, its alpha the shine: texture_pack.h), lighting a native mesh's pixels (gs.frag's
+       LitShade) where the replacement is drawn. 0: none. */
+    virtual void UseMaterial(std::uint64_t id, std::uint64_t material) { (void)id, (void)material; }
     /* Whether block-compressed replacements can be uploaded as they are. */
     virtual bool BlockCompression() const { return false; }
     /* A depth buffer's contents, one Z per pixel, rows top-down: what local

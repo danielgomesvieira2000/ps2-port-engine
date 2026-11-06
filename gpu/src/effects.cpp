@@ -352,8 +352,8 @@ void GsEffects::Record(VkCommandBuffer cmd, const GsEffect& e, const Target& t) 
             push.size[0] = std::int32_t(w);
             push.size[1] = std::int32_t(h);
             const VkImageView top = n > 1 ? set.up[0].view : set.down[0].view;
-            // (sharpening, p17: into the scratch, then copied back)
-            const bool sharpen = push.p[17] > 0.0f;
+            // (sharpening, p17, or debanding, p18: into the scratch, then copied back)
+            const bool sharpen = push.p[17] > 0.0f || push.p[18] > 0.0f;
             Dispatch(cmd, kBloomApply, Descriptors(t, sharpen ? set.full.view : nullptr, top, nullptr), push, w, h);
             if (sharpen) {
                 Barrier(cmd);
@@ -362,7 +362,7 @@ void GsEffects::Record(VkCommandBuffer cmd, const GsEffect& e, const Target& t) 
             break;
         }
         case GsEffectId::kGrade:
-            if (push.p[17] > 0.0f) {
+            if (push.p[17] > 0.0f || push.p[18] > 0.0f) {
                 Set& set = SetFor(w, h, cmd);
                 Dispatch(cmd, kGrade, Descriptors(t, set.full.view, nullptr, nullptr), push, w, h);
                 Barrier(cmd);

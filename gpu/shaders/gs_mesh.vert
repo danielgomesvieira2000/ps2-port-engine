@@ -91,6 +91,7 @@ void main() {
         lit_place = vec4(0.0);
         lit_normal = vec3(0.0);
         lit_colour = vec4(0.0);
+        lit_eye = EyeOf(header.row[3], header.row[4], header.row[5], header.row[6]);
         if (((floatBitsToUint(header.ext[0].x) >> gl_VertexIndex) & 1u) != 0u) {
             const int e = 1 + 5 * gl_VertexIndex;
             const vec4 g = header.ext[e];
@@ -168,5 +169,6 @@ void main() {
     lit_colour = col;
     lit_on = (Enhancements() & kLitPixels) != 0u ? 1.0 : 0.0;
     lit_program = 0u;
+    lit_eye = EyeOf(header.row[3], header.row[4], header.row[5], header.row[6]);
 #endif
 }

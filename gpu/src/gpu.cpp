@@ -21,6 +21,11 @@ std::atomic<std::uint32_t> g_mesh_enhancements{0};
 }
 void SetMeshEnhancements(std::uint32_t bits) { g_mesh_enhancements.store(bits, std::memory_order_relaxed); }
 std::uint32_t MeshEnhancements() { return g_mesh_enhancements.load(std::memory_order_relaxed); }
+namespace {
+std::atomic<std::uint32_t> g_msaa{1};
+}
+void SetGpuMsaa(std::uint32_t samples) { g_msaa.store(samples < 2 ? 1u : samples, std::memory_order_relaxed); }
+std::uint32_t GpuMsaa() { return g_msaa.load(std::memory_order_relaxed); }
 void (*g_renderer_thread_start)() = nullptr;
 void SetRendererThreadStart(void (*start)()) { g_renderer_thread_start = start; }
 

@@ -442,10 +442,26 @@ layout(location = 5) in vec3 lit_normal;
 layout(location = 6) in vec4 lit_colour;
 layout(location = 7) in float lit_on;
 layout(location = 8) flat in uint lit_program;
+layout(location = 9) flat in vec3 lit_eye;
 
 vec4 H(int i) { return mesh_header.h[i]; }
 
+// A texture pack's surface detail (blend_ops bit 27: set 2 its replacement's _n image - texture_pack.h): the
+// normal's RGB in the texture's own space, its shine in alpha. The texture's axes from the screen's change in
+// the place and the coordinates (no tangents in the game's meshes: a cotangent frame, Schueler's).
+bool Detailed() {
+#ifdef SHADER_BLEND
+    return false;
+#else
+    return ((p.blend_ops >> 27) & 1u) != 0u;
+#endif
+}
+
 vec4 LitShade(vec4 vertex_shade) {
+    // (the screen's change in the place and coordinates, while every pixel of the quad still runs)
+    const vec3 dp1 = dFdx(lit_place.xyz), dp2 = dFdy(lit_place.xyz);
+    const vec2 uv = coordinate.xy / coordinate.z;
+    const vec2 duv1 = dFdx(uv), duv2 = dFdy(uv);
     // (a triangle with a vertex not known: lit at its vertices, as the game)
     if (lit_on < 0.999) return vertex_shade;
     const vec3 p = lit_place.xyz;
@@ -453,6 +469,21 @@ vec4 LitShade(vec4 vertex_shade) {
     vec3 n = lit_normal;
     const float nl = length(n);
     if (nl > 0.0) n *= lit_place.w / nl;
+    float shine = 0.0;
+#ifndef SHADER_BLEND
+    if (Detailed() && nl > 0.0) {
+        const vec4 detail = texture(scene_depth, uv);
+        const vec3 un = n / max(lit_place.w, 1e-6);
+        const vec3 q1 = cross(dp2, un), q2 = cross(un, dp1);
+        const vec3 tx = q1 * duv1.x + q2 * duv2.x, ty = q1 * duv1.y + q2 * duv2.y;
+        const float k = inversesqrt(max(max(dot(tx, tx), dot(ty, ty)), 1e-30));
+        const vec3 local = detail.rgb * 2.0 - 1.0;
+        const vec3 bent = normalize(mat3(tx * k, ty * k, un) * local);
+        n = bent * lit_place.w;
+        shine = detail.a;
+    }
+#endif
+    const vec3 view = normalize(lit_eye - p);
     vec3 c;
     if (lit_program == 0u) {
         // the room's (rows 0-23, vf11-vf17 from 24): a point light at vf15-vf17's x, its strength vf12's x
@@ -462,6 +493,11 @@ vec4 LitShade(vec4 vertex_shade) {
         const float lambert = max(dot(l * rs, n), 0.0);
         const vec3 col = lit_colour.rgb;
         c = (H(26).rgb * lambert + H(27).rgb * col) * atten + H(0).rgb * col;
+        if (shine > 0.0) {
+            // the shine: the light's own colour, where it mirrors into the eye (Blinn's half vector)
+            const vec3 half_way = normalize(l * rs + view);
+            c += H(26).rgb * (shine * pow(max(dot(normalize(n), half_way), 0.0), 8.0 + 56.0 * shine)) * atten;
+        }
         c = min(c, vec3(128.0)) * H(1).rgb;
     } else {
         // the characters' (vf00-vf21): x a direction, y and z points, each over its distance
@@ -478,6 +514,15 @@ vec4 LitShade(vec4 vertex_shade) {
         for (int k = 0; k < 3; ++k) d[k] = max(lx[k] * n.x + ly[k] * n.y + lz[k] * n.z, 0.0) * (k > 0 ? atten[k] : 1.0);
         c = H(15).rgb * d.x + H(16).rgb * d.y + H(17).rgb * d.z + H(18).rgb + H(19).rgb * atten.y +
             H(20).rgb * atten.z + H(21).rgb;
+        if (shine > 0.0) {
+            const vec3 un = normalize(n);
+            const float power = 8.0 + 56.0 * shine;
+            for (int k = 0; k < 3; ++k) {
+                const vec3 to = normalize(vec3(lx[k], ly[k], lz[k]));
+                const float lit_by = pow(max(dot(un, normalize(to + view)), 0.0), power) * (k > 0 ? atten[k] : 1.0);
+                c += H(15 + k).rgb * (shine * lit_by);
+            }
+        }
         c = min(c, vec3(128.0)) * H(9).rgb;
     }
     return vec4(clamp(floor(c), 0.0, 255.0) / 255.0, vertex_shade.a);

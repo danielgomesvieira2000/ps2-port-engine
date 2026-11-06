@@ -525,7 +525,7 @@ struct PortOption {
 };
 void AddPortOptions(const std::vector<PortOption>& options);
 /* The engine's graphics rows for a port's page (its GRAPHICS): ANTI-ALIASING (OFF, FXAA, SMAA:
-   SetWindowAntiAliasing). */
+   SetWindowAntiAliasing), MSAA (OFF, 2X, 4X, 8X: the 3D's edges sampled finer - ps2gpu::SetGpuMsaa). */
 std::vector<PortOption> EnhancedGraphicsOptions(const std::string& page);
 /* Their values for a preset: the game's look (all off), or each at its best. */
 void SetEnhancedGraphics(bool on);

@@ -765,14 +765,33 @@ std::vector<PortOption> EnhancedGraphicsOptions(const std::string& page) {
     aa.now = AntiAliasingNow;
     aa.set = [](int i) { SetWindowAntiAliasing(kAntiAliasing[i >= 0 && i < 3 ? i : 0]); };
     options.push_back(aa);
+    PortOption msaa;
+    msaa.page = page;
+    msaa.name = "MSAA";
+    msaa.help = "The 3D's edges drawn with 2-8 samples a pixel: clean, steady edges (costs GPU)";
+    msaa.values = {"OFF", "2X", "4X", "8X"};
+    msaa.now = [] {
+        const std::string now = Setting("msaa", "off");
+        return now == "2x" ? 1 : now == "4x" ? 2 : now == "8x" ? 3 : 0;
+    };
+    msaa.set = [](int i) {
+        static const char* const kValues[] = {"off", "2x", "4x", "8x"};
+        SetSetting("msaa", kValues[i >= 0 && i < 4 ? i : 0]);
+        ApplyGraphicsEnhancements();
+    };
+    options.push_back(msaa);
     return options;
 }
 
-void SetEnhancedGraphics(bool on) { SetWindowAntiAliasing(on ? "smaa" : "off"); }
+void SetEnhancedGraphics(bool on) {
+    SetWindowAntiAliasing(on ? "smaa" : "off");
+    SetSetting("msaa", on ? "4x" : "off");
+    ApplyGraphicsEnhancements();
+}
 
-bool EnhancedGraphicsAll() { return AntiAliasingNow() == 2; }
+bool EnhancedGraphicsAll() { return AntiAliasingNow() == 2 && Setting("msaa", "off") == "4x"; }
 
-bool EnhancedGraphicsNone() { return AntiAliasingNow() == 0; }
+bool EnhancedGraphicsNone() { return AntiAliasingNow() == 0 && Setting("msaa", "off") == "off"; }
 
 namespace bindings {
 void AddPanelPage(const PanelPage& page) { PanelPages().push_back(page); }

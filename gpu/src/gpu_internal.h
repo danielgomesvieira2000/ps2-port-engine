@@ -349,7 +349,10 @@ inline bool VulkanGpu::Flush() {
     bool ok;
     {
         std::lock_guard<std::mutex> hold(g_queue_lock);
-        ok = vkQueueSubmit(queue, 1, &submit, fences[current_]) == VK_SUCCESS;
+        const VkResult result = vkQueueSubmit(queue, 1, &submit, fences[current_]);
+        ok = result == VK_SUCCESS;
+        static int told = 0;
+        if (!ok && told++ < 3) std::fprintf(stderr, "[ps2gpu] vkQueueSubmit failed: %d (the device lost?)\n", int(result));
     }
     ++g_submits;
     in_flight_[current_] = ok;

@@ -73,6 +73,7 @@ void main() {
         lit_place = vec4(0.0);
         lit_normal = vec3(0.0);
         lit_colour = vec4(0.0);
+        lit_eye = EyeOf(header.vf[1], header.vf[2], header.vf[3], header.vf[4]);
         if (((floatBitsToUint(header.ext[0].x) >> gl_VertexIndex) & 1u) != 0u) {
             const int e = 1 + 5 * gl_VertexIndex;
             gl_Position = ClipPlace(header.ext[e + 1], header.misc.xy, target.size, position,
@@ -182,5 +183,6 @@ void main() {
     lit_colour = vec4(0.0);
     lit_on = (Enhancements() & kLitPixels) != 0u ? 1.0 : 0.0;
     lit_program = 1u;
+    lit_eye = EyeOf(header.vf[1], header.vf[2], header.vf[3], header.vf[4]);
 #endif
 }

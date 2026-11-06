@@ -15,6 +15,14 @@ layout(location = 5) out vec3 lit_normal;
 layout(location = 6) out vec4 lit_colour;    // the room's vertex colour (its lighting's input)
 layout(location = 7) out float lit_on;       // 1: lit per pixel (0 at a vertex whose inputs are not known)
 layout(location = 8) flat out uint lit_program;     // 0 the room's lights, 1 the characters'
+layout(location = 9) flat out vec3 lit_eye;         // the camera, where lit_place is (a highlight's view)
+
+// The camera where a place is, from the place's matrix to the screen's (`r0`-`r3`: the rows multiplying x, y, z
+// and 1): the point whose x, y and w come out 0.
+vec3 EyeOf(vec4 r0, vec4 r1, vec4 r2, vec4 r3) {
+    const mat3 m = mat3(vec3(r0.x, r0.y, r0.w), vec3(r1.x, r1.y, r1.w), vec3(r2.x, r2.y, r2.w));
+    return inverse(m) * -vec3(r3.x, r3.y, r3.w);
+}
 
 const uint kLitPixels = 1u, kPrecise = 2u;
 

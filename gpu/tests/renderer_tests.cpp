@@ -55,6 +55,13 @@ void Rect(ps2gpu::GsRenderer& r, const ps2gpu::GsDrawState& state, float x0, flo
     r.DrawTriangles(state, v, 6);
 }
 
+std::uint32_t Pixel8(ps2gpu::GsRenderer& r, std::uint32_t fbp, int x, int y) {
+    std::vector<std::uint32_t> pixels;
+    std::uint32_t w = 0, h = 0;
+    if (!r.ReadTarget(fbp, 8, 0, &pixels, &w, &h) || pixels.size() != std::size_t(w) * h) return 0xDEADBEEF;
+    return pixels[std::size_t(y) * w + x];
+}
+
 std::uint32_t Pixel(ps2gpu::GsRenderer& r, std::uint32_t fbp, int x, int y) {
     std::vector<std::uint32_t> pixels;
     std::uint32_t w = 0, h = 0;
@@ -473,6 +480,91 @@ void Meshes(ps2gpu::GsRenderer& renderer) {
     renderer.DrawMesh(other, 7, header);
 }
 
+
+// MSAA (SetGpuMsaa): a frame buffer drawn into through its multisampled twin - what it held kept (the twin
+// filled from it), the draw resolved into it; and off again, the same.
+void Multisampled(ps2gpu::GsRenderer& renderer) {
+    ps2gpu::SetGpuMsaa(4);
+    renderer.Kick();
+    std::vector<std::uint32_t> pixels(512 * 448);
+    for (std::uint32_t i = 0; i < pixels.size(); ++i) pixels[i] = Rgba(std::uint8_t(i), std::uint8_t(i >> 9), 9, 0x80);
+    renderer.UploadTarget(0x1A0, 8, 0, pixels.data(), 512, 448);
+    ps2gpu::GsDrawState state = Target(0x1A0);
+    state.fbw = 8;
+    state.width = 512;
+    state.height = 448;
+    state.scissor_x1 = 511;
+    state.scissor_y1 = 447;
+    Rect(renderer, state, 10, 10, 100, 100, Rgba(200, 100, 50, 0x80));
+    const std::uint32_t inside = Pixel8(renderer, 0x1A0, 50, 50), outside = Pixel8(renderer, 0x1A0, 300, 300);
+    std::printf("  msaa: inside %08X (want %08X), outside %08X (want %08X)\n", inside, Rgba(200, 100, 50, 0x80), outside,
+                pixels[300 * 512 + 300]);
+    Check(inside == Rgba(200, 100, 50, 0x80), "MSAA: a draw resolved into its target");
+    Check(outside == pixels[300 * 512 + 300], "MSAA: what the target held kept");
+    ps2gpu::SetGpuMsaa(1);
+    renderer.Kick();
+    // ...and as a game goes: memory into the target, a draw, the target back into memory - the same bytes with MSAA
+    // as without (an axis-aligned rectangle: no edge to smooth).
+    auto through_memory = [&](std::uint32_t samples, std::uint32_t fbp) {
+        ps2gpu::SetGpuMsaa(samples);
+        renderer.Kick();
+        const std::uint32_t blocks = 512 * 448 * 4 / 256;
+        std::vector<std::uint8_t> bytes(std::size_t(blocks) * 256);
+        for (std::size_t i = 0; i < bytes.size(); ++i) bytes[i] = std::uint8_t(i * 7 + (i >> 9));
+        renderer.MemoryWrite(fbp * 32, fbp * 32 + blocks, bytes.data());
+        renderer.TargetFromMemory(fbp, 8, 0, 512, 448);
+        ps2gpu::GsDrawState st = Target(fbp);
+        st.fbw = 8;
+        st.width = 512;
+        st.height = 448;
+        st.scissor_x1 = 511;
+        st.scissor_y1 = 447;
+        st.fbmsk = 1;                   // (Outbreak's every draw: red's lowest bit kept)
+        Rect(renderer, st, 10, 10, 100, 100, Rgba(200, 100, 50, 0x80));
+        Rect(renderer, st, 200, 200, 300, 260, Rgba(10, 250, 50, 0x80));
+        // a textured sprite, blended (a logo over its screen)
+        const std::uint32_t texels[4] = {Rgba(0xFF, 0, 0, 0x80), Rgba(0, 0xFF, 0, 0x40), Rgba(0, 0, 0xFF, 0x80),
+                                         Rgba(0xFF, 0xFF, 0xFF, 0x20)};
+        renderer.UploadTexture(77, texels, 2, 2);
+        ps2gpu::GsDrawState tex = st;
+        tex.textured = true;
+        tex.texture = 77;
+        tex.wms = tex.wmt = 1;
+        tex.sprite = true;
+        tex.blend = true;
+        Rect(renderer, tex, 320, 40, 480, 200, Rgba(0x80, 0x80, 0x80, 0x80));
+        // a texture decoded from GPU memory (as a game's are), drawn twice - between, decoded again
+        for (int k = 0; k < 2; ++k) {
+            std::vector<std::uint8_t> texmem(64 * 64 * 4);
+            for (std::size_t i = 0; i < texmem.size(); ++i) texmem[i] = std::uint8_t(i * 3 + k * 50);
+            const std::uint32_t tbp = 0x3000;
+            renderer.MemoryWrite(tbp, tbp + 64, texmem.data());
+            ps2gpu::GsTextureDecode d;
+            d.tbp = tbp;
+            d.tbw = 1;
+            d.psm = 0;
+            d.tw = 64;
+            d.th = 64;
+            renderer.TextureFromMemory(900 + k, d);
+            ps2gpu::GsDrawState dec = st;
+            dec.textured = true;
+            dec.texture = 900 + k;
+            dec.wms = dec.wmt = 1;
+            Rect(renderer, dec, 40 + 200 * float(k), 300, 140 + 200 * float(k), 400, Rgba(0x80, 0x80, 0x80, 0x80));
+        }
+        renderer.TargetToMemory(fbp, 8, 0, 512, 448);
+        renderer.MemoryRead(fbp * 32, fbp * 32 + blocks, bytes.data());
+        ps2gpu::SetGpuMsaa(1);
+        renderer.Kick();
+        return bytes;
+    };
+    const std::vector<std::uint8_t> plain = through_memory(1, 0x400), multi = through_memory(4, 0xA00);
+    std::size_t differ = 0;
+    for (std::size_t i = 0; i < plain.size(); ++i) differ += plain[i] != multi[i];
+    std::printf("  msaa through memory: %zu of %zu bytes differ\n", differ, plain.size());
+    Check(differ == 0, "MSAA: through memory, the same as without");
+}
+
 int main() {
     std::string error;
     // PS2HOST_RENDERER=d3d11: the same tests on Direct3D 11.
@@ -503,6 +595,7 @@ int main() {
     PartlyMaskedChannels(*renderer);
     ComputeBetweenDraws(*renderer);
     Meshes(*renderer);
+    Multisampled(*renderer);
     if (g_failures) std::printf("gpu renderer tests: %d failed\n", g_failures);
     else std::printf("gpu renderer tests: all passed (%s)\n", gpu->Describe().c_str());
     return g_failures ? EXIT_FAILURE : EXIT_SUCCESS;
