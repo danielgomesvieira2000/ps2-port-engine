@@ -229,6 +229,7 @@ public:
     bool dual_source = false;       /* dualSrcBlend: the GS's blending */
     bool logic_op = false;          /* logicOp: FBMSK's partly masked channels */
     bool bc = false;                /* textureCompressionBC: texture packs' DDS uploaded as they are */
+    bool cull_distance = false;     /* shaderCullDistance: native mesh draws (gs_mesh.vert) */
     float anisotropy = 1.0f;        /* samplerAnisotropy's most (1: none): texture packs' samplers */
     bool owns_device = true;
 

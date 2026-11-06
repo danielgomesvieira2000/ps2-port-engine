@@ -94,6 +94,7 @@ bool VulkanGpu::Init(std::string* error) {
     dual_source = setup.supported.dualSrcBlend == VK_TRUE;
     logic_op = setup.supported.logicOp == VK_TRUE;
     bc = setup.supported.textureCompressionBC == VK_TRUE;
+    cull_distance = setup.supported.shaderCullDistance == VK_TRUE;
     if (setup.supported.samplerAnisotropy) anisotropy = p.limits.maxSamplerAnisotropy;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &setup.features;
@@ -168,6 +169,7 @@ bool VulkanGpu::InitShared(VkInstance shared_instance, VkPhysicalDevice shared_g
     vkGetPhysicalDeviceFeatures(shared_gpu, &supported);
     logic_op = supported.logicOp == VK_TRUE;
     bc = supported.textureCompressionBC == VK_TRUE;
+    cull_distance = supported.shaderCullDistance == VK_TRUE;
     // Anisotropy for texture packs' and ANISOTROPIC's samplers, as the
     // headless device has it (a window's device kept 1: no anisotropy).
     if (supported.samplerAnisotropy) {

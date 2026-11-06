@@ -412,6 +412,8 @@ bool ShaderBlend(const GsDrawState& s) {
     return s.c == BlendAlpha::Fix && s.fix > 0x80;
 }
 constexpr std::uint32_t kShaderBlend = 1u << 15;
+// A native mesh draw's pipeline: gs_mesh.vert its vertex stage, no vertex input (the mesh in set 3).
+constexpr std::uint32_t kMeshVertices = 1u << 28;
 
 /* The pipeline a state needs: blending and its operands, and the write mask
    (bits 9-12, inverted so that 0 is the plain pipeline); bit 15 the blend
@@ -853,7 +855,8 @@ private:
     VulkanGpu& g_;
     VkShaderModule vert_ = VK_NULL_HANDLE, frag_ = VK_NULL_HANDLE, frag_blend_ = VK_NULL_HANDLE;
     /* A native microprogram's mesh drawn (gs_mesh.vert; docs/NATIVE_RENDERER.md): its vertex stage, and set 3 -
-       the mesh and the header, storage buffers. Not drawn with yet (the module made then, where the device has shaderCullDistance). */
+       the mesh and the header, storage buffers (the module where the device has shaderCullDistance). Not drawn
+       with yet. */
     VkShaderModule mesh_vert_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout mesh_set_layout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
@@ -1347,6 +1350,7 @@ bool VulkanGsRenderer::Init(std::string* error) {
         return m;
     };
     vert_ = module(spirv_gs_vert, sizeof spirv_gs_vert);
+    if (g_.cull_distance) mesh_vert_ = module(spirv_gs_mesh_vert, sizeof spirv_gs_mesh_vert);
     frag_ = g_.dual_source ? module(spirv_gs_frag, sizeof spirv_gs_frag)
                            : module(spirv_gs_frag_single, sizeof spirv_gs_frag_single);
     g_dual_source_blend = g_.dual_source;
@@ -1426,6 +1430,13 @@ bool VulkanGsRenderer::Init(std::string* error) {
     if (!(g_vk_baked_states ? BakedPipelineFor(0, 0) : PipelineFor(0)) || !MakeDatePipeline()) {
         if (error) *error = "vkCreateGraphicsPipelines failed";
         return false;
+    }
+    // PS2HOST_MESH_PIPELINE_TEST=1: a native mesh draw's pipeline made once (gs_mesh.vert with the layout), said.
+    if (std::getenv("PS2HOST_MESH_PIPELINE_TEST")) {
+        const VkPipeline mesh = MakePipeline(kMeshVertices);
+        std::fprintf(stderr, "[gpu] a mesh draw's pipeline: %s\n",
+                     !mesh_vert_ ? "no shaderCullDistance" : mesh ? "made" : "not made");
+        if (mesh) vkDestroyPipeline(g_.device, mesh, nullptr);
     }
     const std::uint32_t white = 0xFFFFFFFFu;
     if (!MakeImage(blank_.image, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
@@ -2629,7 +2640,8 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key, std::uint32_t baked
     VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                                  {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vert_;
+    stages[0].module = key & kMeshVertices ? mesh_vert_ : vert_;
+    if (!stages[0].module) return VK_NULL_HANDLE;       // (a mesh's, on a device without shaderCullDistance)
     stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = key & kShaderBlend ? frag_blend_ : frag_;
@@ -2654,6 +2666,11 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key, std::uint32_t baked
     input.pVertexBindingDescriptions = bindings;
     input.vertexAttributeDescriptionCount = 6;
     input.pVertexAttributeDescriptions = attributes;
+    if (key & kMeshVertices) {
+        // (its vertices read from the mesh by index)
+        input.vertexBindingDescriptionCount = 0;
+        input.vertexAttributeDescriptionCount = 0;
+    }
     VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
