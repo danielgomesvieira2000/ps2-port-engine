@@ -1368,7 +1368,8 @@ std::unordered_set<u64> g_meshes;       // the meshes the renderer holds (Upload
 /* Its payload: [0] flags (1 a mesh to upload, 2 every mesh released first), [1-2] the key, [3-4] the tag's
    PRIM, [5-128] the header (VU1 rows 0-23, vf11-vf17); with 1: [129] quadwords, [130] indices, the quadwords,
    the indices. */
-constexpr u32 kNativeHeaderWords = 124, kNativeHead = 5 + kNativeHeaderWords;
+// (the header: rows 0-23 and vf11-vf17, 124 words, then the two kept vertices' packet words, 24)
+constexpr u32 kNativeHeaderWords = 148, kNativeHead = 5 + kNativeHeaderWords;
 
 /* A room payload's own triangles for this draw (flag 8: last, after the upload's place - a count, then the
    indices), or none. */
@@ -1419,10 +1420,12 @@ bool NativeMesh(Bridge& s, const ps2gpu::GsDrawState& state, u32 x_offset, u32 y
     const u64 key = u64(n.words[1]) | u64(n.words[2]) << 32;
     if (!g_meshes.count(key) || !s.renderer->MeshDrawable(state)) return false;
     float header[ps2gpu::GsRenderer::kMeshHeaderFloats] = {};
-    std::memcpy(header, n.words + 5, kNativeHeaderWords * 4);
+    std::memcpy(header, n.words + 5, 124 * 4);
     (void)c;
     header[124] = float(n.ofx) - 16.0f * float(x_offset);
     header[125] = float(n.ofy) - 16.0f * float(y_offset);
+    header[126] = 1.0f;                 // (the mesh's first two vertices the kept, below)
+    std::memcpy(header + 128, n.words + 5 + 124, 24 * 4);
     ++g_draws;
     u32 draw_count = 0;
     if (const u32* draw = RoomDrawIndices(n.words, n.count, &draw_count)) {
@@ -2433,6 +2436,19 @@ void MeshTriangles(const u32* words, u32 count, u32 ofx, u32 ofy, std::vector<gs
     }
     u32 draw_count = 0;
     if (const u32* draw = RoomDrawIndices(words, count, &draw_count)) index = draw, indices = draw_count;
+    // the two kept vertices as their packet has them (never culled by themselves)
+    for (u32 i = 0; i < 2 && i < vs.size(); ++i) {
+        const u32* kq = words + 5 + 124 + 12 * i;
+        gs::Vertex v;
+        v.x = (float(kq[8] & 0xFFFF) - float(ofx)) / 16.0f;
+        v.y = (float(kq[9] & 0xFFFF) - float(ofy)) / 16.0f;
+        v.z = (kq[10] >> 4) & 0xFFFFFF;
+        v.r = u8(kq[4]), v.g = u8(kq[5]), v.b = u8(kq[6]), v.a = u8(kq[7]);
+        std::memcpy(&v.s, kq + 0, 4), std::memcpy(&v.t, kq + 1, 4), std::memcpy(&v.q, kq + 2, 4);
+        v.fog = u8((kq[11] >> 4) & 0xFF);
+        vs[i].v = v;
+        for (float& d : vs[i].cull) d = 1.0f;
+    }
     for (u32 i = 0; i + 2 < indices; i += 3) {
         bool culled = false;
         for (int d = 0; d < 6 && !culled; ++d)

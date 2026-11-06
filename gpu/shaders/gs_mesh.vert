@@ -27,7 +27,8 @@ layout(set = 3, binding = 0, std430) readonly buffer Mesh {
 layout(set = 3, binding = 1, std430) readonly buffer Header {
     vec4 row[24];       // VU1 data memory 0-23
     vec4 k[7];          // vf11-vf17
-    vec4 offset;        // XYOFFSET's OFX, OFY (sixteenths of a pixel)
+    vec4 offset;        // XYOFFSET's OFX, OFY (sixteenths of a pixel); z not 0: the mesh's first two vertices the kept
+    vec4 kept[6];       // the two vertices the strip goes on from, as the GS takes them (STQ, RGBAQ, XYZF2 each)
 } header;
 
 layout(push_constant) uniform Target {
@@ -55,6 +56,21 @@ float Dot(int r, vec4 p, int lane) {
 }
 
 void main() {
+    if (header.offset.z != 0.0 && gl_VertexIndex < 2) {
+        // A kept vertex: as its packet has it (the batch before's, under its own header); never culled by itself.
+        const int i = gl_VertexIndex * 3;
+        const uvec4 rgbaq = floatBitsToUint(header.kept[i + 1]);
+        const uvec4 xyzf = floatBitsToUint(header.kept[i + 2]);
+        const vec2 position = (vec2(float(xyzf.x & 0xFFFFu), float(xyzf.y & 0xFFFFu)) - header.offset.xy) / 16.0;
+        const vec2 ndc = (position + 0.5) / target.size * 2.0 - 1.0;
+        gl_Position = vec4(ndc, DepthOfZ((xyzf.z >> 4) & 0xFFFFFFu), 1.0);
+        for (int d = 0; d < 6; ++d) gl_CullDistance[d] = 1.0;
+        shade = vec4(Unorm8(rgbaq.x), Unorm8(rgbaq.y), Unorm8(rgbaq.z), Unorm8(rgbaq.w));
+        coordinate = header.kept[i].xyz;
+        fog_out = Unorm8((xyzf.w >> 4) & 0xFFu);
+        range_out = vec4(-1e9, -1e9, 1e9, 1e9);
+        return;
+    }
     const uint at = uint(gl_VertexIndex) * 4u;
     const vec4 p = mesh.quad[at];
     const vec4 nrm = mesh.quad[at + 1u];

@@ -314,7 +314,7 @@ public:
     /* The mesh's triangles drawn in `state`, in turn with DrawTriangles';
        `header` kMeshHeaderFloats floats (gs_mesh.vert's Header: VU1 data
        rows 0-23, vf11-vf17, XYOFFSET). */
-    static constexpr std::size_t kMeshHeaderFloats = 128;
+    static constexpr std::size_t kMeshHeaderFloats = 152;      // (rows 0-23, vf11-vf17, XYOFFSET, the kept vertices)
     virtual void DrawMesh(const GsDrawState& state, std::uint64_t key, const float* header) {
         DrawMeshWith(state, key, MeshCall{kMeshRoom, header, kMeshHeaderFloats, nullptr, 0});
     }
