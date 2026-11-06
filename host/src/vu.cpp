@@ -196,7 +196,8 @@ bool Holds(const Vu::Span& micro, const Vu::u32* code) {
 
 struct ProgramTime {
     std::uint64_t ns = 0, runs = 0, pairs = 0, interpreted = 0;
-    std::uint32_t pc = 0;
+    std::uint32_t pc = 0, kind = 0;
+    std::uint64_t code = 0;
 };
 thread_local std::uint64_t t_interpreted = 0;     // (RunTimed's last run: its pairs the interpreter ran)
 
@@ -214,8 +215,8 @@ struct ProgramTimes {
                      double(total) / 1e6, (unsigned long long)runs, all.size());
         for (size_t i = 0; i < all.size() && i < 40; ++i) {
             const auto& [k, t] = all[i];
-            std::fprintf(stderr, "[vu profile]  %016llX at 0x%04X: %5.1f%% %9.1f ms, %8llu runs, %11llu pairs (%llu a run), %.0f%% interpreted\n",
-                         (unsigned long long)k, unsigned(t.pc), 100.0 * double(t.ns) / double(std::max<std::uint64_t>(total, 1)),
+            std::fprintf(stderr, "[vu profile]  %016llX at 0x%04X, things of %3u words: %5.1f%% %9.1f ms, %8llu runs, %11llu pairs (%llu a run), %.0f%% interpreted\n",
+                         (unsigned long long)t.code, unsigned(t.pc), unsigned(t.kind), 100.0 * double(t.ns) / double(std::max<std::uint64_t>(total, 1)),
                          double(t.ns) / 1e6, (unsigned long long)t.runs, (unsigned long long)t.pairs,
                          (unsigned long long)(t.pairs / std::max<std::uint64_t>(t.runs, 1)),
                          100.0 * double(t.interpreted) / double(std::max<std::uint64_t>(t.pairs, 1)));
@@ -232,6 +233,8 @@ ProgramTimes* VuProfile() {
 }
 
 }  // namespace
+
+unsigned g_vu_thing_kind = 0;
 
 void VuProfileReport() {
     if (ProgramTimes* t = VuProfile()) t->Report();
@@ -2013,7 +2016,9 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     if (profile && FrameNumber() < VuProfileFrom()) profile = nullptr;
     if (!profile) return RunTimed(pc, limit);
     const auto began = std::chrono::steady_clock::now();
-    const std::uint64_t key = CodeHash(micro, pc & u32(micro.size() - 1) & ~7u);
+    const unsigned kind = g_vu_thing_kind;
+    const std::uint64_t code = CodeHash(micro, pc & u32(micro.size() - 1) & ~7u);
+    const std::uint64_t key = code ^ (std::uint64_t(kind) * 0x9E3779B97F4A7C15ull);
     const u64 pairs = RunTimed(pc, limit);
     const std::uint64_t ns = std::uint64_t(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
@@ -2024,6 +2029,8 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     t.pairs += pairs;
     t.interpreted += t_interpreted;
     t.pc = pc & u32(micro.size() - 1) & ~7u;
+    t.kind = kind;
+    t.code = code;
     return pairs;
 }
 

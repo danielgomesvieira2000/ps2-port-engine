@@ -231,6 +231,8 @@ Vu& Vu0();
 
 /* PS2HOST_VU_PROFILE's table (VU1's time by microprogram), written at the run's end. */
 void VuProfileReport();
+/* The kind of thing VU1 draws now (vif.cpp: the words of the last UNPACK to VU address 0 - a thing's header), for PS2HOST_VU_PROFILE. */
+extern unsigned g_vu_thing_kind;
 
 }  // namespace ps2host
 

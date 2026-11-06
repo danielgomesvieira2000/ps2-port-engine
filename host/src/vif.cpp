@@ -371,6 +371,8 @@ void VifStream::Word(std::uint32_t word) {
         u.written = 0;
         u.bytes.clear();
         pending_ = UnpackWords(command & 0xF, u.num);
+        // (a thing's start: its header to VU address 0 - PS2HOST_VU_PROFILE's kind, its size)
+        if (!(immediate & 0x8000) && (immediate & 0x3FF) == 0) g_vu_thing_kind = pending_;
         data_ = Data::Unpack;
         UnpackFill();
         return;
