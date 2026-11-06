@@ -4,6 +4,7 @@ clang, CMake and Ninja - the Vulkan display through MoltenVK.
 
     python engine/tools/macos.py --game games/<name> build
     python engine/tools/macos.py --game games/<name> run [-- <the port's options>]
+    python engine/tools/macos.py --game games/<name> pgo     # a profile-guided build (below)
     python engine/tools/macos.py --game games/<name> app     # a double-clickable .app
     python engine/tools/macos.py --game games/<name> app --icon <picture file or URL>
 
@@ -22,6 +23,12 @@ keeps saves and settings in ~/Library/Application Support/<Title>. Nothing of
 the game's is inside: it plays from the player's own disc image. Signed ad hoc,
 so it runs on the Mac that made it; another Mac's Gatekeeper needs a right-click
 Open (a release for others wants a Developer ID and notarisation).
+
+A build is ThinLTO when game.json says "lto" (--lto / --no-lto / PS2_LTO=off
+override it: a long link, the race in virtual time faster), and with the
+profile `pgo` made (build/port/pgo.profdata) when there is one (--no-pgo:
+without): the counting build, the game's scripted runs (game.json's
+"pgo_runs", else all of port/runs) and llvm-profdata's merge, as port.py's pgo.
 
 The icon is the disc's own title logo (port/tools/make_icon.py reads it from the
 disc), tilted on a rounded tile. `--icon` takes a picture of your own instead - a
@@ -72,15 +79,30 @@ def folder_of(game) -> str:
     return game.path(os.path.join(game.build, "macos", target_of(game)))
 
 
-def build(game, lto: bool) -> str:
+def want_lto(game, flag) -> bool:
+    """ThinLTO: --lto / --no-lto (flag True / False), else PS2_LTO=off, else game.json's "lto"."""
+    if flag is not None:
+        return flag
+    if os.environ.get("PS2_LTO", "").lower() in ("off", "0", "no"):
+        return False
+    return bool(port._game_json(game).get("lto"))
+
+
+def build(game, lto: bool, pgo: str = "") -> str:
+    """Configure and build; returns the program's path. `pgo`: "generate" (a build that counts what runs),
+    "off" (without the profile), else the profile `pgo` made when there is one."""
     generated = port.generate(game)
     binary = folder_of(game)
     os.makedirs(binary, exist_ok=True)
     target = target_of(game)
+    profile = pgo if pgo == "generate" else ("" if pgo == "off" else port.pgo_profile(game))
+    if profile not in ("", "generate") and not os.path.isfile(profile):
+        profile = ""
     configure = [tool("cmake"), "-S", game.path("port"), "-B", binary, "-G", "Ninja",
                  "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_MAKE_PROGRAM=" + tool("ninja"),
                  "-DCMAKE_OSX_ARCHITECTURES=arm64", "-DCMAKE_OSX_DEPLOYMENT_TARGET=" + DEPLOYMENT_TARGET,
-                 "-DPS2_GENERATED_DIR=" + generated, "-DPS2HOST_LTO=" + ("ON" if lto else "OFF")]
+                 "-DPS2_GENERATED_DIR=" + generated, "-DPS2HOST_LTO=" + ("ON" if lto else "OFF"),
+                 "-DPS2HOST_PGO=" + profile]
     print("+ " + " ".join(configure[:4]) + " ...", flush=True)
     subprocess.run(configure, check=True)
     subprocess.run([tool("cmake"), "--build", binary, "-j", str(jobs())], check=True)
@@ -303,6 +325,44 @@ def app(game, lto: bool = False, icon: str = "") -> str:
     return bundle
 
 
+def pgo(game, lto: bool) -> str:
+    """The profile-guided build: the counting build, the game's scripted runs, their counts merged into
+    build/port/pgo.profdata, and the build with it (port.py's pgo, for Apple's clang)."""
+    merge = subprocess.run(["xcrun", "-f", "llvm-profdata"], capture_output=True, text=True).stdout.strip()
+    if not merge:
+        raise SystemExit("macos: llvm-profdata not found (Xcode's command line tools)")
+    runs = port.pgo_runs(game)
+    if not runs:
+        raise SystemExit("pgo: no scripted runs to make a profile from (port/runs/*.args)")
+    counting = os.path.abspath(build(game, lto, pgo="generate"))
+    raw = game.path(os.path.join(game.build, "port", "pgo"))
+    shutil.rmtree(raw, ignore_errors=True)
+    os.makedirs(raw)
+    env = run_env()
+    env["LLVM_PROFILE_FILE"] = os.path.join(os.path.abspath(raw), "run-%p.profraw")
+    regress = os.path.join(HERE, "regress.py")
+    for name in runs:
+        gpu = os.path.exists(game.path(os.path.join("port", "runs", name + ".gpu.crc")))
+        run_args = dict(env)
+        for key, value in (port._game_json(game).get("pgo_env") or {}).get(name, {}).items():
+            value = value.replace("{game}", os.path.abspath(game.directory))
+            if os.sep in value and not os.path.exists(value):
+                print("pgo: %s: %s not here, left out" % (name, value), flush=True)
+                continue
+            run_args[key] = value
+        print("pgo: %s" % name, flush=True)
+        # (Its pictures checked as ever: a difference is reported, the counts kept.)
+        subprocess.run([sys.executable, regress, "--game", game.directory, name, "--exe", counting]
+                       + (["--gpu"] if gpu else []), env=run_args)
+    counts = [os.path.join(raw, f) for f in sorted(os.listdir(raw))
+              if f.endswith(".profraw") and os.path.getsize(os.path.join(raw, f))]
+    if not counts:
+        raise SystemExit("pgo: the runs left no counts in %s" % raw)
+    subprocess.run([merge, "merge", "-o", port.pgo_profile(game)] + counts, check=True)
+    print("pgo: %d runs' counts in %s" % (len(counts), port.pgo_profile(game)))
+    return build(game, lto)
+
+
 def run_env() -> dict:
     """The environment a Mac run needs for Vulkan: Homebrew's loader and MoltenVK's driver."""
     env = port._game_env()
@@ -321,10 +381,12 @@ def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     game_config.add_argument(parser)
-    parser.add_argument("action", nargs="?", default="all", choices=("all", "build", "run", "app"))
+    parser.add_argument("action", nargs="?", default="all", choices=("all", "build", "run", "app", "pgo"))
     parser.add_argument("--rounds", type=int, default=60,
                         help="all: build-and-run rounds to translate code found at run time")
-    parser.add_argument("--lto", action="store_true", help="build: ThinLTO (a long link)")
+    parser.add_argument("--lto", action="store_true", default=None, help="ThinLTO (a long link; default: game.json's \"lto\")")
+    parser.add_argument("--no-lto", dest="lto", action="store_false", help="without ThinLTO")
+    parser.add_argument("--no-pgo", action="store_true", help="build: without the profile `pgo` made")
     parser.add_argument("--icon", default="", metavar="FILE_OR_URL",
                         help="app: a picture of your own for the icon, a file or an https URL (default: the disc's "
                              "title logo)")
@@ -333,11 +395,16 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv[:split])
     args.extra = argv[split + 1:]
     game = game_config.from_args(args)
+    lto = want_lto(game, args.lto)
+    profile = "off" if args.no_pgo else ""
     if args.action == "build":
-        build(game, args.lto)
+        build(game, lto, profile)
+        return 0
+    if args.action == "pgo":
+        pgo(game, lto)
         return 0
     if args.action == "app":
-        app(game, args.lto, args.icon)
+        app(game, lto, args.icon)
         return 0
     executable = os.path.join(folder_of(game), target_of(game))
     if args.action == "all":
@@ -345,7 +412,7 @@ def main(argv=None) -> int:
         os.environ.update(run_env())
         extra = [a for a in args.extra if a != "--"]
         for _round in range(args.rounds):
-            executable = build(game, args.lto)
+            executable = build(game, lto, profile)
             before = port._count_lines(port.discoveries_path(game))
             code = port.run(game, executable, extra)
             if port._count_lines(port.discoveries_path(game)) == before:
