@@ -5,6 +5,7 @@
 
 #include "gpu_internal.h"
 
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +16,11 @@
 namespace ps2gpu {
 
 void SetGpuWaitObserver(GpuWaitObserver observer) { g_wait_observer = observer; }
+namespace {
+std::atomic<std::uint32_t> g_mesh_enhancements{0};
+}
+void SetMeshEnhancements(std::uint32_t bits) { g_mesh_enhancements.store(bits, std::memory_order_relaxed); }
+std::uint32_t MeshEnhancements() { return g_mesh_enhancements.load(std::memory_order_relaxed); }
 void (*g_renderer_thread_start)() = nullptr;
 void SetRendererThreadStart(void (*start)()) { g_renderer_thread_start = start; }
 
@@ -95,6 +101,7 @@ bool VulkanGpu::Init(std::string* error) {
     logic_op = setup.supported.logicOp == VK_TRUE;
     bc = setup.supported.textureCompressionBC == VK_TRUE;
     cull_distance = setup.supported.shaderCullDistance == VK_TRUE;
+    clip_distance = setup.supported.shaderClipDistance == VK_TRUE;
     if (setup.supported.samplerAnisotropy) anisotropy = p.limits.maxSamplerAnisotropy;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &setup.features;
@@ -170,6 +177,7 @@ bool VulkanGpu::InitShared(VkInstance shared_instance, VkPhysicalDevice shared_g
     logic_op = supported.logicOp == VK_TRUE;
     bc = supported.textureCompressionBC == VK_TRUE;
     cull_distance = supported.shaderCullDistance == VK_TRUE;
+    clip_distance = supported.shaderClipDistance == VK_TRUE;
     // Anisotropy for texture packs' and ANISOTROPIC's samplers, as the
     // headless device has it (a window's device kept 1: no anisotropy).
     if (supported.samplerAnisotropy) {

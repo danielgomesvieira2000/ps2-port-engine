@@ -72,9 +72,31 @@ foreach(shader gs.vert gs_mesh.vert gs_mesh_chars.vert gs.frag date.vert date.fr
                 -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader}
         DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
                 ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_common.glsl
+                ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_enhanced.glsl
                 ${CMAKE_CURRENT_LIST_DIR}/shaders/smaa_common.glsl ${CMAKE_CURRENT_LIST_DIR}/third_party/smaa/SMAA.glsl
                 ${GLSLANG}
         COMMENT "glslang ${shader}")
+    list(APPEND PS2GPU_SHADER_HEADERS ${out})
+endforeach()
+# The enhanced native draws (gs_mesh_enhanced.glsl): the mesh programs with ENHANCED, the fragment shader's
+# three with MESH_LIT (lit per pixel).
+foreach(variant "gs_mesh_enh_vert gs_mesh.vert -DENHANCED"
+                "gs_mesh_chars_enh_vert gs_mesh_chars.vert -DENHANCED"
+                "gs_frag_lit gs.frag -DMESH_LIT"
+                "gs_frag_single_lit gs.frag -DMESH_LIT -DSINGLE_OUTPUT"
+                "gs_frag_blend_lit gs.frag -DMESH_LIT -DSHADER_BLEND")
+    separate_arguments(parts UNIX_COMMAND "${variant}")
+    list(GET parts 0 name)
+    list(GET parts 1 shader)
+    list(SUBLIST parts 2 -1 defines)
+    set(out ${PS2GPU_SHADER_DIR}/${name}.h)
+    add_custom_command(OUTPUT ${out}
+        COMMAND ${GLSLANG} -V --target-env vulkan1.1 ${defines} --vn spirv_${name}
+                -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader}
+        DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
+                ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_common.glsl
+                ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_enhanced.glsl ${GLSLANG}
+        COMMENT "glslang ${shader} (${defines})")
     list(APPEND PS2GPU_SHADER_HEADERS ${out})
 endforeach()
 # The fragment shader without its second output, for devices without

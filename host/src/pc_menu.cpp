@@ -30,6 +30,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -505,7 +506,27 @@ void Draw(bool force = false) {
     if (!force && key == shown) return;
     shown = key;
     std::vector<u32> pixels;
-    if (DrawPanel(l, &pixels)) SetWindowPanel(std::move(pixels), u32(l.w), u32(l.h));
+    if (DrawPanel(l, &pixels)) {
+        // PS2HOST_PANEL_DUMP=<directory> (a test's): each picture of the panel drawn, panel_NNN.bmp there.
+        static const char* dump = std::getenv("PS2HOST_PANEL_DUMP");
+        if (dump) {
+            static int n = 0;
+            char path[512];
+            std::snprintf(path, sizeof path, "%s/panel_%03d.bmp", dump, n++);
+            if (std::FILE* f = std::fopen(path, "wb")) {
+                const u32 w = u32(l.w), h = u32(l.h), bytes = w * h * 4;
+                unsigned char head[54] = {'B', 'M'};
+                auto put32 = [&](int at, u32 v) { for (int i = 0; i < 4; ++i) head[at + i] = u8(v >> (8 * i)); };
+                put32(2, 54 + bytes), put32(10, 54), put32(14, 40), put32(18, w), put32(22, u32(-s32(h)));
+                head[26] = 1, head[28] = 32;
+                put32(34, bytes);
+                std::fwrite(head, 1, 54, f);
+                std::fwrite(pixels.data(), 4, pixels.size(), f);
+                std::fclose(f);
+            }
+        }
+        SetWindowPanel(std::move(pixels), u32(l.w), u32(l.h));
+    }
 #else
     std::vector<std::string> lines = {std::string(OnPhone() ? "PORT SETTINGS" : "PC SETTINGS") + " > " + CurrentTab().title};
     for (int r = 0; r < int(rows.size()); ++r) {
@@ -724,6 +745,66 @@ void AddPortOptions(const std::vector<PortOption>& options) {
     PortOptions().insert(PortOptions().end(), options.begin(), options.end());
 }
 
+namespace {
+const char* const kAntiAliasing[] = {"off", "fxaa", "smaa"};
+int AntiAliasingNow() {
+    const std::string now = Setting("antialiasing", "off");
+    for (int i = 0; i < 3; ++i)
+        if (now == kAntiAliasing[i]) return i;
+    return 0;
+}
+}  // namespace
+
+std::vector<PortOption> EnhancedGraphicsOptions(const std::string& page) {
+    std::vector<PortOption> options;
+    PortOption lighting;
+    lighting.page = page;
+    lighting.name = "LIGHTING";
+    lighting.help = "PER PIXEL: the game's own lights on every pixel, not only at the corners (NATIVE RENDERER)";
+    lighting.values = {"GAME'S", "PER PIXEL"};
+    lighting.now = [] { return Setting("lighting", "game") == "pixel" ? 1 : 0; };
+    lighting.set = [](int i) {
+        SetSetting("lighting", i == 1 ? "pixel" : "game");
+        ApplyGraphicsEnhancements();
+    };
+    options.push_back(lighting);
+    PortOption geometry;
+    geometry.page = page;
+    geometry.name = "GEOMETRY";
+    geometry.help = "PRECISE: 3D placed to the screen's own pixels - no shimmer at high resolutions (NATIVE RENDERER)";
+    geometry.values = {"GAME'S", "PRECISE"};
+    geometry.now = [] { return Setting("geometry", "game") == "precise" ? 1 : 0; };
+    geometry.set = [](int i) {
+        SetSetting("geometry", i == 1 ? "precise" : "game");
+        ApplyGraphicsEnhancements();
+    };
+    options.push_back(geometry);
+    PortOption aa;
+    aa.page = page;
+    aa.name = "ANTI-ALIASING";
+    aa.help = "Edges smoothed: FXAA soft and cheap, SMAA sharper";
+    aa.values = {"OFF", "FXAA", "SMAA"};
+    aa.now = AntiAliasingNow;
+    aa.set = [](int i) { SetWindowAntiAliasing(kAntiAliasing[i >= 0 && i < 3 ? i : 0]); };
+    options.push_back(aa);
+    return options;
+}
+
+void SetEnhancedGraphics(bool on) {
+    SetSetting("lighting", on ? "pixel" : "game");
+    SetSetting("geometry", on ? "precise" : "game");
+    ApplyGraphicsEnhancements();
+    SetWindowAntiAliasing(on ? "smaa" : "off");
+}
+
+bool EnhancedGraphicsAll() {
+    return Setting("lighting", "game") == "pixel" && Setting("geometry", "game") == "precise" && AntiAliasingNow() == 2;
+}
+
+bool EnhancedGraphicsNone() {
+    return Setting("lighting", "game") == "game" && Setting("geometry", "game") == "game" && AntiAliasingNow() == 0;
+}
+
 namespace bindings {
 void AddPanelPage(const PanelPage& page) { PanelPages().push_back(page); }
 }  // namespace bindings
@@ -765,6 +846,23 @@ void OpenPcMenu() {
     g_binding = -1;
     std::fprintf(stderr, "[pc menu] open\n");
     Draw(true);
+    // (PS2HOST_PANEL_DUMP: every tab drawn once as it opens - a scripted run's keys wait while it is open; with
+    // PS2HOST_PANEL_DUMP_STEP=1 the GRAPHICS tab's first row stepped on and back too)
+    if (std::getenv("PS2HOST_PANEL_DUMP")) {
+        const int tabs = int(Tabs().size());
+        for (int t = 1; t < tabs; ++t) {
+            g_tab = t, g_row = g_scroll = 0;
+            Draw(true);
+            if (std::getenv("PS2HOST_PANEL_DUMP_STEP") && CurrentTab().title == "GRAPHICS") {
+                Change(+1);
+                Draw(true);
+                Change(-1);
+                Draw(true);
+            }
+        }
+        g_tab = g_row = g_scroll = 0;
+        Draw(true);
+    }
 }
 
 void UpdatePcMenu() {

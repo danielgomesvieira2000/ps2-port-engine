@@ -230,6 +230,7 @@ public:
     bool logic_op = false;          /* logicOp: FBMSK's partly masked channels */
     bool bc = false;                /* textureCompressionBC: texture packs' DDS uploaded as they are */
     bool cull_distance = false;     /* shaderCullDistance: native mesh draws (gs_mesh.vert) */
+    bool clip_distance = false;     /* shaderClipDistance: their enhanced draws (gs_mesh_enhanced.glsl) */
     float anisotropy = 1.0f;        /* samplerAnisotropy's most (1: none): texture packs' samplers */
     bool owns_device = true;
 

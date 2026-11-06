@@ -6,7 +6,8 @@
  * float operation, the reciprocal square roots through a double (as the
  * emulated RSQRT and ERSQRT). The header as gs_mesh_chars.vert's (floats):
  * vf00-vf21 (0-87), rows 11-13 (88-99), misc (100-103: OFX, OFY, the first
- * matrix row's address, vi15), the kept vertices (104-127), the matrices' rows.
+ * matrix row's address, vi15), the kept vertices (104-127), the enhanced draws' ext (128-175), the matrices' rows
+ * (from quadword kRows).
  */
 
 #include <algorithm>
@@ -23,12 +24,17 @@ namespace native_chars {
 
 #pragma clang fp contract(off)
 
+constexpr int kRows = 44;      // (the header's quadword the matrices' rows start at)
+
 struct Vertex {
     std::uint32_t stq[3];       // S, T, Q as floats' bits
     std::uint32_t rgb[3];       // FTOI0, as the packet's (all 32 bits)
     std::uint32_t xyz[3];       // FTOI4
     std::uint32_t fog4;         // the fog's FTOI4
     float guard[4];             // the place through vf05-vf08 (the clip test)
+    float place[4];             // (full:) the place through its matrix - the lights'
+    float normal[3];            // ...the normal through its own
+    float view[4];              // ...the place through vf01-vf04, before the divide
 };
 
 inline float Rsqrt(float x) {
@@ -116,6 +122,8 @@ inline void MakeWith(const float* h, const float* pos, const float* nrm, const f
         float abc = ab + c;
         cp[l] = abc + vf(4, l);
     }
+    std::memcpy(out->place, p, sizeof p);
+    std::memcpy(out->view, cp, sizeof cp);
     float n[3];
     for (int l = 0; l < 3; ++l) {
         float a = nm[0][l] * nrm[0];
@@ -131,6 +139,7 @@ inline void MakeWith(const float* h, const float* pos, const float* nrm, const f
         const float r = Rsqrt(xy + zz);
         for (int l = 0; l < 3; ++l) n[l] = n[l] * r;
     }
+    std::memcpy(out->normal, n, sizeof n);
     const float q = cp[3] == 0.0f ? (std::signbit(cp[3]) ? -3.4028234663852886e38f : 3.4028234663852886e38f)
                                   : 1.0f / cp[3];
     auto tex = [&](int l) {
@@ -194,8 +203,8 @@ inline void Make(const float* h, const float* pos, const float* nrm, const float
                  bool full, Vertex* out) {
     const std::uint32_t first = First(h);
     float m[4][4], nm[3][4];
-    std::memcpy(m, h + (32 + (ma - first)) * 4, sizeof m);
-    std::memcpy(nm, h + (32 + (mb - first)) * 4, sizeof nm);
+    std::memcpy(m, h + (kRows + (ma - first)) * 4, sizeof m);
+    std::memcpy(nm, h + (kRows + (mb - first)) * 4, sizeof nm);
     MakeWith(h, pos, nrm, tx, m, nm, false, full, out);
 }
 
@@ -204,7 +213,7 @@ inline void Make(const float* h, const float* pos, const float* nrm, const float
 inline void MakeBlended(const float* h, const float* pos, const float* nrm, const float* tx, const std::uint32_t* mats,
                         const float* w, bool full, Vertex* out) {
     const std::uint32_t first = First(h);
-    auto row = [&](std::uint32_t address, int r, int l) { return h[(32 + (address - first) + r) * 4 + l]; };
+    auto row = [&](std::uint32_t address, int r, int l) { return h[(kRows + (address - first) + r) * 4 + l]; };
     float m[4][4];
     for (int r = 0; r < 4; ++r)
         for (int l = 0; l < 4; ++l) {
@@ -226,7 +235,7 @@ inline void Guard(const float* h, const float* q, float* g) {
     const std::uint32_t first = First(h);
     std::uint32_t idx[4];
     std::memcpy(idx, q + 12, 16);
-    auto row = [&](std::uint32_t address, int r) { return _mm_loadu_ps(h + (32 + (address - first) + r) * 4); };
+    auto row = [&](std::uint32_t address, int r) { return _mm_loadu_ps(h + (kRows + (address - first) + r) * 4); };
     __m128 m[4];
     if (Blended(h)) {
         const __m128 wx = _mm_set1_ps(q[16]), wy = _mm_set1_ps(q[17]), wz = _mm_set1_ps(q[18]), ww = _mm_set1_ps(q[19]);

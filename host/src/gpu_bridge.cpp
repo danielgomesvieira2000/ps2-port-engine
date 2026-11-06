@@ -1363,13 +1363,15 @@ struct NativeDraw {
 };
 NativeDraw* g_native = nullptr;
 bool g_meshes_drawn = false;            // the renderer draws meshes (the bridge's start)
+bool g_enhanced_drawn = false;          // ...and their enhanced draws (DrawsEnhancedMeshes)
 std::unordered_set<u64> g_meshes;       // the meshes the renderer holds (UploadMesh), by key
 
 /* Its payload: [0] flags (1 a mesh to upload, 2 every mesh released first), [1-2] the key, [3-4] the tag's
    PRIM, [5-128] the header (VU1 rows 0-23, vf11-vf17); with 1: [129] quadwords, [130] indices, the quadwords,
    the indices. */
 // (the header: rows 0-23 and vf11-vf17, 124 words, then the two kept vertices' packet words, 24)
-constexpr u32 kNativeHeaderWords = 148, kNativeHead = 5 + kNativeHeaderWords;
+// (and the enhanced draws' ext, 48: gs_mesh_enhanced.glsl)
+constexpr u32 kNativeHeaderWords = 196, kNativeHead = 5 + kNativeHeaderWords;
 
 /* A room payload's own triangles for this draw (flag 8: last, after the upload's place - a count, then the
    indices), or none. */
@@ -1426,6 +1428,7 @@ bool NativeMesh(Bridge& s, const ps2gpu::GsDrawState& state, u32 x_offset, u32 y
     header[125] = float(n.ofy) - 16.0f * float(y_offset);
     header[126] = 1.0f;                 // (the mesh's first two vertices the kept, below)
     std::memcpy(header + 128, n.words + 5 + 124, 24 * 4);
+    std::memcpy(header + ps2gpu::GsRenderer::kMeshRoomExt, n.words + 5 + 148, 48 * 4);
     ++g_draws;
     u32 draw_count = 0;
     if (const u32* draw = RoomDrawIndices(n.words, n.count, &draw_count)) {
@@ -2947,7 +2950,9 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
         // Native draws (docs/NATIVE_RENDERER.md): on where the renderer draws meshes - every scripted run of both
         // Files' pictures as recorded with them; PC SETTINGS' NATIVE RENDERER, PS2HOST_NATIVE_DRAW=0 off.
         g_meshes_drawn = bridge.renderer->DrawsMeshes();
+        g_enhanced_drawn = bridge.renderer->DrawsEnhancedMeshes();
         ApplyNativeRendererSetting();
+        ApplyGraphicsEnhancements();
     }
     g.on_effect = OnEffect;
     if (bridge.primary) {
@@ -3252,5 +3257,15 @@ void ApplyNativeRendererSetting() {
     const char* native = std::getenv("PS2HOST_NATIVE_DRAW");
     SetGsNativeDraws(g_meshes_drawn && !(native && std::string(native) == "0") && SettingOn("native_renderer", true));
 }
+
+void ApplyGraphicsEnhancements() {
+    u32 bits = 0;
+    if (Setting("lighting", "game") == "pixel") bits |= ps2gpu::kMeshLitPixels;
+    if (Setting("geometry", "game") == "precise") bits |= ps2gpu::kMeshPrecise;
+    if (const char* test = std::getenv("PS2HOST_ENHANCE")) bits = u32(std::strtoul(test, nullptr, 0));
+    ps2gpu::SetMeshEnhancements(bits);
+}
+
+u32 NativeEnhancements() { return GsNativeDraws() && g_enhanced_drawn ? ps2gpu::MeshEnhancements() : 0u; }
 
 }  // namespace ps2host

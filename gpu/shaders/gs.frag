@@ -430,8 +430,66 @@ layout(location = 0, index = 0) out vec4 colour;
 layout(location = 0, index = 1) out vec4 factor;
 #endif
 
+#ifdef MESH_LIT
+// An enhanced native draw's lighting per pixel (gs_mesh_enhanced.glsl): the microprogram's own lights, from the
+// draw's header (set 3), on the place and normal interpolated across the triangle - the vertex shader's
+// arithmetic (plain floats, not the VU's rounding), its colour as the GS takes it (0-255; 128 the texture's own).
+layout(set = 3, binding = 1, std430) readonly buffer MeshHeader {
+    vec4 h[];
+} mesh_header;
+layout(location = 4) in vec4 lit_place;
+layout(location = 5) in vec3 lit_normal;
+layout(location = 6) in vec4 lit_colour;
+layout(location = 7) in float lit_on;
+layout(location = 8) flat in uint lit_program;
+
+vec4 H(int i) { return mesh_header.h[i]; }
+
+vec4 LitShade(vec4 vertex_shade) {
+    // (a triangle with a vertex not known: lit at its vertices, as the game)
+    if (lit_on < 0.999) return vertex_shade;
+    const vec3 p = lit_place.xyz;
+    // the normal interpolated, its length as its vertices' (the game's normals need not be unit length)
+    vec3 n = lit_normal;
+    const float nl = length(n);
+    if (nl > 0.0) n *= lit_place.w / nl;
+    vec3 c;
+    if (lit_program == 0u) {
+        // the room's (rows 0-23, vf11-vf17 from 24): a point light at vf15-vf17's x, its strength vf12's x
+        vec3 l = vec3(H(28).x - p.x, H(29).x - p.y, H(30).x - p.z);
+        const float rs = inversesqrt(max(dot(l, l), 1e-30));
+        const float atten = min(H(25).x * rs, 1.0);
+        const float lambert = max(dot(l * rs, n), 0.0);
+        const vec3 col = lit_colour.rgb;
+        c = (H(26).rgb * lambert + H(27).rgb * col) * atten + H(0).rgb * col;
+        c = min(c, vec3(128.0)) * H(1).rgb;
+    } else {
+        // the characters' (vf00-vf21): x a direction, y and z points, each over its distance
+        vec3 lx = vec3(H(11).x, H(11).y - p.x, H(11).z - p.x);
+        vec3 ly = vec3(H(12).x, H(12).y - p.y, H(12).z - p.y);
+        vec3 lz = vec3(H(13).x, H(13).y - p.z, H(13).z - p.z);
+        vec3 atten = vec3(1.0);
+        for (int k = 1; k <= 2; ++k) {
+            const float r = inversesqrt(max(lx[k] * lx[k] + ly[k] * ly[k] + lz[k] * lz[k], 1e-30));
+            lx[k] *= r, ly[k] *= r, lz[k] *= r;
+            atten[k] = min(H(14)[k] * r, 1.0);
+        }
+        vec3 d;
+        for (int k = 0; k < 3; ++k) d[k] = max(lx[k] * n.x + ly[k] * n.y + lz[k] * n.z, 0.0) * (k > 0 ? atten[k] : 1.0);
+        c = H(15).rgb * d.x + H(16).rgb * d.y + H(17).rgb * d.z + H(18).rgb + H(19).rgb * atten.y +
+            H(20).rgb * atten.z + H(21).rgb;
+        c = min(c, vec3(128.0)) * H(9).rgb;
+    }
+    return vec4(clamp(floor(c), 0.0, 255.0) / 255.0, vertex_shade.a);
+}
+#endif
+
 void main() {
+#ifdef MESH_LIT
+    vec4 v = round(LitShade(shade) * 255.0);
+#else
     vec4 v = round(shade * 255.0);
+#endif
     vec4 c = v;
     if (Has(kTextured) && p.textured != 0u) {
         vec2 uv = coordinate.xy / coordinate.z * vec2(TextureSize());

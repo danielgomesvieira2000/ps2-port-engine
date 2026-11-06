@@ -29,6 +29,7 @@ layout(set = 3, binding = 1, std430) readonly buffer Header {
     vec4 k[7];          // vf11-vf17
     vec4 offset;        // XYOFFSET's OFX, OFY (sixteenths of a pixel); z not 0: the mesh's first two vertices the kept
     vec4 kept[6];       // the two vertices the strip goes on from, as the GS takes them (STQ, RGBAQ, XYZF2 each)
+    vec4 ext[12];       // the enhanced draws' (gs_mesh_enhanced.glsl)
 } header;
 
 layout(push_constant) uniform Target {
@@ -37,10 +38,20 @@ layout(push_constant) uniform Target {
 
 #include "gs_depth.glsl"
 
+#ifdef ENHANCED
+// (the guard band's planes clip: a triangle across one drawn in part, by the GPU)
+out gl_PerVertex {
+    vec4 gl_Position;
+    float gl_ClipDistance[6];
+};
+#define GUARD gl_ClipDistance
+#else
 out gl_PerVertex {
     vec4 gl_Position;
     float gl_CullDistance[6];
 };
+#define GUARD gl_CullDistance
+#endif
 
 layout(location = 0) out vec4 shade;
 layout(location = 1) noperspective out vec3 coordinate;
@@ -48,6 +59,10 @@ layout(location = 2) noperspective out float fog_out;
 layout(location = 3) flat out vec4 range_out;
 
 #include "gs_mesh_common.glsl"
+#ifdef ENHANCED
+#include "gs_mesh_enhanced.glsl"
+uint Enhancements() { return floatBitsToUint(header.ext[0].y); }
+#endif
 
 // A row's dot with the place, as MULA, MADDA, MADDA, MADD (w: 1) make it.
 float Dot(int r, vec4 p, int lane) {
@@ -64,11 +79,32 @@ void main() {
         const vec2 position = (vec2(float(xyzf.x & 0xFFFFu), float(xyzf.y & 0xFFFFu)) - header.offset.xy) / 16.0;
         const vec2 ndc = (position + 0.5) / target.size * 2.0 - 1.0;
         gl_Position = vec4(ndc, DepthOfZ((xyzf.z >> 4) & 0xFFFFFFu), 1.0);
-        for (int d = 0; d < 6; ++d) gl_CullDistance[d] = 1.0;
+        for (int d = 0; d < 6; ++d) GUARD[d] = 1.0;
         shade = vec4(Unorm8(rgbaq.x), Unorm8(rgbaq.y), Unorm8(rgbaq.z), Unorm8(rgbaq.w));
         coordinate = header.kept[i].xyz;
         fog_out = Unorm8((xyzf.w >> 4) & 0xFFu);
         range_out = vec4(-1e9, -1e9, 1e9, 1e9);
+#ifdef ENHANCED
+        // known (the batch before's, as the game kept it): placed, clipped and lit as the batch's own
+        lit_on = 0.0;
+        lit_program = 0u;
+        lit_place = vec4(0.0);
+        lit_normal = vec3(0.0);
+        lit_colour = vec4(0.0);
+        if (((floatBitsToUint(header.ext[0].x) >> gl_VertexIndex) & 1u) != 0u) {
+            const int e = 1 + 5 * gl_VertexIndex;
+            const vec4 g = header.ext[e];
+            gl_Position = ClipPlace(header.ext[e + 1], header.offset.xy, target.size, position,
+                                    (xyzf.z >> 4) & 0xFFFFFFu, (Enhancements() & kPrecise) == 0u, InGuard(g));
+            const float gw = abs(g.w);
+            GUARD[0] = gw - g.x, GUARD[1] = gw + g.x, GUARD[2] = gw - g.y;
+            GUARD[3] = gw + g.y, GUARD[4] = gw - g.z, GUARD[5] = gw + g.z;
+            lit_place = vec4(header.ext[e + 2].xyz, length(header.ext[e + 3].xyz));
+            lit_normal = header.ext[e + 3].xyz;
+            lit_colour = header.ext[e + 4];
+            lit_on = (Enhancements() & kLitPixels) != 0u ? 1.0 : 0.0;
+        }
+#endif
         return;
     }
     const uint at = uint(gl_VertexIndex) * 4u;
@@ -84,12 +120,12 @@ void main() {
     }
     // the guard band's six planes, as CLIP judges (|x| > |w| out)
     const float gw = abs(g.w);
-    gl_CullDistance[0] = gw - g.x;
-    gl_CullDistance[1] = gw + g.x;
-    gl_CullDistance[2] = gw - g.y;
-    gl_CullDistance[3] = gw + g.y;
-    gl_CullDistance[4] = gw - g.z;
-    gl_CullDistance[5] = gw + g.z;
+    GUARD[0] = gw - g.x;
+    GUARD[1] = gw + g.x;
+    GUARD[2] = gw - g.y;
+    GUARD[3] = gw + g.y;
+    GUARD[4] = gw - g.z;
+    GUARD[5] = gw + g.z;
     const float q = Recip(cp.w);
     // the texture coordinates through rows 15-17 (Q: the vertex's own z)
     const float s0 = Add(Add(Mul(header.row[15].x, tx.x), Mul(header.row[16].x, tx.y)), header.row[17].x);
@@ -124,4 +160,13 @@ void main() {
     coordinate = stq;
     fog_out = Unorm8(f);
     range_out = vec4(-1e9, -1e9, 1e9, 1e9);
+#ifdef ENHANCED
+    gl_Position = ClipPlace(cp, header.offset.xy, target.size, position, z, (Enhancements() & kPrecise) == 0u,
+                            InGuard(g));
+    lit_place = vec4(p.xyz, length(nrm.xyz));
+    lit_normal = nrm.xyz;
+    lit_colour = col;
+    lit_on = (Enhancements() & kLitPixels) != 0u ? 1.0 : 0.0;
+    lit_program = 0u;
+#endif
 }

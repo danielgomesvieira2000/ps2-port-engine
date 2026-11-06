@@ -237,6 +237,13 @@ void SetGsNativeDraws(bool on);
 /* The player's NATIVE RENDERER (PC SETTINGS; the setting native_renderer, on by default): native draws on where
    the renderer draws meshes, now (PS2HOST_NATIVE_DRAW=0 off whatever it says). */
 void ApplyNativeRendererSetting();
+/* GRAPHICS' LIGHTING and GEOMETRY (the settings "lighting": "game" or "pixel", "geometry": "game" or
+   "precise"; PS2HOST_ENHANCE=<bits> a test's): the native draws' enhancements (ps2gpu::SetMeshEnhancements:
+   1 lit per pixel, 2 precise places), now. NativeEnhancements: their bits where native draws are drawn - a
+   game's native programs then send what they need (the kept vertices' places and lighting: the headers'
+   ext, gs_mesh_enhanced.glsl). */
+void ApplyGraphicsEnhancements();
+u32 NativeEnhancements();
 void GsPrivileged(u32 address, u64 value);
 /* A GS register write, as A+D would (the replay's recorded registers). */
 void GsRegister(u32 address, u64 value);
@@ -517,6 +524,13 @@ struct PortOption {
     void (*set)(int) = nullptr;
 };
 void AddPortOptions(const std::vector<PortOption>& options);
+/* The engine's graphics rows for a port's page (its GRAPHICS): LIGHTING and GEOMETRY (the native renderer's
+   enhancements: ApplyGraphicsEnhancements), ANTI-ALIASING (OFF, FXAA, SMAA: SetWindowAntiAliasing). */
+std::vector<PortOption> EnhancedGraphicsOptions(const std::string& page);
+/* Their values for a preset: the game's look (all off), or each at its best. */
+void SetEnhancedGraphics(bool on);
+bool EnhancedGraphicsAll();         // (every one at its best)
+bool EnhancedGraphicsNone();        // (every one the game's)
 /* A port's EXIT GAME: the run ends as when the window is closed. */
 void QuitGame();
 /* The platform's (platform.cpp), for a port's settings - the rows that mean

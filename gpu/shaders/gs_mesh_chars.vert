@@ -27,6 +27,7 @@ layout(set = 3, binding = 1, std430) readonly buffer Header {
     vec4 tex[3];        // data memory rows 11-13
     vec4 misc;          // x, y: XYOFFSET's OFX, OFY (sixteenths); z: the first row below's address; w: vi15 (bits)
     vec4 kept[6];       // the two kept vertices' STQ, RGBAQ, XYZF2, as the packet has them
+    vec4 ext[12];       // the enhanced draws' (gs_mesh_enhanced.glsl)
     vec4 row[];         // data memory from misc.z: the matrices
 } header;
 
@@ -36,6 +37,10 @@ layout(push_constant) uniform Target {
 
 #include "gs_depth.glsl"
 #include "gs_mesh_common.glsl"
+#ifdef ENHANCED
+#include "gs_mesh_enhanced.glsl"
+uint Enhancements() { return floatBitsToUint(header.ext[0].y); }
+#endif
 
 out gl_PerVertex {
     vec4 gl_Position;
@@ -62,6 +67,21 @@ void main() {
         coordinate = header.kept[i].xyz;
         fog_out = Unorm8((xyzf.w >> 4) & 0xFFu);
         range_out = vec4(-1e9, -1e9, 1e9, 1e9);
+#ifdef ENHANCED
+        lit_on = 0.0;
+        lit_program = 1u;
+        lit_place = vec4(0.0);
+        lit_normal = vec3(0.0);
+        lit_colour = vec4(0.0);
+        if (((floatBitsToUint(header.ext[0].x) >> gl_VertexIndex) & 1u) != 0u) {
+            const int e = 1 + 5 * gl_VertexIndex;
+            gl_Position = ClipPlace(header.ext[e + 1], header.misc.xy, target.size, position,
+                                    (xyzf.z >> 4) & 0xFFFFFFu, (Enhancements() & kPrecise) == 0u, true);
+            lit_place = vec4(header.ext[e + 2].xyz, length(header.ext[e + 3].xyz));
+            lit_normal = header.ext[e + 3].xyz;
+            lit_on = (Enhancements() & kLitPixels) != 0u ? 1.0 : 0.0;
+        }
+#endif
         return;
     }
     const uint at = uint(gl_VertexIndex) * 5u;
@@ -155,4 +175,12 @@ void main() {
     coordinate = stq;
     fog_out = Unorm8(f);
     range_out = vec4(-1e9, -1e9, 1e9, 1e9);
+#ifdef ENHANCED
+    gl_Position = ClipPlace(cp, header.misc.xy, target.size, position, z, (Enhancements() & kPrecise) == 0u, true);
+    lit_place = vec4(p.xyz, length(n));
+    lit_normal = n;
+    lit_colour = vec4(0.0);
+    lit_on = (Enhancements() & kLitPixels) != 0u ? 1.0 : 0.0;
+    lit_program = 1u;
+#endif
 }

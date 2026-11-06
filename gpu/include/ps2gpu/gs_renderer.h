@@ -34,6 +34,13 @@ namespace ps2gpu {
    host's profiler (PS2HOST_PROFILE). On the waiting thread. */
 using GpuWaitObserver = void (*)(const char* why, std::uint64_t from_ns, std::uint64_t to_ns);
 void SetGpuWaitObserver(GpuWaitObserver observer);
+/* The native mesh draws' enhancements (PC SETTINGS' GRAPHICS; gs_mesh_enhanced.glsl), bits: kMeshLitPixels the
+   microprograms' lights per pixel, kMeshPrecise their places not rounded to the GS's sixteenths. 0, the
+   default: the GS's picture to the pixel. Any thread: what a game's native program reads as it makes a draw
+   (ps2host::NativeEnhancements), and writes into its header for the renderer - the draw made and drawn alike. */
+constexpr std::uint32_t kMeshLitPixels = 1, kMeshPrecise = 2;
+void SetMeshEnhancements(std::uint32_t bits);
+std::uint32_t MeshEnhancements();
 /* Called on the renderer's own thread (a threaded renderer's) as it starts:
    the host's profiler sampling it (--sample-renderer). */
 void SetRendererThreadStart(void (*start)());
@@ -299,6 +306,9 @@ public:
        program (gs_mesh.vert: Outbreak's room) with, each draw, the header the
        microprogram would have been given. Whether this renderer draws them: */
     virtual bool DrawsMeshes() const { return false; }
+    /* ...and their enhanced draws (gs_mesh_enhanced.glsl: the device's clip distances) - a header whose ext asks
+       for them (its y, the enhancements the game made it for) drawn so. */
+    virtual bool DrawsEnhancedMeshes() const { return false; }
     /* Whether a mesh in `state` draws as its triangles one by one would: not
        where each must see the one before it (a draw sampling its own target,
        blending in the shader, an alpha test's two passes) - a mesh is one batch. */
@@ -314,7 +324,10 @@ public:
     /* The mesh's triangles drawn in `state`, in turn with DrawTriangles';
        `header` kMeshHeaderFloats floats (gs_mesh.vert's Header: VU1 data
        rows 0-23, vf11-vf17, XYOFFSET). */
-    static constexpr std::size_t kMeshHeaderFloats = 152;      // (rows 0-23, vf11-vf17, XYOFFSET, the kept vertices)
+    static constexpr std::size_t kMeshHeaderFloats = 200;      // (rows 0-23, vf11-vf17, XYOFFSET, the kept vertices, ext)
+    /* The headers' ext (gs_mesh_enhanced.glsl), twelve quadwords: the room's at kMeshHeaderFloats - 48, the
+       characters' at kMeshCharactersExt (their matrices' rows after it). */
+    static constexpr std::size_t kMeshRoomExt = 152, kMeshCharactersExt = 128;
     virtual void DrawMesh(const GsDrawState& state, std::uint64_t key, const float* header) {
         DrawMeshWith(state, key, MeshCall{kMeshRoom, header, kMeshHeaderFloats, nullptr, 0});
     }
@@ -323,7 +336,7 @@ public:
        `header_floats` floats (at most kMeshHeaderMost), its triangles this
        draw's `indices` (index_count; none: the mesh's own). */
     enum MeshProgram : std::uint32_t { kMeshRoom = 0, kMeshCharacters = 1 };
-    static constexpr std::size_t kMeshHeaderMost = 4 * (26 + 1024);
+    static constexpr std::size_t kMeshHeaderMost = 4 * (44 + 1024);
     struct MeshCall {
         std::uint32_t program = kMeshRoom;
         const float* header = nullptr;
