@@ -265,7 +265,7 @@
    ]
   },
   "4:8b1d1a50852e421d": {
-   "GetOsdConfigParam": [
+   "SetOsdConfigParam": [
     "SLUS_210.50"
    ]
   },
@@ -305,7 +305,7 @@
    ]
   },
   "4:97f43c210a6add26": {
-   "SetOsdConfigParam": [
+   "GetOsdConfigParam": [
     "SLUS_210.50"
    ]
   },
