@@ -12,7 +12,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <xmmintrin.h>
 
 namespace ps2host {
 namespace native_chars {
@@ -29,7 +32,37 @@ struct Vertex {
 
 inline float Rsqrt(float x) {
     const double root = std::sqrt(std::fabs(double(x)));
-    return root == 0.0 ? 3.4028234663852886e38f : float(1.0 / root);
+    const float vu = root == 0.0 ? 3.4028234663852886e38f : float(1.0 / root);
+    // PS2HOST_NATIVE_RSQRT_CHECK=1 (a test): gs_mesh_common.glsl's Rsqrt (the nearest's arithmetic, its exact
+    // errors) against the VU's, on each input.
+    static const bool check = std::getenv("PS2HOST_NATIVE_RSQRT_CHECK") != nullptr;
+    if (check && x > 0.0f) {
+        static unsigned long long all = 0, differ = 0;
+        const unsigned mode = _MM_GET_ROUNDING_MODE();
+        _MM_SET_ROUNDING_MODE(_MM_ROUND_NEAREST);
+        auto bits = [](float f) { std::uint32_t b; std::memcpy(&b, &f, 4); return b; };
+        auto of = [](std::uint32_t b) { float f; std::memcpy(&f, &b, 4); return f; };
+        auto past = [](float y, float v) {
+            const float pp = y * y;
+            const float pe = std::fma(y, y, -pp);
+            const float t = std::fma(pp, v, -1.0f);
+            return std::fma(pe, v, t) > 0.0f;
+        };
+        float y = 1.0f / std::sqrt(x);
+        const float hh = 0.5f * x * y;
+        const float nn = std::fma(-hh, y, 1.5f);
+        y = y * nn;
+        for (int i = 0; i < 2; ++i)
+            if (past(y, x)) y = of(bits(y) - 1);
+        if (!past(of(bits(y) + 1), x)) y = of(bits(y) + 1);
+        _MM_SET_ROUNDING_MODE(mode);
+        ++all;
+        if (y != vu && ++differ <= 8)
+            std::fprintf(stderr, "[native] rsqrt(%08X): the VU's %08X, the shader's %08X (%llu of %llu)\n", bits(x), bits(vu),
+                         bits(y), differ, all);
+        if (all % 5000000 == 0) std::fprintf(stderr, "[native] rsqrt: %llu of %llu not the VU's\n", differ, all);
+    }
+    return vu;
 }
 
 inline std::uint32_t Ftoi(float y) {

@@ -2536,12 +2536,14 @@ bool OnNative(const gs::Gs::NativeCall& call) {
         _MM_SET_ROUNDING_MODE(mode);
     }
     NativeDraw draw{call.words, call.count, call.ofx, call.ofy, false};
-    g_native = &draw;
-    OnDraw(gs::Gs::DrawCall{call.prim, call.context, call.texa, v, 3, call.fogcol, call.pabe, ~0ull - ++generation});
-    g_native = nullptr;
-    // PS2HOST_NATIVE_FALLBACK=1 (a test): every native draw with no packet after it drawn from the CPU's copy.
+    // PS2HOST_NATIVE_FALLBACK=1 (a test): every native draw with no packet after it drawn from the CPU's copy alone.
     static const bool force_fallback = std::getenv("PS2HOST_NATIVE_FALLBACK") != nullptr;
-    if (no_packet && (flags & 0x100) && (!draw.drawn || force_fallback)) {
+    if (!(force_fallback && no_packet && (flags & 0x100))) {
+        g_native = &draw;
+        OnDraw(gs::Gs::DrawCall{call.prim, call.context, call.texa, v, 3, call.fogcol, call.pabe, ~0ull - ++generation});
+        g_native = nullptr;
+    }
+    if (no_packet && (flags & 0x100) && !draw.drawn) {
         // The characters' declined: their triangles made on the CPU, from the payload (the vertices' CPU copy).
         static std::vector<gs::Vertex> tris;
         tris.clear();
