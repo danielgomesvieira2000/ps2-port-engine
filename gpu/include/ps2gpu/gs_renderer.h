@@ -316,7 +316,23 @@ public:
        rows 0-23, vf11-vf17, XYOFFSET). */
     static constexpr std::size_t kMeshHeaderFloats = 128;
     virtual void DrawMesh(const GsDrawState& state, std::uint64_t key, const float* header) {
-        (void)state, (void)key, (void)header;
+        DrawMeshWith(state, key, MeshCall{kMeshRoom, header, kMeshHeaderFloats, nullptr, 0});
+    }
+    /* A mesh drawn by a program of its own - kMeshRoom gs_mesh.vert (a vertex
+       four quadwords), kMeshCharacters gs_mesh_chars.vert (five) - its header
+       `header_floats` floats (at most kMeshHeaderMost), its triangles this
+       draw's `indices` (index_count; none: the mesh's own). */
+    enum MeshProgram : std::uint32_t { kMeshRoom = 0, kMeshCharacters = 1 };
+    static constexpr std::size_t kMeshHeaderMost = 4 * (26 + 1024);
+    struct MeshCall {
+        std::uint32_t program = kMeshRoom;
+        const float* header = nullptr;
+        std::size_t header_floats = 0;
+        const std::uint32_t* indices = nullptr;
+        std::size_t index_count = 0;
+    };
+    virtual void DrawMeshWith(const GsDrawState& state, std::uint64_t key, const MeshCall& call) {
+        (void)state, (void)key, (void)call;
     }
     /* Runs what has been drawn. */
     virtual void Flush() = 0;

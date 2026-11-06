@@ -40,6 +40,7 @@
 #include "gs_frag_blend.h"
 #include "gs_vert.h"
 #include "gs_mesh_vert.h"
+#include "gs_mesh_chars_vert.h"
 #include "date_frag.h"
 #include "date_vert.h"
 #include "swizzle_comp.h"
@@ -414,6 +415,10 @@ bool ShaderBlend(const GsDrawState& s) {
 constexpr std::uint32_t kShaderBlend = 1u << 15;
 // A native mesh draw's pipeline: gs_mesh.vert its vertex stage, no vertex input (the mesh in set 3).
 constexpr std::uint32_t kMeshVertices = 1u << 28;
+// ...the characters' (gs_mesh_chars.vert). (Not GsRenderer::kMeshCharacters, the program's number.)
+constexpr std::uint32_t kMeshCharactersKey = 1u << 29;
+// A key's bits that pick its vertex stage: kept in a stand-in's key.
+constexpr std::uint32_t kMeshKeys = kMeshVertices | kMeshCharactersKey;
 
 /* The pipeline a state needs: blending and its operands, and the write mask
    (bits 9-12, inverted so that 0 is the plain pipeline); bit 15 the blend
@@ -535,7 +540,10 @@ public:
     void UploadMesh(std::uint64_t key, const void* quads, std::size_t quad_count, const std::uint32_t* indices,
                     std::size_t index_count) override;
     void ReleaseMesh(std::uint64_t key) override;
-    void DrawMesh(const GsDrawState& state, std::uint64_t key, const float* header) override;
+    void DrawMesh(const GsDrawState& state, std::uint64_t key, const float* header) override {
+        DrawMeshWith(state, key, MeshCall{kMeshRoom, header, kMeshHeaderFloats, nullptr, 0});
+    }
+    void DrawMeshWith(const GsDrawState& state, std::uint64_t key, const MeshCall& call) override;
     bool HasTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm) const override {
         return targets_.count(Key{fbp, fbw, psm}) != 0;
     }
@@ -871,15 +879,16 @@ private:
     /* A native microprogram's mesh drawn (gs_mesh.vert; docs/NATIVE_RENDERER.md): its vertex stage, and set 3 -
        the mesh and the header, storage buffers (the module where the device has shaderCullDistance). Not drawn
        with yet. */
-    VkShaderModule mesh_vert_ = VK_NULL_HANDLE;
+    VkShaderModule mesh_vert_ = VK_NULL_HANDLE, mesh_chars_vert_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout mesh_set_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool mesh_pool_ = VK_NULL_HANDLE;
     struct Mesh {
         VkBuffer vertices = VK_NULL_HANDLE, indices = VK_NULL_HANDLE;
         VkDeviceMemory vertex_memory = VK_NULL_HANDLE, index_memory = VK_NULL_HANDLE;
         std::uint32_t index_count = 0;
-        // Set 3 by the vertex ring's chunk its header is in (a dynamic offset within it).
+        // Set 3 by the vertex ring's chunk its header is in (a dynamic offset within it), and the header's size.
         std::vector<std::pair<VkBuffer, VkDescriptorSet>> sets;
+        std::vector<std::pair<VkBuffer, VkDescriptorSet>> large_sets;     // (the characters' headers)
     };
     std::unordered_map<std::uint64_t, Mesh> meshes_;
     void RetireMesh(Mesh mesh);
@@ -888,6 +897,10 @@ private:
         const Mesh* mesh = nullptr;
         VkDescriptorSet set = VK_NULL_HANDLE;
         std::uint32_t offset = 0;
+        std::uint32_t program = kMeshRoom;
+        VkBuffer indices = VK_NULL_HANDLE;      // this draw's own (else the mesh's)
+        VkDeviceSize index_offset = 0;
+        std::uint32_t index_count = 0;
     };
     MeshDraw mesh_draw_;
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
@@ -1130,8 +1143,9 @@ private:
 
 void* VulkanGsRenderer::Vertices(VkDeviceSize bytes, VkBuffer* buffer, VkDeviceSize* offset) {
     // (and a mesh draw's header: read as a storage buffer)
-    return RingAlloc(vertex_rings_, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, bytes,
-                     buffer, offset);
+    return RingAlloc(vertex_rings_,
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     bytes, buffer, offset);
 }
 
 void* VulkanGsRenderer::Staging(VkDeviceSize bytes, VkBuffer* buffer, VkDeviceSize* offset) {
@@ -1383,7 +1397,10 @@ bool VulkanGsRenderer::Init(std::string* error) {
         return m;
     };
     vert_ = module(spirv_gs_vert, sizeof spirv_gs_vert);
-    if (g_.cull_distance) mesh_vert_ = module(spirv_gs_mesh_vert, sizeof spirv_gs_mesh_vert);
+    if (g_.cull_distance) {
+        mesh_vert_ = module(spirv_gs_mesh_vert, sizeof spirv_gs_mesh_vert);
+        mesh_chars_vert_ = module(spirv_gs_mesh_chars_vert, sizeof spirv_gs_mesh_chars_vert);
+    }
     frag_ = g_.dual_source ? module(spirv_gs_frag, sizeof spirv_gs_frag)
                            : module(spirv_gs_frag_single, sizeof spirv_gs_frag_single);
     g_dual_source_blend = g_.dual_source;
@@ -2587,7 +2604,7 @@ VkPipeline VulkanGsRenderer::PipelineFor(std::uint32_t key) {
     // kind's own made here instead, the first time a player meets each, took
     // up to 0.7 s on an integrated GPU's cold driver).
     if (async_pipelines_ && (key >> kFeatureShift)) {
-        const VkPipeline stand_in = PipelineFor(key & ((1u << kFeatureShift) - 1));
+        const VkPipeline stand_in = PipelineFor(key & (((1u << kFeatureShift) - 1) | kMeshKeys));
         if (stand_in) {
             if (pipelines_asked_.insert(key).second) AskWorker(key, true);
             return stand_in;
@@ -2613,7 +2630,7 @@ VkPipeline VulkanGsRenderer::BakedPipelineFor(std::uint32_t key, std::uint32_t b
     // A kind of draw's own asked of the worker, the whole shader's with the
     // same states meanwhile (PipelineFor's way).
     if (async_pipelines_ && (key >> kFeatureShift)) {
-        const VkPipeline stand_in = BakedPipelineFor(key & ((1u << kFeatureShift) - 1), baked);
+        const VkPipeline stand_in = BakedPipelineFor(key & (((1u << kFeatureShift) - 1) | kMeshKeys), baked);
         if (stand_in) {
             if (pipelines_asked_.insert(id).second) AskWorker(id, true);
             return stand_in;
@@ -2683,7 +2700,7 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key, std::uint32_t baked
     VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                                  {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = key & kMeshVertices ? mesh_vert_ : vert_;
+    stages[0].module = (key & kMeshCharactersKey) ? mesh_chars_vert_ : (key & kMeshVertices) ? mesh_vert_ : vert_;
     if (!stages[0].module) return VK_NULL_HANDLE;       // (a mesh's, on a device without shaderCullDistance)
     stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -2709,7 +2726,7 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key, std::uint32_t baked
     input.pVertexBindingDescriptions = bindings;
     input.vertexAttributeDescriptionCount = 6;
     input.pVertexAttributeDescriptions = attributes;
-    if (key & kMeshVertices) {
+    if (key & kMeshKeys) {
         // (its vertices read from the mesh by index)
         input.vertexBindingDescriptionCount = 0;
         input.vertexAttributeDescriptionCount = 0;
@@ -3276,7 +3293,7 @@ void VulkanGsRenderer::ReleaseTexture(std::uint64_t key) {
 
 void VulkanGsRenderer::UploadMesh(std::uint64_t key, const void* quads, std::size_t quad_count,
                                   const std::uint32_t* indices, std::size_t index_count) {
-    if (!DrawsMeshes() || !quad_count || !index_count) return;
+    if (!DrawsMeshes() || !quad_count) return;
     ReleaseMesh(key);
     Mesh mesh;
     void* at = nullptr;
@@ -3285,11 +3302,13 @@ void VulkanGsRenderer::UploadMesh(std::uint64_t key, const void* quads, std::siz
         return;
     }
     std::memcpy(at, quads, quad_count * 16);
-    if (!Buffer(index_count * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &mesh.indices, &mesh.index_memory, &at)) {
-        RetireMesh(mesh);
-        return;
+    if (index_count) {
+        if (!Buffer(index_count * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &mesh.indices, &mesh.index_memory, &at)) {
+            RetireMesh(mesh);
+            return;
+        }
+        std::memcpy(at, indices, index_count * 4);
     }
-    std::memcpy(at, indices, index_count * 4);
     mesh.index_count = std::uint32_t(index_count);
     meshes_[key] = std::move(mesh);
 }
@@ -3310,6 +3329,8 @@ void VulkanGsRenderer::RetireMesh(Mesh mesh) {
     g_.AfterSubmit([device, pool, mesh]() mutable {
         for (auto& [chunk, set] : mesh.sets)
             if (set) vkFreeDescriptorSets(device, pool, 1, &set);
+        for (auto& [chunk, set] : mesh.large_sets)
+            if (set) vkFreeDescriptorSets(device, pool, 1, &set);
         if (mesh.vertices) vkDestroyBuffer(device, mesh.vertices, nullptr);
         if (mesh.indices) vkDestroyBuffer(device, mesh.indices, nullptr);
         if (mesh.vertex_memory) vkFreeMemory(device, mesh.vertex_memory, nullptr);
@@ -3317,20 +3338,26 @@ void VulkanGsRenderer::RetireMesh(Mesh mesh) {
     });
 }
 
-void VulkanGsRenderer::DrawMesh(const GsDrawState& state, std::uint64_t key, const float* header) {
+void VulkanGsRenderer::DrawMeshWith(const GsDrawState& state, std::uint64_t key, const MeshCall& call) {
     auto found = meshes_.find(key);
-    if (found == meshes_.end() || !DrawsMeshes()) return;
+    if (found == meshes_.end() || !DrawsMeshes() || !call.header) return;
+    if (call.program == kMeshCharacters && !mesh_chars_vert_) return;
     Mesh& mesh = found->second;
     RecordShuffle();
     Flush();                            // (what was drawn before it, first)
-    // The header into the vertex ring (as a storage buffer), set 3 for its chunk.
+    // The header into the vertex ring (as a storage buffer), set 3 for its chunk: the room's 512 bytes, the
+    // characters' kMeshHeaderMost floats' worth (the descriptor's range; what is written, the header's own).
+    const bool large = call.program == kMeshCharacters;
+    const VkDeviceSize range = large ? kMeshHeaderMost * 4 : kMeshHeaderFloats * 4;
+    const std::size_t floats = std::min<std::size_t>(call.header_floats, range / 4);
     VkBuffer chunk = VK_NULL_HANDLE;
     VkDeviceSize offset = 0;
-    void* at = Vertices(kMeshHeaderFloats * 4, &chunk, &offset);
+    void* at = Vertices(range, &chunk, &offset);
     if (!at) return;
-    std::memcpy(at, header, kMeshHeaderFloats * 4);
+    std::memcpy(at, call.header, floats * 4);
+    auto& sets = large ? mesh.large_sets : mesh.sets;
     VkDescriptorSet set = VK_NULL_HANDLE;
-    for (const auto& [buffer, s] : mesh.sets)
+    for (const auto& [buffer, s] : sets)
         if (buffer == chunk) set = s;
     if (!set) {
         VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -3339,7 +3366,7 @@ void VulkanGsRenderer::DrawMesh(const GsDrawState& state, std::uint64_t key, con
         ai.pSetLayouts = &mesh_set_layout_;
         if (vkAllocateDescriptorSets(g_.device, &ai, &set) != VK_SUCCESS) return;
         const VkDescriptorBufferInfo vertices{mesh.vertices, 0, VK_WHOLE_SIZE};
-        const VkDescriptorBufferInfo head{chunk, 0, kMeshHeaderFloats * 4};
+        const VkDescriptorBufferInfo head{chunk, 0, range};
         VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
         writes[0].dstSet = set;
         writes[0].dstBinding = 0;
@@ -3351,13 +3378,23 @@ void VulkanGsRenderer::DrawMesh(const GsDrawState& state, std::uint64_t key, con
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
         writes[1].pBufferInfo = &head;
         vkUpdateDescriptorSets(g_.device, 2, writes, 0, nullptr);
-        mesh.sets.emplace_back(chunk, set);
+        sets.emplace_back(chunk, set);
+    }
+    MeshDraw draw{&mesh, set, std::uint32_t(offset), call.program};
+    if (call.indices) {
+        if (!call.index_count) return;
+        void* idx = Vertices(call.index_count * 4, &draw.indices, &draw.index_offset);
+        if (!idx) return;
+        std::memcpy(idx, call.indices, call.index_count * 4);
+        draw.index_count = std::uint32_t(call.index_count);
+    } else if (!mesh.index_count) {
+        return;
     }
     // One batch of its own, through Flush (its target, pass, states as a batch of triangles'). What it
     // reads of its own target (feedback, the shader's blending): all of it - its place is the GPU's.
     state_ = state;
     read_all_ = true;
-    mesh_draw_ = MeshDraw{&mesh, set, std::uint32_t(offset)};
+    mesh_draw_ = draw;
     Flush();
     mesh_draw_ = MeshDraw{};
 }
@@ -3947,7 +3984,8 @@ void VulkanGsRenderer::Flush() {
     if ((state_.tag & 4u) && !ShaderBlend(state_) && SceneDepthSet())
         params.blend_ops |= 1u << 21;                           // gs.frag: a soft particle
     params.blend_ops |= std::uint32_t(Blender16(state_)) << 17;     // gs.frag: S for the blender
-    const std::uint32_t count = mesh ? mesh->index_count : std::uint32_t(pending_.size());
+    const std::uint32_t count = !mesh ? std::uint32_t(pending_.size())
+                                : mesh_draw_.indices ? mesh_draw_.index_count : mesh->index_count;
     static int complaints = 0;
     if (!set && complaints < 5) {
         ++complaints;
@@ -4135,7 +4173,10 @@ void VulkanGsRenderer::Flush() {
                 d.vertices = d.ranges = VK_NULL_HANDLE;
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 3, 1, &mesh_draw_.set, 1,
                                         &mesh_draw_.offset);
-                vkCmdBindIndexBuffer(cmd, mesh->indices, 0, VK_INDEX_TYPE_UINT32);
+                if (mesh_draw_.indices)
+                    vkCmdBindIndexBuffer(cmd, mesh_draw_.indices, mesh_draw_.index_offset, VK_INDEX_TYPE_UINT32);
+                else
+                    vkCmdBindIndexBuffer(cmd, mesh->indices, 0, VK_INDEX_TYPE_UINT32);
             } else if (!own_ranges) {
                 if (d.vertices != vertex_buffer || d.ranges != range_buffer) {
                     d.vertices = vertex_buffer;
@@ -4185,7 +4226,7 @@ void VulkanGsRenderer::Flush() {
                         static const bool whole = std::getenv("PS2HOST_GPU_UBERSHADER") != nullptr;
                         const std::uint32_t full_key =
                             (whole ? op_key : op_key | ((~Features(params) & kFeatureBits) << kFeatureShift)) |
-                            (mesh ? kMeshVertices : 0u);
+                            (!mesh ? 0u : mesh_draw_.program == kMeshCharacters ? kMeshCharactersKey : kMeshVertices);
                         const int depth_write = pass.depth_write && op != 1 ? 1 : 0;
                         const VkPipeline chosen =
                             baked ? BakedPipelineFor(full_key, Baked(depth_test, depth_write, compare, stencil_test, own_ranges))
@@ -4411,15 +4452,16 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (clut_set_layout_) vkDestroyDescriptorSetLayout(g_.device, clut_set_layout_, nullptr);
     if (mesh_set_layout_) vkDestroyDescriptorSetLayout(g_.device, mesh_set_layout_, nullptr);
     for (auto& [key, mesh] : meshes_) {
-        vkDestroyBuffer(g_.device, mesh.vertices, nullptr);
-        vkDestroyBuffer(g_.device, mesh.indices, nullptr);
-        vkFreeMemory(g_.device, mesh.vertex_memory, nullptr);
-        vkFreeMemory(g_.device, mesh.index_memory, nullptr);
+        if (mesh.vertices) vkDestroyBuffer(g_.device, mesh.vertices, nullptr);
+        if (mesh.indices) vkDestroyBuffer(g_.device, mesh.indices, nullptr);
+        if (mesh.vertex_memory) vkFreeMemory(g_.device, mesh.vertex_memory, nullptr);
+        if (mesh.index_memory) vkFreeMemory(g_.device, mesh.index_memory, nullptr);
     }
     if (mesh_pool_) vkDestroyDescriptorPool(g_.device, mesh_pool_, nullptr);
     if (layout_) vkDestroyPipelineLayout(g_.device, layout_, nullptr);
     if (vert_) vkDestroyShaderModule(g_.device, vert_, nullptr);
     if (mesh_vert_) vkDestroyShaderModule(g_.device, mesh_vert_, nullptr);
+    if (mesh_chars_vert_) vkDestroyShaderModule(g_.device, mesh_chars_vert_, nullptr);
     if (frag_) vkDestroyShaderModule(g_.device, frag_, nullptr);
     if (frag_blend_) vkDestroyShaderModule(g_.device, frag_blend_, nullptr);
     if (swizzle_pipeline_) vkDestroyPipeline(g_.device, swizzle_pipeline_, nullptr);

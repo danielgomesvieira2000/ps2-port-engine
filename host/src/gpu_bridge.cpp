@@ -1370,8 +1370,36 @@ constexpr u32 kNativeHeaderWords = 124, kNativeHead = 5 + kNativeHeaderWords;
 
 /* The mesh drawn in `state` (OnDraw's), its places moved as OnDraw moves a
    primitive's (x_offset, y_offset: XYOFFSET less them). */
+/* The characters' payload (flag 0x100): [0] flags, [1-2] the key, [3-4] the tag's PRIM, [5] the header's
+   quadwords H (gs_mesh_chars.vert's: vf00-vf21, rows 11-13, misc - the bridge's XYOFFSET in its x and y -,
+   the matrices' rows), [6] this draw's indices N, the header (4H words), the indices; with 1: the vertices'
+   quadwords Q, the vertices (five quadwords each). */
+bool NativeCharacters(Bridge& s, const ps2gpu::GsDrawState& state, u32 x_offset, u32 y_offset) {
+    const NativeDraw& n = *g_native;
+    if (n.count < 7) return false;
+    const u64 key = u64(n.words[1]) | u64(n.words[2]) << 32;
+    const u32 quads = n.words[5], indices = n.words[6];
+    if (n.count < 7 + quads * 4 + indices || quads * 4 > ps2gpu::GsRenderer::kMeshHeaderMost) return false;
+    if (!g_meshes.count(key) || !s.renderer->MeshDrawable(state)) return false;
+    static std::vector<float> header;
+    header.resize(std::size_t(quads) * 4);
+    std::memcpy(header.data(), n.words + 7, header.size() * 4);
+    header[25 * 4 + 0] = float(n.ofx) - 16.0f * float(x_offset);
+    header[25 * 4 + 1] = float(n.ofy) - 16.0f * float(y_offset);
+    ps2gpu::GsRenderer::MeshCall mc;
+    mc.program = ps2gpu::GsRenderer::kMeshCharacters;
+    mc.header = header.data();
+    mc.header_floats = header.size();
+    mc.indices = n.words + 7 + quads * 4;
+    mc.index_count = indices;
+    ++g_draws;
+    s.renderer->DrawMeshWith(state, key, mc);
+    return true;
+}
+
 bool NativeMesh(Bridge& s, const ps2gpu::GsDrawState& state, u32 x_offset, u32 y_offset, const gs::Context& c) {
     const NativeDraw& n = *g_native;
+    if (n.words[0] & 0x100) return NativeCharacters(s, state, x_offset, y_offset);
     const u64 key = u64(n.words[1]) | u64(n.words[2]) << 32;
     if (!g_meshes.count(key) || !s.renderer->MeshDrawable(state)) return false;
     float header[ps2gpu::GsRenderer::kMeshHeaderFloats] = {};
@@ -2433,14 +2461,36 @@ void VerifyEnd() {
    marked drawn - its renderer call the mesh's. False: not drawn (the packet's). */
 bool OnNative(const gs::Gs::NativeCall& call) {
     Bridge& s = *g_bridge;
-    if (!s.primary || call.count < kNativeHead) return false;
+    if (!s.primary || call.count < 7) return false;
     const u32 flags = call.words[0];
     const u64 key = u64(call.words[1]) | u64(call.words[2]) << 32;
     if (flags & 2) {
-        for (u64 k : g_meshes) s.renderer->ReleaseMesh(k);
-        g_meshes.clear();
+        // (every mesh of the payload's kind: the room's, or the characters')
+        const bool chars = (flags & 0x100) != 0;
+        for (auto it = g_meshes.begin(); it != g_meshes.end();) {
+            if (((*it >> 63) != 0) == chars) {
+                s.renderer->ReleaseMesh(*it);
+                it = g_meshes.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
-    if ((flags & 1) && call.count >= kNativeHead + 2) {
+    if (flags & 0x100) {
+        // The characters': their vertices uploaded (no indices of their own: each draw's).
+        const u32 quads = call.words[5], indices = call.words[6];
+        const u32 at = 7 + quads * 4 + indices;
+        if ((flags & 1) && call.count >= at + 1 && !g_meshes.count(key)) {
+            const u32 vertices = call.words[at];
+            if (call.count >= at + 1 + vertices * 4) {
+                s.renderer->UploadMesh(key, call.words + at + 1, vertices, nullptr, 0);
+                g_meshes.insert(key);
+            }
+        }
+    } else if (call.count < kNativeHead) {
+        return false;
+    }
+    if ((flags & 1) && !(flags & 0x100) && call.count >= kNativeHead + 2) {
         const u32 quads = call.words[kNativeHead], indices = call.words[kNativeHead + 1];
         if (call.count >= kNativeHead + 2 + quads * 4 + indices && !g_meshes.count(key)) {
             const u32* at = call.words + kNativeHead + 2;
@@ -2461,14 +2511,14 @@ bool OnNative(const gs::Gs::NativeCall& call) {
     {
         // (the CPU's copy of the mesh, for a draw declined with no packet after it, and the check)
         NativeVerify& nv = TheVerify();
-        if (flags & 2) nv.meshes.clear();
-        if ((flags & 1) && call.count >= kNativeHead + 2) {
+        if ((flags & 2) && !(flags & 0x100)) nv.meshes.clear();
+        if ((flags & 1) && !(flags & 0x100) && call.count >= kNativeHead + 2) {
             const u32 quads = call.words[kNativeHead], indices = call.words[kNativeHead + 1];
             if (call.count >= kNativeHead + 2 + quads * 4 + indices)
                 nv.meshes[key].assign(call.words + kNativeHead, call.words + kNativeHead + 2 + quads * 4 + indices);
         }
     }
-    if (g_native_verify) {
+    if (g_native_verify && !(flags & 0x100)) {
         // (the VU's rounding: toward zero)
         const unsigned mode = _MM_GET_ROUNDING_MODE();
         _MM_SET_ROUNDING_MODE(_MM_ROUND_TOWARD_ZERO);

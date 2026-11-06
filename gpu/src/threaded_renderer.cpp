@@ -126,6 +126,19 @@ public:
         Put(&key, 8);
         End();
     }
+    void DrawMeshWith(const GsDrawState& state, std::uint64_t key, const MeshCall& call) override {
+        Track(state);
+        std::memcpy(&last_, &state, sizeof state);
+        has_last_ = true;
+        const std::uint32_t head[3] = {call.program, std::uint32_t(call.header_floats), std::uint32_t(call.index_count)};
+        Op(kDrawMeshWith, sizeof state + 8 + sizeof head + call.header_floats * 4 + call.index_count * 4);
+        Put(&state, sizeof state);
+        Put(&key, 8);
+        Put(head, sizeof head);
+        Put(call.header, call.header_floats * 4);
+        Put(call.indices, call.index_count * 4);
+        End();
+    }
     void DrawMesh(const GsDrawState& state, std::uint64_t key, const float* header) override {
         Track(state);
         // (the state the next DrawTrianglesAgain's is compared with, here and on the renderer's thread)
@@ -442,7 +455,7 @@ private:
         kReleaseTexture, kMemoryWrite, kMemoryPatch, kTargetFromMemory, kDepthFromMemory, kTextureFromMemory,
         kClutFromMemory, kClutRows, kReloadKeepsColour, kTargetRowsFromMemory, kDepthRowsFromMemory,
         kTargetToMemory, kDepthToMemory, kChannelShuffle, kRunEffect, kUploadReplacement,
-        kUploadMesh, kReleaseMesh, kDrawMesh,
+        kUploadMesh, kReleaseMesh, kDrawMesh, kDrawMeshWith,
     };
     // The images a draw makes (VulkanGsRenderer::Flush): its target, and its
     // depth buffer as large as the target was made.
@@ -623,6 +636,22 @@ private:
                     break;
                 }
                 case kReleaseMesh: r.ReleaseMesh(Take<std::uint64_t>(at)); break;
+                case kDrawMeshWith: {
+                    std::memcpy(&played_, at, sizeof played_), at += sizeof played_;
+                    const auto key = Take<std::uint64_t>(at);
+                    MeshCall c;
+                    c.program = Take<std::uint32_t>(at);
+                    c.header_floats = Take<std::uint32_t>(at);
+                    c.index_count = Take<std::uint32_t>(at);
+                    mesh_header_.resize(c.header_floats);
+                    std::memcpy(mesh_header_.data(), at, c.header_floats * 4);
+                    indices_.resize(c.index_count);
+                    std::memcpy(indices_.data(), at + c.header_floats * 4, c.index_count * 4);
+                    c.header = mesh_header_.data();
+                    c.indices = c.index_count ? indices_.data() : nullptr;
+                    r.DrawMeshWith(played_, key, c);
+                    break;
+                }
                 case kDrawMesh: {
                     std::memcpy(&played_, at, sizeof played_), at += sizeof played_;
                     const auto key = Take<std::uint64_t>(at);
@@ -744,7 +773,8 @@ private:
     // The renderer's thread.
     GsDrawState played_;
     std::vector<GsVertex> vertices_;
-    std::vector<std::uint32_t> indices_;     // (kUploadMesh's, aligned)
+    std::vector<std::uint32_t> indices_;     // (kUploadMesh's, kDrawMeshWith's, aligned)
+    std::vector<float> mesh_header_;         // (kDrawMeshWith's)
     std::vector<std::uint32_t> words_;
     std::uint32_t clut_[256] = {};
     std::thread thread_;
