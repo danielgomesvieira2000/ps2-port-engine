@@ -3303,6 +3303,9 @@ void ApplyGraphicsEnhancements() {
     u32 samples = msaa == "2x" ? 2 : msaa == "4x" ? 4 : msaa == "8x" ? 8 : 1;
     if (const char* forced = std::getenv("PS2HOST_MSAA")) samples = u32(std::max(1, std::atoi(forced)));
     ps2gpu::SetGpuMsaa(samples);
+    // SHADOWS (the setting "shadows"; PS2HOST_SHADOWS=1 a test's): the native characters' shadows on the room
+    const char* shadows = std::getenv("PS2HOST_SHADOWS");
+    ps2gpu::SetGpuShadows(shadows ? std::atoi(shadows) != 0 : SettingOn("shadows", false));
 }
 
 u32 NativeEnhancements() {

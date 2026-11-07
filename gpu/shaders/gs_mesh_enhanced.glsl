@@ -16,6 +16,7 @@ layout(location = 6) out vec4 lit_colour;    // the room's vertex colour (its li
 layout(location = 7) out float lit_on;       // 1: lit per pixel (0 at a vertex whose inputs are not known)
 layout(location = 8) flat out uint lit_program;     // 0 the room's lights, 1 the characters'
 layout(location = 9) flat out vec3 lit_eye;         // the camera, where lit_place is (a highlight's view)
+layout(location = 10) out vec3 lit_view;            // the place in the view's space (SHADOWS: gs_shadow.glsl)
 
 // The camera where a place is, from the place's matrix to the screen's (`r0`-`r3`: the rows multiplying x, y, z
 // and 1): the point whose x, y and w come out 0.

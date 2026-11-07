@@ -443,8 +443,30 @@ layout(location = 6) in vec4 lit_colour;
 layout(location = 7) in float lit_on;
 layout(location = 8) flat in uint lit_program;
 layout(location = 9) flat in vec3 lit_eye;
+layout(location = 10) in vec3 lit_view;
+layout(set = 1, binding = 1) uniform sampler2D shadow_map;
+#include "gs_shadow.glsl"
 
 vec4 H(int i) { return mesh_header.h[i]; }
+
+// How much of the light a characters' shadow takes from the room at the view's place `v` (0 none): the
+// shadow image's depths around it (3x3, a soft edge) against its own, faded out at the image's edges.
+float Shadowed(vec3 v) {
+    if (shadow.light.w < 0.5 || v == vec3(0.0)) return 0.0;
+    const vec4 lc = shadow.light_clip * vec4(v, 1.0);
+    if (lc.w <= 0.0) return 0.0;
+    const vec3 q = lc.xyz / lc.w;
+    const vec2 uv = q.xy * 0.5 + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))) || q.z <= 0.0 || q.z >= 1.0) return 0.0;
+    float dark = 0.0;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) {
+            const float d = texture(shadow_map, uv + vec2(x, y) * shadow.tuning.z).r;
+            dark += q.z - shadow.tuning.y > d ? 1.0 : 0.0;
+        }
+    const vec2 edge = min(uv, 1.0 - uv);
+    return dark / 9.0 * smoothstep(0.0, 0.08, min(edge.x, edge.y));
+}
 
 // A texture pack's surface detail (blend_ops bit 27: set 2 its replacement's _n image - texture_pack.h): the
 // normal's RGB in the texture's own space, its shine in alpha. The texture's axes from the screen's change in
@@ -499,6 +521,7 @@ vec4 LitShade(vec4 vertex_shade) {
             c += H(26).rgb * (shine * pow(max(dot(normalize(n), half_way), 0.0), 8.0 + 56.0 * shine)) * atten;
         }
         c = min(c, vec3(128.0)) * H(1).rgb;
+        c *= 1.0 - shadow.tuning.x * Shadowed(lit_view);
     } else {
         // the characters' (vf00-vf21): x a direction, y and z points, each over its distance
         vec3 lx = vec3(H(11).x, H(11).y - p.x, H(11).z - p.x);

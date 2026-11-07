@@ -780,6 +780,17 @@ std::vector<PortOption> EnhancedGraphicsOptions(const std::string& page) {
         ApplyGraphicsEnhancements();
     };
     options.push_back(msaa);
+    PortOption shadows;
+    shadows.page = page;
+    shadows.name = "SHADOWS";
+    shadows.help = "Experimental: people cast shadows from their light onto the room (NATIVE RENDERER)";
+    shadows.values = {"OFF", "ON"};
+    shadows.now = [] { return SettingOn("shadows", false) ? 1 : 0; };
+    shadows.set = [](int i) {
+        SetSettingOn("shadows", i == 1);
+        ApplyGraphicsEnhancements();
+    };
+    options.push_back(shadows);
     return options;
 }
 

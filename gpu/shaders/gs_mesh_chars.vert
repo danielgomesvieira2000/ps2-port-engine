@@ -37,7 +37,9 @@ layout(push_constant) uniform Target {
 
 #include "gs_depth.glsl"
 #include "gs_mesh_common.glsl"
-#ifdef ENHANCED
+#ifdef SHADOW
+#include "gs_shadow.glsl"
+#elif defined(ENHANCED)
 #include "gs_mesh_enhanced.glsl"
 uint Enhancements() { return floatBitsToUint(header.ext[0].y); }
 #endif
@@ -55,6 +57,18 @@ layout(location = 3) flat out vec4 range_out;
 vec4 Row(uint address) { return header.row[address - (floatBitsToUint(header.misc.z) & 0xFFFFu)]; }
 
 void main() {
+#ifdef SHADOW
+    if (gl_VertexIndex < 2) {
+        // (a kept vertex: its place if the game sent it - the header's ext - else nowhere: its triangle not cast)
+        const vec4 ext0 = header.ext[0];
+        if (((floatBitsToUint(ext0.x) >> gl_VertexIndex) & 1u) != 0u) {
+            gl_Position = shadow.light_clip * vec4(header.ext[1 + 5 * gl_VertexIndex + 2].xyz, 1.0);
+        } else {
+            gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
+        }
+        return;
+    }
+#else
     if (gl_VertexIndex < 2) {
         // A kept vertex: as its packet has it.
         const int i = gl_VertexIndex * 3;
@@ -74,6 +88,7 @@ void main() {
         lit_normal = vec3(0.0);
         lit_colour = vec4(0.0);
         lit_eye = EyeOf(header.vf[1], header.vf[2], header.vf[3], header.vf[4]);
+        lit_view = vec3(0.0);
         if (((floatBitsToUint(header.ext[0].x) >> gl_VertexIndex) & 1u) != 0u) {
             const int e = 1 + 5 * gl_VertexIndex;
             gl_Position = ClipPlace(header.ext[e + 1], header.misc.xy, target.size, position,
@@ -85,6 +100,7 @@ void main() {
 #endif
         return;
     }
+#endif
     const uint at = uint(gl_VertexIndex) * 5u;
     const vec4 pos = mesh.quad[at];
     const vec4 nrm = mesh.quad[at + 1u];
@@ -118,6 +134,10 @@ void main() {
         const float r = Rsqrt(Add(Add(Mul(n.x, n.x), Mul(n.y, n.y)), Mul(n.z, n.z)));
         n = vec3(Mul(n.x, r), Mul(n.y, r), Mul(n.z, r));
     }
+#ifdef SHADOW
+    gl_Position = shadow.light_clip * vec4(p.xyz, 1.0);
+    return;
+#endif
     // the view (vf01-vf04)
     vec4 cp;
     for (int l = 0; l < 4; ++l)
@@ -184,5 +204,6 @@ void main() {
     lit_on = (Enhancements() & kLitPixels) != 0u ? 1.0 : 0.0;
     lit_program = 1u;
     lit_eye = EyeOf(header.vf[1], header.vf[2], header.vf[3], header.vf[4]);
+    lit_view = p.xyz;
 #endif
 }

@@ -45,6 +45,10 @@ constexpr std::uint32_t kMeshLitPixels = 1, kMeshPrecise = 2;
    thread; the renderer takes it at its next frame. */
 void SetGpuMsaa(std::uint32_t samples);
 std::uint32_t GpuMsaa();
+/* SHADOWS: the native characters' meshes cast shadows from their first point light onto the native room (the
+   enhanced draws: gs_shadow.glsl) - a depth image drawn from the light each picture, read the next. */
+void SetGpuShadows(bool on);
+bool GpuShadows();
 void SetMeshEnhancements(std::uint32_t bits);
 std::uint32_t MeshEnhancements();
 /* Called on the renderer's own thread (a threaded renderer's) as it starts:
