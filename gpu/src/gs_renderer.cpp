@@ -4172,7 +4172,8 @@ void VulkanGsRenderer::DrawMeshWith(const GsDrawState& state, std::uint64_t key,
     Flush();                            // (what was drawn before it, first)
     // The header into the vertex ring (as a storage buffer), set 3 for its chunk: the room's 512 bytes, the
     // characters' kMeshHeaderMost floats' worth (the descriptor's range; what is written, the header's own).
-    const bool large = call.program == kMeshCharacters;     // (RenderWare's headers fit the room's range)
+    // (RenderWare's headers fit the room's range - but a skinned batch's, with its palette)
+    const bool large = call.program == kMeshCharacters || (call.program == kMeshRenderWare && call.header_floats > kMeshHeaderFloats);
     const VkDeviceSize range = large ? kMeshHeaderMost * 4 : kMeshHeaderFloats * 4;
     const std::size_t floats = std::min<std::size_t>(call.header_floats, range / 4);
     VkBuffer chunk = VK_NULL_HANDLE;

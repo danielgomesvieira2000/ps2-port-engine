@@ -54,6 +54,8 @@ constexpr int kRwHeaderQuads = 23;
 // The mode (misc.z)
 constexpr u32 kRwEnvStream = 1;     // the env pass: the sphere map's coordinates, 1012's colour
 constexpr u32 kRwGuardPlace = 2;    // T4: the place through G, then the guard band's scale
+constexpr u32 kRwSkin = 4;          // 1013.z: two bones a vertex (the palette from 974: misc.w its first quadword's
+                                    // address, the header's quadwords from kRwHeaderQuads its rows)
 
 inline float F(u32 b) { float f; std::memcpy(&f, &b, 4); return f; }
 inline u32 B(float f) { u32 b; std::memcpy(&b, &f, 4); return b; }
@@ -74,6 +76,7 @@ inline u32 Ftoi(float y) {
     return u32(std::int32_t(y));
 }
 inline float Itof12(u32 i) { return float(std::int32_t(i)) / 4096.0f; }
+inline float Itof0Rz(u32 i) { return float(std::int32_t(i)); }     // (under the VU's rounding: toward zero)
 // MAX's order: the bits as sign and magnitude
 inline float Max(float a, float b) {
     auto order = [](float f) { const u32 b = B(f); const std::int32_t m = std::int32_t(b & 0x7FFFFFFFu); return (b >> 31) ? -m : m; };
@@ -136,18 +139,54 @@ inline u32 JudgeT2(const float* h, const float* clip) {
     return Judge(gx, gy, gz, gw);
 }
 
+/* The skinning (1013.z): vertex j's two bones (palette rows at 974 + its words, q1 of 4g+1 and 4g+3, lane j
+   mod 4: their weights /65535 too), blended with the identity by what is left, its place and decoded normal
+   through them. `row(address)` a palette row (an address mod 1024). */
+template <class Row>
+inline void CarsSkin(const u32* mesh, u32 j, float bias, Row row, float* p, float* n) {
+    const u32 g = j / 4, lane = j % 4;
+    const u32 wa = mesh[12 * (4 * g + 1) + 4 + lane], wb = mesh[12 * (4 * g + 3) + 4 + lane];
+    const float q = Recip(65535.0f);
+    const float a = Mul(Itof0Rz(wa), q), b = Mul(Itof0Rz(wb), q);
+    const float w0 = Sub(Sub(Mul(1.0f, 1.0f), Mul(a, 1.0f)), Mul(b, 1.0f));
+    const u32 ba = (974 + (wa & 0xFFFF)) & 0x3FF, bb = (974 + (wb & 0xFFFF)) & 0x3FF;
+    float R[4][3];
+    for (int r = 0; r < 4; ++r) {
+        const float* A = row(ba + r), *Bm = row(bb + r);
+        for (int l = 0; l < 3; ++l) {
+            if (r < 3) R[r][l] = Madd(Madd(Mul(A[l], a), r == l ? 1.0f : 0.0f, w0), Bm[l], b);
+            else R[r][l] = Madd(Mul(A[l], a), Bm[l], b);
+        }
+    }
+    const u32* q0 = mesh + 12 * j;
+    const u32* q2 = q0 + 8;
+    const float P[3] = {F(q0[0]), F(q0[1]), F(q0[2])};
+    const float N[3] = {Sub(F(q2[0]), bias), Sub(F(q2[1]), bias), Sub(F(q2[2]), bias)};
+    for (int l = 0; l < 3; ++l) {
+        p[l] = Madd(Madd(Madd(Mul(R[0][l], P[0]), R[1][l], P[1]), R[2][l], P[2]), R[3][l], 1.0f);
+        n[l] = Madd(Madd(Mul(R[0][l], N[0]), R[1][l], N[1]), R[2][l], N[2]);
+    }
+}
+
 /* Vertex j of a car batch (the mesh's quadwords as words), for the header's stream. */
 inline void CarsVertex(const float* h, const u32* mesh, u32 j, GsVertex* o) {
     u32 mode;
     std::memcpy(&mode, Q(h, kRwMisc) + 2, 4);
     const u32* q0 = mesh + 12 * j;
     const u32* q2 = q0 + 8;
-    const float p[3] = {F(q0[0]), F(q0[1]), F(q0[2])};
+    float p[3] = {F(q0[0]), F(q0[1]), F(q0[2])};
     const u32 g = j / 4, lane = j % 4;
     // (s, t): lane 0 q1(4g).xy, 1 q1(4g+2).xy, 2 q1(4g).zw, 3 q1(4g+2).zw
     const u32* st = mesh + 12 * (4 * g + ((lane & 1) ? 2 : 0)) + 4 + ((lane & 2) ? 2 : 0);
     const float* L = Q(h, kRwL);
-    const float X = Sub(F(q2[0]), L[3]), Y = Sub(F(q2[1]), L[3]), Z = Sub(F(q2[2]), L[3]);
+    float X = Sub(F(q2[0]), L[3]), Y = Sub(F(q2[1]), L[3]), Z = Sub(F(q2[2]), L[3]);
+    if (mode & kRwSkin) {
+        u32 first;
+        std::memcpy(&first, Q(h, kRwMisc) + 3, 4);
+        float n[3];
+        CarsSkin(mesh, j, L[3], [&](u32 a) { return Q(h, kRwHeaderQuads + int((a - first) & 0x3FF)); }, p, n);
+        X = n[0], Y = n[1], Z = n[2];
+    }
     // the place, and Q
     float clip[4], q;
     if (mode & kRwGuardPlace) {

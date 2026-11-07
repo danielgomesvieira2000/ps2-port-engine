@@ -34,7 +34,13 @@ layout(location = 3) flat out vec4 range_out;
 
 // (rw_native.h's kRw*)
 const int kMisc = 0, kC = 1, kO = 5, kM = 6, kL = 10, kR = 11, kC0 = 14, kC1 = 15, kEnv = 16, kGuard = 17, kG = 19;
-const uint kEnvStream = 1u, kGuardPlace = 2u;
+const uint kEnvStream = 1u, kGuardPlace = 2u, kSkin = 4u;
+const int kHeaderQuads = 23;        // (rw_native.h's kRwHeaderQuads: the skinning's palette rows after it)
+
+vec4 PaletteRow(uint address) {
+    const uint first = floatBitsToUint(header.q[0].w);
+    return header.q[kHeaderQuads + int((address - first) & 0x3FFu)];
+}
 
 float Madd(float acc, float a, float b) { return Add(acc, Mul(a, b)); }
 float Msub(float acc, float a, float b) { return Sub(acc, Mul(a, b)); }
@@ -219,12 +225,33 @@ void Cars(uint mode) {
     const uint j = uint(gl_VertexIndex);
     const uvec4 q0 = mesh.quad[3u * j];
     const uvec4 q2 = mesh.quad[3u * j + 2u];
-    const vec3 p = uintBitsToFloat(q0.xyz);
+    vec3 p = uintBitsToFloat(q0.xyz);
     const uint g = j / 4u, lane = j % 4u;
     const uvec4 q1 = mesh.quad[3u * (4u * g + ((lane & 1u) != 0u ? 2u : 0u)) + 1u];
     const uvec2 st = (lane & 2u) != 0u ? q1.zw : q1.xy;
     const vec4 L = header.q[kL];
-    const vec3 n = vec3(Sub(uintBitsToFloat(q2.x), L.w), Sub(uintBitsToFloat(q2.y), L.w), Sub(uintBitsToFloat(q2.z), L.w));
+    vec3 n = vec3(Sub(uintBitsToFloat(q2.x), L.w), Sub(uintBitsToFloat(q2.y), L.w), Sub(uintBitsToFloat(q2.z), L.w));
+    if ((mode & kSkin) != 0u) {
+        // two bones a vertex (rw_native.h's CarsSkin): weights /65535, the identity by what is left
+        const uint wa = mesh.quad[3u * (4u * g + 1u) + 1u][lane], wb = mesh.quad[3u * (4u * g + 3u) + 1u][lane];
+        const float q = Recip(65535.0);
+        const float a = Mul(ItofTZ(int(wa)), q), b = Mul(ItofTZ(int(wb)), q);
+        const float w0 = Sub(Sub(Mul(1.0, 1.0), Mul(a, 1.0)), Mul(b, 1.0));
+        const uint ba = (974u + (wa & 0xFFFFu)) & 0x3FFu, bb = (974u + (wb & 0xFFFFu)) & 0x3FFu;
+        vec3 R[4];
+        for (uint r = 0u; r < 4u; ++r) {
+            const vec4 A = PaletteRow(ba + r), Bm = PaletteRow(bb + r);
+            for (int l = 0; l < 3; ++l) {
+                if (r < 3u) R[r][l] = Madd(Madd(Mul(A[l], a), uint(l) == r ? 1.0 : 0.0, w0), Bm[l], b);
+                else R[r][l] = Madd(Mul(A[l], a), Bm[l], b);
+            }
+        }
+        const vec3 P = p, N = n;
+        for (int l = 0; l < 3; ++l) {
+            p[l] = Madd(Madd(Madd(Mul(R[0][l], P.x), R[1][l], P.y), R[2][l], P.z), R[3][l], 1.0);
+            n[l] = Madd(Madd(Mul(R[0][l], N.x), R[1][l], N.y), R[2][l], N.z);
+        }
+    }
     // the place, and Q
     vec4 clip;
     float q;
