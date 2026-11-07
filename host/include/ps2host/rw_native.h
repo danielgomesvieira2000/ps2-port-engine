@@ -368,6 +368,30 @@ inline void WorldClip(const float* h, const float* p, float* c) {
 // ITOF0 under the VU's rounding (toward zero)
 inline float Itof0(u32 i) { return float(std::int32_t(i)); }
 
+/* 1332's alpha of vertex v (its lighting pre-pass): the reflected light's cosine to the eye, raised to the
+   power e by the float's bits, times the mask; 0 with kRwWAlphaZero. */
+inline u32 WorldAlpha(const float* h, const u32* mesh, u32 v) {
+    if (Mode(h) & kRwWAlphaZero) return 0;
+    const u32* q0 = mesh + 12 * v;
+    const float p[3] = {F(q0[0]), F(q0[1]), F(q0[2])};
+    u32 first;
+    std::memcpy(&first, Q(h, kRwMisc) + 3, 4);
+    const u32* nb = mesh + 4 * (first + 4 * (v / 4));
+    const u32 lane = v % 4;
+    const float* L = Q(h, kRwWL), *E = Q(h, kRwWE), *K = Q(h, kRwWK);
+    const float dx = Sub(p[0], E[0]), dy = Sub(p[1], E[1]), dz = Sub(p[2], E[2]);
+    const float d2 = Madd(Madd(Mul(dy, dy), dx, dx), dz, dz);
+    const float inv = Rsqrt(d2);
+    const float nx = Itof0(nb[lane]), ny = Itof0(nb[4 + lane]), nz = Itof0(nb[8 + lane]), m = Itof0(nb[12 + lane]);
+    const float nl = Madd(Madd(Mul(nx, K[0]), ny, K[1]), nz, K[2]);
+    const float rx = Madd(Sub(0.0f, L[0]), nl, nx), ry = Madd(Sub(0.0f, L[1]), nl, ny), rz = Madd(Sub(0.0f, L[2]), nl, nz);
+    const float rd = Madd(Madd(Mul(rx, dx), ry, dy), rz, dz);
+    const float cs = Max(Mul(rd, inv), K[3]);
+    const float pw = Madd(Add(0.0f, Q(h, kRwWBase)[1]), Itof0(B(cs)), L[3]);
+    const float s1 = Max(Mul(m, F(Ftoi(pw))), Q(h, kRwWMin)[0]);
+    return Ftoi(s1);
+}
+
 /* Vertex v of a world batch. */
 inline void WorldVertex(const float* h, const u32* mesh, u32 v, GsVertex* o) {
     const u32 mode = Mode(h);
