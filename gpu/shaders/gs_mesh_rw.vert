@@ -39,8 +39,66 @@ const uint kEnvStream = 1u, kGuardPlace = 2u;
 float Madd(float acc, float a, float b) { return Add(acc, Mul(a, b)); }
 float Msub(float acc, float a, float b) { return Sub(acc, Mul(a, b)); }
 
-void main() {
-    const uint mode = floatBitsToUint(header.q[kMisc].z);
+// The GS's vertex from its packet's words.
+void Emit(uint x, uint y, uint z, vec3 stq, uvec4 rgba, uint w) {
+    const vec2 position = (vec2(float(x), float(y)) - header.q[kMisc].xy) / 16.0;
+    const vec2 ndc = (position + 0.5) / target.size * 2.0 - 1.0;
+    gl_Position = vec4(ndc, DepthOfZ(z), 1.0);
+    shade = vec4(Unorm8(rgba.x), Unorm8(rgba.y), Unorm8(rgba.z), Unorm8(rgba.w));
+    coordinate = stq;
+    fog_out = Unorm8((w >> 4) & 0xFFu);
+    range_out = vec4(-1e9, -1e9, 1e9, 1e9);
+}
+
+// The instanced strips (VU1 D4B61373; rw_native.h's InstancedVertex).
+const uint kInstanced = 1u << 8, kPathB = 1u, kPathC = 2u;
+const int kIM = 1, kIS = 5, kIOff = 6, kIColour = 7, kIAB = 8;
+void Instanced(uint mode) {
+    const bool path_b = (mode & kPathB) != 0u;
+    const uint j = uint(gl_VertexIndex);
+    const uvec4 q0 = mesh.quad[3u * j];
+    const vec2 uv = uintBitsToFloat(mesh.quad[3u * j + 1u].xy);
+    const vec3 p = uintBitsToFloat(q0.xyz);
+    vec4 c;
+    for (int l = 0; l < 4; ++l) {
+        float acc = Mul(header.q[kIM + 3][l], 1.0);
+        if (path_b || l != 2) {
+            acc = Madd(acc, header.q[kIM][l], p.x);
+            acc = Madd(acc, header.q[kIM + 1][l], p.y);
+        }
+        c[l] = Madd(acc, header.q[kIM + 2][l], p.z);
+    }
+    const float q = Recip(c.w);
+    const vec4 S = header.q[kIS], off = header.q[kIOff];
+    uint x, y, z;
+    if (path_b) {
+        x = uint(Ftoi(Add(Mul(Mul(c.x, 1024.0), q), off.x) * 16.0)) & 0xFFFFu;
+        y = uint(Ftoi(Add(Mul(Mul(c.y, 1024.0), q), off.y) * 16.0)) & 0xFFFFu;
+        z = (uint(Ftoi(Add(Mul(S.z, q), off.z) * 16.0)) >> 4) & 0xFFFFFFu;
+    } else {
+        x = uint(Ftoi(Add(Mul(c.x, q), off.x) * 16.0)) & 0xFFFFu;
+        y = uint(Ftoi(Add(Mul(c.y, q), off.y) * 16.0)) & 0xFFFFu;
+        z = (uint(Ftoi(Add(Mul(c.z, q), off.z) * 16.0)) >> 4) & 0xFFFFFFu;
+    }
+    const vec3 stq = vec3(Mul(uv.x, q), Mul(uv.y, q), q);
+    const vec4 colour = header.q[kIColour];
+    uvec4 rgba;
+    if ((mode & kPathC) != 0u) {
+        const uint g = j / 4u, lane = j % 4u;
+        const float nx = uintBitsToFloat(mesh.quad[3u * (4u * g) + 2u][lane]);
+        const float ny = uintBitsToFloat(mesh.quad[3u * (4u * g + 1u) + 2u][lane]);
+        const float nz = uintBitsToFloat(mesh.quad[3u * (4u * g + 2u) + 2u][lane]);
+        const float t = Madd(Madd(Mul(nx, colour.x), ny, colour.y), nz, colour.z);
+        const vec4 ab = header.q[kIAB];
+        rgba.xyz = uvec3(floatBitsToUint(Madd(ab.x, ab.y, t)));
+        rgba.w = floatBitsToUint(Madd(colour.w, 0.0, t));
+    } else {
+        rgba = floatBitsToUint(colour);
+    }
+    Emit(x, y, z, stq, rgba, q0.w);
+}
+
+void Cars(uint mode) {
     const uint j = uint(gl_VertexIndex);
     const uvec4 q0 = mesh.quad[3u * j];
     const uvec4 q2 = mesh.quad[3u * j + 2u];
@@ -119,11 +177,11 @@ void main() {
         for (int l = 0; l < 3; ++l) rgba[l] = uint(Ftoi(Madd(Add(C0[l], 0.0), Sub(C1[l], C0[l]), e)));
         rgba.w = uint(Ftoi(Msub(Add(VuMax(0.0, C1.w), 0.0), Sub(C1.w, C0.w), f)));
     }
-    const vec2 position = (vec2(float(x), float(y)) - header.q[kMisc].xy) / 16.0;
-    const vec2 ndc = (position + 0.5) / target.size * 2.0 - 1.0;
-    gl_Position = vec4(ndc, DepthOfZ(z), 1.0);
-    shade = vec4(Unorm8(rgba.x), Unorm8(rgba.y), Unorm8(rgba.z), Unorm8(rgba.w));
-    coordinate = stq;
-    fog_out = Unorm8((q0.w >> 4) & 0xFFu);
-    range_out = vec4(-1e9, -1e9, 1e9, 1e9);
+    Emit(x, y, z, stq, rgba, q0.w);
+}
+
+void main() {
+    const uint mode = floatBitsToUint(header.q[kMisc].z);
+    if ((mode & kInstanced) != 0u) Instanced(mode);
+    else Cars(mode);
 }

@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "ps2rt/vu_math.h"
+
 namespace ps2host {
 namespace rw_native {
 
@@ -198,6 +200,136 @@ inline void CarsVertex(const float* h, const u32* mesh, u32 j, GsVertex* o) {
     const float* C0 = Q(h, kRwC0), *C1 = Q(h, kRwC1);
     for (int l = 0; l < 3; ++l) o->rgba[l] = Ftoi(Madd(Add(C0[l], 0.0f), Sub(C1[l], C0[l]), e));
     o->rgba[3] = Ftoi(Msub(Add(Max(0.0f, C1[3]), 0.0f), Sub(C1[3], C0[3]), f));
+}
+
+// ---------------------------------------------------------------- the instanced strips (VU1 D4B61373, 34C3CF67)
+//
+// A batch of strip vertices (three quadwords: q0 the place, w its flags - bit 15 the strip's ADC; q1 U, V; q2 the
+// normals, SoA a group of four - nx in q2 of 4g, ny of 4g+1, nz of 4g+2) drawn once an instance, each with its own
+// matrix (the camera's rows by the instance's: InstanceMatrix) and colour (or light: path C). The header
+// (quadwords): misc (OFX, OFY, the mode: kRwInstanced | path bits, -), M0-M3, 1018 (the screen's scale, Zs),
+// 1019 (its offset), the instance's 938 (RGBA words, or path C's light and alpha), its A and B (934.z, 935.z).
+
+constexpr u32 kRwInstanced = 1u << 8;   // the mode's program: the instanced strips
+constexpr u32 kRwPathB = 1;             // the guard band's test (937.z): the place's x, y scaled, z the depth row
+constexpr u32 kRwPathC = 2;             // the lighting (932.y): the colour from the normal
+constexpr int kRwIM = 1, kRwIS = 5, kRwIOff = 6, kRwIColour = 7, kRwIAB = 8, kRwIHeaderQuads = 9;
+
+/* The instance's matrix (into header quadwords 1-4): V the camera's rows (1014-1017), R the instance's
+   (934+5i-937+5i: lanes x, y, w their coefficients), S 1018, `far`/`near` 1022.w/1023.w (path B). */
+inline void InstanceMatrix(const float (*V)[4], const float (*R)[4], const float* S, float far, float near,
+                           bool path_b, float (*M)[4]) {
+    const int lanes[3] = {0, 1, 3};
+    for (int n = 0; n < 4; ++n) {
+        for (int l : lanes) {
+            float acc = Mul(V[0][l], R[n][0]);
+            acc = Madd(acc, V[1][l], R[n][1]);
+            acc = Madd(acc, V[2][l], R[n][3]);
+            if (n == 3) acc = Madd(acc, V[3][l], 1.0f);
+            M[n][l] = acc;
+        }
+        M[n][2] = n == 3 ? 1.0f : 0.0f;
+    }
+    for (int n = 0; n < 4; ++n) {
+        const float h = Mul(M[n][3], 0.5f);
+        M[n][0] = Sub(M[n][0], h);
+        M[n][1] = Sub(M[n][1], h);
+    }
+    if (!path_b) {
+        for (int n = 0; n < 4; ++n) M[n][0] = Mul(M[n][0], S[0]), M[n][1] = Mul(M[n][1], S[1]);
+        M[3][2] = Mul(1.0f, S[2]);
+        return;
+    }
+    const float sx = Mul(S[0], 1.0f / 1024.0f), sy = Mul(S[1], 1.0f / 1024.0f);
+    const float q = Recip(Add(far, near));
+    const float za = Mul(Sub(far, near), q);
+    const float zb = Mul(Mul(Mul(far, near), -2.0f), q);
+    for (int n = 0; n < 4; ++n) M[n][0] = Mul(M[n][0], sx);
+    for (int n = 0; n < 4; ++n) M[n][1] = Mul(M[n][1], sy);
+    for (int n = 0; n < 4; ++n) M[n][2] = Mul(za, M[n][3]);
+    M[3][2] = Add(M[3][2], zb);
+}
+
+/* The place through the instance's matrix (path B: all four lanes; else x, y, w - z Zs). */
+inline void InstancedClip(const float* h, const float* p, bool path_b, float* c) {
+    const float* M0 = Q(h, kRwIM), *M1 = Q(h, kRwIM + 1), *M2 = Q(h, kRwIM + 2), *M3 = Q(h, kRwIM + 3);
+    for (int l = 0; l < 4; ++l) {
+        float acc = Mul(M3[l], 1.0f);
+        if (path_b || l != 2) {
+            acc = Madd(acc, M0[l], p[0]);
+            acc = Madd(acc, M1[l], p[1]);
+        }
+        c[l] = Madd(acc, M2[l], p[2]);
+    }
+}
+
+/* The same with the VU's own arithmetic (ps2rt/vu_math.h: operands cleaned, results saturated - for places that
+   are not floats: memory past a batch), the caller under the VU's rounding; `p` and `c` bits. */
+inline void InstancedClipVu(const float* h, const u32* p, bool path_b, u32* c) {
+    using namespace lifted;
+    const float* M0 = Q(h, kRwIM), *M1 = Q(h, kRwIM + 1), *M2 = Q(h, kRwIM + 2), *M3 = Q(h, kRwIM + 3);
+    for (int l = 0; l < 4; ++l) {
+        u32 acc = BinaryOf<kMul>(B(M3[l]), kOne, 0);
+        if (path_b || l != 2) {
+            acc = BinaryOf<kMadd>(B(M0[l]), p[0], acc);
+            acc = BinaryOf<kMadd>(B(M1[l]), p[1], acc);
+        }
+        c[l] = BinaryOf<kMadd>(B(M2[l]), p[2], acc);
+    }
+}
+
+/* CLIP's judgement as the VU makes it (vu_core.h's ClipJudge: clean magnitudes). */
+inline u32 JudgeVu(const u32* c) {
+    auto magnitude = [](u32 bits) {
+        const u32 e = bits & 0x7F800000u;
+        return e == 0 ? 0u : e == 0x7F800000u ? 0x7F7FFFFFu : bits & 0x7FFFFFFFu;
+    };
+    const u32 w = magnitude(c[3]);
+    u32 j = 0;
+    for (int lane = 0; lane < 3; ++lane)
+        if (magnitude(c[lane]) > w) j |= (c[lane] >> 31 ? 2u : 1u) << (2 * lane);
+    return j;
+}
+
+/* Vertex j of an instanced batch, for the header's instance. */
+inline void InstancedVertex(const float* h, const u32* mesh, u32 j, GsVertex* o) {
+    u32 mode;
+    std::memcpy(&mode, Q(h, kRwMisc) + 2, 4);
+    const bool path_b = (mode & kRwPathB) != 0;
+    const u32* q0 = mesh + 12 * j;
+    const float p[3] = {F(q0[0]), F(q0[1]), F(q0[2])};
+    float c[4];
+    InstancedClip(h, p, path_b, c);
+    const float q = Recip(c[3]);
+    const float* S = Q(h, kRwIS), *off = Q(h, kRwIOff);
+    if (path_b) {
+        o->xyz[0] = Ftoi(Add(Mul(Mul(c[0], 1024.0f), q), off[0]) * 16.0f);
+        o->xyz[1] = Ftoi(Add(Mul(Mul(c[1], 1024.0f), q), off[1]) * 16.0f);
+        o->xyz[2] = Ftoi(Add(Mul(S[2], q), off[2]) * 16.0f);
+    } else {
+        for (int l = 0; l < 3; ++l) o->xyz[l] = Ftoi(Add(Mul(c[l], q), off[l]) * 16.0f);
+    }
+    o->stq[0] = B(Mul(F(q0[4]), q)), o->stq[1] = B(Mul(F(q0[5]), q)), o->stq[2] = B(q);
+    const float* colour = Q(h, kRwIColour);
+    if (mode & kRwPathC) {
+        const u32 g = j / 4, lane = j % 4;
+        const float nx = F(mesh[12 * (4 * g) + 8 + lane]), ny = F(mesh[12 * (4 * g + 1) + 8 + lane]);
+        const float nz = F(mesh[12 * (4 * g + 2) + 8 + lane]);
+        const float t = Madd(Madd(Mul(nx, colour[0]), ny, colour[1]), nz, colour[2]);
+        const float* ab = Q(h, kRwIAB);
+        o->rgba[0] = o->rgba[1] = o->rgba[2] = B(Madd(ab[0], ab[1], t));
+        o->rgba[3] = B(Madd(colour[3], 0.0f, t));
+    } else {
+        std::memcpy(o->rgba, colour, 16);
+    }
+}
+
+/* A vertex of the program the header's mode says (the bridge's fallback). */
+inline void RwVertex(const float* h, const u32* mesh, u32 j, GsVertex* o) {
+    u32 mode;
+    std::memcpy(&mode, Q(h, kRwMisc) + 2, 4);
+    if (mode & kRwInstanced) InstancedVertex(h, mesh, j, o);
+    else CarsVertex(h, mesh, j, o);
 }
 
 }  // namespace rw_native

@@ -2743,7 +2743,7 @@ bool OnNative(const gs::Gs::NativeCall& call) {
                 for (int j = 0; j < 3; ++j) {
                     if (std::size_t(index[i + j] + 1) * 12 > m.size()) continue;
                     ps2host::rw_native::GsVertex o;
-                    ps2host::rw_native::CarsVertex(h, m.data(), index[i + j], &o);
+                    ps2host::rw_native::RwVertex(h, m.data(), index[i + j], &o);
                     gs::Vertex v;
                     v.x = (float(o.xyz[0] & 0xFFFF) - float(call.ofx)) / 16.0f;
                     v.y = (float(o.xyz[1] & 0xFFFF) - float(call.ofy)) / 16.0f;
