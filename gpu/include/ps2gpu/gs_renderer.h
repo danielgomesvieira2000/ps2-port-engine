@@ -354,7 +354,9 @@ public:
        four quadwords), kMeshCharacters gs_mesh_chars.vert (five) - its header
        `header_floats` floats (at most kMeshHeaderMost), its triangles this
        draw's `indices` (index_count; none: the mesh's own). */
-    enum MeshProgram : std::uint32_t { kMeshRoom = 0, kMeshCharacters = 1 };
+    /* kMeshRenderWare gs_mesh_rw.vert: RenderWare's VU1 programs (Burnout 3's; gs_mesh_rw.glsl), its vertex
+       a stride of the header's choosing. */
+    enum MeshProgram : std::uint32_t { kMeshRoom = 0, kMeshCharacters = 1, kMeshRenderWare = 2 };
     static constexpr std::size_t kMeshHeaderMost = 4 * (44 + 1024);
     struct MeshCall {
         std::uint32_t program = kMeshRoom;

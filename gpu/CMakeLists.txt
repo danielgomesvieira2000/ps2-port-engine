@@ -62,7 +62,7 @@ endif()
 set(PS2GPU_SHADER_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${PS2GPU_SHADER_DIR})
 set(PS2GPU_SHADER_HEADERS)
-foreach(shader gs.vert gs_mesh.vert gs_mesh_chars.vert gs.frag date.vert date.frag swizzle.comp decode.comp mipgen.comp msaa_expand.vert msaa_expand.frag depth_load.frag patch.comp shuffle.comp fxaa.comp downsample.comp
+foreach(shader gs.vert gs_mesh.vert gs_mesh_chars.vert gs_mesh_rw.vert gs.frag date.vert date.frag swizzle.comp decode.comp mipgen.comp msaa_expand.vert msaa_expand.frag depth_load.frag patch.comp shuffle.comp fxaa.comp downsample.comp
                smaa_edges.comp smaa_weights.comp smaa_blend.comp)
     string(REPLACE "." "_" name ${shader})
     set(out ${PS2GPU_SHADER_DIR}/${name}.h)
@@ -72,7 +72,7 @@ foreach(shader gs.vert gs_mesh.vert gs_mesh_chars.vert gs.frag date.vert date.fr
                 -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader}
         DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
                 ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_common.glsl
-                ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_enhanced.glsl
+                ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_enhanced.glsl ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_rw.glsl
                 ${CMAKE_CURRENT_LIST_DIR}/shaders/smaa_common.glsl ${CMAKE_CURRENT_LIST_DIR}/third_party/smaa/SMAA.glsl
                 ${GLSLANG}
         COMMENT "glslang ${shader}")

@@ -72,6 +72,7 @@
 #include "ps2host/gs_blend.h"
 #include "ps2host/profile.h"
 #include "ps2host/native_chars.h"
+#include "ps2host/rw_native.h"
 #include "ps2host/run.h"
 #include "ps2host/timeline.h"
 #include "ps2host/settings.h"
@@ -1425,7 +1426,8 @@ const u32* RoomDrawIndices(const u32* words, u32 count, u32* n) {
 /* The characters' payload (flag 0x100): [0] flags, [1-2] the key, [3-4] the tag's PRIM, [5] the header's
    quadwords H (gs_mesh_chars.vert's: vf00-vf21, rows 11-13, misc - the bridge's XYOFFSET in its x and y -,
    the matrices' rows), [6] this draw's indices N, the header (4H words), the indices; with 1: the vertices'
-   quadwords Q, the vertices (five quadwords each). */
+   quadwords Q, the vertices (five quadwords each). With 0x200 too: RenderWare's (gs_mesh_rw.vert, ps2host/
+   rw_native.h: the header's misc its first quadword, the vertices of the program's own size). */
 bool NativeCharacters(Bridge& s, const ps2gpu::GsDrawState& state, u32 x_offset, u32 y_offset) {
     const NativeDraw& n = *g_native;
     if (n.count < 7) return false;
@@ -1436,10 +1438,12 @@ bool NativeCharacters(Bridge& s, const ps2gpu::GsDrawState& state, u32 x_offset,
     static std::vector<float> header;
     header.resize(std::size_t(quads) * 4);
     std::memcpy(header.data(), n.words + 7, header.size() * 4);
-    header[25 * 4 + 0] = float(n.ofx) - 16.0f * float(x_offset);
-    header[25 * 4 + 1] = float(n.ofy) - 16.0f * float(y_offset);
+    const bool rw = (n.words[0] & 0x200) != 0;
+    const u32 misc = rw ? ps2host::rw_native::kRwMisc : 25;
+    header[misc * 4 + 0] = float(n.ofx) - 16.0f * float(x_offset);
+    header[misc * 4 + 1] = float(n.ofy) - 16.0f * float(y_offset);
     ps2gpu::GsRenderer::MeshCall mc;
-    mc.program = ps2gpu::GsRenderer::kMeshCharacters;
+    mc.program = rw ? ps2gpu::GsRenderer::kMeshRenderWare : ps2gpu::GsRenderer::kMeshCharacters;
     mc.header = header.data();
     mc.header_floats = header.size();
     mc.indices = n.words + 7 + quads * 4;
@@ -2723,7 +2727,39 @@ bool OnNative(const gs::Gs::NativeCall& call) {
         OnDraw(gs::Gs::DrawCall{call.prim, call.context, call.texa, v, 3, call.fogcol, call.pabe, ~0ull - ++generation});
         g_native = nullptr;
     }
-    if (no_packet && (flags & 0x100) && !draw.drawn) {
+    if (no_packet && (flags & 0x200) && !draw.drawn) {
+        // RenderWare's declined: its triangles made on the CPU (rw_native.h, the shader's twin).
+        static std::vector<gs::Vertex> tris;
+        tris.clear();
+        auto found = TheVerify().meshes.find(key);
+        const u32 quads = call.words[5], indices = call.words[6];
+        if (found != TheVerify().meshes.end()) {
+            const float* h = reinterpret_cast<const float*>(call.words + 7);
+            const u32* index = call.words + 7 + quads * 4;
+            const std::vector<u32>& m = found->second;
+            const unsigned mode = _MM_GET_ROUNDING_MODE();
+            _MM_SET_ROUNDING_MODE(_MM_ROUND_TOWARD_ZERO);
+            for (u32 i = 0; i + 2 < indices; i += 3)
+                for (int j = 0; j < 3; ++j) {
+                    if (std::size_t(index[i + j] + 1) * 12 > m.size()) continue;
+                    ps2host::rw_native::GsVertex o;
+                    ps2host::rw_native::CarsVertex(h, m.data(), index[i + j], &o);
+                    gs::Vertex v;
+                    v.x = (float(o.xyz[0] & 0xFFFF) - float(call.ofx)) / 16.0f;
+                    v.y = (float(o.xyz[1] & 0xFFFF) - float(call.ofy)) / 16.0f;
+                    v.z = (o.xyz[2] >> 4) & 0xFFFFFF;
+                    v.r = u8(o.rgba[0]), v.g = u8(o.rgba[1]), v.b = u8(o.rgba[2]), v.a = u8(o.rgba[3]);
+                    std::memcpy(&v.s, &o.stq[0], 4), std::memcpy(&v.t, &o.stq[1], 4), std::memcpy(&v.q, &o.stq[2], 4);
+                    v.fog = 0;
+                    tris.push_back(v);
+                }
+            _MM_SET_ROUNDING_MODE(mode);
+        }
+        for (size_t i = 0; i + 2 < tris.size(); i += 3)
+            OnDraw(gs::Gs::DrawCall{call.prim, call.context, call.texa, &tris[i], 3, call.fogcol, call.pabe,
+                                    ~0ull - ++generation});
+        draw.drawn = true;
+    } else if (no_packet && (flags & 0x100) && !draw.drawn) {
         // The characters' declined: their triangles made on the CPU, from the payload (the vertices' CPU copy).
         static std::vector<gs::Vertex> tris;
         tris.clear();

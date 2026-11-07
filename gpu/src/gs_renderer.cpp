@@ -42,6 +42,7 @@
 #include "gs_vert.h"
 #include "gs_mesh_vert.h"
 #include "gs_mesh_chars_vert.h"
+#include "gs_mesh_rw_vert.h"
 #include "gs_mesh_enh_vert.h"
 #include "gs_mesh_clip_vert.h"
 #include "gs_mesh_nofma_vert.h"
@@ -450,6 +451,8 @@ constexpr std::uint32_t kMeshCharactersKey = 1u << 29;
 constexpr std::uint32_t kMeshEnhancedKey = 1u << 30;
 // A multisampled pass's pipeline (MSAA: the renderer's samples).
 constexpr std::uint32_t kMsaaKey = 1u << 31;
+// ...RenderWare's (gs_mesh_rw.vert): both of the bits above.
+constexpr std::uint32_t kMeshRenderWareKey = kMeshVertices | kMeshCharactersKey;
 // A key's bits that pick its vertex stage (and its samples): kept in a stand-in's key.
 constexpr std::uint32_t kMeshKeys = kMeshVertices | kMeshCharactersKey | kMeshEnhancedKey | kMsaaKey;
 // The bits of a key that pick its shaders (modules, features): VulkanGsRenderer::ShaderGroup.
@@ -1003,7 +1006,7 @@ private:
     /* A native microprogram's mesh drawn (gs_mesh.vert; docs/NATIVE_RENDERER.md): its vertex stage, and set 3 -
        the mesh and the header, storage buffers (the module where the device has shaderCullDistance). Not drawn
        with yet. */
-    VkShaderModule mesh_vert_ = VK_NULL_HANDLE, mesh_chars_vert_ = VK_NULL_HANDLE;
+    VkShaderModule mesh_vert_ = VK_NULL_HANDLE, mesh_chars_vert_ = VK_NULL_HANDLE, mesh_rw_vert_ = VK_NULL_HANDLE;
     // (the enhanced draws': gs_mesh_enhanced.glsl - where the device has shaderClipDistance too)
     VkShaderModule mesh_enh_vert_ = VK_NULL_HANDLE, mesh_chars_enh_vert_ = VK_NULL_HANDLE,
                    frag_lit_ = VK_NULL_HANDLE, frag_blend_lit_ = VK_NULL_HANDLE;
@@ -1948,6 +1951,7 @@ bool VulkanGsRenderer::Init(std::string* error) {
     } else if (g_.cull_distance) {
         mesh_vert_ = module(spirv_gs_mesh_vert, sizeof spirv_gs_mesh_vert);
         mesh_chars_vert_ = module(spirv_gs_mesh_chars_vert, sizeof spirv_gs_mesh_chars_vert);
+        mesh_rw_vert_ = module(spirv_gs_mesh_rw_vert, sizeof spirv_gs_mesh_rw_vert);
         if (g_.clip_distance) {
             mesh_enh_vert_ = module(spirv_gs_mesh_enh_vert, sizeof spirv_gs_mesh_enh_vert);
             mesh_chars_enh_vert_ = module(spirv_gs_mesh_chars_enh_vert, sizeof spirv_gs_mesh_chars_enh_vert);
@@ -3406,7 +3410,8 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key, std::uint32_t baked
                                                  {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
     const bool enhanced = (key & kMeshEnhancedKey) != 0;
-    stages[0].module = (key & kMeshCharactersKey) ? (enhanced ? mesh_chars_enh_vert_ : mesh_chars_vert_)
+    stages[0].module = (key & kMeshRenderWareKey) == kMeshRenderWareKey ? (enhanced ? VK_NULL_HANDLE : mesh_rw_vert_)
+                       : (key & kMeshCharactersKey) ? (enhanced ? mesh_chars_enh_vert_ : mesh_chars_vert_)
                        : (key & kMeshVertices)    ? (enhanced ? mesh_enh_vert_ : mesh_vert_)
                                                   : vert_;
     if (!stages[0].module) return VK_NULL_HANDLE;       // (a mesh's, on a device without shaderCullDistance)
@@ -4161,12 +4166,13 @@ void VulkanGsRenderer::DrawMeshWith(const GsDrawState& state, std::uint64_t key,
     auto found = meshes_.find(key);
     if (found == meshes_.end() || !DrawsMeshes() || !call.header) return;
     if (call.program == kMeshCharacters && !mesh_chars_vert_) return;
+    if (call.program == kMeshRenderWare && !mesh_rw_vert_) return;
     Mesh& mesh = found->second;
     RecordShuffle();
     Flush();                            // (what was drawn before it, first)
     // The header into the vertex ring (as a storage buffer), set 3 for its chunk: the room's 512 bytes, the
     // characters' kMeshHeaderMost floats' worth (the descriptor's range; what is written, the header's own).
-    const bool large = call.program == kMeshCharacters;
+    const bool large = call.program == kMeshCharacters || call.program == kMeshRenderWare;
     const VkDeviceSize range = large ? kMeshHeaderMost * 4 : kMeshHeaderFloats * 4;
     const std::size_t floats = std::min<std::size_t>(call.header_floats, range / 4);
     VkBuffer chunk = VK_NULL_HANDLE;
@@ -4178,7 +4184,7 @@ void VulkanGsRenderer::DrawMeshWith(const GsDrawState& state, std::uint64_t key,
     const std::size_t ext = large ? kMeshCharactersExt : kMeshRoomExt;
     std::uint32_t enhancements = 0;
     if (floats > ext + 1) std::memcpy(&enhancements, call.header + ext + 1, 4);
-    if (!DrawsEnhancedMeshes()) enhancements = 0;
+    if (!DrawsEnhancedMeshes() || call.program == kMeshRenderWare) enhancements = 0;    // (RenderWare's: none yet)
     auto& sets = large ? mesh.large_sets : mesh.sets;
     VkDescriptorSet set = VK_NULL_HANDLE;
     for (const auto& e : sets)
@@ -5147,7 +5153,8 @@ void VulkanGsRenderer::Flush() {
                         static const bool whole = std::getenv("PS2HOST_GPU_UBERSHADER") != nullptr;
                         const std::uint32_t full_key =
                             (whole ? op_key : op_key | ((~Features(params) & kFeatureBits) << kFeatureShift)) |
-                            (!mesh ? 0u : mesh_draw_.program == kMeshCharacters ? kMeshCharactersKey : kMeshVertices) |
+                            (!mesh ? 0u : mesh_draw_.program == kMeshCharacters ? kMeshCharactersKey
+                                        : mesh_draw_.program == kMeshRenderWare ? kMeshRenderWareKey : kMeshVertices) |
                             (mesh && mesh_draw_.enhanced ? kMeshEnhancedKey : 0u) | (msaa ? kMsaaKey : 0u);
                         const int depth_write = pass.depth_write && op != 1 ? 1 : 0;
                         const VkPipeline chosen =
@@ -5388,6 +5395,7 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (vert_) vkDestroyShaderModule(g_.device, vert_, nullptr);
     if (mesh_vert_) vkDestroyShaderModule(g_.device, mesh_vert_, nullptr);
     if (mesh_chars_vert_) vkDestroyShaderModule(g_.device, mesh_chars_vert_, nullptr);
+    if (mesh_rw_vert_) vkDestroyShaderModule(g_.device, mesh_rw_vert_, nullptr);
     for (VkShaderModule m : {mesh_enh_vert_, mesh_chars_enh_vert_, frag_lit_, frag_blend_lit_})
         if (m) vkDestroyShaderModule(g_.device, m, nullptr);
     for (VkPipeline p : msaa_expand_)
