@@ -2753,7 +2753,7 @@ bool OnNative(const gs::Gs::NativeCall& call) {
                     v.z = (o.xyz[2] >> 4) & 0xFFFFFF;
                     v.r = u8(o.rgba[0]), v.g = u8(o.rgba[1]), v.b = u8(o.rgba[2]), v.a = u8(o.rgba[3]);
                     std::memcpy(&v.s, &o.stq[0], 4), std::memcpy(&v.t, &o.stq[1], 4), std::memcpy(&v.q, &o.stq[2], 4);
-                    v.fog = 0;
+                    v.fog = u8(o.fog);
                     tris.push_back(v);
                 }
             }

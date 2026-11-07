@@ -84,6 +84,7 @@ struct GsVertex {
     u32 stq[3];         // ST's S, T and Q (floats' bits)
     u32 rgba[4];        // RGBAQ's words (the GS their low bytes)
     u32 xyz[3];         // XYZF2's X, Y, Z words (FTOI4)
+    u32 fog = 0;        // XYZF2's F (the world's path C; else 0)
 };
 
 inline const float* Q(const float* h, int quad) { return h + 4 * quad; }
@@ -342,6 +343,7 @@ constexpr u32 kRwWCull = 1;             // the screen winding's ADC (base: the h
 constexpr u32 kRwWGuard = 2;            // path B's guard band
 constexpr u32 kRwWLit = 4;              // 1332's specular alpha
 constexpr u32 kRwWAlphaZero = 8;        // 1332 with 1013.z: alpha 0
+constexpr u32 kRwWFog = 16;             // path C's fog in XYZF2's F
 constexpr int kRwWT = 1, kRwWO = 5, kRwWScale = 6, kRwWOff = 7, kRwWG0 = 8, kRwWG1 = 9, kRwWL = 10, kRwWE = 11,
               kRwWMin = 12, kRwWK = 13, kRwWBase = 14, kRwWHeaderQuads = 15;
 
@@ -380,6 +382,13 @@ inline void WorldVertex(const float* h, const u32* mesh, u32 v, GsVertex* o) {
     o->xyz[2] = Ftoi(Madd(O[2], c[2], q) * 16.0f);
     o->stq[0] = B(Mul(Itof12(q0[4]), q)), o->stq[1] = B(Mul(Itof12(q0[5]), q)), o->stq[2] = B(q);
     std::memcpy(o->rgba, q0 + 8, 16);
+    if (mode & kRwWFog) {
+        const float fs = Q(h, kRwWScale)[3], fb = Q(h, kRwWOff)[3];
+        float f = Add(Sub(0.0f, Mul(fb, fs)), Mul(c[3], fs));
+        f = Max(f, 0.0f);
+        if (f > 255.0f) f = 255.0f;
+        o->fog = (Ftoi(f * 16.0f) >> 4) & 0xFF;
+    }
     if (mode & kRwWAlphaZero) {
         o->rgba[3] = 0;
     } else if (mode & kRwWLit) {

@@ -33,3 +33,4 @@ int VuOrder(float f) {
     return (b >> 31) != 0u ? -m : m;
 }
 float VuMax(float a, float b) { return VuOrder(a) < VuOrder(b) ? b : a; }
+float VuMin(float a, float b) { return VuOrder(b) < VuOrder(a) ? b : a; }

@@ -100,8 +100,8 @@ void Instanced(uint mode) {
 
 // The world's strips (VU1 2678EB26, 1332C99F, 01CE30D5; rw_native.h's World*): the index a corner of strip
 // triangle t (3t + c), its triangle decided by every corner alike - one the microcode leaves undrawn (ADC) a point.
-const uint kWorld = 1u << 9, kWCull = 1u, kWGuard = 2u, kWLit = 4u, kWAlphaZero = 8u;
-const int kWT = 1, kWO = 5, kWG0 = 8, kWG1 = 9, kWL = 10, kWE = 11, kWMin = 12, kWK = 13, kWBase = 14;
+const uint kWorld = 1u << 9, kWCull = 1u, kWGuard = 2u, kWLit = 4u, kWAlphaZero = 8u, kWFog = 16u;
+const int kWT = 1, kWO = 5, kWScale = 6, kWOff = 7, kWG0 = 8, kWG1 = 9, kWL = 10, kWE = 11, kWMin = 12, kWK = 13, kWBase = 14;
 
 vec4 WorldClip(vec3 p) {
     vec4 c;
@@ -204,7 +204,15 @@ void World(uint mode) {
         const float s1 = VuMax(Mul(m, uintBitsToFloat(uint(Ftoi(pw)))), header.q[kWMin].x);
         rgba.w = uint(Ftoi(s1));
     }
-    Emit(x, y, z, stq, rgba, q0.w);
+    // path C's fog (XYZF2's F): -B F + W F, at least 0, at most 255 (FGE: the GS's PRMODE may say it)
+    uint fw = q0.w;
+    if ((mode & kWFog) != 0u) {
+        const float F = header.q[kWScale].w, Bd = header.q[kWOff].w;
+        float f = Add(Sub(0.0, Mul(Bd, F)), Mul(c.w, F));
+        f = VuMin(VuMax(f, 0.0), 255.0);
+        fw = uint(Ftoi(f * 16.0));
+    }
+    Emit(x, y, z, stq, rgba, fw);
 }
 
 void Cars(uint mode) {
