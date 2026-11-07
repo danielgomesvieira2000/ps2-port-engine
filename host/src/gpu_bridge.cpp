@@ -2739,11 +2739,14 @@ bool OnNative(const gs::Gs::NativeCall& call) {
             const std::vector<u32>& m = found->second;
             const unsigned mode = _MM_GET_ROUNDING_MODE();
             _MM_SET_ROUNDING_MODE(_MM_ROUND_TOWARD_ZERO);
-            for (u32 i = 0; i + 2 < indices; i += 3)
+            for (u32 i = 0; i + 2 < indices; i += 3) {
+                bool fits = true;
+                for (int j = 0; j < 3; ++j)
+                    if (std::size_t(ps2host::rw_native::RwVertexOf(h, index[i + j]) + 1) * 12 > m.size()) fits = false;
+                if (!fits || !ps2host::rw_native::RwDrawn(h, m.data(), index[i])) continue;
                 for (int j = 0; j < 3; ++j) {
-                    if (std::size_t(index[i + j] + 1) * 12 > m.size()) continue;
                     ps2host::rw_native::GsVertex o;
-                    ps2host::rw_native::RwVertex(h, m.data(), index[i + j], &o);
+                    ps2host::rw_native::RwVertex(h, m.data(), ps2host::rw_native::RwVertexOf(h, index[i + j]), &o);
                     gs::Vertex v;
                     v.x = (float(o.xyz[0] & 0xFFFF) - float(call.ofx)) / 16.0f;
                     v.y = (float(o.xyz[1] & 0xFFFF) - float(call.ofy)) / 16.0f;
@@ -2753,6 +2756,7 @@ bool OnNative(const gs::Gs::NativeCall& call) {
                     v.fog = 0;
                     tris.push_back(v);
                 }
+            }
             _MM_SET_ROUNDING_MODE(mode);
         }
         for (size_t i = 0; i + 2 < tris.size(); i += 3)

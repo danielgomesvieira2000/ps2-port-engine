@@ -324,11 +324,163 @@ inline void InstancedVertex(const float* h, const u32* mesh, u32 j, GsVertex* o)
     }
 }
 
-/* A vertex of the program the header's mode says (the bridge's fallback). */
-inline void RwVertex(const float* h, const u32* mesh, u32 j, GsVertex* o) {
+// ---------------------------------------------------------------- the world's strips (VU1 2678EB26, 1332C99F, 01CE30D5)
+//
+// RenderWare's strip pipeline (games/burnout3/build/native/spec_2678EB26.md and its family): a vertex three
+// quadwords - q0 the place (w its flag: bit 15 the strip's ADC), q1 U, V (12-bit fixed point), q2 RGBA (words) -
+// through the transform vf28-vf31 (x, y, w; z the depth scale vf31.z), the screen's offset vf02. Paths A and B:
+// a triangle (k-2, k-1, k) of the strip drawn unless its last vertex's flag, its screen winding (kRwWCull: the
+// cross product's sign, by the strip's parity; 2678's and 1332's) or (kRwWGuard: path B) any of its three
+// vertices out of the guard band (1022-1023) says ADC. 1332's lighting (kRwWLit) puts a specular term in each
+// vertex's alpha from its normal (a block of them past the batch: misc.w the mesh's quadword it starts at).
+//
+// The draw's indices are its triangles' corners, 3t + c (vertex t + c of the strip's triangle t): each corner
+// decides its triangle (WorldDrawn) - one not drawn collapses to a point.
+
+constexpr u32 kRwWorld = 1u << 9;       // the mode's program: the world's strips
+constexpr u32 kRwWCull = 1;             // the screen winding's ADC (base: the header's kRwWBase.x)
+constexpr u32 kRwWGuard = 2;            // path B's guard band
+constexpr u32 kRwWLit = 4;              // 1332's specular alpha
+constexpr u32 kRwWAlphaZero = 8;        // 1332 with 1013.z: alpha 0
+constexpr int kRwWT = 1, kRwWO = 5, kRwWScale = 6, kRwWOff = 7, kRwWG0 = 8, kRwWG1 = 9, kRwWL = 10, kRwWE = 11,
+              kRwWMin = 12, kRwWK = 13, kRwWBase = 14, kRwWHeaderQuads = 15;
+
+inline u32 Mode(const float* h) {
     u32 mode;
     std::memcpy(&mode, Q(h, kRwMisc) + 2, 4);
-    if (mode & kRwInstanced) InstancedVertex(h, mesh, j, o);
+    return mode;
+}
+
+// The place through the transform: x, y, w (z: vf31.z)
+inline void WorldClip(const float* h, const float* p, float* c) {
+    const float* t0 = Q(h, kRwWT), *t1 = Q(h, kRwWT + 1), *t2 = Q(h, kRwWT + 2), *t3 = Q(h, kRwWT + 3);
+    for (int l : {0, 1, 3}) {
+        float acc = Mul(t3[l], 1.0f);
+        acc = Madd(acc, t0[l], p[0]);
+        acc = Madd(acc, t1[l], p[1]);
+        c[l] = Madd(acc, t2[l], p[2]);
+    }
+    c[2] = t3[2];
+}
+
+// ITOF0 under the VU's rounding (toward zero)
+inline float Itof0(u32 i) { return float(std::int32_t(i)); }
+
+/* Vertex v of a world batch. */
+inline void WorldVertex(const float* h, const u32* mesh, u32 v, GsVertex* o) {
+    const u32 mode = Mode(h);
+    const u32* q0 = mesh + 12 * v;
+    const float p[3] = {F(q0[0]), F(q0[1]), F(q0[2])};
+    float c[4];
+    WorldClip(h, p, c);
+    const float q = Recip(c[3]);
+    const float* O = Q(h, kRwWO);
+    o->xyz[0] = Ftoi(Madd(O[0], c[0], q) * 16.0f);
+    o->xyz[1] = Ftoi(Madd(O[1], c[1], q) * 16.0f);
+    o->xyz[2] = Ftoi(Madd(O[2], c[2], q) * 16.0f);
+    o->stq[0] = B(Mul(Itof12(q0[4]), q)), o->stq[1] = B(Mul(Itof12(q0[5]), q)), o->stq[2] = B(q);
+    std::memcpy(o->rgba, q0 + 8, 16);
+    if (mode & kRwWAlphaZero) {
+        o->rgba[3] = 0;
+    } else if (mode & kRwWLit) {
+        // 1332's: the reflected light's cosine to the eye, raised to the power e by the float's bits, times the mask
+        u32 first;
+        std::memcpy(&first, Q(h, kRwMisc) + 3, 4);
+        const u32* nb = mesh + 4 * (first + 4 * (v / 4));
+        const u32 lane = v % 4;
+        const float* L = Q(h, kRwWL), *E = Q(h, kRwWE), *K = Q(h, kRwWK);
+        const float dx = Sub(p[0], E[0]), dy = Sub(p[1], E[1]), dz = Sub(p[2], E[2]);
+        const float d2 = Madd(Madd(Mul(dy, dy), dx, dx), dz, dz);
+        const float inv = Rsqrt(d2);
+        const float nx = Itof0(nb[lane]), ny = Itof0(nb[4 + lane]), nz = Itof0(nb[8 + lane]), m = Itof0(nb[12 + lane]);
+        const float nl = Madd(Madd(Mul(nx, K[0]), ny, K[1]), nz, K[2]);
+        const float rx = Madd(Sub(0.0f, L[0]), nl, nx), ry = Madd(Sub(0.0f, L[1]), nl, ny), rz = Madd(Sub(0.0f, L[2]), nl, nz);
+        const float rd = Madd(Madd(Mul(rx, dx), ry, dy), rz, dz);
+        const float cs = Max(Mul(rd, inv), K[3]);
+        const float pw = Madd(Add(0.0f, Q(h, kRwWBase)[1]), Itof0(B(cs)), L[3]);
+        const float s1 = Max(Mul(m, F(Ftoi(pw))), Q(h, kRwWMin)[0]);
+        o->rgba[3] = Ftoi(s1);
+    }
+}
+
+/* The screen's place before FTOI4 (the winding's). */
+inline void WorldScreen(const float* h, const u32* mesh, u32 v, float* s) {
+    const u32* q0 = mesh + 12 * v;
+    const float p[3] = {F(q0[0]), F(q0[1]), F(q0[2])};
+    float c[4];
+    WorldClip(h, p, c);
+    const float q = Recip(c[3]);
+    const float* O = Q(h, kRwWO);
+    s[0] = Madd(O[0], c[0], q);
+    s[1] = Madd(O[1], c[1], q);
+}
+
+/* Path B's guard band's judgement of vertex v. */
+inline u32 WorldJudge(const float* h, const u32* mesh, u32 v) {
+    const u32* q0 = mesh + 12 * v;
+    const float p[3] = {F(q0[0]), F(q0[1]), F(q0[2])};
+    float c[4];
+    WorldClip(h, p, c);
+    const float* g0 = Q(h, kRwWG0), *g1 = Q(h, kRwWG1);
+    return Judge(Mul(c[0], g0[1]), Mul(c[1], g1[1]), Madd(g0[2], g1[2], c[3]), c[3]);
+}
+
+/* The same with the VU's own arithmetic (memory past a batch: not floats), `q0` the quadword's bits; the caller
+   under the VU's rounding. */
+inline u32 WorldJudgeVu(const float* h, const u32* q0) {
+    using namespace lifted;
+    const float* t0 = Q(h, kRwWT), *t1 = Q(h, kRwWT + 1), *t2 = Q(h, kRwWT + 2), *t3 = Q(h, kRwWT + 3);
+    u32 c[4];
+    for (int l : {0, 1, 3}) {
+        u32 acc = BinaryOf<kMul>(B(t3[l]), kOne, 0);
+        acc = BinaryOf<kMadd>(B(t0[l]), q0[0], acc);
+        acc = BinaryOf<kMadd>(B(t1[l]), q0[1], acc);
+        c[l] = BinaryOf<kMadd>(B(t2[l]), q0[2], acc);
+    }
+    const float* g0 = Q(h, kRwWG0), *g1 = Q(h, kRwWG1);
+    const u32 g[4] = {BinaryOf<kMul>(c[0], B(g0[1]), 0), BinaryOf<kMul>(c[1], B(g1[1]), 0),
+                      BinaryOf<kMadd>(B(g1[2]), c[3], B(g0[2])), c[3]};
+    return JudgeVu(g);
+}
+
+/* Whether the strip's triangle ending at vertex k is drawn (its ADC as the microcode makes it). */
+inline bool WorldDrawn(const float* h, const u32* mesh, u32 k) {
+    const u32 mode = Mode(h);
+    if (mesh[12 * k + 3] & 0x8000) return false;
+    if (mode & kRwWCull) {
+        float a[2], b[2], c[2];
+        WorldScreen(h, mesh, k - 2, a);
+        WorldScreen(h, mesh, k - 1, b);
+        WorldScreen(h, mesh, k, c);
+        float u[2], w[2];
+        if ((k & 1) == 0) {
+            u[0] = Sub(b[0], a[0]), u[1] = Sub(b[1], a[1]);
+            w[0] = Sub(b[0], c[0]), w[1] = Sub(b[1], c[1]);
+        } else {
+            u[0] = Sub(c[0], b[0]), u[1] = Sub(c[1], b[1]);
+            w[0] = Sub(a[0], b[0]), w[1] = Sub(a[1], b[1]);
+        }
+        const float cz = Sub(Mul(u[0], w[1]), Mul(w[0], u[1]));
+        u32 base;
+        std::memcpy(&base, Q(h, kRwWBase), 4);
+        if (((base + ((B(cz) >> 31) ? 0x20u : 0u)) & 0x8000u) != 0) return false;
+    }
+    if (mode & kRwWGuard)
+        for (u32 j = k - 2; j <= k; ++j)
+            if (WorldJudge(h, mesh, j)) return false;
+    return true;
+}
+
+/* The bridge's fallback: an index's vertex (the world's: a triangle's corner, 3t + c), whether its triangle is
+   drawn, and the vertex of the program the header's mode says. */
+inline u32 RwVertexOf(const float* h, u32 index) { return (Mode(h) & kRwWorld) ? index / 3 + index % 3 : index; }
+inline bool RwDrawn(const float* h, const u32* mesh, u32 index) {
+    return !(Mode(h) & kRwWorld) || WorldDrawn(h, mesh, index / 3 + 2);
+}
+inline void RwVertex(const float* h, const u32* mesh, u32 j, GsVertex* o) {
+    const u32 mode = Mode(h);
+    if (mode & kRwWorld) WorldVertex(h, mesh, j, o);
+    else if (mode & kRwInstanced) InstancedVertex(h, mesh, j, o);
     else CarsVertex(h, mesh, j, o);
 }
 

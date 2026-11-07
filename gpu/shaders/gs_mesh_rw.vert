@@ -98,6 +98,115 @@ void Instanced(uint mode) {
     Emit(x, y, z, stq, rgba, q0.w);
 }
 
+// The world's strips (VU1 2678EB26, 1332C99F, 01CE30D5; rw_native.h's World*): the index a corner of strip
+// triangle t (3t + c), its triangle decided by every corner alike - one the microcode leaves undrawn (ADC) a point.
+const uint kWorld = 1u << 9, kWCull = 1u, kWGuard = 2u, kWLit = 4u, kWAlphaZero = 8u;
+const int kWT = 1, kWO = 5, kWG0 = 8, kWG1 = 9, kWL = 10, kWE = 11, kWMin = 12, kWK = 13, kWBase = 14;
+
+vec4 WorldClip(vec3 p) {
+    vec4 c;
+    for (int l = 0; l < 4; ++l) {
+        if (l == 2) continue;
+        float acc = Mul(header.q[kWT + 3][l], 1.0);
+        acc = Madd(acc, header.q[kWT][l], p.x);
+        acc = Madd(acc, header.q[kWT + 1][l], p.y);
+        c[l] = Madd(acc, header.q[kWT + 2][l], p.z);
+    }
+    c.z = header.q[kWT + 3].z;
+    return c;
+}
+
+vec2 WorldScreen(uint v) {
+    const vec4 c = WorldClip(uintBitsToFloat(mesh.quad[3u * v].xyz));
+    const float q = Recip(c.w);
+    const vec4 O = header.q[kWO];
+    return vec2(Madd(O.x, c.x, q), Madd(O.y, c.y, q));
+}
+
+uint Judge(vec4 g) {
+    const float aw = abs(g.w);
+    uint j = 0u;
+    if (g.x > aw) j |= 1u;
+    if (g.x < -aw) j |= 2u;
+    if (g.y > aw) j |= 4u;
+    if (g.y < -aw) j |= 8u;
+    if (g.z > aw) j |= 16u;
+    if (g.z < -aw) j |= 32u;
+    return j;
+}
+
+uint WorldJudge(uint v) {
+    const vec4 c = WorldClip(uintBitsToFloat(mesh.quad[3u * v].xyz));
+    const vec4 g0 = header.q[kWG0], g1 = header.q[kWG1];
+    return Judge(vec4(Mul(c.x, g0.y), Mul(c.y, g1.y), Madd(g0.z, g1.z, c.w), c.w));
+}
+
+bool WorldDrawn(uint mode, uint k) {
+    if ((mesh.quad[3u * k].w & 0x8000u) != 0u) return false;
+    if ((mode & kWCull) != 0u) {
+        const vec2 a = WorldScreen(k - 2u), b = WorldScreen(k - 1u), c = WorldScreen(k);
+        vec2 u, w;
+        if ((k & 1u) == 0u) {
+            u = vec2(Sub(b.x, a.x), Sub(b.y, a.y));
+            w = vec2(Sub(b.x, c.x), Sub(b.y, c.y));
+        } else {
+            u = vec2(Sub(c.x, b.x), Sub(c.y, b.y));
+            w = vec2(Sub(a.x, b.x), Sub(a.y, b.y));
+        }
+        const float cz = Sub(Mul(u.x, w.y), Mul(w.x, u.y));
+        const uint base = floatBitsToUint(header.q[kWBase].x);
+        if (((base + ((floatBitsToUint(cz) >> 31) != 0u ? 0x20u : 0u)) & 0x8000u) != 0u) return false;
+    }
+    if ((mode & kWGuard) != 0u)
+        for (uint j = k - 2u; j <= k; ++j)
+            if (WorldJudge(j) != 0u) return false;
+    return true;
+}
+
+void World(uint mode) {
+    const uint index = uint(gl_VertexIndex);
+    const uint t = index / 3u, v = t + index % 3u;
+    if (!WorldDrawn(mode, t + 2u)) {
+        gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
+        shade = vec4(0.0);
+        coordinate = vec3(0.0);
+        fog_out = 0.0;
+        range_out = vec4(-1e9, -1e9, 1e9, 1e9);
+        return;
+    }
+    const uvec4 q0 = mesh.quad[3u * v], q1 = mesh.quad[3u * v + 1u];
+    const vec3 p = uintBitsToFloat(q0.xyz);
+    const vec4 c = WorldClip(p);
+    const float q = Recip(c.w);
+    const vec4 O = header.q[kWO];
+    const uint x = uint(Ftoi(Madd(O.x, c.x, q) * 16.0)) & 0xFFFFu;
+    const uint y = uint(Ftoi(Madd(O.y, c.y, q) * 16.0)) & 0xFFFFu;
+    const uint z = (uint(Ftoi(Madd(O.z, c.z, q) * 16.0)) >> 4) & 0xFFFFFFu;
+    const vec3 stq = vec3(Mul(Itof12(q1.x), q), Mul(Itof12(q1.y), q), q);
+    uvec4 rgba = mesh.quad[3u * v + 2u];
+    if ((mode & kWAlphaZero) != 0u) {
+        rgba.w = 0u;
+    } else if ((mode & kWLit) != 0u) {
+        // 1332's: the reflected light's cosine to the eye, raised to the power e by the float's bits, times the mask
+        const uint nb = floatBitsToUint(header.q[kMisc].w) + 4u * (v / 4u);
+        const uint lane = v % 4u;
+        const vec4 L = header.q[kWL], E = header.q[kWE], K = header.q[kWK];
+        const float dx = Sub(p.x, E.x), dy = Sub(p.y, E.y), dz = Sub(p.z, E.z);
+        const float d2 = Madd(Madd(Mul(dy, dy), dx, dx), dz, dz);
+        const float inv = Rsqrt(d2);
+        const float nx = ItofTZ(int(mesh.quad[nb][lane])), ny = ItofTZ(int(mesh.quad[nb + 1u][lane]));
+        const float nz = ItofTZ(int(mesh.quad[nb + 2u][lane])), m = ItofTZ(int(mesh.quad[nb + 3u][lane]));
+        const float nl = Madd(Madd(Mul(nx, K.x), ny, K.y), nz, K.z);
+        const float rx = Madd(Sub(0.0, L.x), nl, nx), ry = Madd(Sub(0.0, L.y), nl, ny), rz = Madd(Sub(0.0, L.z), nl, nz);
+        const float rd = Madd(Madd(Mul(rx, dx), ry, dy), rz, dz);
+        const float cs = VuMax(Mul(rd, inv), K.w);
+        const float pw = Madd(Add(0.0, header.q[kWBase].y), ItofTZ(int(floatBitsToUint(cs))), L.w);
+        const float s1 = VuMax(Mul(m, uintBitsToFloat(uint(Ftoi(pw)))), header.q[kWMin].x);
+        rgba.w = uint(Ftoi(s1));
+    }
+    Emit(x, y, z, stq, rgba, q0.w);
+}
+
 void Cars(uint mode) {
     const uint j = uint(gl_VertexIndex);
     const uvec4 q0 = mesh.quad[3u * j];
@@ -182,6 +291,7 @@ void Cars(uint mode) {
 
 void main() {
     const uint mode = floatBitsToUint(header.q[kMisc].z);
-    if ((mode & kInstanced) != 0u) Instanced(mode);
+    if ((mode & kWorld) != 0u) World(mode);
+    else if ((mode & kInstanced) != 0u) Instanced(mode);
     else Cars(mode);
 }

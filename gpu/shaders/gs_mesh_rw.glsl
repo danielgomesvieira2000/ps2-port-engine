@@ -16,7 +16,16 @@ float SqrtTZ(float x) {
     return r;
 }
 
-float Itof12(uint i) { return float(int(i)) / 4096.0; }
+// ITOF0 toward zero (the GPU's int to float rounds to the nearest)
+float ItofTZ(int i) {
+    float f = float(i);
+    if (abs(f) >= 2147483648.0) return i < 0 ? (i == int(0x80000000u) ? -2147483648.0 : -2147483520.0) : 2147483520.0;
+    const int back = int(f);
+    if (i >= 0 ? back > i : back < i) f = TowardZero(f);
+    return f;
+}
+
+float Itof12(uint i) { return ItofTZ(int(i)) / 4096.0; }
 
 int VuOrder(float f) {
     const uint b = floatBitsToUint(f);
