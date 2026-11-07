@@ -21,7 +21,9 @@
  * runs agreed.
  */
 
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #include "ps2host/vu.h"
 
@@ -50,5 +52,34 @@ struct VuNativeAccess {
 /* The runs taken, declined and (check) agreeing, by program: written at the
    run's end. */
 void VuNativeReport();
+
+/* A fast hash for a native program's tests (its microcode, in Holds: every time instruction memory changes) and its
+   meshes' keys: four lanes of 64-bit words, each multiplied on (FNV's prime), then mixed (MurmurHash3's finish).
+   `bytes` a multiple of 4. (Burnout 3's build/native/codehash.py computes the same.) */
+inline std::uint64_t VuNativeHash(const void* data, std::size_t bytes, std::uint64_t seed) {
+    constexpr std::uint64_t kPrime = 1099511628211ull;
+    const auto* p = static_cast<const unsigned char*>(data);
+    std::uint64_t lane[4] = {seed, seed ^ 0x9E3779B97F4A7C15ull, seed ^ 0xC2B2AE3D27D4EB4Full, seed ^ 0x165667B19E3779F9ull};
+    std::size_t i = 0;
+    for (; i + 32 <= bytes; i += 32)
+        for (int l = 0; l < 4; ++l) {
+            std::uint64_t w;
+            std::memcpy(&w, p + i + 8 * l, 8);
+            lane[l] = (lane[l] ^ w) * kPrime;
+        }
+    for (int l = 0; i + 4 <= bytes; i += 4, l = (l + 1) & 3) {
+        std::uint32_t w;
+        std::memcpy(&w, p + i, 4);
+        lane[l] = (lane[l] ^ w) * kPrime;
+    }
+    std::uint64_t h = bytes;
+    for (int l = 0; l < 4; ++l) {
+        std::uint64_t k = lane[l];
+        k ^= k >> 33, k *= 0xFF51AFD7ED558CCDull, k ^= k >> 33, k *= 0xC4CEB9FE1A85EC53ull, k ^= k >> 33;
+        h = (h ^ k) * kPrime;
+    }
+    h ^= h >> 29;
+    return h;
+}
 
 }  // namespace ps2host
