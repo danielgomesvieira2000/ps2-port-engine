@@ -238,6 +238,9 @@ public:
     bool bc = false;                /* textureCompressionBC: texture packs' DDS uploaded as they are */
     bool cull_distance = false;     /* shaderCullDistance: native mesh draws (gs_mesh.vert) */
     bool clip_distance = false;     /* shaderClipDistance: their enhanced draws (gs_mesh_enhanced.glsl) */
+    /* The Vulkan layer over Direct3D 11 (d3d11_vulkan.cpp): host memory the GPU reads is copied from, not shared -
+       what is written once and drawn often (a native mesh) said by vkFlushMappedMemoryRanges. */
+    bool d3d11_layer = false;
     float anisotropy = 1.0f;        /* samplerAnisotropy's most (1: none): texture packs' samplers */
     bool owns_device = true;
 

@@ -44,6 +44,8 @@
 #include "gs_mesh_chars_vert.h"
 #include "gs_mesh_enh_vert.h"
 #include "gs_mesh_clip_vert.h"
+#include "gs_mesh_nofma_vert.h"
+#include "gs_mesh_chars_nofma_vert.h"
 #include "gs_mesh_chars_enh_vert.h"
 #include "gs_frag_lit.h"
 #include "gs_frag_single_lit.h"
@@ -1884,6 +1886,12 @@ bool VulkanGsRenderer::Init(std::string* error) {
         frag_blend_lit_ = module(spirv_gs_frag_blend_lit, sizeof spirv_gs_frag_blend_lit);
         std::fprintf(stderr, "[gpu] native meshes: the guard band by clip distances (%s)\n",
                      g_.cull_distance ? "PS2HOST_MESH_GUARD" : "no cull distances");
+    } else if (g_.cull_distance && std::getenv("PS2HOST_MESH_NO_FMA")) {
+        // (a test: the rounding made without fused multiply-adds, as Direct3D 11's shaders make it - gs_mesh_common's
+        // NO_FMA - the plain draws)
+        mesh_vert_ = module(spirv_gs_mesh_nofma_vert, sizeof spirv_gs_mesh_nofma_vert);
+        mesh_chars_vert_ = module(spirv_gs_mesh_chars_nofma_vert, sizeof spirv_gs_mesh_chars_nofma_vert);
+        std::fprintf(stderr, "[gpu] native meshes: the rounding without fused multiply-adds (PS2HOST_MESH_NO_FMA)\n");
     } else if (g_.cull_distance) {
         mesh_vert_ = module(spirv_gs_mesh_vert, sizeof spirv_gs_mesh_vert);
         mesh_chars_vert_ = module(spirv_gs_mesh_chars_vert, sizeof spirv_gs_mesh_chars_vert);
@@ -3911,6 +3919,14 @@ void VulkanGsRenderer::UploadMesh(std::uint64_t key, const void* quads, std::siz
     std::uint8_t* at = static_cast<std::uint8_t*>(mesh.block->mapped) + offset;
     std::memcpy(at, quads, vertex_bytes);
     if (index_count) std::memcpy(at + index_at, indices, index_count * 4);
+    if (g_.d3d11_layer) {
+        // (the layer's host memory is copied to the GPU: these bytes now, and the block not at every submission)
+        VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+        range.memory = mesh.block->memory;
+        range.offset = offset;
+        range.size = index_at + index_count * 4;
+        vkFlushMappedMemoryRanges(g_.device, 1, &range);
+    }
     mesh.vertex_offset = offset;
     mesh.vertex_bytes = vertex_bytes;
     mesh.index_offset = offset + index_at;

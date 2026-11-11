@@ -83,6 +83,25 @@
 #include "d3d_gs_frag_single_hlsl.h"
 #include "d3d_gs_frag_blend_hlsl.h"
 #include "d3d_gs_frag_uint_hlsl.h"
+#include "gs_mesh_clip_vert.h"
+#include "gs_mesh_chars_vert.h"
+#include "gs_mesh_enh_vert.h"
+#include "gs_mesh_chars_enh_vert.h"
+#include "gs_frag_lit.h"
+#include "gs_frag_single_lit.h"
+#include "gs_frag_blend_lit.h"
+#include "d3d_gs_mesh_vert_dxbc.h"
+#include "d3d_gs_mesh_chars_vert_dxbc.h"
+#include "d3d_gs_mesh_enh_vert_dxbc.h"
+#include "d3d_gs_mesh_chars_enh_vert_dxbc.h"
+#include "d3d_gs_frag_lit_dxbc.h"
+#include "d3d_gs_frag_single_lit_dxbc.h"
+#include "d3d_gs_frag_blend_lit_dxbc.h"
+#include "d3d_gs_frag_uint_lit_dxbc.h"
+#include "d3d_gs_frag_lit_hlsl.h"
+#include "d3d_gs_frag_single_lit_hlsl.h"
+#include "d3d_gs_frag_blend_lit_hlsl.h"
+#include "d3d_gs_frag_uint_lit_hlsl.h"
 #include "d3d_date_vert_dxbc.h"
 #include "d3d_date_frag_dxbc.h"
 #include "d3d_depth_load_frag_dxbc.h"
@@ -159,10 +178,12 @@ std::uint64_t Fnv(const void* data, std::size_t bytes) {
 
 // ------------------------------------------------------------------ objects
 
+struct Buffer;
 struct Memory {
     VkDeviceSize size = 0;
     std::uint32_t type = 0;                 // 0 device-local, 1 host-visible
     std::vector<std::uint8_t> host;
+    std::vector<Buffer*> buffers;           // bound to it (FlushMappedMemoryRanges')
 };
 
 struct Buffer {
@@ -172,6 +193,9 @@ struct Buffer {
     VkDeviceSize offset = 0;
     ID3D11Buffer* gpu = nullptr;            // the GPU's (a host buffer's twin, when the GPU reads it)
     bool dynamic = false, mapped_once = false;      // a DYNAMIC twin (MakeGpuBuffer), and mapped before
+    // Its host writes said by FlushMappedMemoryRanges (the native meshes' blocks: 32 MB, a mesh written once and
+    // drawn for many pictures): copied to the twin then, not the parts drawn at every submission.
+    bool flushed = false;
     std::map<std::pair<VkDeviceSize, VkDeviceSize>, ID3D11ShaderResourceView*> srvs;
     std::map<std::pair<VkDeviceSize, VkDeviceSize>, ID3D11UnorderedAccessView*> uavs;
     bool host() const { return memory && memory->type == 1; }
@@ -356,8 +380,9 @@ struct CommandBuffer {
        vertex buffers and strides bound, as the steps will have them. */
     std::map<Buffer*, std::pair<VkDeviceSize, VkDeviceSize>> uploads;
     struct Bound { Buffer* buffer = nullptr; VkDeviceSize offset = 0; std::uint32_t stride = 0; } bound[4];
+    struct BoundIndex { Buffer* buffer = nullptr; VkDeviceSize offset = 0; VkIndexType type = VK_INDEX_TYPE_UINT32; } index;
     void Reads(Buffer* b, VkDeviceSize lo, VkDeviceSize hi) {
-        if (!b || !b->host() || hi <= lo) return;
+        if (!b || !b->host() || b->flushed || hi <= lo) return;
         auto [at, made] = uploads.try_emplace(b, lo, hi);
         if (!made) {
             at->second.first = std::min(at->second.first, lo);
@@ -368,6 +393,7 @@ struct CommandBuffer {
         steps.clear();
         uploads.clear();
         for (Bound& b : bound) b = Bound{};
+        index = BoundIndex{};
     }
 };
 
@@ -538,6 +564,14 @@ struct KnownShader {
 
 #define PS2GPU_SHADER(spv, hlsl) {spv, sizeof spv, hlsl, sizeof hlsl}
 const KnownShader kShaders[] = {
+    // (the native meshes': the Vulkan renderer's modules, their DXBC made without fused multiply-adds)
+    PS2GPU_SHADER(spirv_gs_mesh_clip_vert, dxbc_d3d_gs_mesh_vert),
+    PS2GPU_SHADER(spirv_gs_mesh_chars_vert, dxbc_d3d_gs_mesh_chars_vert),
+    PS2GPU_SHADER(spirv_gs_mesh_enh_vert, dxbc_d3d_gs_mesh_enh_vert),
+    PS2GPU_SHADER(spirv_gs_mesh_chars_enh_vert, dxbc_d3d_gs_mesh_chars_enh_vert),
+    PS2GPU_SHADER(spirv_gs_frag_lit, dxbc_d3d_gs_frag_lit),
+    PS2GPU_SHADER(spirv_gs_frag_single_lit, dxbc_d3d_gs_frag_single_lit),
+    PS2GPU_SHADER(spirv_gs_frag_blend_lit, dxbc_d3d_gs_frag_blend_lit),
     PS2GPU_SHADER(spirv_gs_vert, dxbc_d3d_gs_vert),
     PS2GPU_SHADER(spirv_gs_frag, dxbc_d3d_gs_frag),
     PS2GPU_SHADER(spirv_gs_frag_single, dxbc_d3d_gs_frag_single),
@@ -689,6 +723,7 @@ bool MakeGpuBuffer(Buffer* b) {
     d.ByteWidth = UINT((b->size + 15) & ~VkDeviceSize(15));
     d.Usage = D3D11_USAGE_DEFAULT;
     if (b->usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) d.BindFlags |= D3D11_BIND_VERTEX_BUFFER;
+    if (b->usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT) d.BindFlags |= D3D11_BIND_INDEX_BUFFER;
     // A host buffer of vertices alone (the renderer's vertex rings): its twin
     // DYNAMIC, written in place with NO_OVERWRITE - the ring hands a part out
     // again only once the GPU is past it (the fences wait for the GPU).
@@ -830,6 +865,14 @@ struct Exec {
     // What is on the context already: set again only when it changes.
     Buffer* vb_bound[2] = {};
     UINT vb_offset[2] = {}, vb_stride[2] = {};
+    UINT dynamic_at = 0;                    // the draw's dynamic offset (CmdBindDescriptorSets)
+    UINT dynamic_bound = ~0u;               // ...as b12's table is bound
+    Buffer* ib = nullptr;                   // CmdBindIndexBuffer's
+    VkDeviceSize ib_offset = 0;
+    VkIndexType ib_type = VK_INDEX_TYPE_UINT32;
+    Buffer* ib_bound = nullptr;             // ...on the context
+    UINT ib_bound_offset = ~0u;
+    DXGI_FORMAT ib_bound_format = DXGI_FORMAT_UNKNOWN;
     DescriptorSet* stage_sets[4] = {};      // the graphics stages' resources as bound from these
     Pipeline* stage_pipeline = nullptr;
     std::uint64_t stage_version = 0;
@@ -848,6 +891,8 @@ struct Exec {
             vb_offset[i] = vb_stride[i] = ~0u;
         }
         stage_pipeline = nullptr;
+        ib_bound = nullptr;
+        dynamic_bound = ~0u;
         depth_bound = nullptr;
         reference_bound = ~0u;
         viewport_bound = D3D11_VIEWPORT{-1, -1, -1, -1, -1, -1};
@@ -953,6 +998,36 @@ void PushConstants(Exec& x, bool compute) {
     }
 }
 
+/* The native meshes' header read at the draw's dynamic offset (spirv_to_hlsl: b12's first uint): a constant buffer
+   whose 16-constant block k holds k * 256 - every offset the ring hands out is a multiple of 256 - bound at the
+   draw's block (Direct3D 11.1's offsets: no map a draw, where pushing the offset mapped the push ring each draw -
+   the NVIDIA driver's 15% of the renderer's thread at 144). Made larger when an offset is past it. */
+ID3D11Buffer* g_dynamic_table = nullptr;
+UINT g_dynamic_table_bytes = 0;
+void BindDynamic(Exec& x) {
+    const UINT at = x.dynamic_at & ~255u;
+    if (!g_context1) return;
+    if (at + 256 > g_dynamic_table_bytes) {
+        const UINT bytes = std::max<UINT>(8u << 20, (at + 256 + (1u << 20) - 1) & ~((1u << 20) - 1));
+        std::vector<std::uint32_t> words(bytes / 4, 0);
+        for (UINT k = 0; k < bytes / 256; ++k) words[std::size_t(k) * 64] = k * 256;
+        D3D11_BUFFER_DESC d{};
+        d.ByteWidth = bytes;
+        d.Usage = D3D11_USAGE_IMMUTABLE;
+        d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        const D3D11_SUBRESOURCE_DATA data{words.data(), 0, 0};
+        ID3D11Buffer* table = nullptr;
+        if (FAILED(g_gpu->device->CreateBuffer(&d, &data, &table))) return;
+        Release(g_dynamic_table);
+        g_dynamic_table = table;
+        g_dynamic_table_bytes = bytes;
+    }
+    const UINT first = at / 16, constants = 16;
+    g_context1->VSSetConstantBuffers1(12, 1, &g_dynamic_table, &first, &constants);
+    g_context1->PSSetConstantBuffers1(12, 1, &g_dynamic_table, &first, &constants);
+    x.dynamic_bound = x.dynamic_at;
+}
+
 const Descriptor* Find(DescriptorSet* const* sets, std::uint32_t reg) {
     DescriptorSet* set = sets[std::min<std::uint32_t>(reg / 7, 3)];
     if (!set) return nullptr;
@@ -974,10 +1049,15 @@ void BindStage(DescriptorSet* const* sets, const std::vector<Slot>& slots, SetSr
             }
             case D3D_SIT_BYTEADDRESS:
             case D3D_SIT_STRUCTURED: {
-                if (d && d->buffer && d->buffer->host()) Upload(d->buffer, d->offset, d->range == VK_WHOLE_SIZE
-                                                                                       ? d->buffer->size - d->offset
-                                                                                       : d->range);
-                set_srv(s.reg, d && d->buffer ? BufferSrv(d->buffer, d->offset, d->range) : nullptr);
+                // (a dynamic one - the native meshes' header - whole: the shader adds the draw's offset, kept in the
+                // push constants' byte 252 - spirv_to_hlsl - and its bytes copied as it is bound, CmdBindDescriptorSets)
+                const bool dynamic = d && (d->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ||
+                                           d->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC);
+                if (d && d->buffer && d->buffer->host() && !d->buffer->flushed && !dynamic)
+                    Upload(d->buffer, d->offset, d->range == VK_WHOLE_SIZE ? d->buffer->size - d->offset : d->range);
+                set_srv(s.reg, d && d->buffer ? dynamic ? BufferSrv(d->buffer, 0, VK_WHOLE_SIZE)
+                                                        : BufferSrv(d->buffer, d->offset, d->range)
+                                              : nullptr);
                 break;
             }
             case D3D_SIT_SAMPLER: {
@@ -1061,6 +1141,7 @@ void ApplyGraphics(Exec& x) {
         x.reference_bound = reference;
     }
     PushConstants(x, false);
+    if (x.dynamic_at != x.dynamic_bound) BindDynamic(x);       // (cheap: a native draw changes it, others do not)
     const std::uint64_t version = g_descriptor_version.load(std::memory_order_relaxed);
     // The stages' resources, unless bound from the same sets, unwritten
     // since, for this pipeline (anything binding an output - a pass, a
@@ -1437,6 +1518,10 @@ VKAPI_ATTR void VKAPI_CALL DestroyBuffer(VkDevice, VkBuffer buffer, const VkAllo
     if (!b) return;
     for (auto& [k, v] : b->srvs) Release(v);
     for (auto& [k, v] : b->uavs) Release(v);
+    if (b->memory) {
+        auto& list = b->memory->buffers;
+        list.erase(std::remove(list.begin(), list.end(), b), list.end());
+    }
     Release(b->gpu);
     delete b;
 }
@@ -1452,6 +1537,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BindBufferMemory(VkDevice, VkBuffer buffer, VkDev
     auto* b = reinterpret_cast<Buffer*>(buffer);
     b->memory = reinterpret_cast<Memory*>(memory);
     b->offset = offset;
+    b->memory->buffers.push_back(b);
     // A device buffer is its GPU resource; a host one gets a twin only when
     // the GPU reads it (MakeGpuBuffer, on first use).
     if (!b->host() && !MakeGpuBuffer(b)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -1481,6 +1567,24 @@ VKAPI_ATTR VkResult VKAPI_CALL MapMemory(VkDevice, VkDeviceMemory memory, VkDevi
 }
 
 VKAPI_ATTR void VKAPI_CALL UnmapMemory(VkDevice, VkDeviceMemory) {}
+
+/* The host's writes to these ranges, for the GPU now: copied to the twins of the buffers there (UploadMesh's, a
+   native mesh's bytes), which are copied so only from then on. */
+VKAPI_ATTR VkResult VKAPI_CALL FlushMappedMemoryRanges(VkDevice, std::uint32_t count, const VkMappedMemoryRange* ranges) {
+    for (std::uint32_t i = 0; i < count; ++i) {
+        auto* m = reinterpret_cast<Memory*>(ranges[i].memory);
+        if (!m || m->type != 1) continue;
+        const VkDeviceSize lo = ranges[i].offset;
+        const VkDeviceSize hi = ranges[i].size == VK_WHOLE_SIZE ? m->size : lo + ranges[i].size;
+        for (Buffer* b : m->buffers) {
+            const VkDeviceSize from = std::max(lo, b->offset), to = std::min(hi, b->offset + b->size);
+            if (from >= to) continue;
+            b->flushed = true;
+            Upload(b, from - b->offset, to - from);
+        }
+    }
+    return VK_SUCCESS;
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL CreateImage(VkDevice, const VkImageCreateInfo* ci, const VkAllocationCallbacks*,
                                           VkImage* out) {
@@ -1614,6 +1718,13 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateShaderModule(VkDevice, const VkShaderModule
                 m->hlsl = k.dxbc == dxbc_d3d_gs_frag ? hlsl_d3d_gs_frag : hlsl_d3d_gs_frag_single;
             }
             if (k.dxbc == dxbc_d3d_gs_frag_blend) m->hlsl = hlsl_d3d_gs_frag_blend;
+            if (k.dxbc == dxbc_d3d_gs_frag_lit || k.dxbc == dxbc_d3d_gs_frag_single_lit) {
+                m->uint_dxbc = dxbc_d3d_gs_frag_uint_lit;
+                m->uint_dxbc_bytes = sizeof dxbc_d3d_gs_frag_uint_lit;
+                m->uint_hlsl = hlsl_d3d_gs_frag_uint_lit;
+                m->hlsl = k.dxbc == dxbc_d3d_gs_frag_lit ? hlsl_d3d_gs_frag_lit : hlsl_d3d_gs_frag_single_lit;
+            }
+            if (k.dxbc == dxbc_d3d_gs_frag_blend_lit) m->hlsl = hlsl_d3d_gs_frag_blend_lit;
             break;
         }
     *out = reinterpret_cast<VkShaderModule>(m);
@@ -1957,13 +2068,73 @@ VKAPI_ATTR void VKAPI_CALL CmdBindPipeline(VkCommandBuffer cmd, VkPipelineBindPo
 
 VKAPI_ATTR void VKAPI_CALL CmdBindDescriptorSets(VkCommandBuffer cmd, VkPipelineBindPoint point, VkPipelineLayout,
                                                 std::uint32_t first, std::uint32_t count, const VkDescriptorSet* sets,
-                                                std::uint32_t, const std::uint32_t*) {
+                                                std::uint32_t dynamic_count, const std::uint32_t* dynamic_offsets) {
     DescriptorSet* bound[4] = {};
     for (std::uint32_t i = 0; i < count && first + i < 4; ++i) bound[i] = reinterpret_cast<DescriptorSet*>(sets[i]);
     const int which = point == VK_PIPELINE_BIND_POINT_COMPUTE ? 1 : 0;
-    Cmd(cmd).steps.push_back([which, first, count, b0 = bound[0], b1 = bound[1], b2 = bound[2], b3 = bound[3]](Exec& x) {
+    // The dynamic descriptors' offsets, in their order (set by set, binding by binding): the first one's byte offset
+    // the draw's (spirv_to_hlsl's _ps2gpu_dynamic: the native meshes' header, set 3's
+    // binding 1 - the only dynamic one the renderer has; b12 bound from the table of offsets there: ApplyGraphics),
+    // its bytes read by this command buffer.
+    bool has_dynamic = false;
+    std::uint32_t dynamic_at = 0;
+    std::uint32_t used = 0;
+    for (std::uint32_t i = 0; i < count && first + i < 4; ++i) {
+        if (!bound[i]) continue;
+        for (const auto& [binding, d] : bound[i]->bindings) {
+            if (d.type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC && d.type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
+                continue;
+            const std::uint32_t offset = used < dynamic_count && dynamic_offsets ? dynamic_offsets[used] : 0;
+            ++used;
+            if (has_dynamic) {
+                Unsupported("a second dynamic descriptor");
+                continue;
+            }
+            has_dynamic = true;
+            dynamic_at = std::uint32_t(d.offset) + offset;
+            const VkDeviceSize range = d.range == VK_WHOLE_SIZE && d.buffer ? d.buffer->size - dynamic_at : d.range;
+            Cmd(cmd).Reads(d.buffer, dynamic_at, dynamic_at + range);
+        }
+    }
+    Cmd(cmd).steps.push_back([which, first, count, b0 = bound[0], b1 = bound[1], b2 = bound[2], b3 = bound[3],
+                              has_dynamic, dynamic_at](Exec& x) {
         DescriptorSet* b[4] = {b0, b1, b2, b3};
         for (std::uint32_t i = 0; i < count && first + i < 4; ++i) x.sets[which][first + i] = b[i];
+        if (has_dynamic && which == 0) x.dynamic_at = dynamic_at;
+    });
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdBindIndexBuffer(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset,
+                                             VkIndexType type) {
+    Buffer* b = reinterpret_cast<Buffer*>(buffer);
+    Cmd(cmd).index = CommandBuffer::BoundIndex{b, offset, type};
+    Cmd(cmd).steps.push_back([b, offset, type](Exec& x) {
+        x.ib = b;
+        x.ib_offset = offset;
+        x.ib_type = type;
+    });
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdDrawIndexed(VkCommandBuffer cmd, std::uint32_t indices, std::uint32_t instances,
+                                         std::uint32_t first_index, std::int32_t vertex_offset,
+                                         std::uint32_t first_instance) {
+    CommandBuffer& c = Cmd(cmd);
+    const VkDeviceSize size = c.index.type == VK_INDEX_TYPE_UINT16 ? 2 : 4;
+    const VkDeviceSize lo = c.index.offset + VkDeviceSize(first_index) * size;
+    c.Reads(c.index.buffer, lo, lo + VkDeviceSize(indices) * size);
+    c.steps.push_back([=](Exec& x) {
+        if (!x.graphics || !x.ib || !MakeGpuBuffer(x.ib)) return;
+        ApplyGraphics(x);
+        const DXGI_FORMAT format = x.ib_type == VK_INDEX_TYPE_UINT16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
+        const UINT offset = UINT(x.ib_offset);
+        if (x.ib_bound != x.ib || x.ib_bound_offset != offset || x.ib_bound_format != format) {
+            g_gpu->context->IASetIndexBuffer(x.ib->gpu, format, offset);
+            x.ib_bound = x.ib;
+            x.ib_bound_offset = offset;
+            x.ib_bound_format = format;
+        }
+        if (instances == 1 && first_instance == 0) g_gpu->context->DrawIndexed(indices, first_index, vertex_offset);
+        else g_gpu->context->DrawIndexedInstanced(indices, instances, first_index, vertex_offset, first_instance);
     });
 }
 
@@ -2552,6 +2723,9 @@ VKAPI_ATTR void VKAPI_CALL GetPhysicalDeviceFeatures(VkPhysicalDevice, VkPhysica
     f->logicOp = g_gpu->logic_op ? VK_TRUE : VK_FALSE;     // (11.1's, through the target's UINT view)
     f->textureCompressionBC = VK_TRUE;
     f->samplerAnisotropy = VK_TRUE;
+    // (SV_ClipDistance: the native meshes' guard band - gs_mesh.vert's GUARD_CLIP; only with Direct3D 11.1's
+    // constant buffer offsets, which their header's dynamic offset is bound by - BindDynamic)
+    f->shaderClipDistance = PushRing() ? VK_TRUE : VK_FALSE;
 }
 
 VKAPI_ATTR void VKAPI_CALL GetPhysicalDeviceMemoryProperties(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties* m) {
@@ -2645,6 +2819,9 @@ void Install(D3D11Gpu& gpu) {
     PS2GPU_VK11(CmdSetStencilWriteMask);
     PS2GPU_VK11(CmdSetStencilReference);
     PS2GPU_VK11(CmdDraw);
+    PS2GPU_VK11(CmdDrawIndexed);
+    PS2GPU_VK11(CmdBindIndexBuffer);
+    PS2GPU_VK11(FlushMappedMemoryRanges);
     PS2GPU_VK11(CmdDispatch);
     PS2GPU_VK11(CmdPipelineBarrier);
     PS2GPU_VK11(CmdBeginRendering);

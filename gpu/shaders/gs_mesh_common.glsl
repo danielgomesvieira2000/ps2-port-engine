@@ -57,9 +57,40 @@ float Fix(float r, float e) {
     // r the nearest, e the exact value's excess over it: past it (the other sign) - one toward zero
     return (e != 0.0 && r != 0.0 && ((e < 0.0) != (r < 0.0))) ? TowardZero(r) : r;
 }
+#ifdef NO_FMA
+// Direct3D 11's shaders have no fused multiply-add for floats (fxc's mad may or may not fuse): a product's exact
+// error by Dekker's - each factor split in two halves (Veltkamp's, 2^12 + 1), their products exact - and each
+// residual below so arranged that its sign, all a decision reads, is the exact value's, as fma's single rounding
+// keeps it. The same results as fma's (every scripted run as recorded with it: PS2HOST_MESH_NO_FMA=1).
+void Split(float a, out float hi, out float lo) {
+    precise float c = 4097.0 * a;
+    precise float h = c - (c - a);
+    hi = isinf(c) ? a : h;
+    lo = isinf(c) ? 0.0 : a - h;
+}
+// a * b = r + e exactly (r the nearest).
+float ProductError(float a, float b, float r) {
+    float ah, al, bh, bl;
+    Split(a, ah, al);
+    Split(b, bh, bl);
+    precise float e = ((ah * bh - r) + ah * bl + al * bh) + al * bl;
+    return e;
+}
+// 1 - a * b, its sign the exact value's (a * b near 1: 1 - p exact, Sterbenz's).
+float OneLess(float a, float b) {
+    precise float p = a * b;
+    precise float pe = ProductError(a, b, p);
+    precise float d = (1.0 - p) - pe;
+    return d;
+}
+#endif
 float Mul(float a, float b) {
     precise float r = a * b;
+#ifdef NO_FMA
+    precise float e = ProductError(a, b, r);
+#else
     precise float e = fma(a, b, -r);
+#endif
     return Fix(r, e);
 }
 float Add(float a, float b) {
@@ -75,15 +106,28 @@ float Recip(float x) {
     if (ax == 0.0) return x < 0.0 || floatBitsToUint(x) == 0x80000000u ? -kMax : kMax;   // (the VU's: the largest)
     precise float q = 1.0 / ax;
     if (isinf(q) || q == 0.0) return x < 0.0 ? -q : q;
+#ifdef NO_FMA
+    precise float e0 = OneLess(ax, q);
+    precise float q1 = q * e0 + q;
+#else
     precise float e0 = fma(-ax, q, 1.0);
     precise float q1 = fma(q, e0, q);
+#endif
     q = q1;
     for (int i = 0; i < 2; ++i) {
+#ifdef NO_FMA
+        precise float r = OneLess(q, ax);
+#else
         precise float r = fma(-q, ax, 1.0);
+#endif
         if (r < 0.0) q = TowardZero(q);
     }
     precise float up = AwayFromZero(q);
+#ifdef NO_FMA
+    precise float ru = OneLess(up, ax);
+#else
     precise float ru = fma(-up, ax, 1.0);
+#endif
     if (ru >= 0.0) q = up;
     return x < 0.0 ? -q : q;
 }
@@ -91,9 +135,23 @@ float Recip(float x) {
 bool Past(float y, float x) {
     // y*y*x > 1, near enough exactly: y*y = p + pe (exact), then p*x - 1 and pe*x
     precise float p = y * y;
+#ifdef NO_FMA
+    // (t: p*x - 1 rounded once, as fma's - s - 1 exact, s near 1; then pe*x + t's sign, the exact sum's)
+    precise float pe = ProductError(y, y, p);
+    precise float s = p * x;
+    precise float se = ProductError(p, x, s);
+    precise float t = (s - 1.0) + se;
+    precise float q = pe * x;
+    precise float qe = ProductError(pe, x, q);
+    precise float u = t + q;
+    precise float ub = u - t;
+    precise float ue = (t - (u - ub)) + (q - ub);
+    precise float total = u + (ue + qe);
+#else
     precise float pe = fma(y, y, -p);
     precise float t = fma(p, x, -1.0);
     precise float total = fma(pe, x, t);
+#endif
     return total > 0.0;
 }
 float Rsqrt(float x) {
@@ -102,7 +160,11 @@ float Rsqrt(float x) {
     if (isinf(y) || y == 0.0) return y;
     // (a Newton step: the GPU's is approximate)
     precise float h = 0.5 * x * y;
+#ifdef NO_FMA
+    precise float n = 1.5 - h * y;
+#else
     precise float n = fma(-h, y, 1.5);
+#endif
     y = y * n;
     for (int i = 0; i < 2; ++i)
         if (Past(y, x)) y = TowardZero(y);

@@ -33,6 +33,7 @@ std::unique_ptr<GsRenderer> CreateD3D11GsRenderer(Gpu& gpu, std::string* error) 
         // Handles of the layer's own: never dereferenced as Vulkan's.
         static int instance, physical, device, queue;
         auto vulkan = std::make_unique<VulkanGpu>();
+        vulkan->d3d11_layer = true;
         std::string why;
         if (!vulkan->InitShared(reinterpret_cast<VkInstance>(&instance), reinterpret_cast<VkPhysicalDevice>(&physical),
                                 reinterpret_cast<VkDevice>(&device), 0, reinterpret_cast<VkQueue>(&queue), true,

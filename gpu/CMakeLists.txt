@@ -82,6 +82,8 @@ endforeach()
 # three with MESH_LIT (lit per pixel).
 foreach(variant "gs_mesh_enh_vert gs_mesh.vert -DENHANCED"
                 "gs_mesh_clip_vert gs_mesh.vert -DGUARD_CLIP"
+                "gs_mesh_nofma_vert gs_mesh.vert -DNO_FMA"
+                "gs_mesh_chars_nofma_vert gs_mesh_chars.vert -DNO_FMA"
                 "gs_mesh_chars_enh_vert gs_mesh_chars.vert -DENHANCED"
                 "gs_frag_lit gs.frag -DMESH_LIT"
                 "gs_frag_single_lit gs.frag -DMESH_LIT -DSINGLE_OUTPUT"
@@ -204,7 +206,8 @@ if(PS2GPU_D3D11)
             COMMAND ps2gpu_spirv_to_hlsl ${spv} ${hlsl} ${PS2GPU_SHADER_DIR}/${name}_hlsl.h ${name}
             COMMAND ${PS2GPU_FXC} /nologo /O3 /T ${profile} /E main /Fh ${out} /Vn dxbc_${name} ${hlsl}
             DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${source} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
-                    ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl
+                    ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_common.glsl
+                    ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_enhanced.glsl
                     ${CMAKE_CURRENT_LIST_DIR}/shaders/smaa_common.glsl ${CMAKE_CURRENT_LIST_DIR}/third_party/smaa/SMAA.glsl
                     ${CMAKE_CURRENT_LIST_DIR}/tools/spirv_to_hlsl.cpp ${GLSLANG} ps2gpu_spirv_to_hlsl
             COMMENT "HLSL ${name} (${source})")
@@ -215,6 +218,17 @@ if(PS2GPU_D3D11)
     ps2gpu_hlsl(d3d_gs_frag_single gs.frag ps_5_0 -DSINGLE_OUTPUT)
     ps2gpu_hlsl(d3d_gs_frag_blend gs.frag ps_5_0 -DSHADER_BLEND)
     ps2gpu_hlsl(d3d_gs_frag_uint gs.frag ps_5_0 -DSINGLE_OUTPUT -DUINT_OUTPUT)
+    # The native meshes (gs_mesh*.vert, gs.frag's MESH_LIT): their rounding without fused multiply-adds (NO_FMA:
+    # Direct3D 11 has none for floats), the room's guard band by clip distances (GUARD_CLIP), the header's dynamic
+    # offset added by spirv_to_hlsl (set 3's binding 1).
+    ps2gpu_hlsl(d3d_gs_mesh_vert gs_mesh.vert vs_5_0 -DGUARD_CLIP -DNO_FMA)
+    ps2gpu_hlsl(d3d_gs_mesh_chars_vert gs_mesh_chars.vert vs_5_0 -DNO_FMA)
+    ps2gpu_hlsl(d3d_gs_mesh_enh_vert gs_mesh.vert vs_5_0 -DENHANCED -DNO_FMA)
+    ps2gpu_hlsl(d3d_gs_mesh_chars_enh_vert gs_mesh_chars.vert vs_5_0 -DENHANCED -DNO_FMA)
+    ps2gpu_hlsl(d3d_gs_frag_lit gs.frag ps_5_0 -DMESH_LIT)
+    ps2gpu_hlsl(d3d_gs_frag_single_lit gs.frag ps_5_0 -DMESH_LIT -DSINGLE_OUTPUT)
+    ps2gpu_hlsl(d3d_gs_frag_blend_lit gs.frag ps_5_0 -DMESH_LIT -DSHADER_BLEND)
+    ps2gpu_hlsl(d3d_gs_frag_uint_lit gs.frag ps_5_0 -DMESH_LIT -DSINGLE_OUTPUT -DUINT_OUTPUT)
     ps2gpu_hlsl(d3d_date_vert date.vert vs_5_0)
     ps2gpu_hlsl(d3d_date_frag date.frag ps_5_0)
     ps2gpu_hlsl(d3d_depth_load_frag depth_load.frag ps_5_0)
