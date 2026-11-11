@@ -38,8 +38,10 @@ layout(push_constant) uniform Target {
 
 #include "gs_depth.glsl"
 
-#ifdef ENHANCED
-// (the guard band's planes clip: a triangle across one drawn in part, by the GPU)
+#if defined(ENHANCED) || defined(GUARD_CLIP)
+// (the guard band's planes clip: a triangle across one drawn in part, by the GPU. GUARD_CLIP: a device without
+// cull distances - MoltenVK's, Metal having none - the plain draws' cull by clipping instead: the same triangles,
+// those of this shader never across a plane - the clipper's batches are drawn apart - so all in or all out.)
 out gl_PerVertex {
     vec4 gl_Position;
     float gl_ClipDistance[6];

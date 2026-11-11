@@ -81,6 +81,7 @@ endforeach()
 # The enhanced native draws (gs_mesh_enhanced.glsl): the mesh programs with ENHANCED, the fragment shader's
 # three with MESH_LIT (lit per pixel).
 foreach(variant "gs_mesh_enh_vert gs_mesh.vert -DENHANCED"
+                "gs_mesh_clip_vert gs_mesh.vert -DGUARD_CLIP"
                 "gs_mesh_chars_enh_vert gs_mesh_chars.vert -DENHANCED"
                 "gs_frag_lit gs.frag -DMESH_LIT"
                 "gs_frag_single_lit gs.frag -DMESH_LIT -DSINGLE_OUTPUT"

@@ -43,6 +43,7 @@
 #include "gs_mesh_vert.h"
 #include "gs_mesh_chars_vert.h"
 #include "gs_mesh_enh_vert.h"
+#include "gs_mesh_clip_vert.h"
 #include "gs_mesh_chars_enh_vert.h"
 #include "gs_frag_lit.h"
 #include "gs_frag_single_lit.h"
@@ -1870,7 +1871,20 @@ bool VulkanGsRenderer::Init(std::string* error) {
         return m;
     };
     vert_ = module(spirv_gs_vert, sizeof spirv_gs_vert);
-    if (g_.cull_distance) {
+    // The native meshes: the guard band culled by cull distances, or (a device without them: MoltenVK's) clipped by
+    // clip distances - the same triangles (gs_mesh.vert's GUARD_CLIP). PS2HOST_MESH_GUARD=clip: the second (a test).
+    static const bool guard_clip = std::getenv("PS2HOST_MESH_GUARD") && std::string(std::getenv("PS2HOST_MESH_GUARD")) == "clip";
+    if ((!g_.cull_distance || guard_clip) && g_.clip_distance) {
+        mesh_vert_ = module(spirv_gs_mesh_clip_vert, sizeof spirv_gs_mesh_clip_vert);
+        mesh_chars_vert_ = module(spirv_gs_mesh_chars_vert, sizeof spirv_gs_mesh_chars_vert);
+        mesh_enh_vert_ = module(spirv_gs_mesh_enh_vert, sizeof spirv_gs_mesh_enh_vert);
+        mesh_chars_enh_vert_ = module(spirv_gs_mesh_chars_enh_vert, sizeof spirv_gs_mesh_chars_enh_vert);
+        frag_lit_ = g_.dual_source ? module(spirv_gs_frag_lit, sizeof spirv_gs_frag_lit)
+                                   : module(spirv_gs_frag_single_lit, sizeof spirv_gs_frag_single_lit);
+        frag_blend_lit_ = module(spirv_gs_frag_blend_lit, sizeof spirv_gs_frag_blend_lit);
+        std::fprintf(stderr, "[gpu] native meshes: the guard band by clip distances (%s)\n",
+                     g_.cull_distance ? "PS2HOST_MESH_GUARD" : "no cull distances");
+    } else if (g_.cull_distance) {
         mesh_vert_ = module(spirv_gs_mesh_vert, sizeof spirv_gs_mesh_vert);
         mesh_chars_vert_ = module(spirv_gs_mesh_chars_vert, sizeof spirv_gs_mesh_chars_vert);
         if (g_.clip_distance) {
