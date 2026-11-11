@@ -208,6 +208,8 @@ struct Feed {
                 waiting.store(true);
                 room.wait_for(lock, std::chrono::milliseconds(1), [&] { return done() || has_failed.load(); });
                 waiting.store(false);
+                lock.unlock();
+                KeepWindowAnswering();      // (a GPU pipeline made meanwhile: seconds on a cold driver)
             }
         }
     }

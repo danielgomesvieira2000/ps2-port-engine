@@ -45,10 +45,6 @@ constexpr std::uint32_t kMeshLitPixels = 1, kMeshPrecise = 2;
    thread; the renderer takes it at its next frame. */
 void SetGpuMsaa(std::uint32_t samples);
 std::uint32_t GpuMsaa();
-/* SHADOWS: the native characters' meshes cast shadows from their first point light onto the native room (the
-   enhanced draws: gs_shadow.glsl) - a depth image drawn from the light each picture, read the next. */
-void SetGpuShadows(bool on);
-bool GpuShadows();
 void SetMeshEnhancements(std::uint32_t bits);
 std::uint32_t MeshEnhancements();
 /* Called on the renderer's own thread (a threaded renderer's) as it starts:
@@ -326,6 +322,9 @@ public:
     virtual bool DrawsMeshes() const { return false; }
     /* Whether a decode's auto_levels are made (GsTextureDecode). */
     virtual bool MakesTextureLevels() const { return false; }
+    /* How many bytes of textures the bridge's cache may keep on the GPU (TextureFromMemory's images): a share
+       of the device's own memory - past it, the least recently drawn go. */
+    virtual std::uint64_t TextureBudget() const { return std::uint64_t(512) << 20; }
     /* ...and their enhanced draws (gs_mesh_enhanced.glsl: the device's clip distances) - a header whose ext asks
        for them (its y, the enhancements the game made it for) drawn so. */
     virtual bool DrawsEnhancedMeshes() const { return false; }
@@ -481,6 +480,11 @@ void SetPipelineHints(const std::uint32_t* keys, std::size_t count);
 /* The start's pipelines (the last runs', the hints) being made: true while
    some are still to come, with how many are made of how many. */
 bool PipelineWarmProgress(std::size_t* made, std::size_t* total);
+/* The GPU's device lost (a submission, present or wait said VK_ERROR_DEVICE_LOST): the renderer on it draws
+   nothing more, and the display's ResetDevice makes it again. LoseDevice: as if (a test's). */
+bool DeviceLost();
+void LoseDevice();
+void DeviceMadeAgain();          // (a device of the renderer's own, without a display: made again by its owner)
 /* `inner` on a thread of its own (threaded_renderer.cpp): what only hands
    work over is queued and made there in order; what answers or reads waits
    for the queue to empty first. One caller thread. */

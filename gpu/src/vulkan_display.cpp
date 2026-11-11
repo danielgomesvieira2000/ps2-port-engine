@@ -272,6 +272,12 @@ private:
     std::uint64_t presents_ = 0;
     double interval_sum_ = 0, interval_squares_ = 0, interval_longest_ = 0;
     std::unique_ptr<VulkanGpu> shared_;
+    // Init's choice, for MakeDevice again (ResetDevice).
+    VkPath path_ = kVk13;
+    bool baked_ = false;
+    bool MakeDevice();
+public:
+    bool ResetDevice() override;
 };
 
 Gpu* VulkanDisplay::SharedGpu() {
@@ -287,6 +293,7 @@ Gpu* VulkanDisplay::SharedGpu() {
 
 bool VulkanDisplay::Check(VkResult result, const char* what) {
     if (result == VK_SUCCESS) return true;
+    NoteResult(result);
     char text[160];
     std::snprintf(text, sizeof text, "%s failed (VkResult %d)", what, int(result));
     error_ = text;
@@ -371,7 +378,15 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
                   VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
                   VK_API_VERSION_PATCH(p.apiVersion), p.driverVersion, VkPathName(path, baked));
     describe_ = text;
+    path_ = path;
+    baked_ = baked;
+    return MakeDevice();
+}
 
+/* The device, its queue, the presents' command buffers and the swapchain (Init's; ResetDevice's again). */
+bool VulkanDisplay::MakeDevice() {
+    const VkPath path = path_;
+    const bool baked = baked_;
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = family_;
@@ -1749,6 +1764,87 @@ void VulkanDisplay::StopDoneWatch() {
     for (auto& [fence, tag] : done_watch_->waiting) vkDestroyFence(device_, fence, nullptr);
     for (VkFence fence : done_watch_->spare) vkDestroyFence(device_, fence, nullptr);
     done_watch_.reset();
+}
+
+/* The device lost (g_device_lost): everything made on it let go - the shared GPU (the renderer's, gone first),
+   the presents' thread and their images, the effects' passes, the swapchain - and made again on a new device of
+   the same GPU, the window and its surface kept. */
+bool VulkanDisplay::ResetDevice() {
+    {
+        std::lock_guard<std::mutex> hold(paced_lock_);
+        stop_ = true;
+    }
+    paced_wake_.notify_all();
+    if (present_thread_.joinable()) present_thread_.join();
+    std::lock_guard<std::mutex> presenting(present_lock_);
+    shared_.reset();
+    GpuDoneObserver done = done_watch_ ? done_watch_->observer : GpuDoneObserver{};
+    StopDoneWatch();
+    if (device_) {
+        std::lock_guard<std::mutex> hold(g_queue_lock);
+        vkDeviceWaitIdle(device_);              // (a lost device's: at once)
+    }
+    DestroyPaced();
+    if (copy_pool_) vkDestroyCommandPool(device_, copy_pool_, nullptr);
+    copy_pool_ = VK_NULL_HANDLE;
+    DestroyPicture();
+    DestroyPostImages();
+    DestroySmaa();
+    smaa_tables_sent_ = smaa_failed_ = false;
+    smaa_width_ = smaa_height_ = 0;
+    smaa_for_in_ = VK_NULL_HANDLE;
+    for (VkDescriptorSet& set : smaa_sets_) set = VK_NULL_HANDLE;
+    if (fxaa_pipeline_) vkDestroyPipeline(device_, fxaa_pipeline_, nullptr);
+    if (downsample_pipeline_) vkDestroyPipeline(device_, downsample_pipeline_, nullptr);
+    if (post_layout_) vkDestroyPipelineLayout(device_, post_layout_, nullptr);
+    if (post_descriptors_) vkDestroyDescriptorPool(device_, post_descriptors_, nullptr);
+    if (post_set_layout_) vkDestroyDescriptorSetLayout(device_, post_set_layout_, nullptr);
+    if (post_sampler_) vkDestroySampler(device_, post_sampler_, nullptr);
+    fxaa_pipeline_ = downsample_pipeline_ = VK_NULL_HANDLE;
+    post_layout_ = VK_NULL_HANDLE;
+    post_descriptors_ = VK_NULL_HANDLE;
+    post_set_layout_ = VK_NULL_HANDLE;
+    post_sampler_ = VK_NULL_HANDLE;
+    post_set_ = VK_NULL_HANDLE;
+    post_failed_ = false;
+    if (overlay_buffer_) vkDestroyBuffer(device_, overlay_buffer_, nullptr);
+    if (overlay_memory_) vkFreeMemory(device_, overlay_memory_, nullptr);
+    overlay_buffer_ = VK_NULL_HANDLE;
+    overlay_memory_ = VK_NULL_HANDLE;
+    overlay_mapped_ = nullptr;
+    for (std::uint64_t& g : overlay_slot_generation_) g = 0;
+    DestroySwapchain();
+    if (device_) {
+        for (int i = 0; i < kInFlight; ++i) {
+            if (fences_[i]) vkDestroyFence(device_, fences_[i], nullptr);
+            if (acquire_fences_[i]) vkDestroyFence(device_, acquire_fences_[i], nullptr);
+            if (acquireds_[i]) vkDestroySemaphore(device_, acquireds_[i], nullptr);
+            fences_[i] = acquire_fences_[i] = VK_NULL_HANDLE;
+            acquireds_[i] = VK_NULL_HANDLE;
+            cmds_[i] = VK_NULL_HANDLE;
+        }
+        if (pool_) vkDestroyCommandPool(device_, pool_, nullptr);
+        pool_ = VK_NULL_HANDLE;
+        vkDestroyDevice(device_, nullptr);
+    }
+    device_ = VK_NULL_HANDLE;
+    queue_ = VK_NULL_HANDLE;
+    slot_ = 0;
+    {
+        std::lock_guard<std::mutex> hold(paced_lock_);
+        stop_ = false;
+        ready_.clear();
+        taken_ = held_ = -1;
+    }
+    g_device_lost = false;
+    if (!MakeDevice()) {
+        std::fprintf(stderr, "[display] the device could not be made again: %s\n", error_.c_str());
+        return false;
+    }
+    if (done) SetGpuDoneObserver(std::move(done));
+    ApplyBoost();
+    std::fprintf(stderr, "[display] the device made again (%s)\n", describe_.c_str());
+    return true;
 }
 
 VulkanDisplay::~VulkanDisplay() {

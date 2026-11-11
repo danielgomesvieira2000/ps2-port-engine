@@ -61,12 +61,7 @@ layout(location = 3) flat out vec4 range_out;
 #include "gs_mesh_common.glsl"
 #ifdef ENHANCED
 #include "gs_mesh_enhanced.glsl"
-#include "gs_shadow.glsl"
 uint Enhancements() { return floatBitsToUint(header.ext[0].y); }
-vec3 ViewOf(vec4 clip) {
-    const vec4 v = shadow.unproject * clip;
-    return v.xyz / (abs(v.w) > 1e-20 ? v.w : 1.0);
-}
 #endif
 
 // A row's dot with the place, as MULA, MADDA, MADDA, MADD (w: 1) make it.
@@ -109,14 +104,11 @@ void main() {
             lit_normal = header.ext[e + 3].xyz;
             lit_colour = header.ext[e + 4];
             lit_on = (Enhancements() & kLitPixels) != 0u ? 1.0 : 0.0;
-            lit_view = ViewOf(header.ext[e + 1]);
-        } else {
-            lit_view = vec3(0.0);
         }
 #endif
         return;
     }
-    const uint at = uint(gl_VertexIndex) * 4u;
+    const uint at = min(uint(gl_VertexIndex) * 4u, uint(mesh.quad.length()) - 4u);     // (held in the mesh: no read past it)
     const vec4 p = mesh.quad[at];
     const vec4 nrm = mesh.quad[at + 1u];
     const vec4 col = mesh.quad[at + 2u];
@@ -178,6 +170,5 @@ void main() {
     lit_on = (Enhancements() & kLitPixels) != 0u ? 1.0 : 0.0;
     lit_program = 0u;
     lit_eye = EyeOf(header.row[3], header.row[4], header.row[5], header.row[6]);
-    lit_view = ViewOf(cp);
 #endif
 }

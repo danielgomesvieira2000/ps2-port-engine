@@ -110,6 +110,7 @@ public:
     void Flush() override { Op(kFlush, 0); End(); }
     bool DrawsMeshes() const override { return inner_->DrawsMeshes(); }
     bool MakesTextureLevels() const override { return inner_->MakesTextureLevels(); }
+    std::uint64_t TextureBudget() const override { return inner_->TextureBudget(); }
     bool DrawsEnhancedMeshes() const override { return inner_->DrawsEnhancedMeshes(); }
     bool MeshDrawable(const GsDrawState& state) const override { return inner_->MeshDrawable(state); }
     void UploadMesh(std::uint64_t key, const void* quads, std::size_t quad_count, const std::uint32_t* indices,

@@ -392,8 +392,16 @@ void PresentFrame();
    thread presents): false once it has been closed. */
 bool PumpWindow();
 /* The GPU's start pipelines made before the game runs, behind a loading
-   screen when that takes a while (a first start on a device). */
-void WaitForGpuPipelines();
+   screen when that takes a while (a first start on a device) - and, while
+   `preparing` is true, whatever another thread is still making (the
+   renderer itself: its first pipelines). The window answers meanwhile. */
+void WaitForGpuPipelines(const std::atomic<bool>* preparing = nullptr);
+/* A wait of the window's thread (the EE's, for the GS thread or VIF1's
+   worker) that may be long: the window told to Windows as answering, every
+   quarter of a second, without taking its events - not "not responding"
+   while a GPU pipeline is made in the middle of a game. Any thread; only
+   the window's does anything. */
+void KeepWindowAnswering();
 /* Fullscreen on or off (saved as the "fullscreen" setting, settings.h, which
    the window opens with); and whether it is. */
 void SetWindowFullscreen(bool on);
@@ -525,8 +533,7 @@ struct PortOption {
 };
 void AddPortOptions(const std::vector<PortOption>& options);
 /* The engine's graphics rows for a port's page (its GRAPHICS): ANTI-ALIASING (OFF, FXAA, SMAA:
-   SetWindowAntiAliasing), MSAA (OFF, 2X, 4X, 8X: the 3D's edges sampled finer - ps2gpu::SetGpuMsaa), SHADOWS
-   (experimental, off: ps2gpu::SetGpuShadows - not a preset's). */
+   SetWindowAntiAliasing), MSAA (OFF, 2X, 4X, 8X: the 3D's edges sampled finer - ps2gpu::SetGpuMsaa). */
 std::vector<PortOption> EnhancedGraphicsOptions(const std::string& page);
 /* Their values for a preset: the game's look (all off), or each at its best. */
 void SetEnhancedGraphics(bool on);

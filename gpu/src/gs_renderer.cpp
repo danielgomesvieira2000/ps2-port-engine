@@ -44,7 +44,6 @@
 #include "gs_mesh_chars_vert.h"
 #include "gs_mesh_enh_vert.h"
 #include "gs_mesh_chars_enh_vert.h"
-#include "gs_mesh_chars_shadow_vert.h"
 #include "gs_frag_lit.h"
 #include "gs_frag_single_lit.h"
 #include "gs_frag_blend_lit.h"
@@ -449,6 +448,18 @@ constexpr std::uint32_t kMeshEnhancedKey = 1u << 30;
 constexpr std::uint32_t kMsaaKey = 1u << 31;
 // A key's bits that pick its vertex stage (and its samples): kept in a stand-in's key.
 constexpr std::uint32_t kMeshKeys = kMeshVertices | kMeshCharactersKey | kMeshEnhancedKey | kMsaaKey;
+// The bits of a key that pick its shaders (modules, features): VulkanGsRenderer::ShaderGroup.
+constexpr std::uint32_t kShaderGroupBits = kShaderBlend | (kFeatureBits << kFeatureShift) | kMeshKeys;
+
+/* A start's list in the order the workers best take it: a pipeline of each
+   shaders (ShaderGroup) first, the rest of each after. */
+template <class Id>
+static void FirstOfEachGroup(std::vector<Id>& ids) {
+    std::unordered_set<std::uint32_t> seen;
+    std::stable_partition(ids.begin(), ids.end(), [&](Id id) {
+        return seen.insert(std::uint32_t(id) & kShaderGroupBits).second;
+    });
+}
 
 /* The pipeline a state needs: blending and its operands, and the write mask
    (bits 9-12, inverted so that 0 is the plain pipeline); bit 15 the blend
@@ -563,6 +574,18 @@ public:
     void ReleaseTexture(std::uint64_t key) override;
     bool DrawsMeshes() const override { return mesh_vert_ && mesh_pool_; }
     bool MakesTextureLevels() const override { return decode_image_pipeline_ && mipgen_pipeline_; }
+    /* A quarter of the largest device-local heap, 256 MB to 2 GB (an 8 GB card: 2 GB; an integrated GPU's
+       shared heap: its quarter) - the rest for the targets at the internal resolution, MSAA's twins, the
+       meshes, the effects. PS2HOST_TEXTURE_BUDGET_MB to test another. */
+    std::uint64_t TextureBudget() const override {
+        if (const char* mb = std::getenv("PS2HOST_TEXTURE_BUDGET_MB")) return std::uint64_t(std::atoll(mb)) << 20;
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(g_.gpu, &mp);
+        VkDeviceSize largest = 0;
+        for (std::uint32_t i = 0; i < mp.memoryHeapCount; ++i)
+            if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) largest = std::max(largest, mp.memoryHeaps[i].size);
+        return std::clamp<std::uint64_t>(largest / 4, std::uint64_t(256) << 20, std::uint64_t(2) << 30);
+    }
     bool DrawsEnhancedMeshes() const override {
         return DrawsMeshes() && mesh_enh_vert_ && mesh_chars_enh_vert_ && frag_lit_ && frag_blend_lit_;
     }
@@ -594,7 +617,6 @@ public:
     void Flush() override;
     void Kick() override {
         Flush();
-        ShadowPass();
         if (GpuMsaa() != msaa_asked_) ApplyMsaa();
         g_.Flush();
         ++frame_;
@@ -667,9 +689,25 @@ private:
        allocation of the driver's each (vkAllocateMemory goes to the system's
        kernel). Larger, an allocation of its own. */
     bool ImageMemory(const VkMemoryRequirements& req, std::uint32_t type, Image& image);
+    bool TryImageMemory(const VkMemoryRequirements& req, std::uint32_t type, Image& image);
     void FreeImageMemory(VkDeviceMemory memory, VkDeviceSize offset, std::uint32_t piece_class, std::uint32_t type);
     std::map<std::uint64_t, std::vector<std::pair<VkDeviceMemory, VkDeviceSize>>> image_pieces_;   // (type, class) -> free
     std::vector<VkDeviceMemory> image_blocks_;
+    /* A block's pieces in use, and its kind's blocks: a block none of whose
+       pieces is used goes back to the driver (one of each kind kept) - kept
+       for ever, a long game's blocks of every size it had ever used came to
+       the GPU's whole memory (8 GB, the TEXTURE FILTER changed a few times:
+       each its textures' sizes), and its next image was not made (a texture
+       white, MSAA's target missing). */
+    struct BlockUse {
+        std::uint64_t kind = 0;         // image_pieces_'s key
+        std::uint32_t live = 0;
+    };
+    std::unordered_map<VkDeviceMemory, BlockUse> image_block_use_;
+    std::map<std::uint64_t, std::uint32_t> image_kind_blocks_;
+    /* What can go when the GPU's memory is short: the pooled textures (their
+       images, sets) and the blocks left empty by them. */
+    void FreeSpareImages();
     void Fill(Texture& texture, const std::uint32_t* pixels);
     VkPipeline PipelineFor(std::uint32_t key);
     /* Without extended dynamic state (g_vk_baked_states): a GS draw's
@@ -816,34 +854,6 @@ private:
     VkSampler msaa_sampler_ = VK_NULL_HANDLE;
     std::map<std::pair<VkImageView, VkImageView>, VkDescriptorSet> msaa_sets_;
     bool MakeMsaaExpand();
-    /* SHADOWS (SetGpuShadows; gs_shadow.glsl): the casters' draws this picture (the characters' enhanced mesh
-       draws: their set, header offset and triangles, as they were), the light and projection from their header,
-       the image drawn from the light at the picture's end (ShadowPass) and its parameters. */
-    struct ShadowCast {
-        VkDescriptorSet set;
-        std::uint32_t offset;
-        VkBuffer indices;
-        VkDeviceSize index_offset;
-        std::uint32_t index_count;
-    };
-    struct ShadowParams {
-        float light_clip[16], unproject[16], light[4], tuning[4];
-    };
-    static constexpr std::uint32_t kShadowSize = 1024;
-    static constexpr float kShadowReach = 240.0f;          // around the characters' middle (Outbreak's units: ~3 m)
-    static constexpr float kShadowStrength = 0.6f;
-    std::vector<ShadowCast> shadow_casts_;
-    float shadow_light_[3] = {}, shadow_centre_[3] = {};
-    std::array<float, 16> shadow_projection_{};
-    std::uint32_t shadow_count_ = 0;
-    bool shadow_light_known_ = false, shadow_on_ = false;
-    Image shadow_map_;
-    VkBuffer shadow_ubo_ = VK_NULL_HANDLE;
-    VkDeviceMemory shadow_ubo_memory_ = VK_NULL_HANDLE;
-    VkSampler shadow_sampler_ = VK_NULL_HANDLE;
-    VkPipeline shadow_pipeline_ = VK_NULL_HANDLE;
-    bool MakeShadowResources();
-    void ShadowPass();
     void EndPass(VkCommandBuffer cmd, PassEnd why = kEndOther) {
         if (!open_target_) return;
         ++g_pass_ends[why];
@@ -1044,6 +1054,16 @@ private:
     std::set<std::uint64_t> pipelines_asked_;          // (keys, and BakedIds)
     std::atomic<bool> pipelines_ready_{false};
     bool pipeline_stop_ = false;
+    /* The shaders a key's pipeline compiles (its modules and features -
+       ShaderGroup): a driver compiles each such once, and a pipeline of the
+       same after it takes a millisecond. Being made by one thread at a time
+       (MakeGrouped, the workers): a cold NVIDIA driver took 28 s for the
+       whole shader's, and five threads made it at once, 42 s each. */
+    static std::uint32_t ShaderGroup(std::uint64_t id) {
+        return std::uint32_t(id) & kShaderGroupBits;
+    }
+    std::unordered_set<std::uint32_t> groups_busy_;     // (pipeline_lock_'s)
+    VkPipeline MakeGrouped(std::uint64_t id);
     VkPipeline MakePipeline(std::uint32_t key, std::uint32_t baked = kDynamicStates);
     void AskWorker(std::uint64_t id, bool soon);
     std::size_t warm_left_ = 0;         // WarmPipelines' still to come
@@ -1674,217 +1694,18 @@ void VulkanGsRenderer::ApplyMsaa() {
         msaa_samples_ = 1;
     }
     std::fprintf(stderr, "[ps2gpu] MSAA: %ux\n", msaa_samples_);
+    // The multisampled pipelines the last runs drew with (WarmPipelines left
+    // them for their samples), asked of the workers now: not each made the
+    // first time it is drawn, in the middle of the game.
+    if (msaa_samples_ > 1 && async_pipelines_) {
+        std::vector<std::uint32_t> keys;
+        for (std::uint32_t key : known_keys_)
+            if ((key & kMsaaKey) && !pipelines_.count(key) && pipelines_asked_.insert(key).second) keys.push_back(key);
+        FirstOfEachGroup(keys);
+        for (std::uint32_t key : keys) AskWorker(key, false);
+    }
 }
 
-/* The shadow image and its parameters (set 1's bindings 1 and 2: gs_shadow.glsl), made with the CLUT's set: the
-   image cleared to the far plane, the parameters off. */
-bool VulkanGsRenderer::MakeShadowResources() {
-    if (!MakeImage(shadow_map_, kShadowSize, kShadowSize,
-                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                   VK_FORMAT_D32_SFLOAT))
-        return false;
-    void* mapped = nullptr;
-    if (!Buffer(sizeof(ShadowParams), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &shadow_ubo_,
-                &shadow_ubo_memory_, &mapped))
-        return false;
-    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    si.magFilter = si.minFilter = VK_FILTER_NEAREST;
-    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    if (vkCreateSampler(g_.device, &si, nullptr, &shadow_sampler_) != VK_SUCCESS) return false;
-    g_.Record([&](VkCommandBuffer cmd) {
-        const ShadowParams off{};
-        vkCmdUpdateBuffer(cmd, shadow_ubo_, 0, sizeof off, &off);
-        Transition(cmd, shadow_map_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-                   VK_PIPELINE_STAGE_TRANSFER_BIT);
-        const VkClearDepthStencilValue far{1.0f, 0};
-        const VkImageSubresourceRange all{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
-        vkCmdClearDepthStencilImage(cmd, shadow_map_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &far, 1, &all);
-        Transition(cmd, shadow_map_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
-                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-        MemoryBarrier(cmd);
-    });
-    // the casters' pipeline: gs_mesh_chars.vert with SHADOW, depth alone
-    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    mi.codeSize = sizeof spirv_gs_mesh_chars_shadow_vert;
-    mi.pCode = spirv_gs_mesh_chars_shadow_vert;
-    VkShaderModule vert = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(g_.device, &mi, nullptr, &vert) != VK_SUCCESS) return false;
-    VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-    stage.stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stage.module = vert;
-    stage.pName = "main";
-    VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-    viewport.viewportCount = viewport.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;
-    raster.lineWidth = 1.0f;
-    raster.depthBiasEnable = VK_TRUE;
-    raster.depthBiasConstantFactor = 2.0f;
-    raster.depthBiasSlopeFactor = 2.0f;
-    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    depth.depthTestEnable = depth.depthWriteEnable = VK_TRUE;
-    depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-    VkPipelineColorBlendStateCreateInfo blending{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    const VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = 2;
-    dynamic.pDynamicStates = dynamic_states;
-    VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-    rendering.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
-    VkGraphicsPipelineCreateInfo pci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    pci.pNext = &rendering;
-    pci.stageCount = 1;
-    pci.pStages = &stage;
-    pci.pVertexInputState = &input;
-    pci.pInputAssemblyState = &assembly;
-    pci.pViewportState = &viewport;
-    pci.pRasterizationState = &raster;
-    pci.pMultisampleState = &multisample;
-    pci.pDepthStencilState = &depth;
-    pci.pColorBlendState = &blending;
-    pci.pDynamicState = &dynamic;
-    pci.layout = layout_;
-    const bool made = vkCreateGraphicsPipelines(g_.device, cache_, 1, &pci, nullptr, &shadow_pipeline_) == VK_SUCCESS;
-    vkDestroyShaderModule(g_.device, vert, nullptr);
-    return made;
-}
-
-namespace {
-// 4x4s as std140's mat4: columns.
-using Mat4 = std::array<float, 16>;
-Mat4 Multiply(const Mat4& a, const Mat4& b) {
-    Mat4 m{};
-    for (int c = 0; c < 4; ++c)
-        for (int r = 0; r < 4; ++r) {
-            float sum = 0.0f;
-            for (int k = 0; k < 4; ++k) sum += a[k * 4 + r] * b[c * 4 + k];
-            m[c * 4 + r] = sum;
-        }
-    return m;
-}
-bool Invert(const Mat4& m, Mat4* out) {
-    double a[4][8];
-    for (int r = 0; r < 4; ++r)
-        for (int c = 0; c < 4; ++c) a[r][c] = m[c * 4 + r], a[r][c + 4] = r == c ? 1.0 : 0.0;
-    for (int c = 0; c < 4; ++c) {
-        int pivot = c;
-        for (int r = c + 1; r < 4; ++r)
-            if (std::fabs(a[r][c]) > std::fabs(a[pivot][c])) pivot = r;
-        if (std::fabs(a[pivot][c]) < 1e-30) return false;
-        for (int k = 0; k < 8; ++k) std::swap(a[c][k], a[pivot][k]);
-        const double d = a[c][c];
-        for (int k = 0; k < 8; ++k) a[c][k] /= d;
-        for (int r = 0; r < 4; ++r)
-            if (r != c) {
-                const double f = a[r][c];
-                for (int k = 0; k < 8; ++k) a[r][k] -= f * a[c][k];
-            }
-    }
-    for (int r = 0; r < 4; ++r)
-        for (int c = 0; c < 4; ++c) (*out)[c * 4 + r] = float(a[r][c + 4]);
-    return true;
-}
-}  // namespace
-
-/* At a picture's end: the characters drawn this picture, from their light, into the shadow image - and the
-   parameters the next picture's room reads (the light's clip space, the projection undone); off when there
-   were none (or SHADOWS is off). */
-void VulkanGsRenderer::ShadowPass() {
-    // (a kick with no casters since the last - more than one a picture: the GPU's reads - keeps what was drawn)
-    if (GpuShadows() && shadow_casts_.empty()) return;
-    const bool on = GpuShadows() && shadow_pipeline_ && !shadow_casts_.empty() && shadow_light_known_;
-    ShadowParams params{};
-    if (on) {
-        const float n = float(shadow_count_);
-        const float cx = shadow_centre_[0] / n, cy = shadow_centre_[1] / n, cz = shadow_centre_[2] / n;
-        const float lx = shadow_light_[0], ly = shadow_light_[1], lz = shadow_light_[2];
-        float fx = cx - lx, fy = cy - ly, fz = cz - lz;
-        const float dist = std::sqrt(fx * fx + fy * fy + fz * fz);
-        if (dist > 1.0f) {
-            fx /= dist, fy /= dist, fz /= dist;
-            // (up: the view's y, or z where the light looks along it)
-            float ux = 0.0f, uy = 1.0f, uz = 0.0f;
-            if (std::fabs(fy) > 0.95f) uy = 0.0f, uz = 1.0f;
-            float sx = fy * uz - fz * uy, sy = fz * ux - fx * uz, sz = fx * uy - fy * ux;
-            const float sl = std::sqrt(sx * sx + sy * sy + sz * sz);
-            sx /= sl, sy /= sl, sz /= sl;
-            const float tx = sy * fz - sz * fy, ty = sz * fx - sx * fz, tz = sx * fy - sy * fx;
-            const Mat4 view = {sx, tx, -fx, 0, sy, ty, -fy, 0, sz, tz, -fz, 0,
-                               -(sx * lx + sy * ly + sz * lz), -(tx * lx + ty * ly + tz * lz), fx * lx + fy * ly + fz * lz, 1};
-            const float reach = kShadowReach;
-            const float nearz = std::max(1.0f, dist - 3.0f * reach), farz = dist + 3.0f * reach;
-            const float focal = dist / reach;
-            const Mat4 proj = {focal, 0, 0, 0, 0, focal, 0, 0, 0, 0, farz / (nearz - farz), -1,
-                               0, 0, nearz * farz / (nearz - farz), 0};
-            const Mat4 light_clip = Multiply(proj, view);
-            Mat4 unproject{};
-            if (Invert(shadow_projection_, &unproject)) {
-                std::memcpy(params.light_clip, light_clip.data(), 64);
-                std::memcpy(params.unproject, unproject.data(), 64);
-                params.light[0] = lx, params.light[1] = ly, params.light[2] = lz, params.light[3] = 1.0f;
-                params.tuning[0] = kShadowStrength;
-                params.tuning[1] = 0.0005f;
-                params.tuning[2] = 1.0f / float(kShadowSize);
-            }
-        }
-    }
-    const bool drawing = params.light[3] > 0.0f;
-    // PS2HOST_SHADOW_LOG=1: what each picture's shadows took (every 60th)
-    static const bool log = std::getenv("PS2HOST_SHADOW_LOG") != nullptr;
-    static std::uint64_t pictures = 0;
-    if (log && ++pictures % 60 == 0)
-        std::fprintf(stderr, "[shadows] %s: %zu casts, light %g %g %g, middle %g %g %g (of %u), drawing %d\n",
-                     GpuShadows() ? "on" : "off", shadow_casts_.size(), shadow_light_[0], shadow_light_[1], shadow_light_[2],
-                     shadow_count_ ? shadow_centre_[0] / float(shadow_count_) : 0.0f,
-                     shadow_count_ ? shadow_centre_[1] / float(shadow_count_) : 0.0f,
-                     shadow_count_ ? shadow_centre_[2] / float(shadow_count_) : 0.0f, shadow_count_, int(drawing));
-    if (drawing || shadow_on_) {
-        g_.Record([&](VkCommandBuffer cmd) {
-            EndPass(cmd);
-            vkCmdUpdateBuffer(cmd, shadow_ubo_, 0, sizeof params, &params);
-            MemoryBarrier(cmd);
-            if (!drawing) return;
-            Transition(cmd, shadow_map_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
-            VkRenderingAttachmentInfo z{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-            z.imageView = shadow_map_.view;
-            z.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-            z.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-            z.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            z.clearValue.depthStencil = {1.0f, 0};
-            VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-            ri.renderArea = {{0, 0}, {kShadowSize, kShadowSize}};
-            ri.layerCount = 1;
-            ri.pDepthAttachment = &z;
-            BeginRendering(cmd, ri, ri.renderArea.extent);
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow_pipeline_);
-            const VkViewport vp{0.0f, 0.0f, float(kShadowSize), float(kShadowSize), 0.0f, 1.0f};
-            vkCmdSetViewport(cmd, 0, 1, &vp);
-            vkCmdSetScissor(cmd, 0, 1, &ri.renderArea);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 1, 1, &clut_set_, 0, nullptr);
-            for (const ShadowCast& c : shadow_casts_) {
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 3, 1, &c.set, 1, &c.offset);
-                vkCmdBindIndexBuffer(cmd, c.indices, c.index_offset, VK_INDEX_TYPE_UINT32);
-                vkCmdDrawIndexed(cmd, c.index_count, 1, 0, 0, 0);
-            }
-            EndRendering(cmd);
-            Transition(cmd, shadow_map_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
-                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-            drawn_ = DrawState{};
-        });
-    }
-    shadow_on_ = drawing;
-    shadow_casts_.clear();
-    shadow_centre_[0] = shadow_centre_[1] = shadow_centre_[2] = 0.0f;
-    shadow_count_ = 0;
-}
 
 void VulkanGsRenderer::DestroyImage(Image& t) {
     if (t.msaa) {
@@ -1923,7 +1744,24 @@ void VulkanGsRenderer::DestroyImage(Image& t) {
     t = Image{};
 }
 
+/* ImageMemory's, and on a failure (the GPU's memory short) once more after
+   what is spare is let go - not an image missing at once. */
 bool VulkanGsRenderer::ImageMemory(const VkMemoryRequirements& req, std::uint32_t type, Image& t) {
+    // PS2HOST_GPU_MEMORY_SHORT=n (a test): every nth image's first try taken as failed - what is spare let go.
+    static const int short_every = std::getenv("PS2HOST_GPU_MEMORY_SHORT") ? std::atoi(std::getenv("PS2HOST_GPU_MEMORY_SHORT")) : 0;
+    static int tries = 0;
+    const bool pretend = short_every > 0 && ++tries % short_every == 0;
+    if (!pretend && TryImageMemory(req, type, t)) return true;
+    FreeSpareImages();
+    if (TryImageMemory(req, type, t)) return true;
+    static int told = 0;
+    if (told++ < 5)
+        std::fprintf(stderr, "[ps2gpu] no GPU memory for an image of %llu KB (%zu textures, %zu blocks)\n",
+                     static_cast<unsigned long long>(req.size >> 10), textures_.size(), image_blocks_.size());
+    return false;
+}
+
+bool VulkanGsRenderer::TryImageMemory(const VkMemoryRequirements& req, std::uint32_t type, Image& t) {
     constexpr VkDeviceSize kBlock = VkDeviceSize(64) << 20, kLargest = VkDeviceSize(16) << 20;
     std::uint32_t piece_class = 16;                 // 64 KB
     while ((VkDeviceSize(1) << piece_class) < std::max(req.size, req.alignment)) ++piece_class;
@@ -1936,7 +1774,8 @@ bool VulkanGsRenderer::ImageMemory(const VkMemoryRequirements& req, std::uint32_
         t.offset = 0;
         return vkAllocateMemory(g_.device, &mai, nullptr, &t.memory) == VK_SUCCESS;
     }
-    auto& free = image_pieces_[std::uint64_t(type) << 32 | piece_class];
+    const std::uint64_t kind = std::uint64_t(type) << 32 | piece_class;
+    auto& free = image_pieces_[kind];
     if (free.empty()) {
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         mai.allocationSize = kBlock;
@@ -1944,6 +1783,8 @@ bool VulkanGsRenderer::ImageMemory(const VkMemoryRequirements& req, std::uint32_
         VkDeviceMemory block = VK_NULL_HANDLE;
         if (vkAllocateMemory(g_.device, &mai, nullptr, &block) != VK_SUCCESS) return false;
         image_blocks_.push_back(block);
+        image_block_use_[block] = BlockUse{kind, 0};
+        ++image_kind_blocks_[kind];
         const VkDeviceSize piece = VkDeviceSize(1) << piece_class;
         for (VkDeviceSize at = kBlock; at >= piece; at -= piece) free.emplace_back(block, at - piece);
     }
@@ -1951,6 +1792,7 @@ bool VulkanGsRenderer::ImageMemory(const VkMemoryRequirements& req, std::uint32_
     t.offset = free.back().second;
     t.piece_class = piece_class;
     free.pop_back();
+    ++image_block_use_[t.memory].live;
     return true;
 }
 
@@ -1960,7 +1802,52 @@ void VulkanGsRenderer::FreeImageMemory(VkDeviceMemory memory, VkDeviceSize offse
         vkFreeMemory(g_.device, memory, nullptr);
         return;
     }
-    image_pieces_[std::uint64_t(type) << 32 | piece_class].emplace_back(memory, offset);
+    const std::uint64_t kind = std::uint64_t(type) << 32 | piece_class;
+    auto& free = image_pieces_[kind];
+    free.emplace_back(memory, offset);
+    auto use = image_block_use_.find(memory);
+    static const bool keep_blocks = std::getenv("PS2HOST_GPU_KEEP_BLOCKS") != nullptr;      // (a test: as before)
+    if (use == image_block_use_.end() || --use->second.live || image_kind_blocks_[kind] <= 1 || keep_blocks) return;
+    // (none of its pieces used, and another of its kind kept: back to the driver)
+    free.erase(std::remove_if(free.begin(), free.end(), [&](const auto& piece) { return piece.first == memory; }),
+               free.end());
+    image_blocks_.erase(std::find(image_blocks_.begin(), image_blocks_.end(), memory));
+    image_block_use_.erase(use);
+    --image_kind_blocks_[kind];
+    vkFreeMemory(g_.device, memory, nullptr);
+}
+
+void VulkanGsRenderer::FreeSpareImages() {
+    std::size_t freed = 0;
+    for (auto& [size, list] : texture_pool_) {
+        for (Texture& texture : list) {
+            for (VkDescriptorSet& set : texture.sets)
+                if (set) vkFreeDescriptorSets(g_.device, pool_, 1, &set);
+            if (texture.image.storage) vkFreeDescriptorSets(g_.device, texture_storage_pool_, 1, &texture.image.storage);
+            texture.image.storage = VK_NULL_HANDLE;
+            DestroyImage(texture.image);
+            ++freed;
+        }
+        list.clear();
+    }
+    pooled_textures_ -= std::min(pooled_textures_, freed);
+    // (the kinds' last blocks too, when empty)
+    for (auto it = image_block_use_.begin(); it != image_block_use_.end();) {
+        if (it->second.live) {
+            ++it;
+            continue;
+        }
+        const VkDeviceMemory block = it->first;
+        auto& free = image_pieces_[it->second.kind];
+        free.erase(std::remove_if(free.begin(), free.end(), [&](const auto& piece) { return piece.first == block; }),
+                   free.end());
+        image_blocks_.erase(std::find(image_blocks_.begin(), image_blocks_.end(), block));
+        --image_kind_blocks_[it->second.kind];
+        vkFreeMemory(g_.device, block, nullptr);
+        it = image_block_use_.erase(it);
+    }
+    std::fprintf(stderr, "[ps2gpu] the GPU's memory short: %zu spare textures let go (%zu blocks left)\n", freed,
+                 image_blocks_.size());
 }
 
 bool VulkanGsRenderer::Init(std::string* error) {
@@ -2012,21 +1899,18 @@ bool VulkanGsRenderer::Init(std::string* error) {
     dli.bindingCount = 2;
     dli.pBindings = bindings;
     vkCreateDescriptorSetLayout(g_.device, &dli, nullptr, &set_layout_);
-    // (and SHADOWS': the image, its parameters - gs_shadow.glsl)
-    VkDescriptorSetLayoutBinding clut_bindings[3] = {
-        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-        {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-        {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+    VkDescriptorSetLayoutBinding clut_binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                              nullptr};
     VkDescriptorSetLayoutCreateInfo cli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    cli.bindingCount = 3;
-    cli.pBindings = clut_bindings;
+    cli.bindingCount = 1;
+    cli.pBindings = &clut_binding;
     vkCreateDescriptorSetLayout(g_.device, &cli, nullptr, &clut_set_layout_);
-    VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * 8192 + 4},
-                                     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4}};
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * 8192},
+                                     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
     dpi.maxSets = 8192 + 4;
-    dpi.poolSizeCount = 3;
+    dpi.poolSizeCount = 2;
     dpi.pPoolSizes = sizes;
     vkCreateDescriptorPool(g_.device, &dpi, nullptr, &pool_);
     for (int i = 0; i < 8; ++i) {
@@ -2085,7 +1969,18 @@ bool VulkanGsRenderer::Init(std::string* error) {
     lci.pushConstantRangeCount = 2;
     lci.pPushConstantRanges = push;
     vkCreatePipelineLayout(g_.device, &lci, nullptr, &layout_);
-    if (!(g_vk_baked_states ? BakedPipelineFor(0, 0) : PipelineFor(0)) || !MakeDatePipeline()) {
+    // The last runs' pipelines asked of the workers first: made while this
+    // thread makes the whole shader's (on a cold driver the slowest of all,
+    // half a minute) and the rest below, not after them.
+    WarmPipelines();
+    const auto init_began = std::chrono::steady_clock::now();
+    static const bool init_log = std::getenv("PS2HOST_PIPELINE_LOG") != nullptr;
+    auto init_step = [&](const char* what) {
+        if (init_log)
+            std::fprintf(stderr, "[gpu] start: %s after %.0f ms\n", what,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - init_began).count());
+    };
+    if (!(g_vk_baked_states ? BakedPipelineFor(0, 0) : PipelineFor(0)) || (init_step("the first pipeline"), !MakeDatePipeline())) {
         if (error) *error = "vkCreateGraphicsPipelines failed";
         return false;
     }
@@ -2103,8 +1998,9 @@ bool VulkanGsRenderer::Init(std::string* error) {
     }
     Fill(blank_, &white);
     g_.end_pass = [this](VkCommandBuffer cmd) { EndPass(cmd); };
+    init_step("DATE's");
     if (!InitMemory(error)) return false;
-    WarmPipelines();
+    init_step("the memory's (compute)");
     return true;
 }
 
@@ -2142,27 +2038,13 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
             if (error) *error = "no descriptor set for the CLUT";
             return false;
         }
-        if (!MakeShadowResources()) {
-            if (error) *error = "no shadow image";
-            return false;
-        }
         const VkDescriptorBufferInfo info{clut_, 0, VK_WHOLE_SIZE};
-        const VkDescriptorImageInfo map{shadow_sampler_, shadow_map_.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
-        const VkDescriptorBufferInfo params{shadow_ubo_, 0, sizeof(ShadowParams)};
-        VkWriteDescriptorSet writes[3] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
-                                          {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
-        for (int i = 0; i < 3; ++i) {
-            writes[i].dstSet = clut_set_;
-            writes[i].dstBinding = std::uint32_t(i);
-            writes[i].descriptorCount = 1;
-        }
-        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[0].pBufferInfo = &info;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[1].pImageInfo = &map;
-        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        writes[2].pBufferInfo = &params;
-        vkUpdateDescriptorSets(g_.device, 3, writes, 0, nullptr);
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = clut_set_;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = &info;
+        vkUpdateDescriptorSets(g_.device, 1, &write, 0, nullptr);
     }
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     ci.codeSize = sizeof spirv_swizzle_comp;
@@ -3095,11 +2977,13 @@ void VulkanGsRenderer::WarmPipelines() {
         while (baked && baked >> word) {
             const std::uint64_t id = std::strtoull(word.c_str(), nullptr, 16);
             if (id & kMsaaKey) continue;
+            if (id == BakedId(0, 0)) continue;      // (Init's own)
             if (!(id >> 32) || baked_pipelines_.count(id) || !pipelines_asked_.insert(id).second) continue;
             known_baked_.insert(id);
             ids.push_back(id);
         }
         if (ids.empty()) return;
+        FirstOfEachGroup(ids);
         warm_began_ = std::chrono::steady_clock::now();
         warm_left_ = ids.size();
         g_warm_made = 0;
@@ -3115,6 +2999,10 @@ void VulkanGsRenderer::WarmPipelines() {
             known_keys_.insert(key);
             continue;
         }
+        if (key == 0) {                     // (Init's own)
+            known_keys_.insert(key);
+            continue;
+        }
         if (pipelines_.count(key) || !pipelines_asked_.insert(key).second) continue;
         known_keys_.insert(key);
         keys.push_back(key);
@@ -3122,8 +3010,9 @@ void VulkanGsRenderer::WarmPipelines() {
     // The game's own list after (SetPipelineHints): kept in the file only
     // once drawn with.
     for (std::uint32_t key : g_pipeline_hints)
-        if (!pipelines_.count(key) && pipelines_asked_.insert(key).second) keys.push_back(key);
+        if (key && !pipelines_.count(key) && pipelines_asked_.insert(key).second) keys.push_back(key);
     if (keys.empty()) return;
+    FirstOfEachGroup(keys);
     warm_began_ = std::chrono::steady_clock::now();
     warm_left_ = keys.size();
     g_warm_made = 0;
@@ -3138,26 +3027,46 @@ void VulkanGsRenderer::AskWorker(std::uint64_t id, bool soon) {
     // shader - a phone's tens of milliseconds and more) made in a fraction
     // of the time, the processors otherwise idle while it waits.
     if (pipeline_workers_.empty()) {
+        // (Up to 8: a first start's wait shortened in proportion - each a
+        // driver's compiler, a few hundred MB while it works. PS2HOST_PIPELINE_WORKERS
+        // to measure another.)
         const unsigned processors = std::max(1u, std::thread::hardware_concurrency());
-        const unsigned workers = std::clamp(processors / 2, 1u, 4u);
+        unsigned workers = std::clamp(processors / 2, 1u, 8u);
+        if (const char* n = std::getenv("PS2HOST_PIPELINE_WORKERS")) workers = std::clamp(unsigned(std::atoi(n)), 1u, 64u);
         for (unsigned i = 0; i < workers; ++i)
             pipeline_workers_.emplace_back([this] {
                 std::unique_lock<std::mutex> hold(pipeline_lock_);
+                // The first asked whose shaders no other thread is compiling.
+                auto ready = [this] {
+                    for (auto it = pipeline_queue_.begin(); it != pipeline_queue_.end(); ++it)
+                        if (!groups_busy_.count(ShaderGroup(*it))) return it;
+                    return pipeline_queue_.end();
+                };
                 for (;;) {
-                    pipeline_wake_.wait(hold, [this] { return pipeline_stop_ || !pipeline_queue_.empty(); });
+                    pipeline_wake_.wait(hold, [&] { return pipeline_stop_ || ready() != pipeline_queue_.end(); });
                     if (pipeline_stop_) return;
-                    const std::uint64_t next = pipeline_queue_.front();
-                    pipeline_queue_.pop_front();
+                    const auto at = ready();
+                    const std::uint64_t next = *at;
+                    pipeline_queue_.erase(at);
+                    groups_busy_.insert(ShaderGroup(next));
                     hold.unlock();
                     // PS2HOST_PIPELINE_SLOW_MS: each made that much slower (a cold driver, to test).
                     static const int slow_ms = std::getenv("PS2HOST_PIPELINE_SLOW_MS") ? std::atoi(std::getenv("PS2HOST_PIPELINE_SLOW_MS")) : 0;
                     if (slow_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(slow_ms));
+                    const auto began = std::chrono::steady_clock::now();
                     const VkPipeline made = MakePipeline(
                         std::uint32_t(next), next >> 32 ? std::uint32_t((next >> 32) - 1) : kDynamicStates);
+                    static const bool log = std::getenv("PS2HOST_PIPELINE_LOG") != nullptr;
+                    if (log)
+                        std::fprintf(stderr, "[gpu] worker: pipeline %016llX made in %.0f ms\n",
+                                     static_cast<unsigned long long>(next),
+                                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count());
                     hold.lock();
+                    groups_busy_.erase(ShaderGroup(next));
                     pipelines_made_.emplace_back(next, made);
                     pipelines_ready_.store(true, std::memory_order_release);
                     g_warm_made.fetch_add(1, std::memory_order_relaxed);
+                    pipeline_wake_.notify_all();        // (one its shaders held back, a MakeGrouped)
                 }
             });
     }
@@ -3167,6 +3076,25 @@ void VulkanGsRenderer::AskWorker(std::uint64_t id, bool soon) {
         else pipeline_queue_.push_back(id);
     }
     pipeline_wake_.notify_one();
+}
+
+/* A pipeline made on this thread now, after any other thread making one of
+   the same shaders (ShaderGroup) - which then costs a millisecond, not the
+   compiling again. */
+VkPipeline VulkanGsRenderer::MakeGrouped(std::uint64_t id) {
+    const std::uint32_t group = ShaderGroup(id);
+    {
+        std::unique_lock<std::mutex> hold(pipeline_lock_);
+        pipeline_wake_.wait(hold, [&] { return !groups_busy_.count(group); });
+        groups_busy_.insert(group);
+    }
+    const VkPipeline made = MakePipeline(std::uint32_t(id), id >> 32 ? std::uint32_t((id >> 32) - 1) : kDynamicStates);
+    {
+        std::lock_guard<std::mutex> hold(pipeline_lock_);
+        groups_busy_.erase(group);
+    }
+    pipeline_wake_.notify_all();
+    return made;
 }
 
 /* The cache and the keys, written when new pipelines came, at most every
@@ -3240,7 +3168,7 @@ VkPipeline VulkanGsRenderer::PipelineFor(std::uint32_t key) {
         }
     }
     const auto began = std::chrono::steady_clock::now();
-    const VkPipeline pipeline = MakePipeline(key);
+    const VkPipeline pipeline = MakeGrouped(key);
     if (!pipeline) return VK_NULL_HANDLE;
     KeepPipeline(key, pipeline, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count());
     return pipeline;
@@ -3266,7 +3194,7 @@ VkPipeline VulkanGsRenderer::BakedPipelineFor(std::uint32_t key, std::uint32_t b
         }
     }
     const auto began = std::chrono::steady_clock::now();
-    const VkPipeline pipeline = MakePipeline(key, baked);
+    const VkPipeline pipeline = MakeGrouped(id);
     if (!pipeline) return VK_NULL_HANDLE;
     KeepBaked(id, pipeline);
     static const bool log = std::getenv("PS2HOST_PIPELINE_LOG") != nullptr;
@@ -4115,7 +4043,6 @@ void VulkanGsRenderer::DrawMeshWith(const GsDrawState& state, std::uint64_t key,
     }
     MeshDraw draw{&mesh, set, std::uint32_t(offset), call.program};
     draw.enhanced = enhancements != 0;
-    const bool casts = large && draw.enhanced && shadow_pipeline_ && GpuShadows() && call.header_floats > 180;
     if (call.indices) {
         if (!call.index_count) return;
         void* idx = Vertices(call.index_count * 4, &draw.indices, &draw.index_offset);
@@ -4124,18 +4051,6 @@ void VulkanGsRenderer::DrawMeshWith(const GsDrawState& state, std::uint64_t key,
         draw.index_count = std::uint32_t(call.index_count);
     } else if (!mesh.index_count) {
         return;
-    }
-    if (casts) {
-        // (the light: vf11-vf13's y, the first point; the projection: vf01-vf04; the middle: the first matrix's place)
-        const float* h = call.header;
-        shadow_light_[0] = h[45], shadow_light_[1] = h[49], shadow_light_[2] = h[53];
-        for (int i = 0; i < 16; ++i) shadow_projection_[std::size_t(i)] = h[4 + i];
-        shadow_light_known_ = true;
-        shadow_centre_[0] += h[176 + 12], shadow_centre_[1] += h[176 + 13], shadow_centre_[2] += h[176 + 14];
-        ++shadow_count_;
-        shadow_casts_.push_back({set, std::uint32_t(offset), draw.indices ? draw.indices : mesh.block->buffer,
-                                 draw.indices ? draw.index_offset : mesh.index_offset,
-                                 draw.indices ? draw.index_count : mesh.index_count});
     }
     // One batch of its own, through Flush (its target, pass, states as a batch of triangles'). What it
     // reads of its own target (feedback, the shader's blending): all of it - its place is the GPU's.
@@ -5225,6 +5140,8 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     for (VkDeviceMemory block : image_blocks_) vkFreeMemory(g_.device, block, nullptr);     // (ImageMemory's)
     image_blocks_.clear();
     image_pieces_.clear();
+    image_block_use_.clear();
+    image_kind_blocks_.clear();
     for (const Staged& staged : staging_free_) {
         vkUnmapMemory(g_.device, staged.memory);
         vkDestroyBuffer(g_.device, staged.buffer, nullptr);
@@ -5261,11 +5178,6 @@ VulkanGsRenderer::~VulkanGsRenderer() {
         if (m) vkDestroyShaderModule(g_.device, m, nullptr);
     for (VkPipeline p : msaa_expand_)
         if (p) vkDestroyPipeline(g_.device, p, nullptr);
-    if (shadow_pipeline_) vkDestroyPipeline(g_.device, shadow_pipeline_, nullptr);
-    if (shadow_sampler_) vkDestroySampler(g_.device, shadow_sampler_, nullptr);
-    if (shadow_ubo_) vkDestroyBuffer(g_.device, shadow_ubo_, nullptr);
-    if (shadow_ubo_memory_) vkFreeMemory(g_.device, shadow_ubo_memory_, nullptr);
-    DestroyImage(shadow_map_);
     if (msaa_expand_layout_) vkDestroyPipelineLayout(g_.device, msaa_expand_layout_, nullptr);
     if (msaa_pool_) vkDestroyDescriptorPool(g_.device, msaa_pool_, nullptr);
     if (msaa_set_layout_) vkDestroyDescriptorSetLayout(g_.device, msaa_set_layout_, nullptr);
@@ -5397,6 +5309,12 @@ void SetPipelineCacheDir(const std::string& dir) { g_pipeline_cache_dir = dir; }
 void SetPipelineHints(const std::uint32_t* keys, std::size_t count) { g_pipeline_hints.assign(keys, keys + count); }
 
 std::string PipelineCacheDir() { return g_pipeline_cache_dir; }
+
+bool DeviceLost() { return g_device_lost.load(); }
+void DeviceMadeAgain() { g_device_lost = false; }
+void LoseDevice() {
+    if (!g_device_lost.exchange(true)) std::fprintf(stderr, "[ps2gpu] the GPU's device taken as lost (a test)\n");
+}
 
 bool PipelineWarmProgress(std::size_t* made, std::size_t* total) {
     const std::size_t all = g_warm_total.load(), done = std::min(all, g_warm_made.load());

@@ -1,5 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
 // The GS's per-pixel work, in its own terms (0-255, with 0x80 as 1.0 where it
 // multiplies): the texture function, then the alpha test. Blending is the
 // fixed-function blender's; the GS's factor - source alpha or FIX over 128 -
@@ -388,33 +389,57 @@ vec4 SampleModern(vec2 uv, vec2 dx, vec2 dy, int mxl, float most) {
     const float f = lod - float(n);
     const vec2 axis = lx > ly ? dx : dy;
     vec4 sum = vec4(0.0);
-    for (int i = 0; i < int(taps); ++i) {
+    const int levels = n < mxl && f > 0.0 ? 2 : 1;      // (one Bilinear called: Sample(uv)'s why)
+    [[dont_unroll]] for (int i = 0; i < int(taps); ++i) {
         const vec2 at = uv + axis * ((float(i) + 0.5) / taps - 0.5);
-        vec4 c = Bilinear(at, n);
-        if (n < mxl && f > 0.0) c = mix(c, Bilinear(at, n + 1), f);
+        vec4 c = vec4(0.0);
+        [[dont_unroll]] for (int j = 0; j < levels; ++j) {
+            const vec4 b = Bilinear(at, n + j);
+            c = j == 0 ? b : mix(c, b, f);
+        }
         sum += c;
     }
     return floor(sum / taps + 0.5);
 }
 
+// (Each level's Sample called from one place, a loop of one level or two: a
+// driver's compiler inlines every call whole, and five calls here - twenty-
+// five in the whole shader, with the paint's four taps - took a cold NVIDIA
+// driver half a minute for that pipeline.)
 vec4 Sample(vec2 uv) {
     const uint m = p.bilinear;
-    if (!Has(kMip) || (m & 2u) == 0u) return Sample(uv, 0, Has(kLinear) && (m & 1u) != 0u);
-    const int mxl = int((m >> 2) & 7u);
-    const uint mmin = (m >> 5) & 7u;
-    float lod = float(int(m << 4) >> 20) / 16.0;    // K, 4 fractional bits
-    const float q = coordinate.z != 0.0 ? abs(coordinate.z) : 1.0;     // as the software GS's
-    if (((m >> 9) & 1u) == 0u) lod += -log2(q) * float(1u << ((m >> 10) & 3u));
-    if (lod <= 0.0) return Sample(uv, 0, ((m >> 8) & 1u) != 0u);
-    const bool linear = mmin == 4u || mmin == 5u;
-    if (mmin == 2u || mmin == 4u) return Sample(uv, int(min(floor(lod + 0.5), float(mxl))), linear);
-    lod = min(lod, float(mxl));
-    const int n = int(floor(lod));
-    const float f = lod - float(n);
-    const vec4 c0 = Sample(uv, n, linear);
-    if (n >= mxl || f == 0.0) return c0;
-    const vec4 c1 = Sample(uv, n + 1, linear);
-    return floor(c0 + (c1 - c0) * f + 0.5);
+    int n = 0, levels = 1;
+    float f = 0.0;
+    bool linear;
+    if (!Has(kMip) || (m & 2u) == 0u) {
+        linear = Has(kLinear) && (m & 1u) != 0u;
+    } else {
+        const int mxl = int((m >> 2) & 7u);
+        const uint mmin = (m >> 5) & 7u;
+        float lod = float(int(m << 4) >> 20) / 16.0;    // K, 4 fractional bits
+        const float q = coordinate.z != 0.0 ? abs(coordinate.z) : 1.0;     // as the software GS's
+        if (((m >> 9) & 1u) == 0u) lod += -log2(q) * float(1u << ((m >> 10) & 3u));
+        if (lod <= 0.0) {
+            linear = ((m >> 8) & 1u) != 0u;
+        } else {
+            linear = mmin == 4u || mmin == 5u;
+            if (mmin == 2u || mmin == 4u) {
+                n = int(min(floor(lod + 0.5), float(mxl)));
+            } else {
+                lod = min(lod, float(mxl));
+                n = int(floor(lod));
+                f = lod - float(n);
+                if (n < mxl && f != 0.0) levels = 2;
+            }
+        }
+    }
+    vec4 c0 = vec4(0.0), c1 = vec4(0.0);
+    [[dont_unroll]] for (int i = 0; i < levels; ++i) {
+        const vec4 c = Sample(uv, n + i, linear);
+        if (i == 0) c0 = c;
+        else c1 = c;
+    }
+    return levels == 1 ? c0 : floor(c0 + (c1 - c0) * f + 0.5);
 }
 
 #ifdef UINT_OUTPUT
@@ -443,30 +468,8 @@ layout(location = 6) in vec4 lit_colour;
 layout(location = 7) in float lit_on;
 layout(location = 8) flat in uint lit_program;
 layout(location = 9) flat in vec3 lit_eye;
-layout(location = 10) in vec3 lit_view;
-layout(set = 1, binding = 1) uniform sampler2D shadow_map;
-#include "gs_shadow.glsl"
 
 vec4 H(int i) { return mesh_header.h[i]; }
-
-// How much of the light a characters' shadow takes from the room at the view's place `v` (0 none): the
-// shadow image's depths around it (3x3, a soft edge) against its own, faded out at the image's edges.
-float Shadowed(vec3 v) {
-    if (shadow.light.w < 0.5 || v == vec3(0.0)) return 0.0;
-    const vec4 lc = shadow.light_clip * vec4(v, 1.0);
-    if (lc.w <= 0.0) return 0.0;
-    const vec3 q = lc.xyz / lc.w;
-    const vec2 uv = q.xy * 0.5 + 0.5;
-    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))) || q.z <= 0.0 || q.z >= 1.0) return 0.0;
-    float dark = 0.0;
-    for (int y = -1; y <= 1; ++y)
-        for (int x = -1; x <= 1; ++x) {
-            const float d = texture(shadow_map, uv + vec2(x, y) * shadow.tuning.z).r;
-            dark += q.z - shadow.tuning.y > d ? 1.0 : 0.0;
-        }
-    const vec2 edge = min(uv, 1.0 - uv);
-    return dark / 9.0 * smoothstep(0.0, 0.08, min(edge.x, edge.y));
-}
 
 // A texture pack's surface detail (blend_ops bit 27: set 2 its replacement's _n image - texture_pack.h): the
 // normal's RGB in the texture's own space, its shine in alpha. The texture's axes from the screen's change in
@@ -521,7 +524,6 @@ vec4 LitShade(vec4 vertex_shade) {
             c += H(26).rgb * (shine * pow(max(dot(normalize(n), half_way), 0.0), 8.0 + 56.0 * shine)) * atten;
         }
         c = min(c, vec3(128.0)) * H(1).rgb;
-        c *= 1.0 - shadow.tuning.x * Shadowed(lit_view);
     } else {
         // the characters' (vf00-vf21): x a direction, y and z points, each over its distance
         vec3 lx = vec3(H(11).x, H(11).y - p.x, H(11).z - p.x);
@@ -587,20 +589,26 @@ void main() {
             const vec2 r = coordinate.xy / coordinate.z * vec2(TextureSize());
             t = SampleModern(uv, dFdx(r), dFdy(r), int((p.bilinear >> 2) & 7u),
                              float(1u << ((p.blend_ops >> 22) & 7u)));
-        } else if (((p.blend_ops >> 19) & 1u) != 0u) {
+        } else {
             // A car's paint reflecting its sphere map (the Fresnel tag, below):
             // a map drawn each frame, no mipmaps - where it is minified, four
             // taps over the pixel's footprint, as a mip would: no shimmer on
-            // a distant or a curved body.
+            // a distant or a curved body. Otherwise the one sample. (Sample
+            // called from one place: its why.)
+            vec2 at[4] = vec2[4](uv, uv, uv, uv);
+            int taps = 1;
             const vec2 dx = dFdx(uv), dy = dFdy(uv);
-            if (max(length(dx), length(dy)) > 1.5) {
+            if (((p.blend_ops >> 19) & 1u) != 0u && max(length(dx), length(dy)) > 1.5) {
                 const vec2 a = 0.25 * (dx + dy), b = 0.25 * (dx - dy);
-                t = floor((Sample(uv + a) + Sample(uv + b) + Sample(uv - b) + Sample(uv - a)) * 0.25 + 0.5);
-            } else {
-                t = Sample(uv);
+                at = vec2[4](uv + a, uv + b, uv - b, uv - a);
+                taps = 4;
             }
-        } else {
-            t = Sample(uv);
+            vec4 sum = vec4(0.0);
+            [[dont_unroll]] for (int i = 0; i < taps; ++i) {
+                const vec4 c = Sample(at[i]);
+                sum = i == 0 ? c : sum + c;
+            }
+            t = taps == 1 ? sum : floor(sum * 0.25 + 0.5);
         }
         vec3 product = floor(t.rgb * v.rgb / 128.0);
         if (p.tfx == 0u) {

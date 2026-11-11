@@ -82,7 +82,6 @@ endforeach()
 # three with MESH_LIT (lit per pixel).
 foreach(variant "gs_mesh_enh_vert gs_mesh.vert -DENHANCED"
                 "gs_mesh_chars_enh_vert gs_mesh_chars.vert -DENHANCED"
-                "gs_mesh_chars_shadow_vert gs_mesh_chars.vert -DSHADOW"
                 "gs_frag_lit gs.frag -DMESH_LIT"
                 "gs_frag_single_lit gs.frag -DMESH_LIT -DSINGLE_OUTPUT"
                 "gs_frag_blend_lit gs.frag -DMESH_LIT -DSHADER_BLEND")
@@ -96,8 +95,7 @@ foreach(variant "gs_mesh_enh_vert gs_mesh.vert -DENHANCED"
                 -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader}
         DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
                 ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_common.glsl
-                ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_enhanced.glsl ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_shadow.glsl
-                ${GLSLANG}
+                ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_enhanced.glsl ${GLSLANG}
         COMMENT "glslang ${shader} (${defines})")
     list(APPEND PS2GPU_SHADER_HEADERS ${out})
 endforeach()
@@ -267,4 +265,6 @@ if(NOT ANDROID)
     target_link_libraries(ps2gpu_smoke PRIVATE ps2gpu)
     add_executable(ps2gpu_tests ${CMAKE_CURRENT_LIST_DIR}/tests/renderer_tests.cpp)
     target_link_libraries(ps2gpu_tests PRIVATE ps2gpu)
+    add_executable(ps2gpu_warm ${CMAKE_CURRENT_LIST_DIR}/tests/pipeline_warm.cpp)
+    target_link_libraries(ps2gpu_warm PRIVATE ps2gpu)
 endif()

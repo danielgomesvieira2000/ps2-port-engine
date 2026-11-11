@@ -67,6 +67,8 @@ bool g_closed = false;
 
 #ifdef PS2HOST_VULKAN
 std::unique_ptr<ps2gpu::Display> g_display;
+std::thread::id g_window_thread;                    // the one that opened it, and pumps it
+std::atomic<std::int64_t> g_answered_ns{0};         // when it last looked at its events
 bool g_pipelines_behind = false;    // the first start went on before its pipelines were all made
 
 // The keys the controller reads, as Win32 virtual keys, by position.
@@ -349,6 +351,12 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
         api = "SDL";
     }
     if (g_display) {
+        g_window_thread = std::this_thread::get_id();
+#ifdef _WIN32
+        // No ghost window ("not responding", its title greyed) for a moment
+        // the game waits on the GPU: a game's own stall is not a hang.
+        DisableProcessWindowsGhosting();
+#endif
         Note("window", std::string("window: ") + api + " on " + g_display->Describe() + why_not);
         g_display->SetVrr(SettingOn("vrr"));
         g_display->SetGpuBoost(SettingOn("gpu_boost", true));      // (the GPU's clocks kept up)
@@ -659,9 +667,30 @@ static bool PumpDisplay() {
 }
 #endif
 
+namespace {
+std::int64_t NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+}  // namespace
+
+void KeepWindowAnswering() {
+#if defined(PS2HOST_VULKAN) && defined(_WIN32)
+    if (!g_display || std::this_thread::get_id() != g_window_thread) return;
+    const std::int64_t now = NowNs();
+    if (now - g_answered_ns.load(std::memory_order_relaxed) < 250'000'000) return;
+    g_answered_ns.store(now, std::memory_order_relaxed);
+    // (Looked at, not taken: Windows counts the window as answering; its
+    // events wait for the next PumpWindow.)
+    MSG msg;
+    PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE);
+#endif
+}
+
 bool PumpWindow() {
 #ifdef PS2HOST_VULKAN
     if (g_display) {
+        g_answered_ns.store(NowNs(), std::memory_order_relaxed);
         if (!PumpDisplay()) g_closed = true;
         KeepFullscreenSetting();
         if (g_display->TakeCapture()) RequestCapture();
@@ -1126,10 +1155,20 @@ void PictureText(std::vector<u32>& picture, const char* text, int y, int scale, 
    10 s, the rest made in the background as the game starts (the way
    before the screen: a driver with no cache of its own took long enough
    that players took the game for hung - issue #29); the log says how far
-   it got every 2 s. PS2HOST_PIPELINE_WAIT_S: that limit (0: none). */
-void WaitForGpuPipelines() {
+   it got every 2 s. PS2HOST_PIPELINE_WAIT_S: that limit (0: none).
+   Since the native renderer (a cold NVIDIA driver: the whole shader's
+   pipeline half a minute, the rest a minute or more on four workers) the
+   screen is up while the renderer itself is made too (`preparing`, on
+   another thread: the window answering, not "not responding"), and stays
+   until all are made - two minutes at most: a pipeline made in the middle
+   of the game froze it for seconds. */
+void WaitForGpuPipelines(const std::atomic<bool>* preparing) {
 #ifdef PS2HOST_VULKAN
-    if (!g_display) return;
+    auto still_preparing = [&] { return preparing && preparing->load(); };
+    if (!g_display) {
+        while (still_preparing()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return;
+    }
     const auto began = std::chrono::steady_clock::now();
     std::size_t made = 0, total = 0;
     bool shown = false;
@@ -1139,11 +1178,13 @@ void WaitForGpuPipelines() {
 #ifdef __ANDROID__
     int limit_s = 0;
 #else
-    int limit_s = 10;
+    int limit_s = 120;
 #endif
     if (const char* limit = std::getenv("PS2HOST_PIPELINE_WAIT_S")) limit_s = std::atoi(limit);
     auto said = began;
-    while (ps2gpu::PipelineWarmProgress(&made, &total) || std::chrono::steady_clock::now() - began < hold) {
+    for (;;) {
+        const bool warming = ps2gpu::PipelineWarmProgress(&made, &total);
+        if (!warming && !still_preparing() && std::chrono::steady_clock::now() - began >= hold) break;
         const auto now = std::chrono::steady_clock::now();
         if (now - said >= std::chrono::seconds(2)) {
             said = now;
@@ -1151,7 +1192,7 @@ void WaitForGpuPipelines() {
                          std::chrono::duration<double>(now - began).count());
             std::fflush(stderr);
         }
-        if (limit_s > 0 && now - began >= std::chrono::seconds(limit_s) && now - began >= hold) {
+        if (limit_s > 0 && !still_preparing() && now - began >= std::chrono::seconds(limit_s) && now - began >= hold) {
             std::fprintf(stderr, "[window] first start: the game goes on after %d s, %zu of %zu GPU pipelines made "
                          "(the rest in the background)\n", limit_s, made, total);
             g_pipelines_behind = true;      // said on the screen until made (PumpWindow)
@@ -1173,10 +1214,17 @@ void WaitForGpuPipelines() {
             char count[64];
             std::snprintf(count, sizeof count, "%zu of %zu", made, total);
             PictureText(picture, count, 280, 2, 0xFFC0C0C0u);
-            if (!g_display->Present(picture.data(), 640, 448)) break;
+            if (!g_display->Present(picture.data(), 640, 448) && !still_preparing()) break;
         }
+        g_answered_ns.store(NowNs(), std::memory_order_relaxed);
         if (!g_display->Pump()) {
             g_closed = true;
+            // (Closed while the renderer is still being made: nothing of the
+            // game's begun, nothing to keep - gone at once, not after it.)
+            if (still_preparing()) {
+                std::fflush(nullptr);
+                std::_Exit(0);
+            }
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(shown ? 30 : 5));

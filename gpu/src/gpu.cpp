@@ -26,11 +26,6 @@ std::atomic<std::uint32_t> g_msaa{1};
 }
 void SetGpuMsaa(std::uint32_t samples) { g_msaa.store(samples < 2 ? 1u : samples, std::memory_order_relaxed); }
 std::uint32_t GpuMsaa() { return g_msaa.load(std::memory_order_relaxed); }
-namespace {
-std::atomic<bool> g_shadows{false};
-}
-void SetGpuShadows(bool on) { g_shadows.store(on, std::memory_order_relaxed); }
-bool GpuShadows() { return g_shadows.load(std::memory_order_relaxed); }
 void (*g_renderer_thread_start)() = nullptr;
 void SetRendererThreadStart(void (*start)()) { g_renderer_thread_start = start; }
 

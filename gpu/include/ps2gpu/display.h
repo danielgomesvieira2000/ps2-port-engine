@@ -63,6 +63,9 @@ public:
     /* Handles the window's events; false once it has been closed. Alt+Enter
        toggles fullscreen. */
     virtual bool Pump() = 0;
+    /* The GPU's device lost (DeviceLost): made again, the window kept - false where it cannot be (or there is
+       none to make: not Vulkan's). The renderer on it must be gone first. */
+    virtual bool ResetDevice() { return false; }
 
     /* How evenly pictures went to the screen since the last call (--frame-times):
        presents, and the time between them - mean, standard deviation and

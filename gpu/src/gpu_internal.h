@@ -25,6 +25,13 @@ inline std::uint64_t g_submits = 0;
    submissions, presents and the device's wait-idle from one thread at a
    time, and the display presents from a thread of its own. */
 inline std::mutex g_queue_lock;
+/* A submission, present or wait found the device lost (VK_ERROR_DEVICE_LOST: the GPU hung or faulted, the driver
+   reset it): DeviceLost (gs_renderer.h) says so until the device is made again (Display::ResetDevice). */
+inline std::atomic<bool> g_device_lost{false};
+inline void NoteResult(VkResult result) {
+    if (result == VK_ERROR_DEVICE_LOST && !g_device_lost.exchange(true))
+        std::fprintf(stderr, "[ps2gpu] the GPU's device was lost (VK_ERROR_DEVICE_LOST)\n");
+}
 inline double g_wait_seconds = 0;
 inline GpuWaitObserver g_wait_observer = nullptr;      // SetGpuWaitObserver
 /* The GPU's time on the command buffers handed over, in all (timestamps at
@@ -293,7 +300,9 @@ void VulkanGpu::Record(F&& record) {
 inline bool VulkanGpu::Retire(int slot, const char* why) {
     if (!in_flight_[slot]) return true;
     const auto start = std::chrono::steady_clock::now();
-    const bool ok = vkWaitForFences(device, 1, &fences[slot], VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+    const VkResult wait_result = vkWaitForFences(device, 1, &fences[slot], VK_TRUE, UINT64_MAX);
+    NoteResult(wait_result);
+    const bool ok = wait_result == VK_SUCCESS;
     const auto end = std::chrono::steady_clock::now();
     const double waited = std::chrono::duration<double>(end - start).count();
     g_wait_seconds += waited;
@@ -350,6 +359,7 @@ inline bool VulkanGpu::Flush() {
     {
         std::lock_guard<std::mutex> hold(g_queue_lock);
         const VkResult result = vkQueueSubmit(queue, 1, &submit, fences[current_]);
+        NoteResult(result);
         ok = result == VK_SUCCESS;
         static int told = 0;
         if (!ok && told++ < 3) std::fprintf(stderr, "[ps2gpu] vkQueueSubmit failed: %d (the device lost?)\n", int(result));

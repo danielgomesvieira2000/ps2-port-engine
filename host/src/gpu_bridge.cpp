@@ -44,6 +44,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <thread>
 #include <bitset>
 #include <cmath>
 #include <cstdio>
@@ -245,6 +246,7 @@ struct Cached {
     std::vector<const Owned*> over;
     std::size_t owned_seen = 0;
     std::list<u64>::iterator lru;
+    u64 bytes = 0;                  // its image's on the GPU (every level), for the cache's budget
 };
 
 struct Bridge {
@@ -275,6 +277,8 @@ struct Bridge {
     std::map<std::tuple<u32, u32, u32, bool>, Owned> owned;
     std::unordered_map<u64, Cached> textures;
     std::list<u64> texture_lru;     // most recent first
+    u64 texture_bytes = 0;          // the cached textures' images, in all (Cached::bytes)
+    u64 texture_budget = 0;         // the renderer's TextureBudget, asked once
     // The textures over each page (32 blocks) of local memory, for what a
     // write there invalidates: scanning all 2,048 on every write was 3% of a
     // race. Elements of `textures` stay put until erased. Each with its
@@ -1037,6 +1041,11 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th, u32
     Cached& t = b.textures[key];
     if (!t.renderer_key) {
         t.renderer_key = b.next_texture++;
+        // (its image as the renderer makes it: TW wide, its levels below one another)
+        u64 rows = 0;
+        for (u32 n = 0; n < std::max(mips.count, auto_levels); ++n) rows += std::max(1u, th >> n);
+        t.bytes = u64(tw) * rows * 4;
+        b.texture_bytes += t.bytes;
         b.texture_lru.push_front(key);
         t.lru = b.texture_lru.begin();
         ++g_mutations;
@@ -1194,16 +1203,25 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th, u32
         t.decoded = true;
     }
     const u64 renderer_key = t.renderer_key;
-    // Keep the cache bounded: the least recently used go (4,096: a race keeps
-    // over 2,048 about, and each one evicted came back decoded again).
-    while (b.textures.size() > 4096) {
+    // Keep the cache bounded: the least recently used go - past 4,096 (a race
+    // keeps over 2,048 about, and each one evicted came back decoded again) or
+    // past the renderer's budget in bytes (a long game's 4,096 large textures,
+    // each TEXTURE FILTER its own, took the GPU's whole memory: its next images
+    // were not made, the game's surfaces white). Never this draw's own.
+    if (!b.texture_budget) {
+        b.texture_budget = std::max<u64>(b.renderer->TextureBudget(), u64(1) << 20);
+        std::fprintf(stderr, "[gpu] textures kept on the GPU: up to %llu MB\n", (unsigned long long)(b.texture_budget >> 20));
+    }
+    while (b.textures.size() > 1 && (b.textures.size() > 4096 || b.texture_bytes > b.texture_budget)) {
         const u64 old = b.texture_lru.back();
+        if (old == key) break;
         b.texture_lru.pop_back();
         auto found = b.textures.find(old);
         if (found != b.textures.end()) {
             ++g_mutations;
             b.renderer->ReleaseTexture(found->second.renderer_key);
             b.IndexTexture(&found->second, false);
+            b.texture_bytes -= std::min(b.texture_bytes, found->second.bytes);
             b.textures.erase(found);
         }
     }
@@ -2753,6 +2771,99 @@ u32 WantedScale(const ps2gpu::Display* display) {
 /* A new internal resolution: what the GPU drew goes to its local memory
    first, the renderer drops its targets and depth buffers, and every image
    comes back from memory at the new size as it is next used. */
+/* The GPU's device lost (a hang or fault the driver reset: ps2gpu::DeviceLost) - at a frame's start on the GS
+   thread, the renderer made again on a new device (the window's, ResetDevice: the window kept) and everything
+   the bridge knew to be on the GPU forgotten: the images back from local memory as they are next used (what the
+   GPU had drawn and not written back is lost: a frame or two of what the CPU last had), every texture decoded
+   again, the CLUT and memory sent again, the native meshes uploaded again from their CPU copies. The game goes
+   on: before, it froze, every draw after declined (an item picked up, File #2, 2026-11-11).
+   PS2HOST_GPU_LOSE_AT_FRAME=n (a test): the device taken as lost at frame n. */
+bool RecoverLostGpu(Bridge& b, u64 frame) {
+    static const u64 lose_at = std::getenv("PS2HOST_GPU_LOSE_AT_FRAME")
+                                   ? std::strtoull(std::getenv("PS2HOST_GPU_LOSE_AT_FRAME"), nullptr, 10) : 0;
+    static bool lost_once = false;
+    if (lose_at && frame >= lose_at && !lost_once && g_meshes.size() >= 200) {     // (in a scene: its meshes to send again)
+        lost_once = true;
+        ps2gpu::LoseDevice();
+    }
+    if (!ps2gpu::DeviceLost()) return false;
+    const auto began = std::chrono::steady_clock::now();
+    const u32 scale = b.renderer->Scale();
+    std::fprintf(stderr, "[gpu] frame %llu: the GPU's device lost - the renderer made again\n", (unsigned long long)frame);
+    b.renderer.reset();                 // (the threaded renderer's thread joined: nothing of it left on the device)
+    ps2gpu::Display* display = WindowDisplay();
+    ps2gpu::Gpu* device = nullptr;
+    std::string error;
+    if (display) {
+        if (display->ResetDevice()) device = WindowGpu();
+    } else {
+        b.gpu.reset();
+        b.gpu = ps2gpu::CreateGpu(&error);
+        ps2gpu::DeviceMadeAgain();
+        device = b.gpu.get();
+    }
+    if (device) b.renderer = ps2gpu::CreateGsRenderer(*device, &error);
+    if (!b.renderer) {
+        std::fprintf(stderr, "[gpu] the renderer could not be made again (%s): the game cannot draw\n", error.c_str());
+        std::fflush(stderr);
+        throw std::runtime_error("the GPU's device was lost and could not be made again");
+    }
+    const char* threaded = std::getenv("PS2HOST_GPU_THREAD");
+    if (!threaded || std::strcmp(threaded, "0") != 0)
+        b.renderer = ps2gpu::MakeThreadedGsRenderer(std::move(b.renderer));
+    b.renderer->SetScaleRule(g_rule_begin, g_rule_end, g_rule_fbw);
+    b.renderer->SetScale(scale);
+    // Nothing on the GPU now: the images stale (as Rescale's, nothing written back - there is nothing to read),
+    for (auto& [key, o] : b.owned) {
+        o.stale = true;
+        o.stale_beyond = false;
+        o.why = 0;
+        o.by16 = false;
+        o.stale_row0 = 0;
+        o.stale_row1 = ~0u;
+        o.stale_pages.set();
+        o.gpu_newer = false;
+        o.dirty_begin = ~0u;
+        o.dirty_end = 0;
+        o.dirty_pages.reset();
+        o.rect_dirty = false;
+        o.checked = 0;
+    }
+    // every block the CPU's to send, the CLUT's rows too,
+    std::fill(b.blocks.begin(), b.blocks.end(), Bridge::kCpuNewer);
+    b.patch.blocks.clear();
+    b.clut_cpu = 0xFFFF;
+    b.clut_gpu = 0;
+    // no texture decoded,
+    b.textures.clear();
+    b.texture_lru.clear();
+    for (auto& page : b.texture_pages) page.clear();
+    b.texture_bytes = 0;
+    b.texture_budget = 0;
+    b.texture_state = {~0ull, 0, 0, 0};
+    b.drawn.clear();
+    b.depth_seeded.clear();
+    g_held = -1;
+    // and the native meshes again, from the CPU's copies (TheVerify's, kept for a declined draw).
+    g_meshes.clear();
+    std::size_t meshes = 0;
+    for (const auto& [key, m] : TheVerify().meshes) {
+        if (key >> 63) {                // the characters': their vertices, four words a quadword
+            b.renderer->UploadMesh(key, m.data(), m.size() / 4, nullptr, 0);
+        } else {                        // the room's: quadwords, indices, then them
+            if (m.size() < 2 || m.size() < 2 + std::size_t(m[0]) * 4 + m[1]) continue;
+            b.renderer->UploadMesh(key, m.data() + 2, m[0], m.data() + 2 + std::size_t(m[0]) * 4, m[1]);
+        }
+        g_meshes.insert(key);
+        ++meshes;
+    }
+    ++b.newer_epoch;
+    ++g_mutations;
+    std::fprintf(stderr, "[gpu] the renderer made again in %.0f ms (%zu meshes sent again)\n",
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count(), meshes);
+    return true;
+}
+
 void Rescale(Bridge& b, u32 scale) {
     for (auto& [key, o] : b.owned)
         if (o.gpu_newer) WriteBack(b, o);
@@ -2953,9 +3064,29 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     // game's runs there would share), and it makes every pipeline at once.
     if (!SettingsPath().empty() && !VirtualClock())
         ps2gpu::SetPipelineCacheDir(std::filesystem::path(SettingsPath()).parent_path().u8string());
-    bridge.renderer = ps2gpu::CreateGsRenderer(*device, error);
-    if (!bridge.renderer) return false;
-    WaitForGpuPipelines();              // a first start's, behind a loading screen
+    // Made on a thread of its own, the loading screen up meanwhile (a first
+    // start's, behind which the window answers): its first pipelines took
+    // half a minute on a cold driver, the window "not responding".
+    {
+        std::atomic<bool> preparing{true};
+        std::string made_error;
+        auto make = [&] {
+            bridge.renderer = ps2gpu::CreateGsRenderer(*device, &made_error);
+            preparing = false;
+        };
+        if (device->api() == ps2gpu::Gpu::Api::kD3D11) {
+            make();                     // (Direct3D 11's context: one thread at a time, the display's too)
+            WaitForGpuPipelines();
+        } else {
+            std::thread maker(make);
+            WaitForGpuPipelines(&preparing);
+            maker.join();
+        }
+        if (!bridge.renderer) {
+            if (error) *error = made_error;
+            return false;
+        }
+    }
     // Vulkan's recording on a thread of its own, beside the GS thread's
     // (PS2HOST_GPU_THREAD=0: on the GS thread, as before).
     const char* threaded = std::getenv("PS2HOST_GPU_THREAD");
@@ -3032,6 +3163,7 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
         // moved past the displayed buffer (SetPresentAtBlankEnd); the EE goes
         // on meanwhile.
         SetGsFrameHandler([](u64 frame) {
+            if (RecoverLostGpu(*g_bridge, frame)) g_present_waits = false;     // (its picture was the old device's)
             PresentWaiting();               // the last frame's, nothing having moved it on
             if (g_between) MakeBetween();
             GpuShadowFrame(frame, std::string());
@@ -3303,9 +3435,6 @@ void ApplyGraphicsEnhancements() {
     u32 samples = msaa == "2x" ? 2 : msaa == "4x" ? 4 : msaa == "8x" ? 8 : 1;
     if (const char* forced = std::getenv("PS2HOST_MSAA")) samples = u32(std::max(1, std::atoi(forced)));
     ps2gpu::SetGpuMsaa(samples);
-    // SHADOWS (the setting "shadows"; PS2HOST_SHADOWS=1 a test's): the native characters' shadows on the room
-    const char* shadows = std::getenv("PS2HOST_SHADOWS");
-    ps2gpu::SetGpuShadows(shadows ? std::atoi(shadows) != 0 : SettingOn("shadows", false));
 }
 
 u32 NativeEnhancements() {
