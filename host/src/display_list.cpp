@@ -494,9 +494,15 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
         if (in_order != ~0u && in_order != best) {
             u32 words = 0;
             const float d = Distance(a.words, ca[sa[in_order].first], b.words, cb[s.first], &words);
-            // In order wins, unless it is out of its place and far while a near one is elsewhere.
+            // In order wins, unless it is far while a near one is elsewhere -
+            // in its place too: a row of things alike the game draws in
+            // another order each step (File #2's train's straps, sorted by
+            // their distance) paired by place each with another, blended
+            // half way across the car (2026-11-12). (The camera is one of a
+            // kind: its place.)
             const bool near_elsewhere = best != ~0u && near(best_d, best_words);
-            if (in_order == expected || near(d, words) || !near_elsewhere) best = in_order, best_d = d, best_words = words;
+            if ((camera && in_order == expected) || near(d, words) || !near_elsewhere)
+                best = in_order, best_d = d, best_words = words;
         }
         if (best != ~0u && best != expected && best != in_order && !camera && !near(best_d, best_words))
             best = ~0u;
