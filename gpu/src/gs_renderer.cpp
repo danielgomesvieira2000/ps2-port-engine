@@ -1169,7 +1169,7 @@ private:
         int depth_test = -1, stencil_test = -1, compare = -1, depth_write = -1;
         VkViewport viewport{};
         VkRect2D scissor{};
-        float size[2] = {-1, -1};
+        float size[3] = {-1, -1, -1};      // the target's, and gs.vert's edge
         VkBuffer vertices = VK_NULL_HANDLE;
         VkBuffer ranges = VK_NULL_HANDLE;   // bound for all the vertices (stride 0), with `vertices`
     } drawn_;
@@ -1960,7 +1960,7 @@ bool VulkanGsRenderer::Init(std::string* error) {
         }
         vkCreateSampler(g_.device, &sci, nullptr, &samplers_[8 + i]);
     }
-    VkPushConstantRange push[2] = {{VK_SHADER_STAGE_VERTEX_BIT, 0, 8},
+    VkPushConstantRange push[2] = {{VK_SHADER_STAGE_VERTEX_BIT, 0, 12},
                                    {VK_SHADER_STAGE_FRAGMENT_BIT, kFragmentOffset, sizeof(FragmentParams)}};
     VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     // Set 2: the target's copy that blending in the shader reads (a texture's
@@ -4898,11 +4898,14 @@ void VulkanGsRenderer::Flush() {
                 pass_depth_read_ = pass_depth_read_ || (depth_test && compare >= 2) || stencil_test == 1;
                 pass_depth_written_ = pass_depth_written_ || stencil_test >= 2;
             }
-            const float size[2] = {float(t->width), float(t->height)};
-            if (size[0] != d.size[0] || size[1] != d.size[1]) {
+            // (drawn larger: a vertex on the top or left edge half a pixel out,
+            // the larger picture's first row and column reached - gs.vert)
+            const float size[3] = {float(t->width), float(t->height), t->scale > 1 ? 0.5f : 0.0f};
+            if (size[0] != d.size[0] || size[1] != d.size[1] || size[2] != d.size[2]) {
                 d.size[0] = size[0];
                 d.size[1] = size[1];
-                vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, 8, size);
+                d.size[2] = size[2];
+                vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, 12, size);
             }
             // Without ranges read: the ring's chunk bound once, at its start,
             // the batch by its first vertex. With them: the batch's vertices

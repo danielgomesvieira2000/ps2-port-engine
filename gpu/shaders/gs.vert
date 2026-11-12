@@ -15,6 +15,14 @@ layout(location = 5) in vec4 range;
 
 layout(push_constant) uniform Target {
     vec2 size;          // the target, in pixels
+    // Drawn larger (the internal resolution): how far a vertex on the
+    // target's top or left edge (0) reaches out (0 at the PS2's own). Its
+    // pixels sample at their centres, (i + 0.5) / scale - 0.5 in the GS's
+    // pixels: the first row and column of the larger picture before 0 -
+    // reached by nothing that starts at 0 (a picture's whole-screen
+    // overlay), they kept what was there before: a line of other pixels
+    // along the top and the left.
+    float edge;
 } target;
 
 #include "gs_depth.glsl"
@@ -27,7 +35,12 @@ layout(location = 2) noperspective out float fog_out;
 layout(location = 3) flat out vec4 range_out;
 
 void main() {
-    vec2 ndc = (position + 0.5) / target.size * 2.0 - 1.0;
+    vec2 at = position;
+    if (target.edge > 0.0) {
+        if (at.x <= 0.0) at.x -= target.edge;
+        if (at.y <= 0.0) at.y -= target.edge;
+    }
+    vec2 ndc = (at + 0.5) / target.size * 2.0 - 1.0;
     gl_Position = vec4(ndc, DepthOfZ(z), 1.0);
     shade = colour;
     coordinate = stq;
