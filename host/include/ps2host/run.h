@@ -657,6 +657,9 @@ void RaiseWindow();
    system's otherwise (hidden in fullscreen). */
 void SetHostCursor(const u32* rgba, u32 width, u32 height, u32 hot_x, u32 hot_y);
 void ShowHostCursor(bool on);
+/* No pointer at all over the window, the game's or the system's, while
+   HideHostPointer(true) (the keys or a controller in use, say). */
+void HideHostPointer(bool hidden);
 /* The window's controller's motors, as a DualShock 2's: the large one 0-255,
    the small one 0-255 (a DualShock 2's is on or off: 0 or 255). */
 void HostRumble(u8 large, u8 small);

@@ -260,6 +260,8 @@ public:
         (void)rgba, (void)width, (void)height, (void)hot_x, (void)hot_y;
     }
     virtual void ShowGameCursor(bool on) { (void)on; }
+    /* No pointer over the window at all (the game's nor the system's) while set. */
+    virtual void HidePointer(bool hidden) { (void)hidden; }
 
     /* Told each picture PresentImageAt was given: shown (when it was due, when
        it was), or dropped unshown (shown_ns 0) - on the presenting thread. */
