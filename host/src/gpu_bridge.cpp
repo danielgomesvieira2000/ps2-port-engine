@@ -2264,8 +2264,25 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     }
 
     if (g_native) {
-        if (!s.primary || t_offset || z_as_colour || zmax < 0xFFFFFFu || !NativeMesh(s, state, x_offset, y_offset, c))
+        // PS2HOST_NATIVE_DECLINE=1 (a test): every native draw declined here - drawn from the CPU's copy, as one this
+        // state turns away (a zombie's attack: thousands of them, 2026-11-11).
+        static const bool decline_all = std::getenv("PS2HOST_NATIVE_DECLINE") != nullptr;
+        // A target wider than a picture (File #2's 1344-wide view of an item
+        // picked up, a hit taken: FBW 21, over most of local memory): a native
+        // draw's pixels are its whole scissor's as far as memory knows (no
+        // vertices here) - its pages all newer than memory, the textures over
+        // them read from it and later written back with it: the room's
+        // surfaces noise until it loaded again (2026-11-12). Drawn from the
+        // CPU's copy, each triangle's own pixels.
+        const bool wide = state.width > 1024;
+        if (decline_all || t_offset || z_as_colour || zmax < 0xFFFFFFu || wide) {
+            if (!decline_all)
+                NoteDeclined(t_offset ? "its texture moved within another target" : z_as_colour ? "its Z drawn as colour"
+                             : wide ? "its target wider than a picture" : "its Z clamped below 24 bits",
+                             state, *g_native);
             return;
+        }
+        if (!s.primary || !NativeMesh(s, state, x_offset, y_offset, c)) return;
         g_native->drawn = true;
     } else {
         for (std::size_t i = 0; i < n; ++i) v[i].z = std::min(v[i].z, zmax);
