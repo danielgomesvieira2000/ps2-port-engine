@@ -522,6 +522,14 @@ void ShowHostCursor(bool on) {
 #endif
 }
 
+void HideHostPointer(bool hidden) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->HidePointer(hidden);
+#else
+    (void)hidden;
+#endif
+}
+
 #ifdef PS2HOST_VULKAN
 namespace {
 ControllerFamily Family(std::uint8_t family) {

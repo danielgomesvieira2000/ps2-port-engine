@@ -160,6 +160,7 @@ public:
         cursor_size_ = 0;                   // made again at the window's size
     }
     void ShowGameCursor(bool on) override { cursor_wanted_.store(on); }
+    void HidePointer(bool hidden) override { pointer_hidden_.store(hidden); }
     const std::string& error() const { return error_; }
 
 protected:
@@ -248,7 +249,8 @@ private:
     std::uint32_t cursor_size_ = 0;
     SDL_Cursor* cursor_ = nullptr;
     std::atomic<bool> cursor_wanted_{false};
-    int cursor_showing_ = -1;               // what the window shows: -1 not yet set, 0 the system's, 1 the game's
+    std::atomic<bool> pointer_hidden_{false};
+    int cursor_showing_ = -1;               // what the window shows: -1 not yet set, 0 the system's, 1 the game's, 2 none
     bool fullscreen_cursor_stale_ = false;
     void UpdateCursor();
 };
