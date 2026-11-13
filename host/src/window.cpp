@@ -1313,7 +1313,8 @@ void PresentFrame() {
         bool got = LoadingScreen(&pixels);          // a port's loading screen in the game's place
         if (got) w = 640, h = 448;
         else got = (g_picture_source && g_picture_source(&pixels, &w, &h)) || gs::TheGs().Picture(&pixels, &w, &h);
-        if (got && !g_display->Present(pixels.data(), w, h)) {
+        // (A lost device is no closed window: made again at the frame's start, gpu_bridge's RecoverLostGpu.)
+        if (got && !g_display->Present(pixels.data(), w, h) && !ps2gpu::DeviceLost()) {
             std::fprintf(stderr, "[window] a picture could not be shown: the window closed\n");
             g_closed = true;
         }

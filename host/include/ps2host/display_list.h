@@ -155,6 +155,10 @@ struct ListBlendPlan {
     std::vector<u32> at;    // the newer list's words to blend
     std::vector<float> from, to;
     std::vector<u32> segment;   // each word's segment (the newer list's), in order
+    // The newer list's length: the plan is that list's alone (ApplyListBlend
+    // leaves any other as it is - a plan kept past its list, its words'
+    // places another list's tags and codes).
+    size_t words = 0;
     ListBlend stats;
     // Every value of a matched pair that changed (blended or not): the newer
     // list's word and its change - the next plan's (the same plan planned

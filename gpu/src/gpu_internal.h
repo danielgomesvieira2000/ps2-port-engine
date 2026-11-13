@@ -32,6 +32,26 @@ inline void NoteResult(VkResult result) {
     if (result == VK_ERROR_DEVICE_LOST && !g_device_lost.exchange(true))
         std::fprintf(stderr, "[ps2gpu] the GPU's device was lost (VK_ERROR_DEVICE_LOST)\n");
 }
+inline bool Lost() { return g_device_lost.load(std::memory_order_relaxed); }
+/* The longest a submission's work is waited for: past it the GPU hangs without saying so, and the device counts as
+   lost (made again, as one the driver says is) rather than the game waiting for good. */
+constexpr std::uint64_t kGpuHangNanoseconds = 15'000'000'000ull;
+/* A fence waited for no longer than that, and not at all on a lost device (VK_ERROR_DEVICE_LOST then; a time-out
+   counts the device lost). */
+inline VkResult WaitForFence(VkDevice device, VkFence fence, const char* why) {
+    if (Lost()) return VK_ERROR_DEVICE_LOST;
+    const VkResult result = vkWaitForFences(device, 1, &fence, VK_TRUE, kGpuHangNanoseconds);
+    NoteResult(result);
+    if (result == VK_TIMEOUT && !g_device_lost.exchange(true))
+        std::fprintf(stderr, "[ps2gpu] the GPU answered nothing for %d s (%s): its device counted as lost\n",
+                     int(kGpuHangNanoseconds / 1'000'000'000ull), why);
+    return result == VK_TIMEOUT ? VK_ERROR_DEVICE_LOST : result;
+}
+/* The device's wait for all its work, not asked of a lost one (a hung GPU's may never return). The caller holds
+   g_queue_lock where another thread may submit. */
+inline void WaitIdle(VkDevice device) {
+    if (!Lost()) NoteResult(vkDeviceWaitIdle(device));
+}
 inline double g_wait_seconds = 0;
 inline GpuWaitObserver g_wait_observer = nullptr;      // SetGpuWaitObserver
 /* The GPU's time on the command buffers handed over, in all (timestamps at
@@ -167,7 +187,7 @@ public:
        buffer's start) counted as `kind` - a timestamp as the work before it
        ends. */
     void Mark(VkCommandBuffer c, int kind) {
-        if (!profile_ || marks_[current_].size() >= kMarks) return;
+        if (!profile_ || spare_open_ || marks_[current_].size() >= kMarks) return;
         vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profile_,
                             std::uint32_t(current_) * kMarks + std::uint32_t(marks_[current_].size()));
         marks_[current_].push_back(kind);
@@ -175,7 +195,7 @@ public:
     }
     /* A draw's mark with its tag. */
     void MarkDraw(VkCommandBuffer c, std::uint32_t tag) {
-        if (!profile_ || marks_[current_].size() >= kMarks) return;
+        if (!profile_ || spare_open_ || marks_[current_].size() >= kMarks) return;
         Mark(c, kProfDraw);
         tags_[current_].back() = tag;
     }
@@ -185,8 +205,10 @@ public:
        With `pass` (a compatible render pass: Vulkan 1.2 without dynamic
        rendering), its subpass is what it continues. */
     VkCommandBuffer BeginSecondary(VkFormat colour, VkFormat depth, VkRenderPass pass = VK_NULL_HANDLE) {
-        std::vector<VkCommandBuffer>& list = secondaries_[current_];
-        if (secondary_used_[current_] == list.size()) {
+        // (The device lost: the spare's own, never a slot's - those may be the GPU's still.)
+        const int of = spare_open_ ? kSlots : current_;
+        std::vector<VkCommandBuffer>& list = secondaries_[of];
+        if (secondary_used_[of] == list.size()) {
             VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
             cai.commandPool = pool;
             cai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
@@ -195,7 +217,7 @@ public:
             if (vkAllocateCommandBuffers(device, &cai, &made) != VK_SUCCESS) return VK_NULL_HANDLE;
             list.push_back(made);
         }
-        VkCommandBuffer c = list[secondary_used_[current_]++];
+        VkCommandBuffer c = list[secondary_used_[of]++];
         vkResetCommandBuffer(c, 0);
         VkCommandBufferInheritanceRenderingInfo rendering{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO};
         rendering.colorAttachmentCount = 1;
@@ -248,8 +270,20 @@ private:
     std::string describe_;
     bool open_ = false;
     std::uint64_t recordings_ = 0;
-    std::vector<VkCommandBuffer> secondaries_[kSlots];     // BeginSecondary's
-    std::size_t secondary_used_[kSlots] = {};
+    std::vector<VkCommandBuffer> secondaries_[kSlots + 1];     // BeginSecondary's (the last: the spare's)
+    std::size_t secondary_used_[kSlots + 1] = {};
+    /* The device lost (g_device_lost), what is recorded goes into this command buffer, never handed to the GPU: the
+       slots' own may be the GPU's still (pending - not to be reset, begun or handed over again), and the renderer
+       goes on as it would until the device is made again (Display::ResetDevice, and with it this). */
+    VkCommandBuffer spare_ = VK_NULL_HANDLE;
+    bool spare_open_ = false;           // the open recording is the spare's
+    void MakeSpare() {
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = pool;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(device, &cai, &spare_) != VK_SUCCESS) spare_ = VK_NULL_HANDLE;
+    }
     // Two timestamps a slot: as its command buffer starts and as it ends.
     VkQueryPool timestamps_ = VK_NULL_HANDLE;
     double timestamp_ns_ = 0;               // a tick, in nanoseconds
@@ -271,18 +305,23 @@ private:
 template <typename F>
 void VulkanGpu::RecordInPass(F&& record) {
     if (!open_) {
+        spare_open_ = Lost();
+        if (spare_open_) {
+            if (!spare_) return;        // (none made: nothing recorded)
+            cmd = spare_;
+        }
         vkResetCommandBuffer(cmd, 0);
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cmd, &begin);
         open_ = true;
         ++recordings_;
-        secondary_used_[current_] = 0;
-        if (timestamps_) {
+        secondary_used_[spare_open_ ? kSlots : current_] = 0;
+        if (timestamps_ && !spare_open_) {
             vkCmdResetQueryPool(cmd, timestamps_, 2 * std::uint32_t(current_), 2);
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamps_, 2 * std::uint32_t(current_));
         }
-        if (profile_) {
+        if (profile_ && !spare_open_) {
             vkCmdResetQueryPool(cmd, profile_, std::uint32_t(current_) * kMarks, kMarks);
             marks_[current_].clear();
             tags_[current_].clear();
@@ -303,9 +342,7 @@ void VulkanGpu::Record(F&& record) {
 inline bool VulkanGpu::Retire(int slot, const char* why) {
     if (!in_flight_[slot]) return true;
     const auto start = std::chrono::steady_clock::now();
-    const VkResult wait_result = vkWaitForFences(device, 1, &fences[slot], VK_TRUE, UINT64_MAX);
-    NoteResult(wait_result);
-    const bool ok = wait_result == VK_SUCCESS;
+    const bool ok = WaitForFence(device, fences[slot], why) == VK_SUCCESS;
     const auto end = std::chrono::steady_clock::now();
     const double waited = std::chrono::duration<double>(end - start).count();
     g_wait_seconds += waited;
@@ -314,6 +351,11 @@ inline bool VulkanGpu::Retire(int slot, const char* why) {
                         std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count()));
     CountWait(why, waited);
     in_flight_[slot] = false;
+    if (!ok) {                          // (the device lost: its queries hold nothing)
+        stamped_[slot] = false;
+        marks_[slot].clear();
+        tags_[slot].clear();
+    }
     if (stamped_[slot]) {
         std::uint64_t ticks[2] = {};
         if (vkGetQueryPoolResults(device, timestamps_, 2 * std::uint32_t(slot), 2, sizeof ticks, ticks,
@@ -349,6 +391,16 @@ inline bool VulkanGpu::Flush() {
     if (end_pass) end_pass(cmd);
     Mark(cmd, kProfOther);
     open_ = false;
+    if (spare_open_ || Lost()) {
+        // The device lost: nothing handed to it, and the ring where it is (a slot's command buffer begun before
+        // the loss was never the GPU's: ended, it waits for the device's end). What waited on this work runs now.
+        vkEndCommandBuffer(cmd);
+        spare_open_ = false;
+        std::vector<std::function<void()>> done;
+        done.swap(after_submit_);
+        for (auto& f : done) f();
+        return false;
+    }
     if (timestamps_) {
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamps_, 2 * std::uint32_t(current_) + 1);
         stamped_[current_] = true;

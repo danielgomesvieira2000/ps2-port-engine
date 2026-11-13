@@ -46,6 +46,8 @@
 #include <atomic>
 #include <thread>
 #include <bitset>
+#include <chrono>
+#include <deque>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1447,14 +1449,43 @@ bool NativeCharacters(Bridge& s, const ps2gpu::GsDrawState& state, u32 x_offset,
     return true;
 }
 
+/* A native draw declined (drawn some other way): why, and the state it had, for the first few - an item picked
+   up froze the GPU twice right after one (2026-11-11), the item's picture drawn into an image of its own. */
+void NoteDeclined(const char* why, const ps2gpu::GsDrawState& state, const NativeDraw& n) {
+    static int told = 0;
+    if (told++ >= 24) return;
+    std::fprintf(stderr,
+                 "[gpu] native draw declined (%s): %s, target %X/%u psm %02X %ux%u, texture %s%X, sprite %d, alpha test %d "
+                 "(atst %u afail %u), %u words\n",
+                 why, (n.words[0] & 0x100) ? "characters" : "room", unsigned(state.fbp), unsigned(state.fbw),
+                 unsigned(state.psm), unsigned(state.width), unsigned(state.height),
+                 state.texture_target ? "target " : "memory ", unsigned(state.texture_target ? state.tex_fbp : 0),
+                 int(state.sprite), int(state.alpha_test), unsigned(state.atst), unsigned(state.afail), unsigned(n.count));
+    std::fflush(stderr);
+}
+
 bool NativeMesh(Bridge& s, const ps2gpu::GsDrawState& state, u32 x_offset, u32 y_offset, const gs::Context& c) {
     const NativeDraw& n = *g_native;
     // (a target sampled as the texture: the pages brought up to date are those the primitive's coordinates reach -
     // the stand-in's are none of the mesh's)
-    if (state.texture_target) return false;
-    if (n.words[0] & 0x100) return NativeCharacters(s, state, x_offset, y_offset);
+    if (state.texture_target) {
+        NoteDeclined("its texture a target", state, n);
+        return false;
+    }
+    if (n.words[0] & 0x100) {
+        const bool drawn = NativeCharacters(s, state, x_offset, y_offset);
+        if (!drawn) NoteDeclined("the characters' declined", state, n);
+        return drawn;
+    }
     const u64 key = u64(n.words[1]) | u64(n.words[2]) << 32;
-    if (!g_meshes.count(key) || !s.renderer->MeshDrawable(state)) return false;
+    if (!g_meshes.count(key)) {
+        NoteDeclined("its mesh not held", state, n);
+        return false;
+    }
+    if (!s.renderer->MeshDrawable(state)) {
+        NoteDeclined("not drawable so (feedback, the shader's blending, two passes or a sprite)", state, n);
+        return false;
+    }
     float header[ps2gpu::GsRenderer::kMeshHeaderFloats] = {};
     std::memcpy(header, n.words + 5, 124 * 4);
     (void)c;
@@ -1852,6 +1883,29 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     // state (a large struct) is made past the fast path below, which reuses
     // the one before.
     const u32 frame_psm = Bits(c.frame, 24, 6), frame_width = std::min(2048u, std::max(1u, Bits(c.frame, 16, 6)) * 64);
+    // A FRAME no GS draws into (a format of textures', or none): not a
+    // game's but a broken packet's (File #2's lists with another list's
+    // colours written over their tags, 2026-11-13: FRAME 165/58 psm 25 and a
+    // hundred more) - each one an image made and kept, its pages over the
+    // room's textures, written back and loaded again every picture after.
+    // Nothing drawn, nothing made.
+    if (s.primary) {
+        switch (frame_psm) {
+            case gs::PSMCT32: case gs::PSMCT24: case gs::PSMCT16: case gs::PSMCT16S:
+            case gs::PSMZ32: case gs::PSMZ24: case gs::PSMZ16: case gs::PSMZ16S:
+                break;
+            default: {
+                static int told = 0;
+                if (told < 8) {
+                    ++told;
+                    std::fprintf(stderr, "[gpu] a draw into FRAME %X/%u psm %02X (no frame's format): not drawn\n",
+                                 unsigned(Bits(c.frame, 0, 9)), unsigned(Bits(c.frame, 16, 6)), unsigned(frame_psm));
+                    std::fflush(stderr);
+                }
+                return;
+            }
+        }
+    }
     // The rows a page holds twice over in a 16-bit format: a 16-bit view of a
     // 448-row picture is 896 rows (Burnout 3 writes its depth into the
     // picture's alpha through one - at 512 rows, the lower half went unwritten,
@@ -1954,7 +2008,14 @@ void OnDraw(const gs::Gs::DrawCall& call) {
         // nothing has drawn since the one before this.
         if (g_native) {
             // (a texture moved within another target, a Z clamped below 24 bits: not the mesh's - the packet's)
-            if (fast.t_offset || fast.zmax < 0xFFFFFFu || !NativeMesh(s, st, 0, fast.y_offset, c)) return;
+            static const bool decline_all = std::getenv("PS2HOST_NATIVE_DECLINE") != nullptr;
+            if (decline_all) return;
+            if (fast.t_offset || fast.zmax < 0xFFFFFFu) {
+                NoteDeclined(fast.t_offset ? "its texture moved within another target (fast)" : "its Z clamped below 24 bits (fast)",
+                             st, *g_native);
+                return;
+            }
+            if (!NativeMesh(s, st, 0, fast.y_offset, c)) return;
             g_native->drawn = true;
         } else if (fast.last_draw == g_draws) {
             ++g_draws;
@@ -2794,6 +2855,9 @@ u32 WantedScale(const ps2gpu::Display* display) {
    GPU had drawn and not written back is lost: a frame or two of what the CPU last had), every texture decoded
    again, the CLUT and memory sent again, the native meshes uploaded again from their CPU copies. The game goes
    on: before, it froze, every draw after declined (an item picked up, File #2, 2026-11-11).
+   A device that cannot be made at once is tried again (three times, a while between: a driver restarting takes
+   one), and one lost over and over - five times within a minute - is not made again: a GPU or a driver that
+   cannot hold a device, the game ended with that said rather than resetting it for good.
    PS2HOST_GPU_LOSE_AT_FRAME=n (a test): the device taken as lost at frame n. */
 bool RecoverLostGpu(Bridge& b, u64 frame) {
     static const u64 lose_at = std::getenv("PS2HOST_GPU_LOSE_AT_FRAME")
@@ -2809,17 +2873,31 @@ bool RecoverLostGpu(Bridge& b, u64 frame) {
     std::fprintf(stderr, "[gpu] frame %llu: the GPU's device lost - the renderer made again\n", (unsigned long long)frame);
     b.renderer.reset();                 // (the threaded renderer's thread joined: nothing of it left on the device)
     ps2gpu::Display* display = WindowDisplay();
-    ps2gpu::Gpu* device = nullptr;
     std::string error;
-    if (display) {
-        if (display->ResetDevice()) device = WindowGpu();
-    } else {
-        b.gpu.reset();
-        b.gpu = ps2gpu::CreateGpu(&error);
-        ps2gpu::DeviceMadeAgain();
-        device = b.gpu.get();
+    static std::deque<std::chrono::steady_clock::time_point> losses;
+    losses.push_back(began);
+    while (!losses.empty() && began - losses.front() > std::chrono::seconds(60)) losses.pop_front();
+    const bool over_and_over = losses.size() >= 5;
+    if (over_and_over) error = "lost five times within a minute";
+    for (int attempt = 0; attempt < 3 && !b.renderer && !over_and_over; ++attempt) {
+        if (attempt) {
+            std::fprintf(stderr, "[gpu] the device not made again (%s): tried again\n", error.c_str());
+            std::this_thread::sleep_for(std::chrono::milliseconds(500 << attempt));
+        }
+        ps2gpu::Gpu* device = nullptr;
+        if (display) {
+            if (display->ResetDevice()) device = WindowGpu();
+            else error = "the window's device";
+        } else {
+            b.gpu.reset();
+            ps2gpu::DeviceMadeAgain();
+            b.gpu = ps2gpu::CreateGpu(&error);
+            if (!b.gpu) ps2gpu::LoseDevice();       // (none: lost still)
+            device = b.gpu.get();
+        }
+        if (device) b.renderer = ps2gpu::CreateGsRenderer(*device, &error);
+        if (device && !b.renderer) ps2gpu::LoseDevice();        // (made again with the device, next time round)
     }
-    if (device) b.renderer = ps2gpu::CreateGsRenderer(*device, &error);
     if (!b.renderer) {
         std::fprintf(stderr, "[gpu] the renderer could not be made again (%s): the game cannot draw\n", error.c_str());
         std::fflush(stderr);

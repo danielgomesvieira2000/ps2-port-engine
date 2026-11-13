@@ -136,6 +136,7 @@ bool VulkanGpu::Init(std::string* error) {
     if ((r = vkAllocateCommandBuffers(device, &cai, cmds)) != VK_SUCCESS)
         return fail("vkAllocateCommandBuffers", r);
     cmd = cmds[0];
+    MakeSpare();
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     for (VkFence& f : fences)
         if ((r = vkCreateFence(device, &fci, nullptr, &f)) != VK_SUCCESS) return fail("vkCreateFence", r);
@@ -210,6 +211,7 @@ bool VulkanGpu::InitShared(VkInstance shared_instance, VkPhysicalDevice shared_g
         return false;
     }
     cmd = cmds[0];
+    MakeSpare();
     MakeTimestamps();
     return true;
 }
@@ -226,11 +228,12 @@ VulkanGpu::~VulkanGpu() {
     if (device) {
         {
             std::lock_guard<std::mutex> hold(g_queue_lock);
-            vkDeviceWaitIdle(device);
+            WaitIdle(device);
         }
         for (VkFence f : fences)
             if (f) vkDestroyFence(device, f, nullptr);
         if (timestamps_) vkDestroyQueryPool(device, timestamps_, nullptr);
+        if (profile_) vkDestroyQueryPool(device, profile_, nullptr);
         if (pool) vkDestroyCommandPool(device, pool, nullptr);
         if (owns_device) vkDestroyDevice(device, nullptr);
     }

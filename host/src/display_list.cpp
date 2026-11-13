@@ -421,6 +421,7 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
     plan.to.clear();
     plan.segment.clear();
     plan.colors.clear();
+    plan.words = b.words.size();
     // The changes the plan before found (this plan's, a step ago) for its
     // steady test, then this step's anew.
     static thread_local std::vector<std::pair<u32, float>> before;
@@ -620,6 +621,7 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
 }
 
 void ApplyListBlend(const ListBlendPlan& plan, float t, std::vector<u32>& words, size_t offset) {
+    if (offset > words.size() || words.size() - offset != plan.words) return;       // (not the list it was planned for)
     for (size_t i = 0; i < plan.at.size(); ++i) {
         const size_t at = offset + plan.at[i];
         if (at >= words.size()) continue;
