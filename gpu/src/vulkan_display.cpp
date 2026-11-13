@@ -1640,15 +1640,44 @@ void VulkanDisplay::PresentLoop() {
             while (Clock::now() < due) std::this_thread::yield();
         }
         {
-            std::lock_guard<std::mutex> hold(paced_lock_);
+            std::unique_lock<std::mutex> hold(paced_lock_);
             if (stop_) {
                 if (began) vkEndCommandBuffer(cmd_);
                 return;
             }
             // The oldest waiting now (a newer one may have taken its turn
-            // meanwhile): into the image already taken.
-            if (ready_.empty()) {
+            // meanwhile: CopyPaced takes the oldest's slot, then queues its
+            // own; a resize empties the queue, then queues anew) - waited for
+            // a little: the image is taken, and it must be shown. Left so (its
+            // command buffer ended, nothing submitted), its slot's fence was
+            // reset and never signalled: the third picture on waited for it
+            // the whole hang limit, 15 s, and the device counted lost.
+            if (ready_.empty() && began)
+                paced_wake_.wait_for(hold, std::chrono::milliseconds(250), [&] { return stop_ || !ready_.empty(); });
+            if (stop_) {
                 if (began) vkEndCommandBuffer(cmd_);
+                return;
+            }
+            if (ready_.empty()) {
+                hold.unlock();
+                if (began) {
+                    // (none came: the image shown black - submitted, its fence signalled, the image given back)
+                    static int told = 0;
+                    if (told < 5) {
+                        ++told;
+                        std::fprintf(stderr, "[display] a picture's turn with none to show: the screen black once\n");
+                    }
+                    const VkImage target = images_[index];
+                    Barrier(cmd_, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    const VkClearColorValue black{};
+                    const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                    vkCmdClearColorImage(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+                    Barrier(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+                    Submit(index);
+                }
                 continue;
             }
             slot = ready_.front();
