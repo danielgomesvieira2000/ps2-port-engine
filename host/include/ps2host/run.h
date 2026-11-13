@@ -509,6 +509,10 @@ struct PanelMouseState {
     bool moved = false;
 };
 void SetWindowPanel(std::vector<u32> pixels, u32 width, u32 height);
+/* A reticle in the picture's middle, under any panel (a first-person
+   style's dot): BGRA pixels, alpha 0 not drawn, at most 64 x 64; none when
+   empty. */
+void SetWindowReticle(std::vector<u32> pixels, u32 width, u32 height);
 bool WindowPixelSize(u32* width, u32* height);
 bool TakePanelMouse(PanelMouseState* state);
 /* The PC settings for a game's own menu (a port's PC SETTINGS screen): each

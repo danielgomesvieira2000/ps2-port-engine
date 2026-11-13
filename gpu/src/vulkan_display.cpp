@@ -74,6 +74,12 @@ public:
     void SetAntiAliasing(AntiAliasing mode) override { anti_aliasing_.store(int(mode)); }
     /* The overlay into the swapchain image (TRANSFER_DST) being made. */
     void DrawOverlay(VkImage target);
+    /* The reticle into it, before the overlay (DrawReticle). */
+    void DrawReticle(VkImage target);
+    VkBuffer reticle_buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory reticle_memory_ = VK_NULL_HANDLE;
+    void* reticle_mapped_ = nullptr;
+    std::uint64_t reticle_slot_generation_[4] = {};
     static constexpr VkDeviceSize kOverlayBytes = VkDeviceSize(1280) * 720 * 4;
     VkBuffer overlay_buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory overlay_memory_ = VK_NULL_HANDLE;
@@ -796,6 +802,69 @@ void VulkanDisplay::DrawOverlay(VkImage target) {
     vkCmdCopyBufferToImage(cmd_, overlay_buffer_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 }
 
+void VulkanDisplay::DrawReticle(VkImage target) {
+    constexpr VkDeviceSize kReticleBytes = 64 * 64 * 4;
+    static_assert(kInFlight <= 4, "reticle_slot_generation_");
+    std::lock_guard<std::mutex> hold(overlay_lock_);
+    if (reticle_.empty() || !reticle_width_ || !reticle_height_) return;
+    if (extent_.width < reticle_width_ || extent_.height < reticle_height_) return;
+    if (!reticle_buffer_) {
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = kReticleBytes * kInFlight;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        if (vkCreateBuffer(device_, &bci, nullptr, &reticle_buffer_) != VK_SUCCESS) return;
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(device_, reticle_buffer_, &req);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (vkAllocateMemory(device_, &mai, nullptr, &reticle_memory_) != VK_SUCCESS) {
+            vkDestroyBuffer(device_, reticle_buffer_, nullptr);
+            reticle_buffer_ = VK_NULL_HANDLE;
+            return;
+        }
+        vkBindBufferMemory(device_, reticle_buffer_, reticle_memory_, 0);
+        vkMapMemory(device_, reticle_memory_, 0, kReticleBytes * kInFlight, 0, &reticle_mapped_);
+        for (std::uint64_t& g : reticle_slot_generation_) g = 0;
+    }
+    const VkDeviceSize offset = kReticleBytes * VkDeviceSize(slot_);
+    if (reticle_slot_generation_[slot_] != reticle_generation_) {
+        std::memcpy(static_cast<char*>(reticle_mapped_) + offset, reticle_.data(),
+                    std::size_t(reticle_width_) * reticle_height_ * 4);
+        reticle_slot_generation_[slot_] = reticle_generation_;
+    }
+    // Its pixels' runs, row by row (alpha 0 left as the picture has it).
+    VkBufferImageCopy copies[64 * 32];
+    std::uint32_t n = 0;
+    const std::int32_t x0 = std::int32_t((extent_.width - reticle_width_) / 2);
+    const std::int32_t y0 = std::int32_t((extent_.height - reticle_height_) / 2);
+    for (std::uint32_t y = 0; y < reticle_height_; ++y)
+        for (std::uint32_t x = 0; x < reticle_width_;) {
+            if (!(reticle_[y * reticle_width_ + x] >> 24)) {
+                ++x;
+                continue;
+            }
+            std::uint32_t end = x;
+            while (end < reticle_width_ && (reticle_[y * reticle_width_ + end] >> 24)) ++end;
+            if (n < sizeof copies / sizeof copies[0]) {
+                VkBufferImageCopy& c = copies[n++];
+                c = {};
+                c.bufferOffset = offset + VkDeviceSize(y * reticle_width_ + x) * 4;
+                c.bufferRowLength = reticle_width_;
+                c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                c.imageOffset = {x0 + std::int32_t(x), y0 + std::int32_t(y), 0};
+                c.imageExtent = {end - x, 1, 1};
+            }
+            x = end;
+        }
+    if (!n) return;
+    Barrier(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT);
+    vkCmdCopyBufferToImage(cmd_, reticle_buffer_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, n, copies);
+}
+
 void VulkanDisplay::DestroyPostImages() {
     if (!device_) return;
     if (post_in_view_) vkDestroyImageView(device_, post_in_view_, nullptr);
@@ -1264,6 +1333,7 @@ bool VulkanDisplay::FinishPresent(std::uint32_t index, VkImage source, std::uint
     blit.dstOffsets[1] = {x0 + dw, y0 + dh, 1};
     vkCmdBlitImage(cmd_, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    DrawReticle(target);
     DrawOverlay(target);
     Barrier(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -1849,6 +1919,11 @@ bool VulkanDisplay::ResetDevice() {
     overlay_memory_ = VK_NULL_HANDLE;
     overlay_mapped_ = nullptr;
     for (std::uint64_t& g : overlay_slot_generation_) g = 0;
+    if (reticle_buffer_) vkDestroyBuffer(device_, reticle_buffer_, nullptr);
+    if (reticle_memory_) vkFreeMemory(device_, reticle_memory_, nullptr);
+    reticle_buffer_ = VK_NULL_HANDLE;
+    reticle_memory_ = VK_NULL_HANDLE;
+    reticle_mapped_ = nullptr;
     DestroySwapchain();
     if (device_) {
         for (int i = 0; i < kInFlight; ++i) {
@@ -1908,6 +1983,8 @@ VulkanDisplay::~VulkanDisplay() {
     if (post_sampler_) vkDestroySampler(device_, post_sampler_, nullptr);
     if (overlay_buffer_) vkDestroyBuffer(device_, overlay_buffer_, nullptr);
     if (overlay_memory_) vkFreeMemory(device_, overlay_memory_, nullptr);
+    if (reticle_buffer_) vkDestroyBuffer(device_, reticle_buffer_, nullptr);
+    if (reticle_memory_) vkFreeMemory(device_, reticle_memory_, nullptr);
     DestroySwapchain();
     if (device_) {
         for (int i = 0; i < kInFlight; ++i) {

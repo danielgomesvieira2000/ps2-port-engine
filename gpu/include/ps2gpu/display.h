@@ -142,6 +142,12 @@ public:
     virtual void SetOverlayRight(bool right) { (void)right; }
     /* The overlay in the window's middle (the PC settings panel), not its corner. */
     virtual void SetOverlayCentred(bool centred) { (void)centred; }
+    /* A reticle in the picture's middle (a first-person game's dot), under the
+       overlay: BGRA pixels, rows top-down - those with alpha 0 not drawn (the
+       rest copied, not blended); none when empty. At most 64 x 64. */
+    virtual void SetReticle(std::vector<std::uint32_t> pixels, std::uint32_t width, std::uint32_t height) {
+        (void)pixels, (void)width, (void)height;
+    }
     virtual std::uint32_t PixelWidth() const { return 0; }
     /* The mouse for a panel over the game (its own clicks: not the game's
        TakeMouse) - the pointer in the window's pixels, the buttons gone down

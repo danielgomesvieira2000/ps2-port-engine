@@ -66,6 +66,14 @@ public:
     }
     void SetOverlayRight(bool right) override { overlay_right_.store(right); }
     void SetOverlayCentred(bool centred) override { overlay_centred_.store(centred); }
+    void SetReticle(std::vector<std::uint32_t> pixels, std::uint32_t width, std::uint32_t height) override {
+        std::lock_guard<std::mutex> hold(overlay_lock_);
+        if (width > 64 || height > 64 || pixels.size() < std::size_t(width) * height) pixels.clear();
+        reticle_ = std::move(pixels);
+        reticle_width_ = reticle_.empty() ? 0 : width;
+        reticle_height_ = reticle_.empty() ? 0 : height;
+        ++reticle_generation_;
+    }
     std::uint32_t PixelWidth() const override {
         int w = 0, h = 0;
         if (!window_ || !SDL_GetWindowSizeInPixels(window_, &w, &h)) return 0;
@@ -205,6 +213,9 @@ protected:
     std::uint64_t overlay_generation_ = 1;      // a SetOverlay's
     std::atomic<bool> overlay_right_{false};    // SetOverlayRight's: the top right
     std::atomic<bool> overlay_centred_{false};  // SetOverlayCentred's: the middle
+    std::vector<std::uint32_t> reticle_;        // SetReticle's (overlay_lock_)
+    std::uint32_t reticle_width_ = 0, reticle_height_ = 0;
+    std::uint64_t reticle_generation_ = 1;
     PanelMouse panel_mouse_;                    // TakePanelMouse's (mouse_lock_)
     std::shared_ptr<VblankWatch> vblank_watch_;     // RefreshTiming's (null: no such thread)
     std::atomic<std::int32_t> shown_x0_{0}, shown_y0_{0}, shown_w_{1}, shown_h_{1};

@@ -274,6 +274,43 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
                     }
                 }
                 (void)changed_mark;
+                // The thing's jump is the newer step's (shown at the step, as
+                // the game) - but between, it goes on as it moved the step
+                // before: each word its newer value less what is left of the
+                // last step's move (from - before to the newer). Left still at
+                // the newer step's, a flickering lamp's glow (its place
+                // swinging 7% each step) stood while the camera turned and
+                // the room slid past it: the light juddering, worst turning
+                // in the RE4 style (2026-11-13). A word with no move before (a
+                // thing appearing) as the newer step has it.
+                // PS2HOST_BLEND_JUMP_STILL=1: the whole thing the newer step's (before).
+                static const bool still = std::getenv("PS2HOST_BLEND_JUMP_STILL") != nullptr;
+                if (!still) {
+                    for (u32 q = s.first; q < s.end; ++q) {
+                        if (older(q) == ~0u) continue;
+                        const Code& yq = cb[q];
+                        const Code& xq = ca[older(q)];
+                        if (!yq.floats || !yq.words || ((yq.code & 0x8000) && !o.blend_flg) || xq.words != yq.words) continue;
+                        float lane[4] = {0, 0, 0, 0};       // (each lane's largest, as `scale` above)
+                        for (u32 r = 0; r < yq.words; ++r) {
+                            const float ga = Float(a[xq.at + 1 + r]), gb = Float(b[yq.at + 1 + r]);
+                            if (Plausible(ga)) lane[r & 3] = std::max(lane[r & 3], std::fabs(ga));
+                            if (Plausible(gb)) lane[r & 3] = std::max(lane[r & 3], std::fabs(gb));
+                        }
+                        for (u32 r = 0; r < yq.words; ++r) {
+                            if (skipped(yq.at + 1 + r)) continue;
+                            const float gb = Float(b[yq.at + 1 + r]);
+                            float was = 0.0f;
+                            if (!Plausible(gb) || !ChangedBefore(xq.at + 1 + r, &was) || was == 0.0f) continue;
+                            // (only a move: a step before that jumped too is no motion to go on with)
+                            if (!(std::fabs(was) <= o.jump * lane[r & 3])) continue;
+                            plan.at.push_back(yq.at + 1 + r);
+                            plan.from.push_back(gb - was);
+                            plan.to.push_back(gb);
+                            plan.segment.push_back(segment);
+                        }
+                    }
+                }
                 return false;
             }
             if (scale[k & 3] > 0.0f && !steady) most = std::max(most, std::fabs(fb - fa) / (o.jump * scale[k & 3]));
@@ -536,6 +573,19 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
         float worst = 0.0f;
         if (!PlanPair(a.words, ca, sa[best].first, b.words, cb, s, o, plan, moving, 0, 0, &worst, jb)) {
             ++r.jumps;
+            static const bool pair_log = std::getenv("PS2HOST_BLEND_JUMPS") != nullptr;
+            if (pair_log) {
+                // (the jump's pairing: the older one taken, and those alike near it - their distances)
+                std::fprintf(stderr, "[jump] segment %u paired with %u (in order %d, d %g/%u words);", jb, best,
+                             in_order == ~0u ? -1 : int(in_order), best_d, best_words);
+                for (auto p = lo; p != hi; ++p) {
+                    if (p->second + 6 < best || p->second > best + 6) continue;
+                    u32 words = 0;
+                    const float d = Distance(a.words, ca[sa[p->second].first], b.words, cb[s.first], &words);
+                    std::fprintf(stderr, " %u%s: %g/%u", p->second, used[p->second] ? "u" : "", d, words);
+                }
+                std::fprintf(stderr, "\n");
+            }
             continue;
         }
         if (worst > 0.5f) ++r.near;

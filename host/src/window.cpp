@@ -936,6 +936,14 @@ void SetWindowPanel(std::vector<u32> pixels, u32 width, u32 height) {
 #endif
 }
 
+void SetWindowReticle(std::vector<u32> pixels, u32 width, u32 height) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetReticle(std::vector<std::uint32_t>(pixels.begin(), pixels.end()), width, height);
+#else
+    (void)pixels, (void)width, (void)height;
+#endif
+}
+
 bool WindowPixelSize(u32* width, u32* height) {
 #ifdef PS2HOST_VULKAN
     if (g_display) {
