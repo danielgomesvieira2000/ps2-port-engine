@@ -324,6 +324,12 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
     return true;
 }
 
+/* PS2HOST_BLEND_XYZ_LOG=1 (a measurement's): GS vertices' places in packets that differ step to step, counted. */
+bool XyzMeasured() {
+    static const bool on = std::getenv("PS2HOST_BLEND_XYZ_LOG") != nullptr;
+    return on;
+}
+
 /* A matched pair's colours to blend (ListBlendOptions::blend_colors): in each
    of its DIRECTs and DIRECTHLs, the same code in both, the GIF packets whose
    tags are the same in both - their RGBAQ writes that differ (PACKED's
@@ -355,6 +361,13 @@ void PlanColors(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, 
                 for (u32 l = 0; l < nloop && ib + 4 <= end; ++l)
                     for (u32 r = 0; r < nreg && ib + 4 <= end; ++r, ia += 4, ib += 4) {
                         const u32 d = u32(regs >> (4 * r)) & 0xF;
+                        if (XyzMeasured() && (d == 0x4 || d == 0x5 || d == 0xC || d == 0xD) && (a[ia] != b[ib] || a[ia + 1] != b[ib + 1])) {
+                            // (a GS vertex's place in a packet, unlike the step before: not blended)
+                            static unsigned long long n = 0;
+                            if (++n % 200 == 1)
+                                std::fprintf(stderr, "[xyz] %llu so far; code %u reg %X: (%u %u) -> (%u %u)\n", n, j, d,
+                                             a[ia] & 0xFFFF, a[ia + 1] & 0xFFFF, b[ib] & 0xFFFF, b[ib + 1] & 0xFFFF);
+                        }
                         if (d == 0x1) {
                             for (u32 k = 0; k < 4; ++k) color(ia + k, ib + k, 1);
                         } else if (d == 0xE && (b[ib + 2] & 0xFF) == 0x01 && (a[ia + 2] & 0xFF) == 0x01) {
@@ -553,6 +566,12 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
         used[best] = true;
         ++matched;
         if (o.blend_colors) PlanColors(a.words, ca, sa[best].first, b.words, cb, s, plan);
+        else if (XyzMeasured()) {
+            // (the measurement's alone: its colours not planned)
+            static thread_local ListBlendPlan unused;
+            unused.colors.clear();
+            PlanColors(a.words, ca, sa[best].first, b.words, cb, s, unused);
+        }
         const bool moved = best != expected;
         if (moved) ++r.moved;
         expected = best + 1;
