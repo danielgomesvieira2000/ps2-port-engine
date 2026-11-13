@@ -568,6 +568,24 @@ void AudioFrames(const short* frames, unsigned count) {
         d.wav_frames += count;
     }
     if (!d.open) return;
+    {
+        // A long wait for the game's sound (its IOP held: the game busy
+        // between two frames) - a gap heard, then the sound skipped back to
+        // the picture: said in the log with its frame, a few times, for a
+        // report (the first: RANDOM's figure drawn as Character Select opened).
+        static std::chrono::steady_clock::time_point before{};
+        static int told = 0;
+        const auto now = std::chrono::steady_clock::now();
+        if (before.time_since_epoch().count() && told < 12) {
+            const double ms = std::chrono::duration<double, std::milli>(now - before).count();
+            if (ms > 100.0) {
+                ++told;
+                std::fprintf(stderr, "[audio] no sound from the game for %.0f ms (frame %llu)\n", ms,
+                             (unsigned long long)FrameNumber());
+            }
+        }
+        before = now;
+    }
     if (d.log) {
         const auto now = std::chrono::steady_clock::now();
         if (d.last_batch.time_since_epoch().count())
