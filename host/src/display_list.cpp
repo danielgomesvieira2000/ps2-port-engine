@@ -281,11 +281,24 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
                 // the newer step's, a flickering lamp's glow (its place
                 // swinging 7% each step) stood while the camera turned and
                 // the room slid past it: the light juddering, worst turning
-                // in the RE4 style (2026-11-13). A word with no move before (a
-                // thing appearing) as the newer step has it.
-                // PS2HOST_BLEND_JUMP_STILL=1: the whole thing the newer step's (before).
-                static const bool still = std::getenv("PS2HOST_BLEND_JUMP_STILL") != nullptr;
-                if (!still) {
+                // in the RE4 style (2026-11-13). Only where the step before's
+                // moves are this thing's own: most of its words that did not
+                // jump moving on as they moved then (else the history is
+                // another thing's - a thing come or gone before it in the
+                // list - and its moves, carried over, smeared the street
+                // across the picture). A word with no move before as the
+                // newer step has it.
+                // EXPERIMENTAL, OFF unless PS2HOST_BLEND_JUMP_CARRY=1: carried
+                // so, words that are no place (a texture's cell, an offset, a
+                // count as a float) moved on too - for single pictures the
+                // whole screen a texture's noise (120 fps turning in the RE4
+                // style, 2026-11-14; blend_glitches.py: 1,969 pixels unlike
+                // both neighbours, 932 without). Off, the thing is the newer
+                // step's between steps, as before.
+                static const bool carry = std::getenv("PS2HOST_BLEND_JUMP_CARRY") != nullptr;
+                if (carry) {
+                    const size_t carry_mark = plan.at.size();
+                    u32 moving_on = 0, moved = 0;
                     for (u32 q = s.first; q < s.end; ++q) {
                         if (older(q) == ~0u) continue;
                         const Code& yq = cb[q];
@@ -299,16 +312,27 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
                         }
                         for (u32 r = 0; r < yq.words; ++r) {
                             if (skipped(yq.at + 1 + r)) continue;
-                            const float gb = Float(b[yq.at + 1 + r]);
+                            const float ga = Float(a[xq.at + 1 + r]), gb = Float(b[yq.at + 1 + r]);
                             float was = 0.0f;
-                            if (!Plausible(gb) || !ChangedBefore(xq.at + 1 + r, &was) || was == 0.0f) continue;
+                            if (!Plausible(gb) || !Plausible(ga) || !ChangedBefore(xq.at + 1 + r, &was) || was == 0.0f) continue;
                             // (only a move: a step before that jumped too is no motion to go on with)
                             if (!(std::fabs(was) <= o.jump * lane[r & 3])) continue;
+                            const float now = gb - ga;
+                            if (std::fabs(now) <= o.jump * lane[r & 3] && now != 0.0f) {
+                                ++moved;
+                                if (std::fabs(now - was) <= 0.5f * std::max(std::fabs(now), std::fabs(was))) ++moving_on;
+                            }
                             plan.at.push_back(yq.at + 1 + r);
                             plan.from.push_back(gb - was);
                             plan.to.push_back(gb);
                             plan.segment.push_back(segment);
                         }
+                    }
+                    if (moved < 4 || moving_on * 4 < moved * 3) {
+                        plan.at.resize(carry_mark);
+                        plan.from.resize(carry_mark);
+                        plan.to.resize(carry_mark);
+                        plan.segment.resize(carry_mark);
                     }
                 }
                 return false;
