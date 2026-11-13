@@ -288,29 +288,41 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
                 // list - and its moves, carried over, smeared the street
                 // across the picture). A word with no move before as the
                 // newer step has it.
-                // EXPERIMENTAL, OFF unless PS2HOST_BLEND_JUMP_CARRY=1: carried
-                // so, words that are no place (a texture's cell, an offset, a
-                // count as a float) moved on too - for single pictures the
-                // whole screen a texture's noise (120 fps turning in the RE4
-                // style, 2026-11-14; blend_glitches.py: 1,969 pixels unlike
-                // both neighbours, 932 without). Off, the thing is the newer
-                // step's between steps, as before.
-                static const bool carry = std::getenv("PS2HOST_BLEND_JUMP_CARRY") != nullptr;
-                if (carry) {
+                // Every word carried so, those that are no place (a texture's
+                // cell, an offset, a count as a float) moved on too - for
+                // single pictures the whole screen a texture's noise (120 fps
+                // turning in the RE4 style, 2026-11-14; blend_glitches.py:
+                // 1,969 pixels unlike both neighbours, 932 without).
+                // PS2HOST_BLEND_JUMP_CARRY=rows: only the thing's place on the screen carried:
+                // its first values' view rows (view_first to view_end - the
+                // camera's own, File #2's rows 3-6: the world to the screen),
+                // nothing else of it (safe, but in File #2's street under 16 levels of a
+                // pixel different: OFF by default). =all: every
+                // word (the noise above); =0: none.
+                static const int carry = [] {
+                    const char* e = std::getenv("PS2HOST_BLEND_JUMP_CARRY");
+                    return !e ? 0 : std::strcmp(e, "all") == 0 ? 2 : std::strcmp(e, "rows") == 0 ? 1 : 0;
+                }();
+                if (carry && (carry == 2 || o.view_end > o.view_first)) {
                     const size_t carry_mark = plan.at.size();
                     u32 moving_on = 0, moved = 0;
+                    bool first_values = true;
                     for (u32 q = s.first; q < s.end; ++q) {
                         if (older(q) == ~0u) continue;
                         const Code& yq = cb[q];
                         const Code& xq = ca[older(q)];
                         if (!yq.floats || !yq.words || ((yq.code & 0x8000) && !o.blend_flg) || xq.words != yq.words) continue;
+                        if (carry == 1 && !first_values) break;
+                        first_values = false;
+                        const u32 r_from = carry == 1 ? std::min(4 * o.view_first, yq.words) : 0;
+                        const u32 r_end = carry == 1 ? std::min(4 * o.view_end, yq.words) : yq.words;
                         float lane[4] = {0, 0, 0, 0};       // (each lane's largest, as `scale` above)
                         for (u32 r = 0; r < yq.words; ++r) {
                             const float ga = Float(a[xq.at + 1 + r]), gb = Float(b[yq.at + 1 + r]);
                             if (Plausible(ga)) lane[r & 3] = std::max(lane[r & 3], std::fabs(ga));
                             if (Plausible(gb)) lane[r & 3] = std::max(lane[r & 3], std::fabs(gb));
                         }
-                        for (u32 r = 0; r < yq.words; ++r) {
+                        for (u32 r = r_from; r < r_end; ++r) {
                             if (skipped(yq.at + 1 + r)) continue;
                             const float ga = Float(a[xq.at + 1 + r]), gb = Float(b[yq.at + 1 + r]);
                             float was = 0.0f;
@@ -328,7 +340,7 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
                             plan.segment.push_back(segment);
                         }
                     }
-                    if (moved < 4 || moving_on * 4 < moved * 3) {
+                    if (moved < 4 || moving_on * 4 < moved * 3) {     // (its history not its own)
                         plan.at.resize(carry_mark);
                         plan.from.resize(carry_mark);
                         plan.to.resize(carry_mark);
