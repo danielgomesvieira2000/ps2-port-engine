@@ -248,8 +248,11 @@ public:
     /* (PS2HOST_NATIVE_VERIFY's) each primitive a held packet would have drawn, and the packet's end. */
     std::function<void(const DrawCall&)> on_held;
     std::function<void()> on_held_end;
-    /* The payload's words 3-4: the tag's PRIM (~0: none - PRIM as it is). */
+    /* The payload's words 3-4: the tag's PRIM (~0: none - PRIM as it is). Recorded ('N') as it comes. */
     void Native(const u32* words, u32 count);
+    /* BeginRecord's, after the registers: what a recording needs of its own that the stream does not carry - the
+       native draws' meshes uploaded before it began ('M' records: the bridge's). */
+    std::function<void(std::FILE*)> on_record_begin;
     /* --gpu: the GS model draws nothing itself (rasterize false) and a second
        renderer draws instead; to keep its images and local memory in step it
        hears of every other access to local memory first - blocks

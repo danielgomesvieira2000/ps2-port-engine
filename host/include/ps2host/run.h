@@ -184,6 +184,9 @@ void SetFrameDumps(const std::string& dir, int every, int limit, u64 from = 0);
 enum class GpuMode { Shadow, ShadowRtt, Primary };
 bool StartGpuRenderer(std::string* error, GpuMode mode, bool show);
 void GpuShadowFrame(u64 frame, const std::string& dump_dir);
+/* A capture's mesh ('M' in replay.bin: --gs-replay), as the native draws had it when the capture began: the room's
+   (key bit 63 clear) its quadword and index counts, quadwords, indices; the characters' their vertices' quadwords. */
+void GpuReplayMesh(u64 key, const u32* words, u32 count);
 /* A capture (F12): the GPU's passes of `frame` dumped into `passes_dir`;
    then the picture shown, at the internal resolution and the PS2's, into
    `dir` (screen.bmp, screen_1x.bmp) - what it was, as text. GpuPrimary:

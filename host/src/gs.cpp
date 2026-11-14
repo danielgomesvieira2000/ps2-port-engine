@@ -171,6 +171,7 @@ void Gs::BeginRecord(std::FILE* out) {
     privileged(0x0090, dispfb_[1]);
     privileged(0x00A0, display_[1]);
     privileged(0x00E0, bgcolor_);
+    if (on_record_begin) on_record_begin(out);
     record_ = out;
 }
 
@@ -199,6 +200,11 @@ void Gs::Words(int path, const u32* words, u32 count, u32 from) {
 }
 
 void Gs::Native(const u32* words, u32 count) {
+    if (record_) {
+        std::fputc('N', record_);
+        std::fwrite(&count, 4, 1, record_);
+        std::fwrite(words, 4, count, record_);
+    }
     hold_next_ = false;
     if (!on_native || count < 5) return;
     const u64 tag_prim = u64(words[3]) | u64(words[4]) << 32;

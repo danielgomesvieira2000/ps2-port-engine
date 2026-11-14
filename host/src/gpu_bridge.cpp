@@ -3241,6 +3241,17 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     g.on_draw = OnDraw;
     if (bridge.primary) {
         g.on_native = OnNative;
+        // (a capture's replay.bin: the meshes held now, which its native draws may use without sending)
+        g.on_record_begin = [](std::FILE* out) {
+            for (const auto& [key, words] : TheVerify().meshes) {
+                if (!g_meshes.count(key)) continue;
+                std::fputc('M', out);
+                std::fwrite(&key, 8, 1, out);
+                const u32 count = u32(words.size());
+                std::fwrite(&count, 4, 1, out);
+                std::fwrite(words.data(), 4, count, out);
+            }
+        };
         if (g_native_verify) {
             g.on_held = VerifyHeld;
             g.on_held_end = VerifyEnd;
@@ -3376,8 +3387,15 @@ std::string GpuCaptureScreen(const std::string& dir) {
     const u32 k = s.renderer->Scale();
     if (s.renderer->ReadTargetFull(fbp, fbw, psm, &pixels, &w, &h))
         WriteBmp(dir + "/screen.bmp", pixels, w, std::min(w, 640u * k), std::min(h, 448u * k));
-    if (s.renderer->ReadTarget(fbp, fbw, psm, &pixels, &w, &h))
+    if (s.renderer->ReadTarget(fbp, fbw, psm, &pixels, &w, &h)) {
         WriteBmp(dir + "/screen_1x.bmp", pixels, w, std::min(w, 640u), std::min(h, 448u));
+    } else {
+        // (a picture the GPU holds no target of - a replay's first, drawn before its capture began: in local memory)
+        gs::Gs& g = gs::TheGs();
+        g.Finish();
+        if (g.on_memory) g.on_memory(0, 16384, false);
+        g.WriteBmp(dir + "/screen_1x.bmp");
+    }
     std::snprintf(text, sizeof text, "shown: FBP %X FBW %u PSM %02X; internal resolution %ux", unsigned(fbp),
                   unsigned(fbw), unsigned(psm), unsigned(k));
     return text;
@@ -3400,6 +3418,18 @@ bool GpuShownPicture(std::vector<u32>* pixels, u32* width, u32* height) {
 
 void SavePicture(const std::string& path, const std::vector<u32>& pixels, u32 width, u32 height) {
     WriteBmp(path, pixels, width, width, height);
+}
+
+void GpuReplayMesh(u64 key, const u32* words, u32 count) {
+    if (!g_bridge || !g_bridge->primary || g_meshes.count(key)) return;
+    if (key >> 63) {
+        g_bridge->renderer->UploadMesh(key, words, count / 4, nullptr, 0);
+    } else {
+        if (count < 2 || count < 2 + words[0] * 4 + words[1]) return;
+        g_bridge->renderer->UploadMesh(key, words + 2, words[0], words + 2 + words[0] * 4, words[1]);
+    }
+    g_meshes.insert(key);
+    TheVerify().meshes[key].assign(words, words + count);
 }
 
 void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
@@ -3545,6 +3575,7 @@ bool StartGpuRenderer(std::string* error, GpuMode, bool) {
 }
 void GpuSetScale(u32) {}
 void GpuShadowFrame(gs::u64, const std::string&) {}
+void GpuReplayMesh(gs::u64, const gs::u32*, gs::u32) {}
 std::string GpuShadowSummary() { return ""; }
 bool ShownPicture(std::vector<u32>* pixels, u32* width, u32* height) {
     return gs::TheGs().Picture(pixels, width, height);

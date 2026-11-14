@@ -255,6 +255,27 @@ int GsReplay(const std::string& file, const std::string& out) {
                     break;
                 }
             }
+        } else if (kind == 'N') {
+            // (a native draw: a mesh and its header, drawn in its place - gs::Gs::Native)
+            const u32 count = u32_at(at);
+            at += 4;
+            words.resize(count);
+            std::memcpy(words.data(), data.data() + at, std::size_t(count) * 4);
+            at += std::size_t(count) * 4;
+            // (PS2HOST_REPLAY_NO_NATIVE=1: left out - their packets drawn, as before they were recorded)
+            static const bool no_native = std::getenv("PS2HOST_REPLAY_NO_NATIVE") != nullptr;
+            if (no_native) continue;
+            if (threaded) GsNative(words.data(), count);
+            else g.Native(words.data(), count);
+        } else if (kind == 'M') {
+            // (a mesh the native draws held as the capture began)
+            const u64 key = u64_at(at);
+            const u32 count = u32_at(at + 8);
+            at += 12;
+            words.resize(count);
+            std::memcpy(words.data(), data.data() + at, std::size_t(count) * 4);
+            at += std::size_t(count) * 4;
+            if (gpu && !timing) GpuReplayMesh(key, words.data(), count);
         } else if (kind == 'V') {
             if (threaded) SyncGs();
             g.Finish();
