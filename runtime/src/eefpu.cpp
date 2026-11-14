@@ -60,14 +60,16 @@ u32 FloatNarrow(double value) {
     } else if (value < -kFloatMax) {
         value = -kFloatMax;
     }
-    float narrowed = static_cast<float>(value);
-    if (!kNearest) {
-        // Toward zero: a value rounded away from it steps back one.
-        if (std::fabs(double(narrowed)) > std::fabs(value)) narrowed = std::nextafter(narrowed, 0.0f);
-        if (std::fabs(narrowed) < FLT_MIN) narrowed = std::copysign(0.0f, narrowed);
-    }
+    const float narrowed = static_cast<float>(value);
     u32 bits;
     std::memcpy(&bits, &narrowed, sizeof bits);
+    if (!kNearest) {
+        // Toward zero: a value rounded away from it steps back one - its magnitude's bits less one, either sign
+        // (std::nextafter's step toward zero, a library call in the EE's every float operation; never 0 here: a
+        // zero is not rounded away). Below the least normal: zero, its sign kept (as copysign did).
+        if (std::fabs(double(narrowed)) > std::fabs(value)) --bits;
+        if ((bits & 0x7F800000u) == 0) bits &= 0x80000000u;
+    }
     return bits;
 }
 
