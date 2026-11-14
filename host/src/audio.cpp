@@ -91,6 +91,9 @@ constexpr unsigned kTargetStepMs = 10, kTargetMostMs = 60;
 struct Ring {
     std::vector<float> data = std::vector<float>(kRingFrames * 2);
     std::atomic<unsigned long long> written{0}, read{0};
+    // A skip's crossfade's old frames, behind `read` (~0: none): not the
+    // writer's to fill until the crossfade is done.
+    std::atomic<unsigned long long> kept{~0ull};
     unsigned long long Filled() const { return written.load(std::memory_order_acquire) - read.load(std::memory_order_acquire); }
 };
 
@@ -199,6 +202,7 @@ void Device::Render(float* out, unsigned frames) {
             if (window_low != ~0ull && window_low > target_frames + excess && !cross) {
                 const unsigned long long skip = window_low - target_frames;
                 cross_from = ring.read.load(std::memory_order_relaxed);
+                ring.kept.store(cross_from, std::memory_order_release);
                 ring.read.store(cross_from + skip, std::memory_order_release);
                 cross = kCrossFrames;
                 smoothed_fill = double(available - skip);
@@ -273,7 +277,7 @@ void Device::Render(float* out, unsigned frames) {
             out[2 * k + ch] = v;
         }
         if (fade) --fade;
-        if (cross) --cross;
+        if (cross && !--cross) ring.kept.store(~0ull, std::memory_order_release);
         last[0] = out[2 * k];
         last[1] = out[2 * k + 1];
         phase += step;
@@ -293,6 +297,7 @@ void Device::Render(float* out, unsigned frames) {
         window_low = ~0ull;
         window_frames = 0;
         cross = 0;
+        ring.kept.store(~0ull, std::memory_order_release);
         for (unsigned n = 0; k < frames; ++k, ++n) {
             const float g = n < kFadeFrames ? float(kFadeFrames - n) / float(kFadeFrames) : 0.0f;
             out[2 * k] = last[0] * g;
@@ -583,6 +588,20 @@ void AudioFrames(const short* frames, unsigned count) {
     }
     if (!d.open) return;
     {
+        // PS2HOST_AUDIO_TEST_STALL=FRAME:MS (a test's): the game held MS once
+        // at FRAME - a hitch, the sound's catch-up and skip back exercised.
+        static unsigned long long stall_at = 0;
+        static int stall_ms = 0;
+        static const bool stall = [] {
+            const char* e = std::getenv("PS2HOST_AUDIO_TEST_STALL");
+            return e && std::sscanf(e, "%llu:%d", &stall_at, &stall_ms) == 2;
+        }();
+        if (stall && FrameNumber() >= stall_at && stall_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms));
+            stall_ms = 0;
+        }
+    }
+    {
         // A long wait for the game's sound (its IOP held: the game busy
         // between two frames) - a gap heard, then the sound skipped back to
         // the picture: said in the log with its frame, a few times, for a
@@ -610,7 +629,8 @@ void AudioFrames(const short* frames, unsigned count) {
     }
     Ring& r = d.ring;
     const unsigned long long w = r.written.load(std::memory_order_relaxed);
-    const unsigned long long room = kRingFrames - 4 - (w - r.read.load(std::memory_order_acquire));
+    const unsigned long long oldest = std::min(r.read.load(std::memory_order_acquire), r.kept.load(std::memory_order_acquire));
+    const unsigned long long room = w - oldest + 4 >= kRingFrames ? 0 : kRingFrames - 4 - (w - oldest);
     if (count > room) {
         // A burst the ring cannot hold (the emulation far ahead of the device:
         // virtual time, a catch-up): the newest are dropped.
