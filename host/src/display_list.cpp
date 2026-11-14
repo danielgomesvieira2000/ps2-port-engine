@@ -215,7 +215,10 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
             // shaking against itself as the player turned (2026-11-14).
             // PS2HOST_BLEND_CUT_ALWAYS=1: the cut whatever the camera did (before).
             static const bool cut_always = std::getenv("PS2HOST_BLEND_CUT_ALWAYS") != nullptr;
-            if (past_cut && t_camera_moved && !cut_always && std::fabs(change) <= o.jump * scale[k & 3]) past_cut = false;
+            // (within a tenth of the lane's largest: a turn moves the far things 2%; two
+            // alike things swapped in the list - the zoo gate's lantern glows - 14%, a
+            // jump still, paired again below: blended as moved, they met in the middle)
+            if (past_cut && t_camera_moved && !cut_always && std::fabs(change) <= 0.1f * scale[k & 3]) past_cut = false;
             if (past_cut && o.cut_steady && had_before && (before > 0) == (change > 0) &&
                 std::fabs(before) * 3.0f >= std::fabs(change) && std::fabs(before) <= 3.0f * std::fabs(change))
                 past_cut = false;           // (moving on steadily: blended)
@@ -267,9 +270,9 @@ bool PlanPair(const std::vector<u32>& a, const std::vector<Code>& ca, u32 sa, co
             if (jumps) {
                 static const bool jump_log = std::getenv("PS2HOST_BLEND_JUMPS") != nullptr;
                 if (jump_log)
-                    std::fprintf(stderr, "[jump] frame %llu segment %u words %u word %u: %g -> %g (scale %g, before %g%s)%s%s\n",
+                    std::fprintf(stderr, "[jump] frame %llu segment %u words %u word %u: %g -> %g (scale %g, before %g%s)%s%s%s\n",
                                  (unsigned long long)FrameNumber(), segment, y.words, k, fa, fb,
-                                 scale[k & 3], had_before ? before : 0.0f, had_before ? "" : " none", wraps ? " wraps" : "", past_cut ? " past the cut" : "");
+                                 scale[k & 3], had_before ? before : 0.0f, had_before ? "" : " none", wraps ? " wraps" : "", past_cut ? " past the cut" : "", t_camera_moved ? " (the camera moving)" : "");
                 plan.at.resize(mark);
                 plan.from.resize(mark);
                 plan.to.resize(mark);
@@ -529,7 +532,7 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
     before.swap(plan.changed);
     plan.changed.clear();
     t_before = &before;
-    t_camera_moved = false;
+    t_camera_moved = o.cut_segment < 0 && o.camera_moving;     // (a list with no camera: the scene's verdict)
     struct Forget {
         ~Forget() { t_before = nullptr, t_camera_moved = false; }
     } forget;

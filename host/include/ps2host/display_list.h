@@ -129,6 +129,11 @@ struct ListBlendOptions {
     // alternated (4.8 pictures a step), and those words "jumped" every step:
     // the characters, 19 of the 59 things, stepped at 30.
     const std::vector<u32>* buffer_before = nullptr;
+    // The camera moved this step and did not cut - another list's verdict
+    // (the scene's, by its camera's segment), for a list with no camera of
+    // its own (cut_segment < 0): its things' moves past the cut but within
+    // the jump's reach are the camera's motion, as in the scene's list.
+    bool camera_moving = false;
 };
 
 struct ListBlend {
