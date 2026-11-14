@@ -766,14 +766,18 @@ ListBlend PlanListBlend(const Vif1Chain& a, const Vif1Chain& b, const ListBlendO
                     pairing[q - s.first] = older_unpacks[n];
                 ++n;
             }
-            // (the first pairing's changes, kept for the next step's steady test, taken back: this one's instead)
+            // (the changes kept for the next step's steady test: the first pairing's, or - paired again - this one's;
+            // a failed pairing again leaves the first's)
             const u32 lo_at = cb[s.first].at, hi_at = s.end < cb.size() ? cb[s.end].at : u32(b.words.size());
-            plan.changed.erase(std::remove_if(plan.changed.begin(), plan.changed.end(),
-                                              [&](const std::pair<u32, float>& c) { return c.first >= lo_at && c.first < hi_at; }),
-                               plan.changed.end());
+            const size_t changed_mark = plan.changed.size();
             float worst = 0.0f;
-            if (!PlanPair(a.words, ca, sa[best].first, b.words, cb, s, o, plan, moving, 0, 0, &worst, j.newer, &pairing))
+            if (!PlanPair(a.words, ca, sa[best].first, b.words, cb, s, o, plan, moving, 0, 0, &worst, j.newer, &pairing)) {
+                plan.changed.resize(changed_mark);
                 continue;
+            }
+            plan.changed.erase(std::remove_if(plan.changed.begin(), plan.changed.begin() + std::ptrdiff_t(changed_mark),
+                                              [&](const std::pair<u32, float>& c) { return c.first >= lo_at && c.first < hi_at; }),
+                               plan.changed.begin() + std::ptrdiff_t(changed_mark));
             static const bool pair_log = std::getenv("PS2HOST_BLEND_JUMPS") != nullptr;
             if (pair_log)
                 std::fprintf(stderr, "[jump] segment %u paired again: with %u (d %g a word, was %u's %g)\n", j.newer, best,
