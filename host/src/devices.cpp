@@ -775,13 +775,17 @@ void InstallDevices() {
     for (const Channel& ch : kChannels) {
         if (ch.base == 0x1000B000u || ch.base == 0x1000B400u) continue;     // the IPU's (ipu.cpp)
         const u32 chcr = ch.base, madr = ch.base + kMadr, qwc = ch.base + kQwc;
-        m.OnWrite(chcr, [ch, madr, qwc, chcr](u32, u64 value) {
+        // (its note once noted: the notes' set - a lock, a string made and compared - not asked again at every
+        // start, thousands a second, unless every note is wanted)
+        auto noted = std::make_shared<std::atomic<bool>>(false);
+        m.OnWrite(chcr, [ch, madr, qwc, chcr, noted](u32, u64 value) {
             if (!(value & 0x100)) return;                       // STR not set
             Memory& memory = GuestMemory();
             // The text only when it is logged: a DMA start is thousands a second.
-            const std::string key = std::string("dma ") + ch.name;
             const bool traced = gs::TheGs().trace && (ch.base == 0x10009000u || ch.base == 0x1000A000u);
-            const bool describe = traced || Noting(key);
+            const bool asked = !noted->load(std::memory_order_relaxed) || NotingAll();
+            const std::string key = asked ? std::string("dma ") + ch.name : std::string();
+            const bool describe = traced || (asked && Noting(key));
             char text[256] = "";
             if (describe)
                 std::snprintf(text, sizeof text,
@@ -810,7 +814,10 @@ void InstallDevices() {
                              calls.c_str());
             }
             const std::string walked = ch.walked ? Walk(ch, u32(value), describe) : std::string();
-            if (describe) Note(key, ch.walked ? std::string(text) + ": " + walked : std::string(text));
+            if (describe && asked) {
+                Note(key, ch.walked ? std::string(text) + ": " + walked : std::string(text));
+                noted->store(true, std::memory_order_relaxed);
+            }
             *Register(chcr) &= ~0x100u;                         // done
             SetDStat(d_stat | (1u << ch.status_bit));
             PostDmac(ch.status_bit);
