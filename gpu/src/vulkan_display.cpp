@@ -835,7 +835,7 @@ void VulkanDisplay::DrawReticle(VkImage target) {
         reticle_slot_generation_[slot_] = reticle_generation_;
     }
     // Its pixels' runs, row by row (alpha 0 left as the picture has it).
-    VkBufferImageCopy copies[64 * 32];
+    static thread_local std::vector<VkBufferImageCopy> copies(64 * 32);   // (each row's runs; reused, not on the stack)
     std::uint32_t n = 0;
     const std::int32_t x0 = std::int32_t((extent_.width - reticle_width_) / 2);
     const std::int32_t y0 = std::int32_t((extent_.height - reticle_height_) / 2);
@@ -847,7 +847,7 @@ void VulkanDisplay::DrawReticle(VkImage target) {
             }
             std::uint32_t end = x;
             while (end < reticle_width_ && (reticle_[y * reticle_width_ + end] >> 24)) ++end;
-            if (n < sizeof copies / sizeof copies[0]) {
+            if (n < copies.size()) {
                 VkBufferImageCopy& c = copies[n++];
                 c = {};
                 c.bufferOffset = offset + VkDeviceSize(y * reticle_width_ + x) * 4;
@@ -862,7 +862,7 @@ void VulkanDisplay::DrawReticle(VkImage target) {
     Barrier(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT);
-    vkCmdCopyBufferToImage(cmd_, reticle_buffer_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, n, copies);
+    vkCmdCopyBufferToImage(cmd_, reticle_buffer_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, n, copies.data());
 }
 
 void VulkanDisplay::DestroyPostImages() {
