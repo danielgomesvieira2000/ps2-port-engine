@@ -61,6 +61,15 @@ layout(location = 2) noperspective out float fog_out;
 layout(location = 3) flat out vec4 range_out;
 
 #include "gs_mesh_common.glsl"
+#ifdef GENERATED
+// The GS's values by the function engine/tools/vutrans derived from the microcode itself (PS2HOST_MESH_GENERATED=1:
+// a test - the same values as the hand-written arithmetic below, word for word): the room's VU1 image's per-vertex
+// function, its inputs this shader's mesh and header.
+#ifdef ENHANCED
+#error "GENERATED: the plain draws alone (the enhanced ones need the place before the divide)"
+#endif
+#include "generated/vu_room_990887E7.glsl"
+#endif
 #ifdef ENHANCED
 #include "gs_mesh_enhanced.glsl"
 uint Enhancements() { return floatBitsToUint(header.ext[0].y); }
@@ -115,12 +124,18 @@ void main() {
     const vec4 nrm = mesh.quad[at + 1u];
     const vec4 col = mesh.quad[at + 2u];
     const vec4 tx = mesh.quad[at + 3u];
+#ifdef GENERATED
+    // the guard band (rows 7-10): the triangles' rule, not the GS's values
+    vec4 g;
+    for (int l = 0; l < 4; ++l) g[l] = Dot(7, p, l);
+#else
     // the place through rows 3-6 (the view) and 7-10 (the guard band)
     vec4 cp, g;
     for (int l = 0; l < 4; ++l) {
         cp[l] = Dot(3, p, l);
         g[l] = Dot(7, p, l);
     }
+#endif
     // the guard band's six planes, as CLIP judges (|x| > |w| out)
     const float gw = abs(g.w);
     GUARD[0] = gw - g.x;
@@ -129,6 +144,16 @@ void main() {
     GUARD[3] = gw + g.y;
     GUARD[4] = gw - g.z;
     GUARD[5] = gw + g.z;
+#ifdef GENERATED
+    uint o[11];
+    VuRoomGenerated(at, o);
+    const vec3 stq = uintBitsToFloat(uvec3(o[kOut_ST_x], o[kOut_ST_y], o[kOut_ST_z]));
+    const uvec4 rgba = uvec4(o[kOut_RGBAQ_x], o[kOut_RGBAQ_y], o[kOut_RGBAQ_z], o[kOut_RGBAQ_w]) & 0xFFu;
+    const uint f = (o[kOut_XYZF2_w] >> 4) & 0xFFu;
+    const uint x = o[kOut_XYZF2_x] & 0xFFFFu;
+    const uint y = o[kOut_XYZF2_y] & 0xFFFFu;
+    const uint z = (o[kOut_XYZF2_z] >> 4) & 0xFFFFFFu;
+#else
     const float q = Recip(cp.w);
     // the texture coordinates through rows 15-17 (Q: the vertex's own z)
     const float s0 = Add(Add(Mul(header.row[15].x, tx.x), Mul(header.row[16].x, tx.y)), header.row[17].x);
@@ -155,6 +180,7 @@ void main() {
     const uint x = uint(Ftoi(Mul(cp.x, q) * 16.0)) & 0xFFFFu;
     const uint y = uint(Ftoi(Mul(cp.y, q) * 16.0)) & 0xFFFFu;
     const uint z = (uint(Ftoi(Mul(cp.z, q) * 16.0)) >> 4) & 0xFFFFFFu;
+#endif
     const vec2 position = (vec2(float(x), float(y)) - header.offset.xy) / 16.0;
     // ...on as gs.vert
     const vec2 ndc = (position + 0.5) / target.size * 2.0 - 1.0;

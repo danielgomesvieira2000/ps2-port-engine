@@ -22,6 +22,9 @@ def _leaf_py(r, j, uidx):
     if r[0] == "G4":
         _, B, rel = r
         return "M(base + %d + %d * (i // 4), i %% 4)" % (rel, B)
+    if r[0] == "I":
+        _, stride, rel, ls, k, lane = r
+        return "M((M(base + %d * i + %d, %d) & 0xFFFF) + %d, %d)" % (stride, rel, ls, k, lane)
     if r[0] == "P":
         _, p, slope, table = r
         rels = [a if a is not None else 0 for a, _ in table]
@@ -80,6 +83,8 @@ def python_module(image, funcs):
 # ---------------------------------------------------------------- GLSL
 
 KNOWN = {"Mul", "Add", "Sub", "Recip", "Rsqrt", "Ftoi", "SqrtTZ", "ItofTZ", "Itof12", "VuMax", "VuMin"}
+# (gs_mesh_common.glsl's alone - what a native mesh shader other than RenderWare's has)
+COMMON = {"Mul", "Add", "Sub", "Recip", "Rsqrt", "Ftoi", "VuMax", "VuMin"}
 STUBS = {
     "VuDiv": "// MISSING: DIV toward zero with a numerator other than 1.0 (Recip(d) times n is two roundings)\n"
              "float VuDiv(float n, float d) { return n == 0.0 ? 0.0 : (d == 0.0 ? kMax : n / d); }\n",
@@ -100,10 +105,12 @@ STUBS = {
 }
 
 
-def _glsl_function(name, fit, used):
+def _glsl_function(name, fit, used, leaf=None, params=None):
+    """leaf(j, role) -> a GLSL uint expression for leaf j (default: the compute harness's VuU / VuM);
+    params: the function's parameters before its outputs (default 'uint i, uint base')."""
     uidx = _uidx(fit)
     out = ["// outputs: %s" % " ".join(fit["names"]),
-           "void %s(uint i, uint base, out uint o[%d]) {" % (name, len(fit["outs"]))]
+           "void %s(%s, out uint o[%d]) {" % (name, params or "uint i, uint base", len(fit["outs"]))]
     typ = {}
     expr = {}
 
@@ -118,7 +125,9 @@ def _glsl_function(name, fit, used):
         return r if typ[r] == "u" else "floatBitsToUint(%s)" % r
 
     for j, r in enumerate(fit["abstract"]):
-        if r[0] == "U":
+        if leaf is not None:
+            e = leaf(j, fit["roles"][j], r)
+        elif r[0] == "U":
             e = "VuU(%du)" % uidx[j]
         elif r[0] == "V":
             _, stride, k, lane = r
@@ -126,6 +135,9 @@ def _glsl_function(name, fit, used):
         elif r[0] == "G4":
             _, B, rel = r
             e = "VuM(base + %du + %du * (i / 4u), int(i %% 4u))" % (rel, B)
+        elif r[0] == "I":
+            _, stride, rel, ls, k, lane = r
+            e = "VuM((VuM(base + %du * i + %du, %d) & 0xFFFFu) + %du, %d)" % (stride, rel, ls, k, lane)
         else:
             _, p, slope, table = r
             rels = ", ".join("%du" % (a if a is not None else 0) for a, _ in table)
@@ -254,3 +266,88 @@ uint VuM(uint q, int lane) { return mesh.quad[q & 0x3FFu][lane]; }
     main = "void main() {\n    const uint i = gl_GlobalInvocationID.x;\n    if (i >= batch.count) return;\n%s\n}\n" \
         % "\n".join(calls)
     return hdr + "\n" + stubs + "\n" + "\n".join(bodies) + "\n" + main, missing
+
+
+# ---------------------------------------------------------------- drop-ins for the native mesh shaders
+
+def _gs_mesh_leaf(j, role, abstract):
+    """gs_mesh.vert's inputs: a vertex's quadwords mesh.quad[at + k] (at = 4 x the mesh's vertex, the tag's loop
+    index: the mesh holds the strip's two kept vertices first, as the tag does), the header's rows 0-23
+    (VU1 data memory 0-23) and vf11-vf17 (header.k)."""
+    if abstract[0] == "V":
+        _, stride, rel, lane = abstract
+        if stride != 4:
+            raise ValueError("gs_mesh: a vertex input of stride %d (the mesh's is 4)" % stride)
+        return "floatBitsToUint(mesh.quad[at %s %du][%d])" % ("+" if rel >= 0 else "-", abs(rel), lane)
+    if abstract[0] == "U":
+        d = role[1]
+        if d[0] == "m" and d[1] < 24:
+            return "floatBitsToUint(header.row[%d][%d])" % (d[1], d[2])
+        if d[0] == "vf" and 11 <= d[1] <= 17:
+            return "floatBitsToUint(header.k[%d][%d])" % (d[1] - 11, d[2])
+        raise ValueError("gs_mesh: a uniform the header does not carry: %r" % (d,))
+    raise ValueError("gs_mesh: an input role it cannot read: %r" % (abstract,))
+
+
+def _gs_mesh_chars_leaf(j, role, abstract):
+    """gs_mesh_chars.vert's inputs: a vertex's quadwords mesh.quad[at + k] (at = 5 x the mesh's vertex), the rows
+    at an address the vertex holds through its Row() (the header's rows from misc.z), vf00-vf21 (header.vf), rows
+    11-13 (header.tex) and vi15 (misc.w's bits)."""
+    if abstract[0] == "V":
+        _, stride, rel, lane = abstract
+        if stride != 5:
+            raise ValueError("gs_mesh_chars: a vertex input of stride %d (the mesh's is 5)" % stride)
+        return "floatBitsToUint(mesh.quad[at %s %du][%d])" % ("+" if rel >= 0 else "-", abs(rel), lane)
+    if abstract[0] == "I":
+        _, stride, rel, ls, k, lane = abstract
+        if stride != 5 or rel < 0:
+            raise ValueError("gs_mesh_chars: an address word outside the vertex: %r" % (abstract,))
+        return "floatBitsToUint(Row((floatBitsToUint(mesh.quad[at + %du][%d]) & 0xFFFFu) + %du)[%d])" % (
+            rel, ls, k, lane)
+    if abstract[0] == "U":
+        d = role[1]
+        if d[0] == "vf" and d[1] < 22:
+            return "floatBitsToUint(header.vf[%d][%d])" % (d[1], d[2])
+        if d[0] == "m" and 11 <= d[1] <= 13:
+            return "floatBitsToUint(header.tex[%d][%d])" % (d[1] - 11, d[2])
+        if d[0] == "vi" and d[1] == 15:
+            return "(floatBitsToUint(header.misc.w) & 0xFFFFu)"
+        raise ValueError("gs_mesh_chars: a uniform the header does not carry: %r" % (d,))
+    raise ValueError("gs_mesh_chars: an input role it cannot read: %r" % (abstract,))
+
+
+BINDINGS = {
+    # name: (leaf, parameters, function name, what the shader defines first)
+    "gs_mesh": (_gs_mesh_leaf, "uint at", "VuRoomGenerated",
+                "gs_mesh.vert's Mesh (set 3 binding 0: vec4 quad[]) and Header (binding 1: row[24], k[7])"),
+    "gs_mesh_chars": (_gs_mesh_chars_leaf, "uint at", "VuCharsGenerated",
+                      "gs_mesh_chars.vert's Mesh (vec4 quad[]), Header (vf[22], tex[3], misc, row[]) and Row()"),
+}
+
+
+def glsl_bound(binding, fname, fit, info):
+    """The projected function fit as a drop-in for a native mesh shader (BINDINGS[binding]): its inputs read
+    from the shader's own buffers, its outputs the words (masked by the consumer) named by kOut_* constants."""
+    leaf, params, name, needs = BINDINGS[binding]
+    used = set()
+    body = _glsl_function(name, fit, used, leaf=leaf, params=params)
+    missing = sorted(x for x in used if x not in COMMON)
+    if missing:
+        raise ValueError("helpers gs_mesh_common.glsl lacks: %s" % " ".join(missing))
+    consts = "\n".join("const int kOut_%s = %d;     // (the consumer reads bits 0x%X)" % (
+        n.replace(".", "_"), k, m) for k, (n, m) in enumerate(zip(fit["names"], fit["out_masks"])))
+    assumed = ", ".join("%s zero in 0x%X" % (",".join(str(x) for x in k), v) for k, v in info["assume"].items())
+    head = """// GENERATED by engine/tools/vutrans (translate.py --emit-glsl-mesh, binding %s) - do not edit by hand.
+//
+// VU1 image %s's per-vertex function (%s), derived from the snapshot %s (%d runs of the image):
+// serves %s; %d vertices in %d batches, the Python evaluator of the same function bit-exact on %d of %d
+// (the words below, as the consumer reads them). Projection: the GS's words with masks %s; assumed: %s.
+//   %s
+// Needs %s and gs_mesh_common.glsl (included before this file).
+// Inputs: at = the vertex's first quadword in the mesh (its index times the stride). Outputs: o[kOut_*], each word's bits as the microcode
+// kicks them (the GS reads them through its own masks).
+""" % (binding, info["image"], fname, info["snapshot"], info["runs"], info["serves"], info["vertices"],
+       info["batches"], info["exact"], info["checked"],
+       "{%s}" % ", ".join("%s: 0x%X" % kv for kv in info["masks"].items()), assumed or "nothing",
+       info["command"], needs)
+    return head + "\n" + consts + "\n\n" + body

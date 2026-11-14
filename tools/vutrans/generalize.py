@@ -11,8 +11,13 @@ fit_batch(): for the vertices of one shape, each leaf slot is given a role from 
         a neighbour, e.g. the CLIP flags of the two previous vertices; a second stride: a second stream)
   G4    qword base + rel + B*(i // 4), lane i % 4  (structure-of-arrays groups of four, e.g. normals)
   P     periodic, p = 2 or 4 (an unrolled loop's lanes): qword base + slope*i + rel[i % p], lane lane[i % p]
+  I     indirect: qword lo16(M(base + stride*i + rel, lane_src)) + k (0 <= k < 4), one lane - a row of a matrix
+        whose address the vertex holds (ILW then LQ; e.g. a character's bones)
   ?     none of these (the function does not generalize)
 stride and base are inferred (the stride the V slots share; base so that most V slots have delta 0).
+
+project(): the function as a consumer reads it (data-dependent identities dropped, output words masked, inputs
+assumed zero in some bits) - functions that differ only in what the consumer does not read merged.
 
 signature(): the function's identity across batches and runs - the canonical text plus the roles with the
 uniform slots abstracted (their addresses are the CPU-side header layout, which may move per instance).
@@ -165,15 +170,42 @@ def _flag_ops(dag, root, cache):
     return found
 
 
-def fit_batch(dag, tag, slicer, top=None, hint=None):
+def _indirect(pts, base, stride, mem, sources, kmax=4):
+    """An input read at an address the vertex holds (a matrix's rows, ILW then LQ): qword lo16(M(base + stride*i
+    + rel, lane_src)) + k, lane lane_out, for one of sources [(rel, lane_src)] (or any word of the vertex when
+    sources is None) with 0 <= k < kmax. Returns (rel, lane_src, k) or None."""
+    if mem is None or base is None or not stride:
+        return None
+    if not all(d[0] == "m" for _, d in pts) or len(set(d[2] for _, d in pts)) != 1:
+        return None
+    cands = sources if sources is not None else [(rel, l) for rel in range(stride) for l in range(4)]
+    for rel, ls in cands:
+        k0 = None
+        for i, d in pts:
+            k = (d[1] - (mem((base + stride * i + rel) & 0x3FF, ls) & 0xFFFF)) & 0x3FF
+            if k0 is None:
+                k0 = k
+            if k != k0 or k >= kmax:
+                k0 = None
+                break
+        if k0 is not None:
+            return rel, ls, k0
+    return None
+
+
+def fit_batch(dag, tag, slicer, top=None, hint=None, mem=None, sources=None):
     """tag: a slice.Tag. Returns a Batch. hint: (stride, base - TOP) seen in earlier batches of the image, for
-    batches too short to infer them (every vertex its own shape)."""
+    batches too short to infer them (every vertex its own shape). mem(q, lane): the run's initial data memory, to
+    find inputs read at an address a vertex holds (role I, see _indirect); sources: the (rel, lane) vertex words
+    known to hold such addresses (from batches before, or given), tried for slots otherwise uniform. b.sources: the
+    ones this batch found."""
     b = Batch()
     b.tag = tag
     groups = collections.OrderedDict()
     per = []
     flagcache = {}
     b.controlled = 0          # vertices with a word under a data-dependent branch
+    b.sources = set()
     for idx, v in enumerate(tag.vertices):
         sig = slicer.significant(v)
         if any(dag.ctl[s[2]] for s in sig):
@@ -236,6 +268,17 @@ def fit_batch(dag, tag, slicer, top=None, hint=None):
             fit["stride"] = None
         fit["base"] = base
         fit["top"] = top
+        # inputs at an address the vertex holds: the slots no other role fits, and (given sources) uniform ones
+        if mem is not None and base is not None and fit["stride"]:
+            for j, r in enumerate(roles):
+                if r[0] == "?" or (r[0] == "U" and r[1][0] == "m" and sources and len(idxs) > 0):
+                    pts = [(tag.vertices[i].loop, leaf_desc(dag, per[i][0][j])) for i in idxs]
+                    found = _indirect(pts, base, fit["stride"], mem, None if r[0] == "?" else sorted(sources))
+                    if found:
+                        rel, ls, k = found
+                        roles[j] = ("I", fit["stride"], (base + rel) % 1024, ls, k, pts[0][1][2])
+                        b.sources.add((rel, ls))
+            fit["ok"] = all(r[0] != "?" for r in roles)
         # the abstract roles (the function's identity) and the uniform list (the batch's header)
         abstract, uniforms = [], []
         for r in roles:
@@ -253,6 +296,9 @@ def fit_batch(dag, tag, slicer, top=None, hint=None):
                 abstract.append(("V", r[1], rel, r[3]))
             elif r[0] == "G4":
                 abstract.append(("G4", r[1], ((r[2] - base) % 1024) if base is not None else r[2]))
+            elif r[0] == "I":
+                rel = (r[2] - base) % 1024
+                abstract.append(("I", r[1], rel, r[3], r[4], r[5]))
             elif r[0] == "P":
                 b0 = base if base is not None else 0
                 abstract.append(("P", r[1], r[2], tuple((None, None) if a is None else ((a - b0) % 1024, l)
@@ -321,6 +367,9 @@ def leaf_value_for(fit, i, leafval_mem, regval, uvals=None):
         elif r[0] == "P":
             a, l = r[3][i % r[1]]
             out.append(leafval_mem((a + r[2] * i) & 0x3FF, l))
+        elif r[0] == "I":
+            src = leafval_mem((r[2] + r[1] * i) & 0x3FF, r[3]) & 0xFFFF
+            out.append(leafval_mem((src + r[4]) & 0x3FF, r[5]))
         else:
             raise ValueError("slot %d does not generalize" % j)
     return out
@@ -340,3 +389,143 @@ def run_prog(prog, outs, leafvals):
     for t, op, attr, args in prog:
         env[t] = ops[op](attr, *[get(a) for a in args])
     return [get(o) for o in outs]
+
+
+# ---------------------------------------------------------------- projection (what a consumer reads)
+
+def _low_range(mask):
+    """The bits at and below a mask's highest bit (an addition's carries reach them from below only)."""
+    return (1 << mask.bit_length()) - 1 if mask else 0
+
+
+def project(fit, masks=None, assume=None):
+    """A fit's function as a consumer reads it: a new fit (or None: nothing left), merged across what the
+    consumer cannot tell apart.
+
+    - g (a value written under a data-dependent branch) is the identity: its value is its argument's.
+    - masks {word: bits}: the bits of an output word the consumer reads (in place of the GS's: e.g. XYZF2.w's
+      fog alone, 0xFF0, its ADC bit drawn by the consumer's own rule); a word masked 0 is dropped.
+    - assume {abstract role: bits}: an input known zero in those bits (a precondition the consumer checks, e.g. a
+      room vertex's mark word, 0 or 0x8000 - other marks declined by the native path: ("V", 4, 0, 3): 0x7FFF).
+    Under a mask, iadd / ior of an operand zero in every bit up to the mask's highest is the other operand, and
+    ops of constants are folded (OPS). Then dead code goes, the leaves are renumbered in first use, and the
+    signature is made again. fit["masks"]: the output words' read bits, in the new order."""
+    masks = masks or {}
+    assume = assume or {}
+    ops = vu1sym.OPS
+    leafrole = {"L%d" % j: fit["abstract"][j] for j in range(len(fit["abstract"]))}
+    defs = {t: (op, attr, args) for t, op, attr, args in fit["prog"]}
+
+    def const(r):
+        return int(r[1:], 16) if r[0] == "c" else None
+
+    def known_zero(r):
+        """Bits known zero in r's value."""
+        c = const(r)
+        if c is not None:
+            return ~c & 0xFFFFFFFF
+        if r[0] == "L":
+            return assume.get(leafrole[r], 0)
+        op, attr, args = (newdefs if r[0] == "n" else defs)[r]
+        if op == "g":
+            return known_zero(args[0])
+        if op == "lo16":
+            return 0xFFFF0000 | known_zero(args[0])
+        if op in ("iadd", "isub", "iand", "ior"):
+            kz = 0xFFFF0000
+            if op == "iand":
+                kz |= known_zero(args[0]) | known_zero(args[1])
+            elif op == "ior":
+                kz |= known_zero(args[0]) & known_zero(args[1])
+            return kz
+        return 0
+
+    new = {}            # old ref -> new ref (under no mask)
+    prog = []           # (new temporaries: n0, n1, ...)
+    newdefs = {}
+
+    def emit_op(op, attr, args):
+        if op != "c" and all(a[0] == "c" for a in args) and op not in ("clipj", "mac", "fcand", "fcor", "fceq",
+                                                                         "fcget"):
+            return "c%08X" % (ops[op](attr, *[const(a) for a in args]) & 0xFFFFFFFF)
+        key = (op, attr, tuple(args))
+        for t, o, at, ar in prog:           # (hash-consed again: the g's dropped make twins)
+            if (o, at, ar) == key:
+                return t
+        t = "n%d" % len(prog)
+        prog.append((t, op, attr, tuple(args)))
+        newdefs[t] = (op, attr, tuple(args))
+        return t
+
+    def rewrite(r, demand=0xFFFFFFFF):
+        if r[0] in "cL":
+            return r
+        op, attr, args = defs[r]
+        if op == "g":
+            return rewrite(args[0], demand)
+        if demand == 0xFFFFFFFF and r in new:
+            return new[r]
+        sub = demand if op in ("iadd", "ior", "lo16") else 0xFFFFFFFF
+        a2 = [rewrite(a, sub) for a in args]
+        if demand != 0xFFFFFFFF:
+            low = _low_range(demand)
+            if op in ("iadd", "ior"):
+                # (an operand zero in every bit up to the demand's highest: the sum's demanded bits the other's)
+                for k in (0, 1):
+                    if known_zero(a2[k]) & low == low:
+                        return a2[1 - k]
+            if op == "lo16" and low <= 0xFFFF:
+                return a2[0]
+        out = emit_op(op, attr, a2)
+        if demand == 0xFFFFFFFF:
+            new[r] = out
+        return out
+
+    names, outs, outmasks = [], [], []
+    for name, o in zip(fit["names"], fit["outs"]):
+        m = masks.get(name, 0xFFFFFFFF)
+        if m == 0:
+            continue
+        names.append(name)
+        outs.append(rewrite(o, m))
+        outmasks.append(m)
+    if not names:
+        return None
+    # dead code out, leaves and temporaries renumbered in first use
+    live = set(outs)
+    for t, op, attr, args in reversed(prog):
+        if t in live:
+            live.update(args)
+    ren = {}
+    leaves = []
+    prog2 = []
+
+    def ref(a):
+        if a[0] == "c":
+            return a
+        if a not in ren:
+            if a[0] == "L":
+                ren[a] = "L%d" % len(leaves)
+                leaves.append(a)
+            else:
+                raise KeyError(a)
+        return ren[a]
+    for t, op, attr, args in prog:
+        if t not in live:
+            continue
+        a2 = tuple(ref(a) for a in args)
+        nt = "t%d" % len(prog2)
+        ren[t] = nt
+        prog2.append((nt, op, attr, a2))
+    outs2 = tuple(ref(o) for o in outs)
+    old_index = [int(l[1:]) for l in leaves]
+    roles = [fit["roles"][j] for j in old_index]
+    abstract = tuple(fit["abstract"][j] for j in old_index)
+    uniforms = [r[1] for r in roles if r[0] == "U"]
+    text = "\n".join("%s=%s%s(%s)" % (t, op, "" if attr is None else "<%s>" % (attr,), ",".join(args))
+                     for t, op, attr, args in prog2) + "\n=>" + ",".join(outs2)
+    p = dict(fit)
+    p.update({"names": tuple(names), "text": text, "prog": prog2, "outs": outs2, "roles": roles,
+              "abstract": abstract, "uniforms": uniforms, "out_masks": tuple(outmasks),
+              "signature": (tuple(names), text, abstract, tuple(outmasks)), "from": fit["signature"]})
+    return p

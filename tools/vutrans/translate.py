@@ -9,6 +9,16 @@ the functions found (stride, base relative to TOP, uniform rows, data-dependent 
 branches (and which words they guard), and checks every function across all batches that share it: the emitted
 Python evaluator (--emit-py; else an in-memory one) must reproduce every kicked significant word of every vertex
 bit for bit. --emit-glsl writes the same functions as GLSL (gs_mesh_common.glsl / gs_mesh_rw.glsl helpers).
+
+Milestone 2 (--project, --mask, --assume, --emit-glsl-mesh, --binding): the functions as a native mesh shader reads
+them (generalize.project), each checked the same way on its words as read, and the one serving most vertices
+written as a drop-in for the shader (emit.glsl_bound: its inputs the shader's own buffers). Outbreak's room and
+characters (engine/gpu/shaders/generated/):
+    translate.py SNAP 990887E7 --runs 2000 --mask XYZF2.w=0xFF0 --assume V,4,0,3=0x7FFF --emit-glsl-mesh F
+    translate.py SNAP 6BD7E3E9 --runs 2000 --mask XYZF2.w=0xFF0 --assume V,5,0,3=0x7FFF --binding gs_mesh_chars
+                 --emit-glsl-mesh F
+(XYZF2.w: the fog alone, ADC being the shader's index buffer and guard band; the mark word 0 or 0x8000, others
+declined by the native path.)
 """
 import argparse
 import collections
@@ -45,7 +55,23 @@ def main():
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--engine-moves", action="store_true",
                     help="MOVE/MR32/MFIR timing as vu.cpp (no write when unchanged); default: as vu1emu")
+    ap.add_argument("--mask", action="append", default=[], metavar="WORD=BITS",
+                    help="project: the bits of an output word the consumer reads (0: dropped), e.g. XYZF2.w=0xFF0")
+    ap.add_argument("--assume", action="append", default=[], metavar="ROLE=BITS",
+                    help="project: an input zero in BITS (a precondition the consumer checks), ROLE an abstract "
+                         "vertex role 'V,stride,rel,lane', e.g. V,4,0,3=0x7FFF")
+    ap.add_argument("--project", action="store_true",
+                    help="also report the functions as the consumer reads them (g dropped, --mask / --assume)")
+    ap.add_argument("--emit-glsl-mesh", metavar="FILE",
+                    help="write the projected function serving most vertices as a drop-in for a native mesh shader "
+                         "(--binding)")
+    ap.add_argument("--indirect", action="append", default=[], metavar="REL,LANE",
+                    help="a vertex word (qword rel from the vertex's base, lane) holding an address its inputs are "
+                         "read at (a matrix's rows), tried for slots otherwise uniform; found ones are added")
+    ap.add_argument("--binding", default="gs_mesh", help="the shader the drop-in is for (emit.BINDINGS)")
     a = ap.parse_args()
+    if a.mask or a.assume or a.emit_glsl_mesh:
+        a.project = True
     image = int(a.image, 16)
 
     funcs = collections.OrderedDict()       # signature -> {"fit": first fit, "batches": [...]}
@@ -62,6 +88,10 @@ def main():
     stride_seen = collections.Counter()
     ncontrolled = nsingle = nsingle_batches = 0
     diag = None
+    sources = set()                           # (rel, lane): vertex words holding addresses (role I)
+    for x in a.indirect:
+        rel, lane = x.split(",")
+        sources.add((int(rel), int(lane)))
     for si, head, m, d in vu1sym.image_runs(a.snap, image, a.runs, a.skip):
         if ipdom is None:
             ipdom = vu1sym.build_ipdom(m)
@@ -86,6 +116,10 @@ def main():
                 c[0] += 1
                 c[1] += bool(taken)
         tags = gifslice.parse_kicks(s.kicks)
+        dwords = memoryview(d).cast("I")
+
+        def memf(q, lane, dwords=dwords):
+            return dwords[(q & 0x3FF) * 4 + lane]
         leafval = s.leafval_fn(head, d)
         mem = s.leafval_fn(head, d)
         top = s.top
@@ -96,7 +130,8 @@ def main():
             hint = None
             if stride_seen:
                 hint = stride_seen.most_common(1)[0][0]
-            b = generalize.fit_batch(dag, t, gifslice, top, hint)
+            b = generalize.fit_batch(dag, t, gifslice, top, hint, mem=memf, sources=sources or None)
+            sources |= b.sources
             for fit in b.fits:
                 if fit["stride"] is not None and fit["base"] is not None and len(fit["idxs"]) > 2:
                     stride_seen[(fit["stride"], (fit["base"] - top) % 1024)] += 1
@@ -171,6 +206,9 @@ def main():
                 elif len(bad_examples) < 5:
                     bad_examples.append((names[sig], si, v.loop, out, want))
             del vc
+    projected = None
+    if a.project:
+        projected = project_all(a, funcs, image)
     if a.emit_glsl:
         src, missing = emit.glsl_module(image, [(names[s], f["fit"]) for s, f in funcs.items()])
         with open(a.emit_glsl, "w", newline="\n") as fh:
@@ -215,6 +253,10 @@ def main():
         g4 = [r for r in fit["abstract"] if r[0] == "G4"]
         if g4:
             print("     SoA groups of 4 (qword base+rel + B*(i//4), lane i%%4): %s" % sorted(set(g4)))
+        ind = sorted(set(r[2:] for r in fit["abstract"] if r[0] == "I"))
+        if ind:
+            print("     indirect (rows at an address the vertex holds: (address word's qword, lane), row, lane): %s"
+                  % " ".join("(%d.%d)+%d.%s" % (q, l, k, "xyzw"[lo]) for q, l, k, lo in ind))
         pp = [r for r in fit["abstract"] if r[0] == "P"]
         if pp:
             print("     periodic slots (period, slope, per-residue (base+, lane)): %s" % sorted(set(pp), key=str))
@@ -238,7 +280,105 @@ def main():
     if missing:
         print("GLSL helpers missing from gs_mesh_common.glsl / gs_mesh_rw.glsl (emitted as stubs): %s" %
               " ".join(sorted(missing)))
-    return 0 if exact == checked else 1
+    ok = exact == checked
+    if projected is not None:
+        ok = report_projected(a, projected, image, nruns) and ok
+    return 0 if ok else 1
+
+
+def parse_bits(text):
+    k, v = text.split("=")
+    return k, int(v, 0)
+
+
+def project_all(a, funcs, image):
+    """The functions projected (generalize.project) and merged by their projected signature; each batch checked
+    with its own projected fit (its uniforms): the emitted evaluator's words, masked, against the kicks'."""
+    masks = dict(parse_bits(x) for x in a.mask)
+    assume = {}
+    for x in a.assume:
+        k, v = parse_bits(x)
+        parts = k.split(",")
+        assume[(parts[0],) + tuple(int(p) for p in parts[1:])] = v
+    pf = collections.OrderedDict()
+    for sig, f in funcs.items():
+        for si, head, d, fit, verts in f["batches"]:
+            p = generalize.project(fit, masks, assume)
+            if p is None:
+                continue
+            g = pf.get(p["signature"])
+            if g is None:
+                g = pf[p["signature"]] = {"fit": p, "batches": [], "vertices": 0, "runs": set(), "from": set(),
+                                          "loops": collections.Counter()}
+            g["batches"].append((si, head, d, p, verts))
+            g["vertices"] += len(verts)
+            g["runs"].add(si)
+            g["from"].add(sig)
+            g["loops"].update(fit["loops"])
+    order = sorted(pf, key=lambda k: -pf[k]["vertices"])
+    names = {sig: "vu_%08X_p%d" % (image, k) for k, sig in enumerate(order)}
+    src = emit.python_module(image, [(names[s], pf[s]["fit"]) for s in order])
+    out_py = os.path.join(os.environ.get("TEMP", "."), "vutrans_%08X_projected.py" % image)
+    with open(out_py, "w", newline="\n") as fh:
+        fh.write(src)
+    spec = importlib.util.spec_from_file_location("vutrans_projected_%08X" % image, out_py)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    for sig in order:
+        g = pf[sig]
+        fn = getattr(mod, names[sig])
+        g["checked"] = g["exact"] = 0
+        g["bad"] = []
+        for si, head, d, p, verts in g["batches"]:
+            words = memoryview(d).cast("I")
+
+            def M(q, lane, words=words):
+                return words[(q & 0x3FF) * 4 + lane]
+            U = [regval_head(head, r[1]) if r[1][0] != "m" else M(r[1][1], r[1][2]) for r in p["roles"]
+                 if r[0] == "U"]
+            for v in verts:
+                out = fn(v.loop, M, p["base"] if p["base"] is not None else 0, U)
+                have = {n: b for n, b, _node, _m in gifslice.significant(v)}
+                want = [have[n] & m for n, m in zip(p["names"], p["out_masks"])]
+                got = [o & m for o, m in zip(out, p["out_masks"])]
+                g["checked"] += 1
+                if got == want:
+                    g["exact"] += 1
+                elif len(g["bad"]) < 3:
+                    g["bad"].append((si, v.loop, got, want))
+    return {"order": order, "funcs": pf, "names": names, "masks": masks, "assume": assume, "py": out_py}
+
+
+def report_projected(a, pr, image, nruns):
+    pf, order, names = pr["funcs"], pr["order"], pr["names"]
+    print("\nprojected (g dropped; masks %s; assumed zero %s): %d functions" % (
+        {k: "0x%X" % v for k, v in pr["masks"].items()}, {k: "0x%X" % v for k, v in pr["assume"].items()},
+        len(pf)))
+    ok = True
+    for sig in order:
+        g = pf[sig]
+        fit = g["fit"]
+        nu = sum(1 for r in fit["abstract"] if r[0] == "U")
+        print("  %s: %d vertices in %d batches over %d runs (from %d functions); %d ops, %d leaves (%d uniform); "
+              "serves %s; evaluator %d of %d exact (masked)" % (
+                  names[sig], g["vertices"], len(g["batches"]), len(g["runs"]), len(g["from"]), len(fit["prog"]),
+                  len(fit["abstract"]), nu, selector(g["loops"]), g["exact"], g["checked"]))
+        for b in g["bad"]:
+            print("     MISMATCH run %d vertex %d: %s vs %s" % b)
+        ok = ok and g["exact"] == g["checked"]
+    if a.emit_glsl_mesh:
+        sig = order[0]
+        g = pf[sig]
+        src = emit.glsl_bound(a.binding, names[sig], g["fit"], {
+            "snapshot": os.path.basename(a.snap), "image": "%08X" % image, "runs": nruns,
+            "vertices": g["vertices"], "batches": len(g["batches"]), "exact": g["exact"], "checked": g["checked"],
+            "masks": pr["masks"], "assume": pr["assume"], "serves": selector(g["loops"]),
+            "command": "python -I engine/tools/vutrans/translate.py " + " ".join(
+                os.path.basename(x) if ("/" in x or "\\" in x) else x for x in sys.argv[1:])})
+        with open(a.emit_glsl_mesh, "w", newline="\n") as fh:
+            fh.write(src)
+        print("wrote %s (%s, binding %s)" % (a.emit_glsl_mesh, names[sig], a.binding))
+    return ok
 
 
 def induction_diag(dag, tag):

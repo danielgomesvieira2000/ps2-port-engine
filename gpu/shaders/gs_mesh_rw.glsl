@@ -1,5 +1,5 @@
 // RenderWare's programs' arithmetic beyond gs_mesh_common.glsl's (gs_mesh_rw.vert; host's ps2host/rw_native.h
-// the CPU's twin): SQRT toward zero, ITOF12, MAX's sign-and-magnitude order.
+// the CPU's twin): SQRT toward zero, ITOF12. (MAX's sign-and-magnitude order, VuMax / VuMin: gs_mesh_common.glsl.)
 
 // sqrt(|x|) toward zero: the nearest, one step down where its square is past x
 float SqrtTZ(float x) {
@@ -26,11 +26,3 @@ float ItofTZ(int i) {
 }
 
 float Itof12(uint i) { return ItofTZ(int(i)) / 4096.0; }
-
-int VuOrder(float f) {
-    const uint b = floatBitsToUint(f);
-    const int m = int(b & 0x7FFFFFFFu);
-    return (b >> 31) != 0u ? -m : m;
-}
-float VuMax(float a, float b) { return VuOrder(a) < VuOrder(b) ? b : a; }
-float VuMin(float a, float b) { return VuOrder(b) < VuOrder(a) ? b : a; }

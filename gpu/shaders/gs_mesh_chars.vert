@@ -58,6 +58,16 @@ vec4 Row(uint address) {
     return header.row[min(address - (floatBitsToUint(header.misc.z) & 0xFFFFu), uint(header.row.length()) - 1u)];
 }
 
+#ifdef GENERATED
+// The rigid batch's GS values by the function engine/tools/vutrans derived from the microcode itself
+// (PS2HOST_MESH_GENERATED=1 or chars: a test - the same values as the hand-written arithmetic below, word for word),
+// its inputs this shader's mesh, header and Row(). (The blended batch: the hand-written arithmetic, as ever.)
+#ifdef ENHANCED
+#error "GENERATED: the plain draws alone"
+#endif
+#include "generated/vu_chars_6BD7E3E9.glsl"
+#endif
+
 void main() {
     if (gl_VertexIndex < 2) {
         // A kept vertex: as its packet has it.
@@ -95,6 +105,22 @@ void main() {
     const vec4 tx = mesh.quad[at + 2u];
     const uvec4 matrices = floatBitsToUint(mesh.quad[at + 3u]);
     const bool blended = ((floatBitsToUint(header.misc.z) >> 16) & 1u) != 0u;
+#ifdef GENERATED
+    if (!blended) {
+        uint o[11];
+        VuCharsGenerated(at, o);
+        const uint gx = o[kOut_XYZF2_x] & 0xFFFFu;
+        const uint gy = o[kOut_XYZF2_y] & 0xFFFFu;
+        const uint gz = (o[kOut_XYZF2_z] >> 4) & 0xFFFFFFu;
+        const vec2 gposition = (vec2(float(gx), float(gy)) - header.misc.xy) / 16.0;
+        gl_Position = vec4((gposition + 0.5) / target.size * 2.0 - 1.0, DepthOfZ(gz), 1.0);
+        shade = vec4(Unorm8(o[kOut_RGBAQ_x]), Unorm8(o[kOut_RGBAQ_y]), Unorm8(o[kOut_RGBAQ_z]), Unorm8(o[kOut_RGBAQ_w]));
+        coordinate = uintBitsToFloat(uvec3(o[kOut_ST_x], o[kOut_ST_y], o[kOut_ST_z]));
+        fog_out = Unorm8((o[kOut_XYZF2_w] >> 4) & 0xFFu);
+        range_out = vec4(-1e9, -1e9, 1e9, 1e9);
+        return;
+    }
+#endif
     vec4 a0, a1, a2, a3, b0, b1, b2;
     if (blended) {
         // four matrices by the vertex's weights (MULAX, MADDAY, MADDAZ, MADDW), for the place and the normal

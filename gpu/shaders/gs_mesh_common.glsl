@@ -171,3 +171,13 @@ float Rsqrt(float x) {
     if (!Past(AwayFromZero(y), x)) y = AwayFromZero(y);
     return y;
 }
+
+// MAX / MINI: the VU's order, sign and magnitude (-0 below +0, as integers) - (from gs_mesh_rw.glsl: the generated
+// functions, engine/tools/vutrans, use them in every native mesh shader)
+int VuOrder(float f) {
+    const uint b = floatBitsToUint(f);
+    const int m = int(b & 0x7FFFFFFFu);
+    return (b >> 31) != 0u ? -m : m;
+}
+float VuMax(float a, float b) { return VuOrder(a) < VuOrder(b) ? b : a; }
+float VuMin(float a, float b) { return VuOrder(b) < VuOrder(a) ? b : a; }
