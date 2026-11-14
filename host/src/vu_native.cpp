@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "ps2host/settings.h"
+#define XXH_INLINE_ALL
+#include "xxhash.h"
 
 namespace ps2host {
 namespace {
@@ -191,6 +193,10 @@ bool VuNativeRun(Vu& vu, Vu::u32 pc, Vu::u64 limit, Vu::u64* pairs, Vu::u64 gene
     if (Compare(r.program.name, pc, native, emulated)) ++r.agreed;
     else ++r.differed;
     return true;
+}
+
+std::uint64_t VuMeshHash(const void* data, std::size_t bytes, std::uint64_t seed) {
+    return XXH3_64bits_withSeed(data, bytes, seed);
 }
 
 void VuNativeReport() {

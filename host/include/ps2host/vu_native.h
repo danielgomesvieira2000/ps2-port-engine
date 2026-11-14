@@ -82,4 +82,9 @@ inline std::uint64_t VuNativeHash(const void* data, std::size_t bytes, std::uint
     return h;
 }
 
+/* A mesh's key from its vertices (the native programs' mesh caches): XXH3, several times VuNativeHash's speed - a
+   key is only compared within a run, never written down (VuNativeHash stays the microcode's test, which tools
+   compute too). */
+std::uint64_t VuMeshHash(const void* data, std::size_t bytes, std::uint64_t seed);
+
 }  // namespace ps2host
