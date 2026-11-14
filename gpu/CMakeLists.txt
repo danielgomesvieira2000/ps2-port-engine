@@ -84,6 +84,7 @@ foreach(variant "gs_mesh_enh_vert gs_mesh.vert -DENHANCED"
                 "gs_mesh_clip_vert gs_mesh.vert -DGUARD_CLIP"
                 "gs_mesh_nofma_vert gs_mesh.vert -DNO_FMA"
                 "gs_mesh_chars_nofma_vert gs_mesh_chars.vert -DNO_FMA"
+                "gs_mesh_rw_nofma_vert gs_mesh_rw.vert -DNO_FMA"
                 "gs_mesh_chars_enh_vert gs_mesh_chars.vert -DENHANCED"
                 "gs_frag_lit gs.frag -DMESH_LIT"
                 "gs_frag_single_lit gs.frag -DMESH_LIT -DSINGLE_OUTPUT"
@@ -223,6 +224,7 @@ if(PS2GPU_D3D11)
     # offset added by spirv_to_hlsl (set 3's binding 1).
     ps2gpu_hlsl(d3d_gs_mesh_vert gs_mesh.vert vs_5_0 -DGUARD_CLIP -DNO_FMA)
     ps2gpu_hlsl(d3d_gs_mesh_chars_vert gs_mesh_chars.vert vs_5_0 -DNO_FMA)
+    ps2gpu_hlsl(d3d_gs_mesh_rw_vert gs_mesh_rw.vert vs_5_0 -DNO_FMA)
     ps2gpu_hlsl(d3d_gs_mesh_enh_vert gs_mesh.vert vs_5_0 -DENHANCED -DNO_FMA)
     ps2gpu_hlsl(d3d_gs_mesh_chars_enh_vert gs_mesh_chars.vert vs_5_0 -DENHANCED -DNO_FMA)
     ps2gpu_hlsl(d3d_gs_frag_lit gs.frag ps_5_0 -DMESH_LIT)

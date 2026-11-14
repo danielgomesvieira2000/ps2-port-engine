@@ -85,6 +85,7 @@
 #include "d3d_gs_frag_uint_hlsl.h"
 #include "gs_mesh_clip_vert.h"
 #include "gs_mesh_chars_vert.h"
+#include "gs_mesh_rw_nofma_vert.h"
 #include "gs_mesh_enh_vert.h"
 #include "gs_mesh_chars_enh_vert.h"
 #include "gs_frag_lit.h"
@@ -92,6 +93,7 @@
 #include "gs_frag_blend_lit.h"
 #include "d3d_gs_mesh_vert_dxbc.h"
 #include "d3d_gs_mesh_chars_vert_dxbc.h"
+#include "d3d_gs_mesh_rw_vert_dxbc.h"
 #include "d3d_gs_mesh_enh_vert_dxbc.h"
 #include "d3d_gs_mesh_chars_enh_vert_dxbc.h"
 #include "d3d_gs_frag_lit_dxbc.h"
@@ -567,6 +569,7 @@ const KnownShader kShaders[] = {
     // (the native meshes': the Vulkan renderer's modules, their DXBC made without fused multiply-adds)
     PS2GPU_SHADER(spirv_gs_mesh_clip_vert, dxbc_d3d_gs_mesh_vert),
     PS2GPU_SHADER(spirv_gs_mesh_chars_vert, dxbc_d3d_gs_mesh_chars_vert),
+    PS2GPU_SHADER(spirv_gs_mesh_rw_nofma_vert, dxbc_d3d_gs_mesh_rw_vert),
     PS2GPU_SHADER(spirv_gs_mesh_enh_vert, dxbc_d3d_gs_mesh_enh_vert),
     PS2GPU_SHADER(spirv_gs_mesh_chars_enh_vert, dxbc_d3d_gs_mesh_chars_enh_vert),
     PS2GPU_SHADER(spirv_gs_frag_lit, dxbc_d3d_gs_frag_lit),
