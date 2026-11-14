@@ -1397,6 +1397,8 @@ struct NativeDraw {
     u32 count;
     u32 ofx, ofy;           // XYOFFSET as the GS's decoding takes it
     bool drawn;
+    bool texture_moved = false;     // its texture a target found inside another (OnDraw's t_offset: the mesh's own
+                                    // coordinates know nothing of it)
 };
 NativeDraw* g_native = nullptr;
 bool g_meshes_drawn = false;            // the renderer draws meshes (the bridge's start)
@@ -1470,10 +1472,10 @@ void NoteDeclined(const char* why, const ps2gpu::GsDrawState& state, const Nativ
 
 bool NativeMesh(Bridge& s, const ps2gpu::GsDrawState& state, u32 x_offset, u32 y_offset, const gs::Context& c) {
     const NativeDraw& n = *g_native;
-    // (a target sampled as the texture: the pages brought up to date are those the primitive's coordinates reach -
-    // the stand-in's are none of the mesh's)
-    if (state.texture_target) {
-        NoteDeclined("its texture a target", state, n);
+    // (a target sampled as the texture: brought up to date over the whole texture (OnDraw) - but one found inside
+    // another target, its rows lower, the mesh's coordinates would need moving too: the packet's way)
+    if (state.texture_target && n.texture_moved) {
+        NoteDeclined("its texture a target inside another", state, n);
         return false;
     }
     if (n.words[0] & 0x100) {
@@ -2160,8 +2162,19 @@ void OnDraw(const gs::Gs::DrawCall& call) {
                 if (s.primary) {
                     Owned& source = s.owned[std::make_tuple(tex_fbp, tex_fbw, psm, false)];
                     Pages sampled;
-                    if (SampledPages(source, c.clamp, tw, th, v, n, &sampled)) Sample(s, source, sampled);
-                    else Use(s, tex_fbp, tex_fbw, psm, false, source.width, source.height, 1);   // sampling grows nothing
+                    if (g_native) {
+                        // (a native draw's coordinates are its mesh's, not the stand-in's: the whole texture, as
+                        // far as the target reaches - brought up to date only where it lacks something)
+                        g_native->texture_moved = t_offset != 0;
+                        if (tw <= std::max(1u, source.fbw) * 64)
+                            Sample(s, source, PagesOf(source, 0, tw, 0, std::max(1u, th)));
+                        else
+                            Use(s, tex_fbp, tex_fbw, psm, false, source.width, source.height, 1);
+                    } else if (SampledPages(source, c.clamp, tw, th, v, n, &sampled)) {
+                        Sample(s, source, sampled);
+                    } else {
+                        Use(s, tex_fbp, tex_fbw, psm, false, source.width, source.height, 1);   // sampling grows nothing
+                    }
                     tex_source = &source;
                 }
                 if (tex_format == 4 && b_clut_rows_cpu_only(s)) {
