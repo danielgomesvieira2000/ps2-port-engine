@@ -694,6 +694,48 @@ ID3D11DepthStencilView* DsvOf(View* v) {
     return v->dsv;
 }
 
+/* A target of a depth buffer's size for a pass whose target is not (Direct3D 11 binds them only alike; Vulkan
+   draws where both are): its colour the pass's own over the part they share, copied in as the pass begins and back
+   as it ends - what draws outside it the Vulkan pass's area leaves out too. Kept by format and size. A multisampled
+   target has none (Direct3D 11 copies such an image only whole). */
+View* StandIn(View* colour, std::uint32_t width, std::uint32_t height) {
+    struct Kept {
+        Image image;
+        View view;
+    };
+    static std::map<std::tuple<VkFormat, std::uint32_t, std::uint32_t>, std::unique_ptr<Kept>> kept;
+    D3D11_TEXTURE2D_DESC d{};
+    colour->image->texture->GetDesc(&d);
+    if (d.SampleDesc.Count > 1) return nullptr;
+    std::unique_ptr<Kept>& k = kept[{colour->image->format, width, height}];
+    if (!k) {
+        auto made = std::make_unique<Kept>();
+        d.Width = width;
+        d.Height = height;
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.MiscFlags = 0;
+        if (FAILED(g_gpu->device->CreateTexture2D(&d, nullptr, &made->image.texture))) return nullptr;
+        made->image.format = colour->image->format;
+        made->image.width = width;
+        made->image.height = height;
+        made->image.usage = colour->image->usage;
+        made->view.image = &made->image;
+        made->view.format = colour->format;
+        made->view.aspect = colour->aspect;
+        k = std::move(made);
+    }
+    return &k->view;
+}
+
+/* The part a target and its stand-in share, from one to the other. */
+void CopyShared(View* from, View* to) {
+    const std::uint32_t w = std::min(from->image->width >> from->base, to->image->width >> to->base);
+    const std::uint32_t h = std::min(from->image->height >> from->base, to->image->height >> to->base);
+    const D3D11_BOX box{0, 0, 0, w, h, 1};
+    g_gpu->context->CopySubresourceRegion(to->image->texture, to->base, 0, 0, 0, from->image->texture, from->base, &box);
+}
+
 /* An image's own view of it all (copies, clears), kept with it. */
 std::map<Image*, std::unique_ptr<View>> g_whole_views;
 std::mutex g_whole_lock;                // (the display's present asks for one from its own thread)
@@ -863,6 +905,7 @@ struct Exec {
     std::vector<Readback>* readbacks = nullptr;
     Pipeline* applied = nullptr;            // the graphics pipeline last put on the context
     View* colour = nullptr;                 // the open pass's attachments
+    View* stood_in = nullptr;               // ...its target, when colour is a stand-in (StandIn)
     ID3D11DepthStencilView* dsv = nullptr;
     bool colour_uint = false;               // ...its colour bound as its UINT view (a logic op's)
     // What is on the context already: set again only when it changes.
@@ -2266,8 +2309,29 @@ VKAPI_ATTR void VKAPI_CALL CmdBeginRendering(VkCommandBuffer cmd, const VkRender
         x.stage_pipeline = nullptr;
         ID3D11RenderTargetView* rtv = RtvOf(colour);
         ID3D11DepthStencilView* dsv = DsvOf(depth);
+        // (Direct3D 11 binds a depth buffer only with a target of its own size - Vulkan draws where both are: a
+        // target taller than its depth buffer (Flush's kDepthRows), drawn through a stand-in of the depth buffer's.
+        // Refused, the pass is not drawn: said once.)
+        View* drawn = colour;
+        if (rtv && dsv && colour->image && depth->image &&
+            ((colour->image->width >> colour->base) != depth->image->width ||
+             (colour->image->height >> colour->base) != depth->image->height)) {
+            View* stand_in = StandIn(colour, depth->image->width, depth->image->height);
+            if (stand_in && (rtv = RtvOf(stand_in))) {
+                if (!clear_colour) CopyShared(colour, stand_in);
+                drawn = stand_in;
+                x.stood_in = colour;
+            } else {
+                static bool said = false;
+                if (!said)
+                    std::fprintf(stderr, "[d3d11] a pass's target (%ux%u) and depth buffer (%ux%u) of different "
+                                 "sizes: not drawn\n", colour->image->width, colour->image->height,
+                                 depth->image->width, depth->image->height);
+                said = true;
+            }
+        }
         c->OMSetRenderTargets(rtv ? 1 : 0, rtv ? &rtv : nullptr, dsv);
-        x.colour = colour;
+        x.colour = drawn;
         x.dsv = dsv;
         x.colour_uint = false;
         if (rtv && clear_colour) c->ClearRenderTargetView(rtv, colour_value.float32);
@@ -2281,6 +2345,8 @@ VKAPI_ATTR void VKAPI_CALL CmdBeginRendering(VkCommandBuffer cmd, const VkRender
 VKAPI_ATTR void VKAPI_CALL CmdEndRendering(VkCommandBuffer cmd) {
     Cmd(cmd).steps.push_back([](Exec& x) {
         g_gpu->context->OMSetRenderTargets(0, nullptr, nullptr);
+        if (x.stood_in) CopyShared(x.colour, x.stood_in);     // (the stand-in's drawing into the target)
+        x.stood_in = nullptr;
         x.colour = nullptr;
         x.dsv = nullptr;
         x.colour_uint = false;
