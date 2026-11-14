@@ -22,9 +22,10 @@
  * minute. When the ring has held more than kExcessMs over its target for a
  * whole window (kWindowMs: its fill never that low through it - bursts
  * alone are not lag), the excess is skipped, the old and the new sound
- * crossfaded over kCrossFrames. And a ring that ran dry raises its target
- * (kTargetStepMs a time, kTargetMostMs over the start's at most: a PC whose
- * frames come late holds more), back down slowly while it plays on.
+ * crossfaded over kCrossFrames. And a ring that ran dry for a hitch (under a
+ * quarter of a second; not a pause) raises its target (kTargetStepMs a time,
+ * kTargetMostMs over the start's at most: a PC whose frames come late holds
+ * more), back down slowly while it plays on.
  *
  * --audio-wav records the SPU2's output itself to a WAV file, instead of (or as
  * well as) playing it: how sound is checked without anyone listening
@@ -127,6 +128,8 @@ struct Device {
     unsigned long long cross_from = 0;  // a skip's old place, crossfaded from
     unsigned cross = 0;                 // frames left of its crossfade
     unsigned long long since_dry = 0;   // device frames played since the ring last ran dry
+    bool dry = false;                   // buffering after running dry (not the start's)
+    unsigned long long dry_frames = 0;  // ...for so many device frames
 
     ~Device() { Close(); }
     void Close() {
@@ -224,8 +227,18 @@ void Device::Render(float* out, unsigned frames) {
     if (buffering) {
         if (available < target_frames) {
             std::fill(out, out + 2 * frames, 0.0f);
+            if (dry) dry_frames += frames;
             return;
         }
+        // Back from running dry: a hitch (the game's frames late, under a
+        // quarter of a second) - more kept from now on, up to kTargetMostMs
+        // more; a pause (the PC settings panel, the window put away: no
+        // sound made for longer) is no lateness, the target as it was (else
+        // the sound came later after every pause, for minutes).
+        if (dry && dry_frames < unsigned(kRate / 4))
+            target_frames = std::min(base_target + kRate * kTargetMostMs / 1000, target_frames + kRate * kTargetStepMs / 1000);
+        dry = false;
+        dry_frames = 0;
         buffering = false;
         fade = kFadeFrames;
         smoothed_fill = double(available);
@@ -273,8 +286,9 @@ void Device::Render(float* out, unsigned frames) {
         // Ran dry: what was playing fades to silence, and the ring fills to
         // the target before it plays again.
         if (log) ++stats.ran_dry;
-        // (late frames on this PC: more kept from now on, up to kTargetMostMs more)
-        target_frames = std::min(base_target + kRate * kTargetMostMs / 1000, target_frames + kRate * kTargetStepMs / 1000);
+        // (its target raised as it plays again, if it was a hitch: above)
+        dry = true;
+        dry_frames = 0;
         since_dry = 0;
         window_low = ~0ull;
         window_frames = 0;
