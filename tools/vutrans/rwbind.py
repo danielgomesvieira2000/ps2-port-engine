@@ -93,6 +93,14 @@ def bind_all(a, pr, run_image, nruns, regval_head):
             if not hd:
                 why = "no header (the port declines the run, or path C)"
                 break
+            if rwheader.program_of(run_image[si]) == "cars":
+                # the run's streams (the lit pass, then path A's environment pass): the header of the kick's own
+                k = p.get("stream", 0)
+                if k >= len(hd):
+                    why = "a kick past the run's streams"
+                    break
+                hd = [hd[k]]
+                stats["stream %d prim %s" % (k, "%X" % p["prim"] if p.get("prim") is not None else "-")] += len(verts)
             batches.append((p, U, hd))
             full.append((si, head, d, p, verts))
         if why is None:
@@ -200,11 +208,58 @@ def bind_all(a, pr, run_image, nruns, regval_head):
               "(every word but RGBAQ.w)" % (mode, alias, names[main], ex, ch))
         if ex != ch:
             conflicts.setdefault(alias, []).append(("(mode %X's vertices)" % mode, ex, ch, bad))
+    # A mode whose functions are genuinely different (not bit-equal on each other's vertices: RenderWare's cars'
+    # environment pass, its first group of four's squared length summed in another order) - split by the vertex:
+    # the first group's each (i < 4), then the unrolled loop's lanes (i % 4): per class the first of the mode's
+    # functions (most vertices first) bit-exact on every vertex of the mode in it; a class no vertex reached is the
+    # hand-written arithmetic's (the dispatch says false)
+    parts = {}
+    for mode, rest in list(conflicts.items()):
+        if any(n.startswith("(") for n, _ex, _ch, _bad in rest):
+            continue
+        sigs = sorted(by_mode[mode], key=lambda s_: -bound[s_]["modes"][mode])
+        classes = collections.defaultdict(list)
+        for s_ in sigs:
+            for bt in bound[s_]["batches"]:
+                if rwheader_mode(bt) != mode:
+                    continue
+                by = collections.defaultdict(list)
+                for v in bt[4]:
+                    by[part_of(v.loop)].append(v)
+                for c_, vs in by.items():
+                    classes[c_].append(bt[:4] + (vs, bt[5]))
+        chosen = {}
+        for c_, bts in sorted(classes.items()):
+            for s_ in sigs:
+                fn = getattr(mod, names[s_])
+                ex = ch = 0
+                for bt in bts:
+                    x, c2, _b = _check(fn, bound[s_]["fit"], bt)
+                    ex += x
+                    ch += c2
+                    if x != c2:
+                        break
+                if ex == ch:
+                    chosen[c_] = (s_, ch)
+                    break
+            else:
+                chosen = None
+                break
+        if chosen is None:
+            print("mode %X: no function bit-exact on every vertex of some class (i < 4 each, then i %% 4) - left to "
+                  "the hand-written shader" % mode)
+            continue
+        parts[mode] = {c_: s_ for c_, (s_, _n) in chosen.items()}
+        del conflicts[mode]
+        print("mode %X split by the vertex: %s" % (mode, ", ".join(
+            "%s -> %s (%d)" % (part_name(c_), names[s_], n) for c_, (s_, n) in sorted(chosen.items()))))
     # ---- report
     print("\nbound to RenderWare's header (rwheader.py): %d functions from %d projected (%d header words matched "
           "structurally, %d by value); not bound: %d (%d vertices)" % (
               len(bound), len(order) - len(failed), stats["structural"], stats["value"], len(failed),
               sum(f[1] for f in failed)))
+    for k in sorted(x for x in stats if x.startswith("stream")):
+        print("  (%s: %d vertices)" % (k, stats[k]))
     print("  (functions merged with another's lanes or first vertices - one function, its mesh inputs fitted again "
           "over all their vertices: %d)" % nlanes)
     for n, nv, why in failed[:12]:
@@ -239,7 +294,7 @@ def bind_all(a, pr, run_image, nruns, regval_head):
                   "shader" % (mode, n, names[dispatch[mode]], ch - ex, ch, bad))
     if a.emit_glsl_rw:
         good = {m_: s for m_, s in dispatch.items() if m_ not in conflicts and bound[s]["exact"] == bound[s]["checked"]}
-        src = glsl_rw(a, bound, names, good, merged, nruns, run_image)
+        src = glsl_rw(a, bound, names, good, merged, nruns, run_image, parts)
         with open(a.emit_glsl_rw, "w", newline="\n") as fh:
             fh.write(src)
         print("wrote %s (modes %s)" % (a.emit_glsl_rw, " ".join("%X" % m_ for m_ in sorted(good))))
@@ -350,6 +405,15 @@ def unify_lanes(bound):
     return merges
 
 
+def part_of(i):
+    """A vertex's class for a mode split by the vertex: the first group of four's each (0-3), then the lane (4-7)."""
+    return i if i < 4 else 4 + i % 4
+
+
+def part_name(c):
+    return "i = %d" % c if c < 4 else "i %% 4 = %d (i >= 4)" % (c - 4)
+
+
 def rwheader_mode(bt):
     return bt[6] if len(bt) > 6 else None
 
@@ -397,11 +461,13 @@ def _rw_leaf(j, role, abstract):
     raise ValueError("gs_mesh_rw: an input it cannot read: %r" % (abstract,))
 
 
-def glsl_rw(a, bound, names, dispatch, merged, nruns, run_image):
+def glsl_rw(a, bound, names, dispatch, merged, nruns, run_image, parts=None):
+    parts = parts or {}
     sigs = []
     for m_, s in sorted(dispatch.items()):
-        if s not in sigs:
-            sigs.append(s)
+        for s2 in ([s2 for _c, s2 in sorted(parts[m_].items())] if m_ in parts else [s]):
+            if s2 not in sigs:
+                sigs.append(s2)
     first = bound[sigs[0]]["fit"]
     onames, omasks = first["names"], first["out_masks"]
     used = set()
@@ -424,14 +490,32 @@ def glsl_rw(a, bound, names, dispatch, merged, nruns, run_image):
                      "modes %s" % (names[s], e["vertices"], len(e["batches"]),
                                    " ".join("%s x%d" % kv for kv in sorted(e["images"].items())),
                                    selector_of(e["loops"]), e["exact"], e["checked"],
-                                   " ".join("%X" % m_ for m_, s2 in sorted(dispatch.items()) if s2 == s)))
+                                   " ".join(["%X" % m_ for m_, s2 in sorted(dispatch.items())
+                                             if s2 == s and m_ not in parts] +
+                                            ["%X (%s)" % (m_, "; ".join(part_name(c) for c, s3 in sorted(pt.items())
+                                                                        if s3 == s))
+                                             for m_, pt in sorted(parts.items()) if s in pt.values()])))
         for other, mode, ch in merged.get(s, []):
             if mode in dispatch:
                 lines.append("//     (and on mode %X the vertices of %s, %d: bit-equal - one function)" % (
                     mode, other, ch))
     cases = []
     for m_, s in sorted(dispatch.items()):
-        cases.append("    case 0x%Xu: %s(v, o); return true;" % (m_, names[s]))
+        if m_ not in parts:
+            cases.append("    case 0x%Xu: %s(v, o); return true;" % (m_, names[s]))
+            continue
+        # (split by the vertex: the first group's each, then the lane; a class without a function the hand's)
+        pt = parts[m_]
+
+        def split(cs, sel):
+            got = [pt.get(c) for c in cs]
+            if None not in got and len(set(got)) == 1:
+                return "{ %s(v, o); return true; }" % names[got[0]]
+            body = "".join("            case %du: %s(v, o); return true;\n" % (k, names[g]) for k, g in enumerate(got)
+                           if g is not None)
+            return "switch (%s) {\n%s            default: break;\n            }" % (sel, body)
+        cases.append("    case 0x%Xu:\n        if (v < 4u) %s\n        else %s\n        break;"
+                     % (m_, split(range(4), "v"), split(range(4, 8), "v % 4u")))
     cmd = "python -I engine/tools/vutrans/translate.py " + " ".join(
         os.path.basename(x) if ("/" in x or "\\" in x) else x for x in sys.argv[1:])
     head = """// GENERATED by engine/tools/vutrans (translate.py --bind rw --emit-glsl-rw) - do not edit by hand.

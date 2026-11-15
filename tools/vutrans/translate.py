@@ -30,7 +30,10 @@ first vertices: rwbind.py), checked and written with a dispatch by the header's 
     translate.py SNAP 2678EB26,1332C99F,01CE30D5,0835A68B --runs 5000 --no-data-branches --mask XYZF2.w=0 --bind rw
                  --emit-glsl-rw vu_rw_world.glsl --rw-name VuRwWorldGenerated
 (XYZF2.w: ADC and fog, the shader's own - the strip's triangles its indices; --no-data-branches: the world's paths A
-and B, path C's clipper the CPU's.)
+and B, path C's clipper the CPU's.) The cars (a run kicks two streams: the lit pass, then path A's environment pass -
+each tag bound to its stream's header; a mode whose functions differ by the vertex dispatched on it):
+    translate.py SNAP 7E86891B --runs 5000 --mask XYZF2.w=0 --bind rw
+                 --emit-glsl-rw vu_rw_cars.glsl --rw-name VuRwCarsGenerated
 """
 import argparse
 import collections
@@ -161,16 +164,22 @@ def main():
         leafval = s.leafval_fn(head, d)
         mem = s.leafval_fn(head, d)
         top = s.top
+        ordinal = 0
         for t in tags:
             if not t.vertices:
                 continue
             nbatch += 1
+            ordinal += 1
             hint = None
             if stride_seen:
                 hint = stride_seen.most_common(1)[0][0]
             b = generalize.fit_batch(dag, t, gifslice, top, hint, mem=memf, sources=sources or None)
             sources |= b.sources
             for fit in b.fits:
+                # (the tag's place among the run's tags with vertices, and its PRIM: a run kicking more than one
+                # stream - RenderWare's cars, the lit pass then the environment's - binds each to its own header)
+                fit["stream"] = ordinal - 1
+                fit["prim"] = t.prim
                 if fit["stride"] is not None and fit["base"] is not None and len(fit["idxs"]) > 2:
                     stride_seen[(fit["stride"], (fit["base"] - top) % 1024)] += 1
             for name, w in b.words.items():

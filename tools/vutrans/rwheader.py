@@ -273,7 +273,8 @@ def instanced_headers(image, st):
 
 
 def cars_headers(image, st):
-    """Decide's header (cars), the palette aside; both streams' modes (the tag's own: the binding tells)."""
+    """Decide's header (cars), the palette aside; both streams' modes - the lit pass's, then path A's environment
+    pass's (rwbind: a kick's tag binds to its stream's, by its place among the run's tags)."""
     rebuild = st.lo(965, 3) == 0
     path_a = st.lo(1013, 1) == 0
     if rebuild:

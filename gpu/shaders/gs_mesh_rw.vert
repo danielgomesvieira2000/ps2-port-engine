@@ -24,12 +24,14 @@ layout(push_constant) uniform Target {
 #include "gs_mesh_rw.glsl"
 #ifdef GENERATED
 // The GS's values by the functions engine/tools/vutrans derived from the microcode itself (PS2HOST_MESH_GENERATED=1
-// or rw: a test - the same values as the hand-written arithmetic below, word for word): the instanced strips' and
-// the world's per-vertex functions bound to this shader's header (translate.py --bind rw), dispatched by its mode -
-// a mode they do not serve (the world's path C fog, the cars) the hand-written arithmetic's. Their XYZF2.w (ADC and
+// or rw: a test - the same values as the hand-written arithmetic below, word for word): the instanced strips', the
+// world's and the cars' per-vertex functions bound to this shader's header (translate.py --bind rw), dispatched by
+// its mode (the cars' environment pass by the vertex too: its first group of four's another function) - a mode they
+// do not serve (the world's path C fog, the cars' skinning) the hand-written arithmetic's. Their XYZF2.w (ADC and
 // fog) is not theirs: the strips' triangles are the draw's indices, the fog the vertex's own word as below.
 #include "generated/vu_rw_instanced.glsl"
 #include "generated/vu_rw_world.glsl"
+#include "generated/vu_rw_cars.glsl"
 #endif
 
 out gl_PerVertex {
@@ -257,6 +259,17 @@ void World(uint mode) {
 void Cars(uint mode) {
     const uint j = uint(gl_VertexIndex);
     const uvec4 q0 = mesh.quad[3u * j];
+#ifdef GENERATED
+    {
+        uint o[10];
+        if (VuRwCarsGenerated(mode, j, o)) {
+            Emit(o[kVuRwCars_XYZF2_x] & 0xFFFFu, o[kVuRwCars_XYZF2_y] & 0xFFFFu, (o[kVuRwCars_XYZF2_z] >> 4) & 0xFFFFFFu,
+                 uintBitsToFloat(uvec3(o[kVuRwCars_ST_x], o[kVuRwCars_ST_y], o[kVuRwCars_ST_z])),
+                 uvec4(o[kVuRwCars_RGBAQ_x], o[kVuRwCars_RGBAQ_y], o[kVuRwCars_RGBAQ_z], o[kVuRwCars_RGBAQ_w]), q0.w);
+            return;
+        }
+    }
+#endif
     const uvec4 q2 = mesh.quad[3u * j + 2u];
     vec3 p = uintBitsToFloat(q0.xyz);
     const uint g = j / 4u, lane = j % 4u;
