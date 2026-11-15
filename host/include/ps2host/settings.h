@@ -27,6 +27,10 @@ void SetSetting(const std::string& key, const std::string& value);
 void SetSettingOn(const std::string& key, bool on);
 /* Sets one for this run only (--setting): the file is not written. */
 void RunSetting(const std::string& key, const std::string& value);
+/* Sets one for a session (a LAN game's host's, say): read before the file's
+   value, never written to the file, until ClearSessionSettings. */
+void SessionSetting(const std::string& key, const std::string& value);
+void ClearSessionSettings();
 /* --setting-at KEY=VALUE@FRAME: a scripted run's setting changed at a frame
    (a mod turned on or off mid-race), as RunSetting; applied as that frame's
    blank is delivered (ApplyScheduledSettings). */
