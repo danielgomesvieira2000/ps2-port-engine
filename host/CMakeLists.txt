@@ -124,11 +124,15 @@ option(PS2HOST_AVX2 "Build for processors with AVX2 (off: SSE4.1)" ON)
 # A game executable's entry (ps2_add_port's /ENTRY), before the runtime: the
 # processor checked by code built without AVX - a library of its own, apart
 # from ps2rt's flags - and the SSE4 build started instead where it must be.
+# (Linux: an object of the executable's own - its .preinit_array entry,
+# referred to by nothing, would not be taken from a static library.)
 if(MSVC)
     add_library(ps2_cpu_check STATIC ${CMAKE_CURRENT_LIST_DIR}/src/cpu_check.cpp)
-    if(PS2HOST_AVX2)
-        target_compile_definitions(ps2_cpu_check PRIVATE PS2HOST_BUILT_FOR_AVX2=1)
-    endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+    add_library(ps2_cpu_check OBJECT ${CMAKE_CURRENT_LIST_DIR}/src/cpu_check.cpp)
+endif()
+if(TARGET ps2_cpu_check AND PS2HOST_AVX2)
+    target_compile_definitions(ps2_cpu_check PRIVATE PS2HOST_BUILT_FOR_AVX2=1)
 endif()
 
 if(MSVC)
@@ -314,7 +318,7 @@ function(ps2_add_port target)
         ${translated}
         ${PORT_SOURCES})
     endif()
-    if(MSVC)
+    if(TARGET ps2_cpu_check)
         target_link_libraries(${target} PRIVATE ps2_cpu_check)
     endif()
     target_link_libraries(${target} PRIVATE ps2host)
