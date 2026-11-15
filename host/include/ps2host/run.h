@@ -803,6 +803,9 @@ void SetGpuDrawTag(u32 tbp, u32 tag);
    by the GS's depth-based level (GsDrawState::tag bit 1). Anisotropic taps
    are SetGpuTextureFilter's (4), the player's choice: they cost. */
 void SetGpuModernTextures(bool on);
+/* ps2gpu::SetGpuEdgeReach: drawn larger, a vertex on a target's top or left edge half a pixel out (on, the default)
+   - off for a game that draws its last picture back over itself (its pictures as recorded before it). */
+void SetGpuEdgeReach(bool on);
 /* The texture filtering a player chose, over the game's own (TEX1) on its
    3D draws - not on sprites (the HUD, text, a picture's copies and effects,
    drawn texel for texel) or a draw that samples a target (render to

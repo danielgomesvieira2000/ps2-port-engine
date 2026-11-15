@@ -45,6 +45,13 @@ constexpr std::uint32_t kMeshLitPixels = 1, kMeshPrecise = 2;
    thread; the renderer takes it at its next frame. */
 void SetGpuMsaa(std::uint32_t samples);
 std::uint32_t GpuMsaa();
+/* Drawn larger (an internal resolution): a vertex on the target's top or left edge reaches half a pixel out
+   (gs.vert's edge), so the larger picture's first row and column are drawn by what starts at 0 - a whole-screen
+   overlay (Outbreak's fades) - on by default. It stretches a primitive touching the edge by that half pixel,
+   its texture with it: a game that draws its last picture back over itself each frame (Burnout 3's blur and
+   glow) sees that grow; such a game turns it off (its pictures as at its own recordings). Any thread. */
+void SetGpuEdgeReach(bool on);
+bool GpuEdgeReach();
 void SetMeshEnhancements(std::uint32_t bits);
 std::uint32_t MeshEnhancements();
 /* Called on the renderer's own thread (a threaded renderer's) as it starts:

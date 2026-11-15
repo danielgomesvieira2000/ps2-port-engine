@@ -101,6 +101,13 @@ std::atomic<u32> g_rule_begin{0}, g_rule_end{0}, g_rule_fbw{0};
 // (PS2HOST_MODERN_TEXTURES=1: on from the start - a capture's replay)
 std::atomic<bool> g_modern_textures{std::getenv("PS2HOST_MODERN_TEXTURES") != nullptr};
 void SetGpuModernTextures(bool on) { g_modern_textures = on; }
+void SetGpuEdgeReach(bool on) {
+#if PS2HOST_VULKAN
+    ps2gpu::SetGpuEdgeReach(on);
+#else
+    (void)on;
+#endif
+}
 // SetGpuTextureFilter's: the filter (0 the game's) and the anisotropic taps'
 // log2 (GsDrawState::tag bits 8-10).
 std::atomic<int> g_texture_filter{0}, g_texture_taps{3};

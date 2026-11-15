@@ -5110,7 +5110,7 @@ void VulkanGsRenderer::Flush() {
             }
             // (drawn larger: a vertex on the top or left edge half a pixel out,
             // the larger picture's first row and column reached - gs.vert)
-            const float size[3] = {float(t->width), float(t->height), t->scale > 1 ? 0.5f : 0.0f};
+            const float size[3] = {float(t->width), float(t->height), t->scale > 1 && GpuEdgeReach() ? 0.5f : 0.0f};
             if (size[0] != d.size[0] || size[1] != d.size[1] || size[2] != d.size[2]) {
                 d.size[0] = size[0];
                 d.size[1] = size[1];
