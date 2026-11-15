@@ -54,7 +54,7 @@ default; `PS2HOST_MESH_GENERATED` picks the generated ones (`1` all, `room`,
 | Outbreak | characters, rigid (6BD7E3E9) | 45,533 | one function (189 ops) | every scripted run as recorded |
 | Burnout 3 | instanced strips (D4B61373, 34C3CF67) | 98,930 | 3 functions (modes A, B, lit C) | 8 runs as recorded, Vulkan and D3D11 |
 | Burnout 3 | world paths A/B (2678EB26, 1332C99F, 01CE30D5, 0835A68B) | 41,959 | 5 functions, 7 modes | as above |
-| Burnout 3 | cars (7E86891B) | 180,321 | analysed (111 -> 43 functions), not emitted | - |
+| Burnout 3 | cars (7E86891B) | 180,321 | 6 functions over modes 0-3 (lit, guard band, env); skinning hand-written | as above |
 
 Each was also shown to fail when wrong: one output shifted a pixel fails
 zoo_street (41/49) and the race (57/67).
@@ -87,6 +87,5 @@ modules (the tool's own are not).
   hand work.
 - **More snapshots**: each function so far came from one snapshot; they pass
   every scripted run, but a second scene's snapshot would widen the check.
-- **Burnout 3's cars**: the env and lit passes share a header mode, and their
-  remaining lane variants differ in arithmetic order (genuinely different
-  functions); the skinning palette is not a role yet.
+- **Burnout 3's cars' skinning** (modes 4-7): race.snap has no skinned car, and
+  the palette lookup is not a role yet - a snapshot with one comes first.
