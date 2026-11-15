@@ -22,6 +22,15 @@ layout(push_constant) uniform Target {
 #include "gs_depth.glsl"
 #include "gs_mesh_common.glsl"
 #include "gs_mesh_rw.glsl"
+#ifdef GENERATED
+// The GS's values by the functions engine/tools/vutrans derived from the microcode itself (PS2HOST_MESH_GENERATED=1
+// or rw: a test - the same values as the hand-written arithmetic below, word for word): the instanced strips' and
+// the world's per-vertex functions bound to this shader's header (translate.py --bind rw), dispatched by its mode -
+// a mode they do not serve (the world's path C fog, the cars) the hand-written arithmetic's. Their XYZF2.w (ADC and
+// fog) is not theirs: the strips' triangles are the draw's indices, the fog the vertex's own word as below.
+#include "generated/vu_rw_instanced.glsl"
+#include "generated/vu_rw_world.glsl"
+#endif
 
 out gl_PerVertex {
     vec4 gl_Position;
@@ -63,6 +72,19 @@ void Instanced(uint mode) {
     const bool path_b = (mode & kPathB) != 0u;
     const uint j = uint(gl_VertexIndex);
     const uvec4 q0 = mesh.quad[3u * j];
+#ifdef GENERATED
+    {
+        uint o[10];
+        if (VuRwInstancedGenerated(mode, j, o)) {
+            Emit(o[kVuRwInstanced_XYZF2_x] & 0xFFFFu, o[kVuRwInstanced_XYZF2_y] & 0xFFFFu,
+                 (o[kVuRwInstanced_XYZF2_z] >> 4) & 0xFFFFFFu,
+                 uintBitsToFloat(uvec3(o[kVuRwInstanced_ST_x], o[kVuRwInstanced_ST_y], o[kVuRwInstanced_ST_z])),
+                 uvec4(o[kVuRwInstanced_RGBAQ_x], o[kVuRwInstanced_RGBAQ_y], o[kVuRwInstanced_RGBAQ_z],
+                       o[kVuRwInstanced_RGBAQ_w]), q0.w);
+            return;
+        }
+    }
+#endif
     const vec2 uv = uintBitsToFloat(mesh.quad[3u * j + 1u].xy);
     const vec3 p = uintBitsToFloat(q0.xyz);
     vec4 c;
@@ -181,6 +203,17 @@ void World(uint mode) {
         return;
     }
     const uvec4 q0 = mesh.quad[3u * v], q1 = mesh.quad[3u * v + 1u];
+#ifdef GENERATED
+    {
+        uint o[10];
+        if (VuRwWorldGenerated(mode, v, o)) {
+            Emit(o[kVuRwWorld_XYZF2_x] & 0xFFFFu, o[kVuRwWorld_XYZF2_y] & 0xFFFFu, (o[kVuRwWorld_XYZF2_z] >> 4) & 0xFFFFFFu,
+                 uintBitsToFloat(uvec3(o[kVuRwWorld_ST_x], o[kVuRwWorld_ST_y], o[kVuRwWorld_ST_z])),
+                 uvec4(o[kVuRwWorld_RGBAQ_x], o[kVuRwWorld_RGBAQ_y], o[kVuRwWorld_RGBAQ_z], o[kVuRwWorld_RGBAQ_w]), q0.w);
+            return;
+        }
+    }
+#endif
     const vec3 p = uintBitsToFloat(q0.xyz);
     const vec4 c = WorldClip(p);
     const float q = Recip(c.w);

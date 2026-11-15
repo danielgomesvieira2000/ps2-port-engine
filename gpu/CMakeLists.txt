@@ -93,6 +93,8 @@ foreach(variant "gs_mesh_enh_vert gs_mesh.vert -DENHANCED"
                 "gs_mesh_chars_gen_nofma_vert gs_mesh_chars.vert -DGENERATED -DNO_FMA"
                 "gs_mesh_chars_nofma_vert gs_mesh_chars.vert -DNO_FMA"
                 "gs_mesh_rw_nofma_vert gs_mesh_rw.vert -DNO_FMA"
+                "gs_mesh_rw_gen_vert gs_mesh_rw.vert -DGENERATED"
+                "gs_mesh_rw_gen_nofma_vert gs_mesh_rw.vert -DGENERATED -DNO_FMA"
                 "gs_mesh_chars_enh_vert gs_mesh_chars.vert -DENHANCED"
                 "gs_frag_lit gs.frag -DMESH_LIT"
                 "gs_frag_single_lit gs.frag -DMESH_LIT -DSINGLE_OUTPUT"
@@ -107,7 +109,8 @@ foreach(variant "gs_mesh_enh_vert gs_mesh.vert -DENHANCED"
                 -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader}
         DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
                 ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_common.glsl
-                ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_enhanced.glsl ${PS2GPU_GENERATED_GLSL} ${GLSLANG}
+                ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_enhanced.glsl ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_rw.glsl
+                ${PS2GPU_GENERATED_GLSL} ${GLSLANG}
         COMMENT "glslang ${shader} (${defines})")
     list(APPEND PS2GPU_SHADER_HEADERS ${out})
 endforeach()
@@ -217,6 +220,7 @@ if(PS2GPU_D3D11)
             DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${source} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
                     ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_common.glsl
                     ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_enhanced.glsl ${PS2GPU_GENERATED_GLSL}
+                    ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_rw.glsl
                     ${CMAKE_CURRENT_LIST_DIR}/shaders/smaa_common.glsl ${CMAKE_CURRENT_LIST_DIR}/third_party/smaa/SMAA.glsl
                     ${CMAKE_CURRENT_LIST_DIR}/tools/spirv_to_hlsl.cpp ${GLSLANG} ps2gpu_spirv_to_hlsl
             COMMENT "HLSL ${name} (${source})")
@@ -235,6 +239,7 @@ if(PS2GPU_D3D11)
     ps2gpu_hlsl(d3d_gs_mesh_chars_gen_vert gs_mesh_chars.vert vs_5_0 -DNO_FMA -DGENERATED)
     ps2gpu_hlsl(d3d_gs_mesh_chars_vert gs_mesh_chars.vert vs_5_0 -DNO_FMA)
     ps2gpu_hlsl(d3d_gs_mesh_rw_vert gs_mesh_rw.vert vs_5_0 -DNO_FMA)
+    ps2gpu_hlsl(d3d_gs_mesh_rw_gen_vert gs_mesh_rw.vert vs_5_0 -DNO_FMA -DGENERATED)
     ps2gpu_hlsl(d3d_gs_mesh_enh_vert gs_mesh.vert vs_5_0 -DENHANCED -DNO_FMA)
     ps2gpu_hlsl(d3d_gs_mesh_chars_enh_vert gs_mesh_chars.vert vs_5_0 -DENHANCED -DNO_FMA)
     ps2gpu_hlsl(d3d_gs_frag_lit gs.frag ps_5_0 -DMESH_LIT)

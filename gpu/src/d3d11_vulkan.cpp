@@ -88,6 +88,7 @@
 #include "gs_mesh_chars_gen_vert.h"
 #include "gs_mesh_chars_vert.h"
 #include "gs_mesh_rw_nofma_vert.h"
+#include "gs_mesh_rw_gen_nofma_vert.h"
 #include "gs_mesh_enh_vert.h"
 #include "gs_mesh_chars_enh_vert.h"
 #include "gs_frag_lit.h"
@@ -98,6 +99,7 @@
 #include "d3d_gs_mesh_chars_gen_vert_dxbc.h"
 #include "d3d_gs_mesh_chars_vert_dxbc.h"
 #include "d3d_gs_mesh_rw_vert_dxbc.h"
+#include "d3d_gs_mesh_rw_gen_vert_dxbc.h"
 #include "d3d_gs_mesh_enh_vert_dxbc.h"
 #include "d3d_gs_mesh_chars_enh_vert_dxbc.h"
 #include "d3d_gs_frag_lit_dxbc.h"
@@ -576,6 +578,7 @@ const KnownShader kShaders[] = {
     PS2GPU_SHADER(spirv_gs_mesh_chars_gen_vert, dxbc_d3d_gs_mesh_chars_gen_vert),
     PS2GPU_SHADER(spirv_gs_mesh_chars_vert, dxbc_d3d_gs_mesh_chars_vert),
     PS2GPU_SHADER(spirv_gs_mesh_rw_nofma_vert, dxbc_d3d_gs_mesh_rw_vert),
+    PS2GPU_SHADER(spirv_gs_mesh_rw_gen_nofma_vert, dxbc_d3d_gs_mesh_rw_gen_vert),     // (PS2HOST_MESH_GENERATED)
     PS2GPU_SHADER(spirv_gs_mesh_enh_vert, dxbc_d3d_gs_mesh_enh_vert),
     PS2GPU_SHADER(spirv_gs_mesh_chars_enh_vert, dxbc_d3d_gs_mesh_chars_enh_vert),
     PS2GPU_SHADER(spirv_gs_frag_lit, dxbc_d3d_gs_frag_lit),

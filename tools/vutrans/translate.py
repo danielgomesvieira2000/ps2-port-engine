@@ -19,6 +19,18 @@ characters (engine/gpu/shaders/generated/):
                  --emit-glsl-mesh F
 (XYZF2.w: the fog alone, ADC being the shader's index buffer and guard band; the mark word 0 or 0x8000, others
 declined by the native path.)
+
+Milestone 3 (--bind rw, --emit-glsl-rw, --no-data-branches; IMAGE a comma-separated list): a second engine's
+programs - Burnout 3's RenderWare - whose native shader (gs_mesh_rw.vert) reads a header the port computes on the
+CPU (transforms rebuilt, an instance's matrix): each projected function's uniform part bound to that header
+(rwheader.py), merged by what it reads (rebuilt or carried transforms, images, an unrolled loop's lanes, a strip's
+first vertices: rwbind.py), checked and written with a dispatch by the header's mode (engine/gpu/shaders/generated/):
+    translate.py SNAP D4B61373,34C3CF67 --runs 5000 --mask XYZF2.w=0 --bind rw
+                 --emit-glsl-rw vu_rw_instanced.glsl --rw-name VuRwInstancedGenerated
+    translate.py SNAP 2678EB26,1332C99F,01CE30D5,0835A68B --runs 5000 --no-data-branches --mask XYZF2.w=0 --bind rw
+                 --emit-glsl-rw vu_rw_world.glsl --rw-name VuRwWorldGenerated
+(XYZF2.w: ADC and fog, the shader's own - the strip's triangles its indices; --no-data-branches: the world's paths A
+and B, path C's clipper the CPU's.)
 """
 import argparse
 import collections
@@ -69,10 +81,21 @@ def main():
                     help="a vertex word (qword rel from the vertex's base, lane) holding an address its inputs are "
                          "read at (a matrix's rows), tried for slots otherwise uniform; found ones are added")
     ap.add_argument("--binding", default="gs_mesh", help="the shader the drop-in is for (emit.BINDINGS)")
+    ap.add_argument("--no-data-branches", action="store_true",
+                    help="only the runs that took no data-dependent branch (e.g. RenderWare's world: paths A and B, "
+                         "not path C's clipper)")
+    ap.add_argument("--bind", choices=["rw"],
+                    help="milestone 3: bind the projected functions to a native header (rw: RenderWare's, "
+                         "rwheader.py) and merge them by what they read from it")
+    ap.add_argument("--emit-glsl-rw", metavar="FILE",
+                    help="write the bound functions and a dispatch by the header's mode as a drop-in for "
+                         "gs_mesh_rw.vert")
+    ap.add_argument("--rw-name", default=None, help="the drop-in's dispatch function (default by the program)")
     a = ap.parse_args()
-    if a.mask or a.assume or a.emit_glsl_mesh:
+    if a.mask or a.assume or a.emit_glsl_mesh or a.bind:
         a.project = True
-    image = int(a.image, 16)
+    images = [int(x, 16) for x in a.image.split(",")]
+    image = images[0]
 
     funcs = collections.OrderedDict()       # signature -> {"fit": first fit, "batches": [...]}
     paths = collections.Counter()
@@ -92,14 +115,29 @@ def main():
     for x in a.indirect:
         rel, lane = x.split(",")
         sources.add((int(rel), int(lane)))
-    for si, head, m, d in vu1sym.image_runs(a.snap, image, a.runs, a.skip):
-        if ipdom is None:
+    run_image = {}                            # snapshot index -> image (several images: one report)
+    nskipped = 0
+
+    def all_runs():
+        for im in images:
+            for si, head, m, d in vu1sym.image_runs(a.snap, im, a.runs, a.skip):
+                yield im, si, head, m, d
+    current = None
+    for im, si, head, m, d in all_runs():
+        if im != current:
+            current = im
             ipdom = vu1sym.build_ipdom(m)
             dec = vu1sym.decode_image(m)
+            stride_seen.clear()
+        run_image[si] = im
         t0 = time.perf_counter()
         s = vu1sym.SymVu(head, m, d, decoded=dec, ipdom=ipdom, engine_moves=a.engine_moves)
         s.run()
         t_sym += time.perf_counter() - t0
+        if a.no_data_branches and any(kind == "data" for _pc, _t, _n, kind in s.branches):
+            nskipped += 1
+            del s
+            continue
         nruns += 1
         dag = s.dag
         pk = path_key(s.branches)
@@ -217,8 +255,9 @@ def main():
         _src, missing = emit.glsl_module(image, [(names[s], f["fit"]) for s, f in funcs.items()])
 
     # ---- report
-    print("image %08X: %d runs (%.1f runs/s symbolic), %d batches, %d vertices" %
-          (image, nruns, nruns / max(t_sym, 1e-9), nbatch, nverts))
+    print("image %s: %d runs (%.1f runs/s symbolic), %d batches, %d vertices%s" %
+          (",".join("%08X" % x for x in images), nruns, nruns / max(t_sym, 1e-9), nbatch, nverts,
+           ("; %d runs skipped (a data-dependent branch)" % nskipped) if a.no_data_branches else ""))
     print("vertices in a generalized function: %d; not generalized: %s" %
           (sum(f["vertices"] for f in funcs.values()), dict(failures) or 0))
     print("emitted evaluator (%s): %d of %d vertices bit-exact (all significant words)" % (out_py, exact, checked))
@@ -283,6 +322,9 @@ def main():
     ok = exact == checked
     if projected is not None:
         ok = report_projected(a, projected, image, nruns) and ok
+    if a.bind:
+        import rwbind
+        ok = rwbind.bind_all(a, projected, run_image, nruns, regval_head) and ok
     return 0 if ok else 1
 
 

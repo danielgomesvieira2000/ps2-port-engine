@@ -14,7 +14,7 @@ ONE = 0x3F800000
 
 
 def _leaf_py(r, j, uidx):
-    if r[0] == "U":
+    if r[0] in ("U", "H"):          # (H: a native header's word - rwheader.bind - given as a uniform)
         return "U[%d]" % uidx[j]
     if r[0] == "V":
         _, stride, rel, lane = r

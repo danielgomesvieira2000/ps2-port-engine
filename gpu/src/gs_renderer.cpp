@@ -53,6 +53,8 @@
 #include "gs_mesh_chars_gen_nofma_vert.h"
 #include "gs_mesh_chars_nofma_vert.h"
 #include "gs_mesh_rw_nofma_vert.h"
+#include "gs_mesh_rw_gen_vert.h"
+#include "gs_mesh_rw_gen_nofma_vert.h"
 #include "gs_mesh_chars_enh_vert.h"
 #include "gs_frag_lit.h"
 #include "gs_frag_single_lit.h"
@@ -1945,13 +1947,16 @@ bool VulkanGsRenderer::Init(std::string* error) {
     static const std::string generated_which = std::getenv("PS2HOST_MESH_GENERATED") ? std::getenv("PS2HOST_MESH_GENERATED") : "";
     static const bool generated = generated_which == "1" || generated_which == "room";
     static const bool generated_chars = generated_which == "1" || generated_which == "chars";
+    // (rw: RenderWare's - the instanced strips' and the world's values, gs_mesh_rw.vert's GENERATED)
+    static const bool generated_rw = generated_which == "1" || generated_which == "rw";
     if ((!g_.cull_distance || guard_clip) && g_.clip_distance) {
         mesh_vert_ = generated ? module(spirv_gs_mesh_gen_clip_vert, sizeof spirv_gs_mesh_gen_clip_vert)
                                : module(spirv_gs_mesh_clip_vert, sizeof spirv_gs_mesh_clip_vert);
         mesh_chars_vert_ = generated_chars ? module(spirv_gs_mesh_chars_gen_vert, sizeof spirv_gs_mesh_chars_gen_vert)
                                            : module(spirv_gs_mesh_chars_vert, sizeof spirv_gs_mesh_chars_vert);
         // (RenderWare's: no cull distances of its own; the twin of Direct3D 11's, made without fused multiply-adds)
-        mesh_rw_vert_ = module(spirv_gs_mesh_rw_nofma_vert, sizeof spirv_gs_mesh_rw_nofma_vert);
+        mesh_rw_vert_ = generated_rw ? module(spirv_gs_mesh_rw_gen_nofma_vert, sizeof spirv_gs_mesh_rw_gen_nofma_vert)
+                                     : module(spirv_gs_mesh_rw_nofma_vert, sizeof spirv_gs_mesh_rw_nofma_vert);
         mesh_enh_vert_ = module(spirv_gs_mesh_enh_vert, sizeof spirv_gs_mesh_enh_vert);
         mesh_chars_enh_vert_ = module(spirv_gs_mesh_chars_enh_vert, sizeof spirv_gs_mesh_chars_enh_vert);
         frag_lit_ = g_.dual_source ? module(spirv_gs_frag_lit, sizeof spirv_gs_frag_lit)
@@ -1966,14 +1971,16 @@ bool VulkanGsRenderer::Init(std::string* error) {
                                : module(spirv_gs_mesh_nofma_vert, sizeof spirv_gs_mesh_nofma_vert);
         mesh_chars_vert_ = generated_chars ? module(spirv_gs_mesh_chars_gen_nofma_vert, sizeof spirv_gs_mesh_chars_gen_nofma_vert)
                                            : module(spirv_gs_mesh_chars_nofma_vert, sizeof spirv_gs_mesh_chars_nofma_vert);
-        mesh_rw_vert_ = module(spirv_gs_mesh_rw_nofma_vert, sizeof spirv_gs_mesh_rw_nofma_vert);
+        mesh_rw_vert_ = generated_rw ? module(spirv_gs_mesh_rw_gen_nofma_vert, sizeof spirv_gs_mesh_rw_gen_nofma_vert)
+                                     : module(spirv_gs_mesh_rw_nofma_vert, sizeof spirv_gs_mesh_rw_nofma_vert);
         std::fprintf(stderr, "[gpu] native meshes: the rounding without fused multiply-adds (PS2HOST_MESH_NO_FMA)\n");
     } else if (g_.cull_distance) {
         mesh_vert_ = generated ? module(spirv_gs_mesh_gen_vert, sizeof spirv_gs_mesh_gen_vert)
                                : module(spirv_gs_mesh_vert, sizeof spirv_gs_mesh_vert);
         mesh_chars_vert_ = generated_chars ? module(spirv_gs_mesh_chars_gen_vert, sizeof spirv_gs_mesh_chars_gen_vert)
                                            : module(spirv_gs_mesh_chars_vert, sizeof spirv_gs_mesh_chars_vert);
-        mesh_rw_vert_ = module(spirv_gs_mesh_rw_vert, sizeof spirv_gs_mesh_rw_vert);
+        mesh_rw_vert_ = generated_rw ? module(spirv_gs_mesh_rw_gen_vert, sizeof spirv_gs_mesh_rw_gen_vert)
+                                     : module(spirv_gs_mesh_rw_vert, sizeof spirv_gs_mesh_rw_vert);
         if (g_.clip_distance) {
             mesh_enh_vert_ = module(spirv_gs_mesh_enh_vert, sizeof spirv_gs_mesh_enh_vert);
             mesh_chars_enh_vert_ = module(spirv_gs_mesh_chars_enh_vert, sizeof spirv_gs_mesh_chars_enh_vert);
@@ -1985,6 +1992,9 @@ bool VulkanGsRenderer::Init(std::string* error) {
     if (generated || generated_chars)
         std::fprintf(stderr, "[gpu] native meshes: %s values by the generated functions (PS2HOST_MESH_GENERATED)\n",
                      generated && generated_chars ? "the room's and the characters' rigid" : generated ? "the room's" : "the characters' rigid");
+    if (generated_rw)
+        std::fprintf(stderr, "[gpu] native meshes: RenderWare's instanced strips' and world's values by the generated "
+                             "functions (PS2HOST_MESH_GENERATED)\n");
     frag_ = g_.dual_source ? module(spirv_gs_frag, sizeof spirv_gs_frag)
                            : module(spirv_gs_frag_single, sizeof spirv_gs_frag_single);
     g_dual_source_blend = g_.dual_source;
