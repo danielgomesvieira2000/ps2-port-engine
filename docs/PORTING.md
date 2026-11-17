@@ -49,7 +49,11 @@ beside the main one); a release ships both. The executable's entry
 processor before anything else runs - the runtime's start and static
 constructors are AVX2 code too - and on one without AVX2 starts the SSE4
 build beside it with the same command line, or says what is needed
-(`PS2HOST_TEST_NO_AVX2=1` takes that way on a processor with it). `port.py`
+(`PS2HOST_TEST_NO_AVX2=1` takes that way on a processor with it). On
+Linux the check is a `.preinit_array` function (run by the C library before
+every constructor) that hands the process to `<name>-sse4` (`execve`);
+`linux.py build --sse4` builds it, and `package.py --platform linux` ships
+both. `port.py`
 builds with a compiler per 2.5 GB of memory: a file of compiled VU code
 takes one 2 GB and more.
 

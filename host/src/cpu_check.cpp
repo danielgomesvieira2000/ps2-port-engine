@@ -11,7 +11,11 @@
 // same command line, or says what is needed. The SSE4 build checks for
 // SSE4.1 in turn (its intrinsics: the VU's lanes, the IPU).
 //
-// Only the Windows API here: nothing of the C runtime is up yet.
+// Windows: only the Windows API here, nothing of the C runtime is up yet.
+// Linux: a function in the executable's .preinit_array, which the C library
+// runs before every constructor (its own, libstdc++'s, the port's): the SSE4
+// build (<name>-sse4) takes the process over (execve), with the same
+// arguments and environment.
 
 #if defined(_WIN32) && defined(_MSC_VER)
 
@@ -113,5 +117,82 @@ extern "C" DWORD Ps2CheckedStart(LPVOID peb) {
     ExitProcess(70);
 #endif
 }
+
+#elif defined(__linux__) && defined(__x86_64__) && !defined(__ANDROID__)
+
+#if defined(__AVX__)
+#error "cpu_check.cpp must be built without AVX (it runs on processors without it)"
+#endif
+
+#include <cpuid.h>
+#include <cstdlib>
+#include <cstring>
+#include <unistd.h>
+
+namespace {
+
+[[maybe_unused]] bool HasAvx2() {
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (__get_cpuid_max(0, nullptr) < 7) return false;
+    __get_cpuid(1, &a, &b, &c, &d);
+    const bool osxsave = (c >> 27) & 1, avx = (c >> 28) & 1;
+    if (!osxsave || !avx) return false;
+    unsigned lo = 0, hi = 0;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    if ((lo & 6) != 6) return false;            // the OS saves the YMM registers
+    __get_cpuid_count(7, 0, &a, &b, &c, &d);
+    return (b >> 5) & 1;
+}
+
+[[maybe_unused]] bool HasSse41() {
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    __get_cpuid(1, &a, &b, &c, &d);
+    return (c >> 19) & 1;
+}
+
+void Say(const char* text) {
+    if (write(2, text, std::strlen(text)) < 0) return;
+}
+
+// The environment's variable `name`, from envp: getenv is not up yet here (the
+// C library sets environ in its own initializer, after the executable's
+// .preinit_array).
+[[maybe_unused]] bool HasVariable(char** envp, const char* name) {
+    const size_t length = std::strlen(name);
+    for (char** e = envp; e && *e; ++e)
+        if (std::strncmp(*e, name, length) == 0 && (*e)[length] == '=') return true;
+    return false;
+}
+
+void CheckProcessor(int argc, char** argv, char** envp) {
+    (void)argc;
+#if defined(PS2HOST_BUILT_FOR_AVX2)
+    // PS2HOST_TEST_NO_AVX2=1: as on a processor without AVX2.
+    if (HasAvx2() && !HasVariable(envp, "PS2HOST_TEST_NO_AVX2")) return;
+    char self[4096];
+    const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 8);
+    if (n > 0) {
+        std::memcpy(self + n, "-sse4", 6);
+        if (access(self, X_OK) == 0) {
+            argv[0] = self;
+            execve(self, argv, envp);
+        }
+    }
+    Say("This build needs a processor with AVX2 (Intel Haswell or AMD Excavator, 2013-2015, or later).\n"
+        "For a processor without it (Intel Pentium or Celeron before 2021), run the \"-sse4\" program "
+        "that comes with it, in the same folder.\n");
+    _exit(70);
+#else
+    (void)argv, (void)envp;
+    if (HasSse41()) return;
+    Say("This build needs a processor with SSE4.1 (2008 or later).\n");
+    _exit(70);
+#endif
+}
+
+}  // namespace
+
+__attribute__((section(".preinit_array"), used)) void (*const ps2_check_processor)(int, char**, char**) =
+    CheckProcessor;
 
 #endif

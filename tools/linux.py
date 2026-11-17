@@ -5,6 +5,7 @@ Windows or Linux alike - Docker with the image in tools/linux/Dockerfile
 the processor, so the GPU renderer runs its tests without a GPU).
 
     python engine/tools/linux.py --game games/<name> build          # <game>/build/linux/<target>
+    python engine/tools/linux.py --game games/<name> build --sse4   # <target>-sse4: without AVX2
     python engine/tools/linux.py --game games/<name> test [--runs car_select,race] [--gpu]
     python engine/tools/linux.py --game games/<name> shell          # a shell in the container
 
@@ -110,10 +111,14 @@ def port_target(game) -> str:
     return os.path.basename(os.path.normpath(game.directory))
 
 
-def build(game, jobs: int):
+def build(game, jobs: int, sse4: bool = False):
+    """`sse4`: the build for processors without AVX2 (PS2HOST_AVX2=OFF),
+    <target>-sse4 beside the main one - which starts it on such a processor
+    (host/src/cpu_check.cpp)."""
     generated = port.generate(game)
     root = root_of(game)
     target = port_target(game)
+    folder = target + ("-sse4" if sse4 else "")
     out = game.path(os.path.join(game.build, "linux"))
     os.makedirs(out, exist_ok=True)
     # ThinLTO where the game asks for it (game.json's "lto", as port.py's;
@@ -124,14 +129,14 @@ def build(game, jobs: int):
     script = " && ".join([
         "cmake -S %s -B /build/%s -G Ninja -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 "
         "-DCMAKE_BUILD_TYPE=Release -DPS2_GENERATED_DIR=%s -DPS2HOST_LTO=%s -DPS2HOST_LTO_JOBS=%d "
-        "'-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc' > /build/configure.log"
-        % (inside(root, game.path("port")), target, inside(root, generated), "ON" if lto else "OFF",
-           max(1, jobs // 2)),
-        "cmake --build /build/%s -j %d" % (target, jobs),
-        "cp /build/%s/%s %s/" % (target, target, inside(root, out)),
+        "-DPS2HOST_AVX2=%s '-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc' > /build/configure.log"
+        % (inside(root, game.path("port")), folder, inside(root, generated), "ON" if lto else "OFF",
+           max(1, jobs // 2), "OFF" if sse4 else "ON"),
+        "cmake --build /build/%s -j %d" % (folder, jobs),
+        "cp /build/%s/%s %s/%s" % (folder, target, inside(root, out), folder),
     ])
     container(game, script)
-    print("built %s%s" % (os.path.join(out, target), " (ThinLTO)" if lto else ""))
+    print("built %s%s" % (os.path.join(out, folder), " (ThinLTO)" if lto else ""))
 
 
 def test(game, runs: str, gpu: bool, renderer: str = ""):
@@ -157,11 +162,13 @@ def main(argv=None) -> int:
     parser.add_argument("--gpu", action="store_true", help="test: the runs with the GPU renderer (lavapipe)")
     parser.add_argument("--renderer", default="", help="test: PS2HOST_RENDERER for the runs (sdl, vulkan)")
     parser.add_argument("--jobs", type=int, default=6, help="build: compile jobs (the container's memory: ~1 GB each)")
+    parser.add_argument("--sse4", action="store_true",
+                        help="build: the build for processors without AVX2 (<target>-sse4 beside the main one)")
     args = parser.parse_args(argv)
     game = game_config.from_args(args)
     image()
     if args.action == "build":
-        build(game, args.jobs)
+        build(game, args.jobs, args.sse4)
     elif args.action == "test":
         test(game, args.runs, args.gpu, args.renderer)
     else:
