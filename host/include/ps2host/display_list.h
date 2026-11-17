@@ -29,26 +29,72 @@
  *
  * A pair's blend is planned once (PlanListBlend: the words to blend, from and
  * to) and made for each picture between the two steps (ApplyListBlend).
+ * PS2HOST_BLEND_JUMPS=1 logs each thing that jumps: the word, its values,
+ * its lane's scale and its change the step before.
  */
 
 #include "ps2host/run.h"
+
+#include <cstdio>
+#include <unordered_map>
+#include <vector>
 
 namespace ps2host {
 
 struct ListBlendOptions {
     float cut = 100000.0f;      // a value changing by more: not motion (not blended)
+    // A value changing by more than `cut` blended all the same where it moves
+    // on as it moved the step before (the same way, a third to three times
+    // as far) - else its thing jumps (steps whole). A camera turning behind
+    // the shoulder (Outbreak's RE4 style) moves every thing's screen
+    // translations by 1e6 a step, steadily: past the cut, each prop stepped
+    // while the room turned. A lamp's glow given another lamp's place moves
+    // as far at once: left out alone, it was put between the two.
+    bool cut_steady = false;
+    // A value moving on as it moved the step before - the same way, its
+    // change within this share of it of the change before - is motion, not
+    // a jump (ListBlendPlan::changed). A camera easing to a stop (Outbreak's
+    // RE4 camera, 0.8 of its move a step) changes by ~20% a step and more
+    // where it passes 0: a quarter stepped its things as it came to rest.
+    float steady = 0.25f;
     int segment_address = 0;    // a segment starts at each UNPACK to this VU address (-1: one segment)
     float jump = 0.5f;          // of a lane's largest value: a jump - the segment not blended
     float cut_share = 0.2f;     // segments jumping or moved, of those matched: the camera cut
     float moved_distance = 0.02f;   // a match out of its place: its first values this far a word at most
+    // A segment's match in the list's order first: the first unused one of its
+    // codes at most this many places on from where the last match left off
+    // (things come and go before it), whatever its values - the nearest
+    // values took another copy of the same model and lost the list's order
+    // for every thing after it (Outbreak File #2's street: 19 of 63 things
+    // stepped at once). Out of its place and far, a near one elsewhere wins.
+    u32 skip_window = 8;
     // The segment that is the camera (its view's matrices: Outbreak's 1, the
     // first after the list's start): its jump the cut, and only it (a flash
-    // of light makes many things jump at once); -1: `cut_share` decides.
+    // of light makes many things jump at once); -1: `cut_share` decides; -2:
+    // never a cut (a list whose cut another list decides: Outbreak's others,
+    // their camera list 0's - File #2's characters' list's segment 1 is a
+    // tree, and its going unmatched cancelled the list's blend).
     int cut_segment = -1;
     // Its view: these rows (quadwords) of its first UNPACK of floats, each
     // turned or moved by more than `jump` of its own length the cut (not its
     // lights' rows: a shot's flash). The rest of it blended whole.
     unsigned view_first = 0, view_end = ~0u;
+    // Of those, the rows from view_first to here are its axes (a projection
+    // times a rotation: x, y and z), judged together - moved by more than
+    // `jump` of their length as one (a turn keeps it). Each alone, a turning
+    // camera's axis passing its depth (Outbreak's x and z: 2,000 across the
+    // screen, ~1 in depth) was short, its step a "jump": a cut every 60
+    // degrees of a turn, the whole picture stepped (RE4's camera behind the
+    // shoulder). view_first: none - every row alone.
+    unsigned view_axes_end = 0;
+    // A sudden move of the view the cut: its move (ListBlend::view, a share
+    // of a cut's) `view_sudden` times the step before's (+0.01) or more, and
+    // at least `view_sudden_least` - a still camera put somewhere else,
+    // nearer than a cut's length (Outbreak File #2's street: 0.28 after
+    // 0.0001, blended, a picture swung between the two views). A turn or a
+    // pan comes on gradually: Outbreak's RE4 camera eases in (3x at most).
+    // 0: off.
+    float view_sudden = 0.0f, view_sudden_least = 0.15f;
     // A cut the view's rows miss: most of the things new (`new_share` of the
     // segments: another room's or shot's) while the camera's view moved by
     // `new_view` of a cut or more. Outbreak (played 2026-10-24): two steps
@@ -60,6 +106,34 @@ struct ListBlendOptions {
     // Mosquito's bodies, deformed by the EE each step). Off: a batch's own
     // data may be read as other than coordinates (Outbreak's decal CLUTs).
     bool blend_flg = false;
+    // Rows (quadwords) a jump steps alone, the rest of the thing blended:
+    // UNPACKs of `words` words, rows first_row to end_row. Outbreak's things'
+    // 992-word headers have their lights at rows 14-23 (bones from 24): a
+    // light's slot given to another lamp stepped the whole character.
+    struct StepRows {
+        u32 words, first_row, end_row;
+    };
+    std::vector<StepRows> step_rows;
+    // The colours (RGBAQ's R, G, B and A) of a matched pair's GIF packets
+    // (its DIRECTs and DIRECTHLs, their tags the same in both) blended too:
+    // a fade is a sprite over the screen whose alpha the game steps (File
+    // #2's, 0x10 a step: the picture brightened at 30 a second at 120).
+    bool blend_colors = false;
+    // The two lists made in different buffers (a double buffer's halves, its
+    // memory each half's own): the last list made in the newer's buffer
+    // before it. A value the newer has as that one had it, at the same place
+    // under the same code, is the newer buffer's own - the newer's, neither
+    // blended nor a jump; the thing blends on. Outbreak's lists keep each
+    // half's leftovers in words the VU never reads (a character's 992-word
+    // header: 0 in one half, 128 in the other); at 144 a step's half
+    // alternated (4.8 pictures a step), and those words "jumped" every step:
+    // the characters, 19 of the 59 things, stepped at 30.
+    const std::vector<u32>* buffer_before = nullptr;
+    // The camera moved this step and did not cut - another list's verdict
+    // (the scene's, by its camera's segment), for a list with no camera of
+    // its own (cut_segment < 0): its things' moves past the cut but within
+    // the jump's reach are the camera's motion, as in the scene's list.
+    bool camera_moving = false;
 };
 
 struct ListBlend {
@@ -86,7 +160,33 @@ struct ListBlendPlan {
     std::vector<u32> at;    // the newer list's words to blend
     std::vector<float> from, to;
     std::vector<u32> segment;   // each word's segment (the newer list's), in order
+    // The newer list's length: the plan is that list's alone (ApplyListBlend
+    // leaves any other as it is - a plan kept past its list, its words'
+    // places another list's tags and codes).
+    size_t words = 0;
     ListBlend stats;
+    // Every value of a matched pair that changed (blended or not): the newer
+    // list's word and its change - the next plan's (the same plan planned
+    // again a step on) to tell steady motion from a jump. A value moving on
+    // as it moved (within a quarter of its change, the same way) is motion:
+    // a thing's translation passing through 0 as the camera pans steadily
+    // was a jump by its lane's largest, the thing stepped while the room
+    // blended (File #1's bar: props shaking at 30 a second).
+    std::vector<std::pair<u32, float>> changed;
+    // Set before planning: this step's moves are not motion (a camera's snap
+    // the game told of, the step shown whole) - `changed` carries each
+    // value's change of the step before on, not this step's. Its moves as
+    // the next step's history, every thing moving on ordinarily after it was
+    // "unsteady" and stepped (Outbreak's RE4 camera pulled in at a hedge: 44
+    // things the step after).
+    bool carry = false;
+    // The colours to blend (ListBlendOptions::blend_colors): the newer list's
+    // word, its value in each list, and its bytes blended (4: an RGBA word;
+    // 1: a PACKED RGBAQ's colour, its low byte).
+    struct Color {
+        u32 at, from, to, bytes;
+    };
+    std::vector<Color> colors;
 };
 
 /* The blend of `a` (older) into `b` (newer), planned. `moving`: the words of
@@ -112,5 +212,23 @@ void GsRegisterWrites(const std::vector<u32>& words, const std::vector<u32>& reg
 
 /* Both at once: `out` = `b` blended `t` of the way from `a`. */
 ListBlend BlendVif1Chains(const Vif1Chain& a, const Vif1Chain& b, float t, float cut, Vif1Chain& out);
+
+/* A profile of the pictures' motion, thing by thing: each picture's list as
+   sent (its first `end` words), cut as the blend cuts it, each thing's first
+   UNPACK of floats (its matrices) against the picture before's same thing
+   (its codes', and the how-manyth of them). A line a thing a picture to
+   `file` (CSV: frame, segment, key, copy, words, change, size, t, step): its
+   change the length of its values' move, `size` theirs. Blended, a thing's
+   change is even from picture to picture; stepping as the game's, it moves
+   on a step's pictures and stands on the others' - a judder
+   (engine/tools/list_motion.py ranks them). */
+class ListMotion {
+public:
+    void Picture(const std::vector<u32>& words, size_t end, int segment_address, unsigned long long frame, float t,
+                 bool step, FILE* file);
+
+private:
+    std::unordered_map<u64, std::vector<float>> last_;
+};
 
 }  // namespace ps2host

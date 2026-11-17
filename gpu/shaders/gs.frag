@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
 // The GS's per-pixel work, in its own terms (0-255, with 0x80 as 1.0 where it
 // multiplies): the texture function, then the alpha test. Blending is the
 // fixed-function blender's; the GS's factor - source alpha or FIX over 128 -
@@ -17,6 +19,8 @@ layout(set = 2, binding = 0) uniform sampler2D destination;
 // game's soft particles (blend_ops bit 21).
 layout(set = 2, binding = 0) uniform sampler2D scene_depth;
 #endif
+
+#include "gs_depth.glsl"
 
 layout(location = 0) in vec4 shade;
 layout(location = 1) noperspective in vec3 coordinate;
@@ -385,33 +389,57 @@ vec4 SampleModern(vec2 uv, vec2 dx, vec2 dy, int mxl, float most) {
     const float f = lod - float(n);
     const vec2 axis = lx > ly ? dx : dy;
     vec4 sum = vec4(0.0);
-    for (int i = 0; i < int(taps); ++i) {
+    const int levels = n < mxl && f > 0.0 ? 2 : 1;      // (one Bilinear called: Sample(uv)'s why)
+    [[dont_unroll]] for (int i = 0; i < int(taps); ++i) {
         const vec2 at = uv + axis * ((float(i) + 0.5) / taps - 0.5);
-        vec4 c = Bilinear(at, n);
-        if (n < mxl && f > 0.0) c = mix(c, Bilinear(at, n + 1), f);
+        vec4 c = vec4(0.0);
+        [[dont_unroll]] for (int j = 0; j < levels; ++j) {
+            const vec4 b = Bilinear(at, n + j);
+            c = j == 0 ? b : mix(c, b, f);
+        }
         sum += c;
     }
     return floor(sum / taps + 0.5);
 }
 
+// (Each level's Sample called from one place, a loop of one level or two: a
+// driver's compiler inlines every call whole, and five calls here - twenty-
+// five in the whole shader, with the paint's four taps - took a cold NVIDIA
+// driver half a minute for that pipeline.)
 vec4 Sample(vec2 uv) {
     const uint m = p.bilinear;
-    if (!Has(kMip) || (m & 2u) == 0u) return Sample(uv, 0, Has(kLinear) && (m & 1u) != 0u);
-    const int mxl = int((m >> 2) & 7u);
-    const uint mmin = (m >> 5) & 7u;
-    float lod = float(int(m << 4) >> 20) / 16.0;    // K, 4 fractional bits
-    const float q = coordinate.z != 0.0 ? abs(coordinate.z) : 1.0;     // as the software GS's
-    if (((m >> 9) & 1u) == 0u) lod += -log2(q) * float(1u << ((m >> 10) & 3u));
-    if (lod <= 0.0) return Sample(uv, 0, ((m >> 8) & 1u) != 0u);
-    const bool linear = mmin == 4u || mmin == 5u;
-    if (mmin == 2u || mmin == 4u) return Sample(uv, int(min(floor(lod + 0.5), float(mxl))), linear);
-    lod = min(lod, float(mxl));
-    const int n = int(floor(lod));
-    const float f = lod - float(n);
-    const vec4 c0 = Sample(uv, n, linear);
-    if (n >= mxl || f == 0.0) return c0;
-    const vec4 c1 = Sample(uv, n + 1, linear);
-    return floor(c0 + (c1 - c0) * f + 0.5);
+    int n = 0, levels = 1;
+    float f = 0.0;
+    bool linear;
+    if (!Has(kMip) || (m & 2u) == 0u) {
+        linear = Has(kLinear) && (m & 1u) != 0u;
+    } else {
+        const int mxl = int((m >> 2) & 7u);
+        const uint mmin = (m >> 5) & 7u;
+        float lod = float(int(m << 4) >> 20) / 16.0;    // K, 4 fractional bits
+        const float q = coordinate.z != 0.0 ? abs(coordinate.z) : 1.0;     // as the software GS's
+        if (((m >> 9) & 1u) == 0u) lod += -log2(q) * float(1u << ((m >> 10) & 3u));
+        if (lod <= 0.0) {
+            linear = ((m >> 8) & 1u) != 0u;
+        } else {
+            linear = mmin == 4u || mmin == 5u;
+            if (mmin == 2u || mmin == 4u) {
+                n = int(min(floor(lod + 0.5), float(mxl)));
+            } else {
+                lod = min(lod, float(mxl));
+                n = int(floor(lod));
+                f = lod - float(n);
+                if (n < mxl && f != 0.0) levels = 2;
+            }
+        }
+    }
+    vec4 c0 = vec4(0.0), c1 = vec4(0.0);
+    [[dont_unroll]] for (int i = 0; i < levels; ++i) {
+        const vec4 c = Sample(uv, n + i, linear);
+        if (i == 0) c0 = c;
+        else c1 = c;
+    }
+    return levels == 1 ? c0 : floor(c0 + (c1 - c0) * f + 0.5);
 }
 
 #ifdef UINT_OUTPUT
@@ -427,8 +455,111 @@ layout(location = 0, index = 0) out vec4 colour;
 layout(location = 0, index = 1) out vec4 factor;
 #endif
 
+#ifdef MESH_LIT
+// An enhanced native draw's lighting per pixel (gs_mesh_enhanced.glsl): the microprogram's own lights, from the
+// draw's header (set 3), on the place and normal interpolated across the triangle - the vertex shader's
+// arithmetic (plain floats, not the VU's rounding), its colour as the GS takes it (0-255; 128 the texture's own).
+layout(set = 3, binding = 1, std430) readonly buffer MeshHeader {
+    vec4 h[];
+} mesh_header;
+layout(location = 4) in vec4 lit_place;
+layout(location = 5) in vec3 lit_normal;
+layout(location = 6) in vec4 lit_colour;
+layout(location = 7) in float lit_on;
+layout(location = 8) flat in uint lit_program;
+layout(location = 9) flat in vec3 lit_eye;
+
+vec4 H(int i) { return mesh_header.h[i]; }
+
+// A texture pack's surface detail (blend_ops bit 27: set 2 its replacement's _n image - texture_pack.h): the
+// normal's RGB in the texture's own space, its shine in alpha. The texture's axes from the screen's change in
+// the place and the coordinates (no tangents in the game's meshes: a cotangent frame, Schueler's).
+bool Detailed() {
+#ifdef SHADER_BLEND
+    return false;
+#else
+    return ((p.blend_ops >> 27) & 1u) != 0u;
+#endif
+}
+
+vec4 LitShade(vec4 vertex_shade) {
+    // (the screen's change in the place and coordinates, while every pixel of the quad still runs)
+    const vec3 dp1 = dFdx(lit_place.xyz), dp2 = dFdy(lit_place.xyz);
+    const vec2 uv = coordinate.xy / coordinate.z;
+    const vec2 duv1 = dFdx(uv), duv2 = dFdy(uv);
+    // (a triangle with a vertex not known: lit at its vertices, as the game)
+    if (lit_on < 0.999) return vertex_shade;
+    const vec3 p = lit_place.xyz;
+    // the normal interpolated, its length as its vertices' (the game's normals need not be unit length)
+    vec3 n = lit_normal;
+    const float nl = length(n);
+    if (nl > 0.0) n *= lit_place.w / nl;
+    float shine = 0.0;
+#ifndef SHADER_BLEND
+    if (Detailed() && nl > 0.0) {
+        const vec4 detail = texture(scene_depth, uv);
+        const vec3 un = n / max(lit_place.w, 1e-6);
+        const vec3 q1 = cross(dp2, un), q2 = cross(un, dp1);
+        const vec3 tx = q1 * duv1.x + q2 * duv2.x, ty = q1 * duv1.y + q2 * duv2.y;
+        const float k = inversesqrt(max(max(dot(tx, tx), dot(ty, ty)), 1e-30));
+        const vec3 local = detail.rgb * 2.0 - 1.0;
+        const vec3 bent = normalize(mat3(tx * k, ty * k, un) * local);
+        n = bent * lit_place.w;
+        shine = detail.a;
+    }
+#endif
+    const vec3 view = normalize(lit_eye - p);
+    vec3 c;
+    if (lit_program == 0u) {
+        // the room's (rows 0-23, vf11-vf17 from 24): a point light at vf15-vf17's x, its strength vf12's x
+        vec3 l = vec3(H(28).x - p.x, H(29).x - p.y, H(30).x - p.z);
+        const float rs = inversesqrt(max(dot(l, l), 1e-30));
+        const float atten = min(H(25).x * rs, 1.0);
+        const float lambert = max(dot(l * rs, n), 0.0);
+        const vec3 col = lit_colour.rgb;
+        c = (H(26).rgb * lambert + H(27).rgb * col) * atten + H(0).rgb * col;
+        if (shine > 0.0) {
+            // the shine: the light's own colour, where it mirrors into the eye (Blinn's half vector)
+            const vec3 half_way = normalize(l * rs + view);
+            c += H(26).rgb * (shine * pow(max(dot(normalize(n), half_way), 0.0), 8.0 + 56.0 * shine)) * atten;
+        }
+        c = min(c, vec3(128.0)) * H(1).rgb;
+    } else {
+        // the characters' (vf00-vf21): x a direction, y and z points, each over its distance
+        vec3 lx = vec3(H(11).x, H(11).y - p.x, H(11).z - p.x);
+        vec3 ly = vec3(H(12).x, H(12).y - p.y, H(12).z - p.y);
+        vec3 lz = vec3(H(13).x, H(13).y - p.z, H(13).z - p.z);
+        vec3 atten = vec3(1.0);
+        for (int k = 1; k <= 2; ++k) {
+            const float r = inversesqrt(max(lx[k] * lx[k] + ly[k] * ly[k] + lz[k] * lz[k], 1e-30));
+            lx[k] *= r, ly[k] *= r, lz[k] *= r;
+            atten[k] = min(H(14)[k] * r, 1.0);
+        }
+        vec3 d;
+        for (int k = 0; k < 3; ++k) d[k] = max(lx[k] * n.x + ly[k] * n.y + lz[k] * n.z, 0.0) * (k > 0 ? atten[k] : 1.0);
+        c = H(15).rgb * d.x + H(16).rgb * d.y + H(17).rgb * d.z + H(18).rgb + H(19).rgb * atten.y +
+            H(20).rgb * atten.z + H(21).rgb;
+        if (shine > 0.0) {
+            const vec3 un = normalize(n);
+            const float power = 8.0 + 56.0 * shine;
+            for (int k = 0; k < 3; ++k) {
+                const vec3 to = normalize(vec3(lx[k], ly[k], lz[k]));
+                const float lit_by = pow(max(dot(un, normalize(to + view)), 0.0), power) * (k > 0 ? atten[k] : 1.0);
+                c += H(15 + k).rgb * (shine * lit_by);
+            }
+        }
+        c = min(c, vec3(128.0)) * H(9).rgb;
+    }
+    return vec4(clamp(floor(c), 0.0, 255.0) / 255.0, vertex_shade.a);
+}
+#endif
+
 void main() {
+#ifdef MESH_LIT
+    vec4 v = round(LitShade(shade) * 255.0);
+#else
     vec4 v = round(shade * 255.0);
+#endif
     vec4 c = v;
     if (Has(kTextured) && p.textured != 0u) {
         vec2 uv = coordinate.xy / coordinate.z * vec2(TextureSize());
@@ -458,20 +589,26 @@ void main() {
             const vec2 r = coordinate.xy / coordinate.z * vec2(TextureSize());
             t = SampleModern(uv, dFdx(r), dFdy(r), int((p.bilinear >> 2) & 7u),
                              float(1u << ((p.blend_ops >> 22) & 7u)));
-        } else if (((p.blend_ops >> 19) & 1u) != 0u) {
+        } else {
             // A car's paint reflecting its sphere map (the Fresnel tag, below):
             // a map drawn each frame, no mipmaps - where it is minified, four
             // taps over the pixel's footprint, as a mip would: no shimmer on
-            // a distant or a curved body.
+            // a distant or a curved body. Otherwise the one sample. (Sample
+            // called from one place: its why.)
+            vec2 at[4] = vec2[4](uv, uv, uv, uv);
+            int taps = 1;
             const vec2 dx = dFdx(uv), dy = dFdy(uv);
-            if (max(length(dx), length(dy)) > 1.5) {
+            if (((p.blend_ops >> 19) & 1u) != 0u && max(length(dx), length(dy)) > 1.5) {
                 const vec2 a = 0.25 * (dx + dy), b = 0.25 * (dx - dy);
-                t = floor((Sample(uv + a) + Sample(uv + b) + Sample(uv - b) + Sample(uv - a)) * 0.25 + 0.5);
-            } else {
-                t = Sample(uv);
+                at = vec2[4](uv + a, uv + b, uv - b, uv - a);
+                taps = 4;
             }
-        } else {
-            t = Sample(uv);
+            vec4 sum = vec4(0.0);
+            [[dont_unroll]] for (int i = 0; i < taps; ++i) {
+                const vec4 c = Sample(at[i]);
+                sum = i == 0 ? c : sum + c;
+            }
+            t = taps == 1 ? sum : floor(sum * 0.25 + 0.5);
         }
         vec3 product = floor(t.rgb * v.rgb / 128.0);
         if (p.tfx == 0u) {
@@ -548,7 +685,7 @@ void main() {
         // A soft particle (a game's tag): faded as it nears what is behind
         // it, so smoke and fire meet the road and the cars without a seam.
         const vec4 scene = texelFetch(scene_depth, ivec2(gl_FragCoord.xy), 0);
-        const float z = gl_FragCoord.z * 4294967296.0;
+        const float z = ZOfDepthF(gl_FragCoord.z);
         if (scene.a > 0.5 && z > scene.b + 0.5) {
             const float mine = scene.g * 1024.0 / (z - scene.b);
             const float soft = 0.35 + 0.025 * mine;

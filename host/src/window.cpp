@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <functional>
@@ -43,6 +44,16 @@
 
 namespace ps2host {
 
+#ifdef PS2HOST_VULKAN
+// Fullscreen keeps the screen's own mode (borderless) unless the player asks
+// for "exclusive" (the "fullscreen_mode" setting): a mode 60 divides evenly,
+// taken by switching the screen - a black flicker, and lost on a click on
+// another screen. Always the screen's own for DISPLAY's frame rate and VRR.
+static bool KeepRefresh(bool display_rate) {
+    return display_rate || SettingOn("vrr") || Setting("fullscreen_mode", "borderless") != "exclusive";
+}
+#endif
+
 std::atomic<std::uint64_t> g_late_pictures{0};    // LatePictures
 
 namespace {
@@ -56,6 +67,8 @@ bool g_closed = false;
 
 #ifdef PS2HOST_VULKAN
 std::unique_ptr<ps2gpu::Display> g_display;
+std::thread::id g_window_thread;                    // the one that opened it, and pumps it
+std::atomic<std::int64_t> g_answered_ns{0};         // when it last looked at its events
 bool g_pipelines_behind = false;    // the first start went on before its pipelines were all made
 
 // The keys the controller reads, as Win32 virtual keys, by position.
@@ -338,10 +351,16 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
         api = "SDL";
     }
     if (g_display) {
+        g_window_thread = std::this_thread::get_id();
+#ifdef _WIN32
+        // No ghost window ("not responding", its title greyed) for a moment
+        // the game waits on the GPU: a game's own stall is not a hang.
+        DisableProcessWindowsGhosting();
+#endif
         Note("window", std::string("window: ") + api + " on " + g_display->Describe() + why_not);
         g_display->SetVrr(SettingOn("vrr"));
         g_display->SetGpuBoost(SettingOn("gpu_boost", true));      // (the GPU's clocks kept up)
-        g_display->SetKeepRefresh(Setting("frame_rate", "60") == "display" || SettingOn("vrr"));
+        g_display->SetKeepRefresh(KeepRefresh(Setting("frame_rate", "60") == "display"));
         if (SettingOn("fullscreen")) g_display->SetFullscreen(true);
         ApplyCursorArt();
         g_display->SetPresentObserver([](std::uint64_t due_ns, std::uint64_t shown_ns, bool dropped) {
@@ -470,6 +489,8 @@ bool TakeHostMouse(HostMouseState* state) {
         state->pressed = m.pressed;
         state->wheel = m.wheel;
         state->moved = m.moved;
+        state->dx = m.dx;
+        state->dy = m.dy;
         return true;
     }
 #endif
@@ -509,6 +530,14 @@ void ShowHostCursor(bool on) {
 #endif
 }
 
+void HideHostPointer(bool hidden) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->HidePointer(hidden);
+#else
+    (void)hidden;
+#endif
+}
+
 #ifdef PS2HOST_VULKAN
 namespace {
 ControllerFamily Family(std::uint8_t family) {
@@ -542,9 +571,37 @@ std::vector<HostDevice> WindowControllers() {
     std::vector<HostDevice> list;
 #ifdef PS2HOST_VULKAN
     if (g_display)
-        for (const auto& c : g_display->Controllers()) list.push_back({c.id, c.name, Family(c.family)});
+        for (const auto& c : g_display->Controllers()) list.push_back({c.id, c.name, Family(c.family), c.path});
 #endif
     return list;
+}
+
+void SetWindowPlacement(int x, int y, int w, int h, bool borderless) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetPlacement(x, y, w, h, borderless);
+#endif
+    (void)x, (void)y, (void)w, (void)h, (void)borderless;
+}
+
+bool WindowDesktopArea(int* x, int* y, int* w, int* h) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) return g_display->DesktopArea(x, y, w, h);
+#endif
+    (void)x, (void)y, (void)w, (void)h;
+    return false;
+}
+
+void SetMouseCaptured(bool on) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetMouseCaptured(on);
+#endif
+    (void)on;
+}
+
+void RaiseWindow() {
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->Raise();
+#endif
 }
 
 bool WindowControllerPad(u32 id, HostPadState* state) {
@@ -591,7 +648,7 @@ void SetPictureSource(std::function<bool(std::vector<u32>*, u32*, u32*)> source)
 }
 
 namespace {
-void RefreshOverlay();      // the overlay's lines and the FPS counter's, drawn
+void RefreshOverlay(bool force = false);      // the overlay's lines and the FPS counter's, drawn
 }  // namespace
 
 // Alt+Enter changes fullscreen in the display's Pump: saved as the setting.
@@ -618,9 +675,30 @@ static bool PumpDisplay() {
 }
 #endif
 
+namespace {
+std::int64_t NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+}  // namespace
+
+void KeepWindowAnswering() {
+#if defined(PS2HOST_VULKAN) && defined(_WIN32)
+    if (!g_display || std::this_thread::get_id() != g_window_thread) return;
+    const std::int64_t now = NowNs();
+    if (now - g_answered_ns.load(std::memory_order_relaxed) < 250'000'000) return;
+    g_answered_ns.store(now, std::memory_order_relaxed);
+    // (Looked at, not taken: Windows counts the window as answering; its
+    // events wait for the next PumpWindow.)
+    MSG msg;
+    PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE);
+#endif
+}
+
 bool PumpWindow() {
 #ifdef PS2HOST_VULKAN
     if (g_display) {
+        g_answered_ns.store(NowNs(), std::memory_order_relaxed);
         if (!PumpDisplay()) g_closed = true;
         KeepFullscreenSetting();
         if (g_display->TakeCapture()) RequestCapture();
@@ -682,9 +760,13 @@ void SetWindowFullscreen(bool on) {
 #endif
 }
 
+bool g_panel_shown = false;      // SetWindowPanel's picture is the overlay (RefreshOverlay leaves it)
+
 namespace {
 
 std::vector<std::string> g_overlay_lines;      // SetWindowOverlay's: the panel's, a notice's
+std::string g_badge;                            // SetWindowBadge's: a few words at the top right
+constexpr char kYellow = '\x01';                // a line in yellow, the mark not drawn (the badge's)
 
 // Draws the lines as the window's overlay (none when empty).
 void DrawOverlay(const std::vector<std::string>& lines) {
@@ -711,7 +793,8 @@ void DrawOverlay(const std::vector<std::string>& lines) {
     int width = 0;
     for (const std::string& text : lines) {
         SIZE size{};
-        GetTextExtentPoint32A(dc, text.c_str(), int(text.size()), &size);
+        const int bare = !text.empty() && text[0] == kYellow ? 1 : 0;
+        GetTextExtentPoint32A(dc, text.c_str() + bare, int(text.size()) - bare, &size);
         width = std::max(width, int(size.cx));
     }
     width = std::min(1280, width + line);
@@ -734,9 +817,11 @@ void DrawOverlay(const std::vector<std::string>& lines) {
         DeleteObject(panel);
         SetBkMode(dc, TRANSPARENT);
         for (std::size_t i = 0; i < lines.size(); ++i) {
-            const bool chosen = !lines[i].empty() && lines[i][0] == '>';
+            const bool chosen = !lines[i].empty() && (lines[i][0] == '>' || lines[i][0] == kYellow);
+            const bool bare = !lines[i].empty() && lines[i][0] == kYellow;     // (its mark not drawn)
             SetTextColor(dc, chosen ? RGB(255, 210, 60) : i == 0 ? RGB(120, 190, 255) : RGB(235, 235, 235));
-            TextOutA(dc, line / 2, int(i) * line + line / 4, lines[i].c_str(), int(lines[i].size()));
+            TextOutA(dc, line / 2, int(i) * line + line / 4, lines[i].c_str() + (bare ? 1 : 0),
+                     int(lines[i].size()) - (bare ? 1 : 0));
         }
         GdiFlush();
         pixels.assign(static_cast<const std::uint32_t*>(bits), static_cast<const std::uint32_t*>(bits) + width * height);
@@ -783,7 +868,8 @@ void DrawOverlay(const std::vector<std::string>& lines) {
 
 // The FPS counter (F1, setting "fps_counter", off unless turned on): the
 // pictures shown a second, a line under whatever else the overlay says.
-void RefreshOverlay() {
+void RefreshOverlay(bool force) {
+    if (g_panel_shown) return;     // (the panel's picture over it)
     std::vector<std::string> lines = g_overlay_lines;
 #ifdef PS2HOST_VULKAN
     if (g_display && SettingOn("fps_counter", false)) {
@@ -814,16 +900,102 @@ void RefreshOverlay() {
         }
     }
 #endif
+    // A badge (a game's few words, at the top right) when no panel is up.
+    const bool badge = lines.empty() && !g_badge.empty();
+    if (badge) lines = {std::string(1, kYellow) + g_badge};
     static std::vector<std::string> shown;
-    if (lines == shown) return;                 // drawn again only when it changes
+    static bool shown_right = false;
+    if (!force && lines == shown && badge == shown_right) return;     // drawn again only when it changes
     shown = lines;
+    shown_right = badge;
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetOverlayRight(badge);
+#endif
     DrawOverlay(lines);
 }
 
 }  // namespace
 
+void SetWindowPanel(std::vector<u32> pixels, u32 width, u32 height) {
+#ifdef PS2HOST_VULKAN
+    if (!g_display) return;
+    if (pixels.empty()) {
+        if (!g_panel_shown) return;
+        g_panel_shown = false;
+        g_display->SetOverlayCentred(false);
+        g_display->SetOverlay({}, 0, 0);
+        RefreshOverlay(true);
+        return;
+    }
+    g_panel_shown = true;
+    g_display->SetOverlayCentred(true);
+    g_display->SetOverlayRight(false);
+    g_display->SetOverlay(std::move(pixels), width, height);
+#else
+    (void)pixels, (void)width, (void)height;
+#endif
+}
+
+void SetWindowReticle(std::vector<u32> pixels, u32 width, u32 height) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetReticle(std::vector<std::uint32_t>(pixels.begin(), pixels.end()), width, height);
+#else
+    (void)pixels, (void)width, (void)height;
+#endif
+}
+
+bool WindowPixelSize(u32* width, u32* height) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) {
+        *width = g_display->PixelWidth();
+        *height = g_display->PixelHeight();
+        return *width && *height;
+    }
+#endif
+    (void)width, (void)height;
+    return false;
+}
+
+bool TakePanelMouse(PanelMouseState* state) {
+    // --mouse in a run with a window: the panel's pointer too, its x and y
+    // the window's fractions (a test of the panel's tabs and rows)
+    HostMouseState scripted;
+    u32 ww = 0, wh = 0;
+    if (ScriptedMouse(&scripted) && WindowPixelSize(&ww, &wh)) {
+        state->over = scripted.over;
+        state->px = scripted.x * float(ww);
+        state->py = scripted.y * float(wh);
+        state->held = 0;
+        state->pressed = scripted.pressed;
+        state->wheel = scripted.wheel;
+        state->moved = scripted.moved;
+        return true;
+    }
+#ifdef PS2HOST_VULKAN
+    ps2gpu::Display::PanelMouse m;
+    if (g_display && g_display->TakePanelMouse(&m)) {
+        state->over = m.over;
+        state->px = m.px;
+        state->py = m.py;
+        state->held = m.held;
+        state->pressed = m.pressed;
+        state->wheel = m.wheel;
+        state->moved = m.moved;
+        return true;
+    }
+#endif
+    (void)state;
+    return false;
+}
+
 void SetWindowOverlay(const std::vector<std::string>& lines) {
     g_overlay_lines = lines;
+    RefreshOverlay();
+}
+
+void SetWindowBadge(const std::string& text) {
+    if (text == g_badge) return;
+    g_badge = text;
     RefreshOverlay();
 }
 
@@ -837,6 +1009,13 @@ void SetWindowStatus(const std::string& status) {
 
 void SetWindowAspect(const std::string& aspect) {
     SetSetting("aspect", aspect);
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetAspect(SettingAspect());
+#endif
+}
+
+void RunWindowAspect(const std::string& aspect) {
+    RunSetting("aspect", aspect);
 #ifdef PS2HOST_VULKAN
     if (g_display) g_display->SetAspect(SettingAspect());
 #endif
@@ -890,7 +1069,7 @@ bool WindowFullscreen() {
 void SetWindowKeepRefresh(bool keep) {
 #ifdef PS2HOST_VULKAN
     // (On a VRR screen, always: its own refresh is the most it can follow.)
-    if (g_display) g_display->SetKeepRefresh(keep || SettingOn("vrr"));
+    if (g_display) g_display->SetKeepRefresh(KeepRefresh(keep));
 #endif
     (void)keep;
 }
@@ -900,12 +1079,19 @@ void SetWindowVrr(bool on) {
 #ifdef PS2HOST_VULKAN
     if (g_display) {
         g_display->SetVrr(on);
-        g_display->SetKeepRefresh(on || Setting("frame_rate", "60") == "display");
+        g_display->SetKeepRefresh(KeepRefresh(Setting("frame_rate", "60") == "display"));
     }
 #endif
 }
 
 bool WindowVrr() { return SettingOn("vrr"); }
+
+void SetWindowFullscreenMode(const std::string& mode) {
+    SetSetting("fullscreen_mode", mode);
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetKeepRefresh(KeepRefresh(Setting("frame_rate", "60") == "display"));
+#endif
+}
 
 void SetWindowGpuBoost(bool on) {
     SetSettingOn("gpu_boost", on);
@@ -955,14 +1141,16 @@ ps2gpu::Display* WindowDisplay() {
 #ifdef PS2HOST_VULKAN
 namespace {
 
-/* `text` into a 640 x 448 picture (R in the low byte), centred on `y`,
-   stb_easy_font's strokes `scale` times. */
-void PictureText(std::vector<u32>& picture, const char* text, int y, int scale, u32 colour) {
+/* `text` into a 640 x 448 picture (R in the low byte), centred on `y`
+   (as if it were `centred_as`, when given), stb_easy_font's strokes `scale`
+   times. */
+void PictureText(std::vector<u32>& picture, const char* text, int y, int scale, u32 colour,
+                 const char* centred_as = nullptr) {
     std::vector<float> quads(4 * 1024 * 4);
     unsigned char unused[4] = {255, 255, 255, 255};
     const int n = stb_easy_font_print(0, 0, const_cast<char*>(text), unused, quads.data(),
                                       int(quads.size() * sizeof(float)));
-    const int x0 = (640 - stb_easy_font_width(const_cast<char*>(text)) * scale) / 2;
+    const int x0 = (640 - stb_easy_font_width(const_cast<char*>(centred_as ? centred_as : text)) * scale) / 2;
     for (int q = 0; q < n; ++q) {
         const float* v = &quads[std::size_t(q) * 16];
         const int left = x0 + int(v[0] * scale), top = y + int(v[1] * scale);
@@ -983,10 +1171,20 @@ void PictureText(std::vector<u32>& picture, const char* text, int y, int scale, 
    10 s, the rest made in the background as the game starts (the way
    before the screen: a driver with no cache of its own took long enough
    that players took the game for hung - issue #29); the log says how far
-   it got every 2 s. PS2HOST_PIPELINE_WAIT_S: that limit (0: none). */
-void WaitForGpuPipelines() {
+   it got every 2 s. PS2HOST_PIPELINE_WAIT_S: that limit (0: none).
+   Since the native renderer (a cold NVIDIA driver: the whole shader's
+   pipeline half a minute, the rest a minute or more on four workers) the
+   screen is up while the renderer itself is made too (`preparing`, on
+   another thread: the window answering, not "not responding"), and stays
+   until all are made - two minutes at most: a pipeline made in the middle
+   of the game froze it for seconds. */
+void WaitForGpuPipelines(const std::atomic<bool>* preparing) {
 #ifdef PS2HOST_VULKAN
-    if (!g_display) return;
+    auto still_preparing = [&] { return preparing && preparing->load(); };
+    if (!g_display) {
+        while (still_preparing()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return;
+    }
     const auto began = std::chrono::steady_clock::now();
     std::size_t made = 0, total = 0;
     bool shown = false;
@@ -996,11 +1194,13 @@ void WaitForGpuPipelines() {
 #ifdef __ANDROID__
     int limit_s = 0;
 #else
-    int limit_s = 10;
+    int limit_s = 120;
 #endif
     if (const char* limit = std::getenv("PS2HOST_PIPELINE_WAIT_S")) limit_s = std::atoi(limit);
     auto said = began;
-    while (ps2gpu::PipelineWarmProgress(&made, &total) || std::chrono::steady_clock::now() - began < hold) {
+    for (;;) {
+        const bool warming = ps2gpu::PipelineWarmProgress(&made, &total);
+        if (!warming && !still_preparing() && std::chrono::steady_clock::now() - began >= hold) break;
         const auto now = std::chrono::steady_clock::now();
         if (now - said >= std::chrono::seconds(2)) {
             said = now;
@@ -1008,7 +1208,7 @@ void WaitForGpuPipelines() {
                          std::chrono::duration<double>(now - began).count());
             std::fflush(stderr);
         }
-        if (limit_s > 0 && now - began >= std::chrono::seconds(limit_s) && now - began >= hold) {
+        if (limit_s > 0 && !still_preparing() && now - began >= std::chrono::seconds(limit_s) && now - began >= hold) {
             std::fprintf(stderr, "[window] first start: the game goes on after %d s, %zu of %zu GPU pipelines made "
                          "(the rest in the background)\n", limit_s, made, total);
             g_pipelines_behind = true;      // said on the screen until made (PumpWindow)
@@ -1030,10 +1230,17 @@ void WaitForGpuPipelines() {
             char count[64];
             std::snprintf(count, sizeof count, "%zu of %zu", made, total);
             PictureText(picture, count, 280, 2, 0xFFC0C0C0u);
-            if (!g_display->Present(picture.data(), 640, 448)) break;
+            if (!g_display->Present(picture.data(), 640, 448) && !still_preparing()) break;
         }
+        g_answered_ns.store(NowNs(), std::memory_order_relaxed);
         if (!g_display->Pump()) {
             g_closed = true;
+            // (Closed while the renderer is still being made: nothing of the
+            // game's begun, nothing to keep - gone at once, not after it.)
+            if (still_preparing()) {
+                std::fflush(nullptr);
+                std::_Exit(0);
+            }
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(shown ? 30 : 5));
@@ -1041,6 +1248,63 @@ void WaitForGpuPipelines() {
     if (shown && made == total)
         std::fprintf(stderr, "[window] first start: %zu GPU pipelines made in %.1f s behind the loading screen\n", total,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count());
+#endif
+}
+
+namespace {
+std::mutex g_loading_mutex;
+std::vector<std::string> g_loading_lines;      // SetLoadingScreen's
+std::vector<u32> g_loading_picture;            // SetLoadingPicture's, 640 x 448
+std::atomic<bool> g_loading_shown{false};
+}  // namespace
+
+void SetLoadingScreen(const std::vector<std::string>& lines) {
+    std::lock_guard<std::mutex> lock(g_loading_mutex);
+    g_loading_lines = lines;
+    g_loading_picture.clear();
+    g_loading_shown = !lines.empty();
+}
+
+void SetLoadingPicture(const std::vector<u32>& pixels, u32 width, u32 height) {
+    std::vector<u32> scaled;
+    if (width && height && pixels.size() >= std::size_t(width) * height) {
+        scaled.resize(640 * 448);
+        for (u32 y = 0; y < 448; ++y)
+            for (u32 x = 0; x < 640; ++x)
+                scaled[std::size_t(y) * 640 + x] = pixels[std::size_t(y * height / 448) * width + x * width / 640];
+    }
+    std::lock_guard<std::mutex> lock(g_loading_mutex);
+    g_loading_lines.clear();
+    g_loading_picture = std::move(scaled);
+    g_loading_shown = !g_loading_picture.empty();
+}
+
+bool LoadingScreenShown() { return g_loading_shown; }
+
+bool LoadingScreen(std::vector<u32>* pixels) {
+#ifdef PS2HOST_VULKAN
+    std::vector<std::string> lines;
+    {
+        std::lock_guard<std::mutex> lock(g_loading_mutex);
+        if (!g_loading_picture.empty()) {
+            *pixels = g_loading_picture;
+            return true;
+        }
+        if (g_loading_lines.empty()) return false;
+        lines = g_loading_lines;
+    }
+    pixels->assign(640 * 448, 0xFF000000u);
+    // The heading, its dots counting the time (that it is not hung).
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const std::string heading = lines[0] + std::string(std::size_t(ms / 400 % 4), '.');
+    PictureText(*pixels, heading.c_str(), 190, 4, 0xFFFFFFFFu, (lines[0] + "...").c_str());   // (still as they count)
+    for (std::size_t i = 1; i < lines.size(); ++i)
+        PictureText(*pixels, lines[i].c_str(), 240 + int(i - 1) * 24, 2, 0xFFB0B0B0u);
+    return true;
+#else
+    (void)pixels;
+    return false;
 #endif
 }
 
@@ -1054,8 +1318,11 @@ void PresentFrame() {
         KeepFullscreenSetting();
         std::vector<u32> pixels;
         u32 w = 0, h = 0;
-        const bool got = (g_picture_source && g_picture_source(&pixels, &w, &h)) || gs::TheGs().Picture(&pixels, &w, &h);
-        if (got && !g_display->Present(pixels.data(), w, h)) {
+        bool got = LoadingScreen(&pixels);          // a port's loading screen in the game's place
+        if (got) w = 640, h = 448;
+        else got = (g_picture_source && g_picture_source(&pixels, &w, &h)) || gs::TheGs().Picture(&pixels, &w, &h);
+        // (A lost device is no closed window: made again at the frame's start, gpu_bridge's RecoverLostGpu.)
+        if (got && !g_display->Present(pixels.data(), w, h) && !ps2gpu::DeviceLost()) {
             std::fprintf(stderr, "[window] a picture could not be shown: the window closed\n");
             g_closed = true;
         }

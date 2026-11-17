@@ -44,7 +44,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <thread>
 #include <bitset>
+#include <chrono>
+#include <deque>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -58,6 +61,8 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
+#include <xmmintrin.h>
 #include <vector>
 
 #define XXH_INLINE_ALL
@@ -66,6 +71,8 @@
 #include "ps2host/gs.h"
 #include "ps2host/gs_blend.h"
 #include "ps2host/profile.h"
+#include "ps2host/native_chars.h"
+#include "ps2host/rw_native.h"
 #include "ps2host/run.h"
 #include "ps2host/timeline.h"
 #include "ps2host/settings.h"
@@ -94,10 +101,22 @@ std::atomic<u32> g_rule_begin{0}, g_rule_end{0}, g_rule_fbw{0};
 // (PS2HOST_MODERN_TEXTURES=1: on from the start - a capture's replay)
 std::atomic<bool> g_modern_textures{std::getenv("PS2HOST_MODERN_TEXTURES") != nullptr};
 void SetGpuModernTextures(bool on) { g_modern_textures = on; }
+void SetGpuEdgeReach(bool on) {
+#if PS2HOST_VULKAN
+    ps2gpu::SetGpuEdgeReach(on);
+#else
+    (void)on;
+#endif
+}
 // SetGpuTextureFilter's: the filter (0 the game's) and the anisotropic taps'
 // log2 (GsDrawState::tag bits 8-10).
 std::atomic<int> g_texture_filter{0}, g_texture_taps{3};
+// (PS2HOST_NO_AUTO_LEVELS=1: a game's textures without levels drawn from level 0 alone, as before - to compare)
+const bool g_no_auto_levels = std::getenv("PS2HOST_NO_AUTO_LEVELS") != nullptr;
 void SetGpuTextureFilter(int filter, int taps) {
+    // (PS2HOST_TEXTURE_FILTER=<filter>: a test's, whatever the game sets - a scripted run's --setting comes after
+    // the game's start applied its own)
+    if (const char* test = std::getenv("PS2HOST_TEXTURE_FILTER")) filter = std::atoi(test), taps = 16;
     int log2 = 0;
     while (log2 < 4 && (2 << log2) <= taps) ++log2;
     g_texture_filter = filter;
@@ -237,6 +256,7 @@ struct Cached {
     std::vector<const Owned*> over;
     std::size_t owned_seen = 0;
     std::list<u64>::iterator lru;
+    u64 bytes = 0;                  // its image's on the GPU (every level), for the cache's budget
 };
 
 struct Bridge {
@@ -267,6 +287,8 @@ struct Bridge {
     std::map<std::tuple<u32, u32, u32, bool>, Owned> owned;
     std::unordered_map<u64, Cached> textures;
     std::list<u64> texture_lru;     // most recent first
+    u64 texture_bytes = 0;          // the cached textures' images, in all (Cached::bytes)
+    u64 texture_budget = 0;         // the renderer's TextureBudget, asked once
     // The textures over each page (32 blocks) of local memory, for what a
     // write there invalidates: scanning all 2,048 on every write was 3% of a
     // race. Elements of `textures` stay put until erased. Each with its
@@ -994,6 +1016,15 @@ bool Replace(Bridge& b, Cached& t) {
                                            image->data.data(), image->data.size()))
             return false;
     }
+    // ...and its surface detail (texture_pack.h's _n file), for the native renderer's lighting.
+    if (const auto& detail = image->material) {
+        if (!b.renderer->HasReplacement(detail->id) &&
+            b.renderer->UploadReplacement(detail->id, detail->format, detail->width, detail->height, detail->levels,
+                                          detail->data.data(), detail->data.size()))
+            b.renderer->UseMaterial(image->id, detail->id);
+        else if (b.renderer->HasReplacement(detail->id))
+            b.renderer->UseMaterial(image->id, detail->id);
+    }
     ++g_mutations;
     b.renderer->UseReplacement(t.renderer_key, image->id);
     t.replaced = true;
@@ -1003,7 +1034,7 @@ bool Replace(Bridge& b, Cached& t) {
     return true;
 }
 
-u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
+u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th, u32 auto_levels = 1) {
     const u32 tbp = Bits(c.tex0, 0, 14), tbw = Bits(c.tex0, 14, 6), psm = Bits(c.tex0, 20, 6);
     // What decides the decoded texels: where and how it is stored (TBP0, TBW,
     // PSM, TW, TH), how a region mode wraps it (CLAMP), TEXA, the CLUT's
@@ -1016,9 +1047,15 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
     gs::MipLevels mips = gs::LevelsOf(c);
     if (!gs::MipMode(c)) mips.count = 1;        // levels never read: not decoded
     for (u32 n = 1; n < mips.count; ++n) key ^= (u64(mips.tbp[n]) << 6 | mips.tbw[n]) * (0x9E3779B97F4A7C15ull + n);
+    if (auto_levels > 1) key ^= u64(auto_levels) * 0xD6E8FEB86659FD93ull;     // (its levels made: another decode)
     Cached& t = b.textures[key];
     if (!t.renderer_key) {
         t.renderer_key = b.next_texture++;
+        // (its image as the renderer makes it: TW wide, its levels below one another)
+        u64 rows = 0;
+        for (u32 n = 0; n < std::max(mips.count, auto_levels); ++n) rows += std::max(1u, th >> n);
+        t.bytes = u64(tw) * rows * 4;
+        b.texture_bytes += t.bytes;
         b.texture_lru.push_front(key);
         t.lru = b.texture_lru.begin();
         ++g_mutations;
@@ -1082,6 +1119,7 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
         d.ta1 = Bits(texa, 32, 8);
         d.csa = Bits(c.tex0, 56, 5);
         d.levels = mips.count;
+        d.auto_levels = auto_levels;
         for (u32 n = 0; n < mips.count; ++n) {
             d.level_tbp[n] = mips.tbp[n];
             d.level_tbw[n] = mips.tbw[n];
@@ -1175,16 +1213,25 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
         t.decoded = true;
     }
     const u64 renderer_key = t.renderer_key;
-    // Keep the cache bounded: the least recently used go (4,096: a race keeps
-    // over 2,048 about, and each one evicted came back decoded again).
-    while (b.textures.size() > 4096) {
+    // Keep the cache bounded: the least recently used go - past 4,096 (a race
+    // keeps over 2,048 about, and each one evicted came back decoded again) or
+    // past the renderer's budget in bytes (a long game's 4,096 large textures,
+    // each TEXTURE FILTER its own, took the GPU's whole memory: its next images
+    // were not made, the game's surfaces white). Never this draw's own.
+    if (!b.texture_budget) {
+        b.texture_budget = std::max<u64>(b.renderer->TextureBudget(), u64(1) << 20);
+        std::fprintf(stderr, "[gpu] textures kept on the GPU: up to %llu MB\n", (unsigned long long)(b.texture_budget >> 20));
+    }
+    while (b.textures.size() > 1 && (b.textures.size() > 4096 || b.texture_bytes > b.texture_budget)) {
         const u64 old = b.texture_lru.back();
+        if (old == key) break;
         b.texture_lru.pop_back();
         auto found = b.textures.find(old);
         if (found != b.textures.end()) {
             ++g_mutations;
             b.renderer->ReleaseTexture(found->second.renderer_key);
             b.IndexTexture(&found->second, false);
+            b.texture_bytes -= std::min(b.texture_bytes, found->second.bytes);
             b.textures.erase(found);
         }
     }
@@ -1348,6 +1395,132 @@ u64 g_draws = 0;
 void DrawOn(Bridge& s, const ps2gpu::GsDrawState& state, const ps2gpu::GsVertex* v, std::size_t n) {
     ++g_draws;
     s.renderer->DrawTriangles(state, v, n);
+}
+
+/* A native draw going through OnDraw (OnNative's): OnDraw's state, target and
+   bookkeeping for it, its renderer call the mesh's. */
+struct NativeDraw {
+    const u32* words;
+    u32 count;
+    u32 ofx, ofy;           // XYOFFSET as the GS's decoding takes it
+    bool drawn;
+    bool texture_moved = false;     // its texture a target found inside another (OnDraw's t_offset: the mesh's own
+                                    // coordinates know nothing of it)
+};
+NativeDraw* g_native = nullptr;
+bool g_meshes_drawn = false;            // the renderer draws meshes (the bridge's start)
+bool g_enhanced_drawn = false;          // ...and their enhanced draws (DrawsEnhancedMeshes)
+std::unordered_set<u64> g_meshes;       // the meshes the renderer holds (UploadMesh), by key
+
+/* Its payload: [0] flags (1 a mesh to upload, 2 every mesh released first), [1-2] the key, [3-4] the tag's
+   PRIM, [5-128] the header (VU1 rows 0-23, vf11-vf17); with 1: [129] quadwords, [130] indices, the quadwords,
+   the indices. */
+// (the header: rows 0-23 and vf11-vf17, 124 words, then the two kept vertices' packet words, 24)
+// (and the enhanced draws' ext, 48: gs_mesh_enhanced.glsl)
+constexpr u32 kNativeHeaderWords = 196, kNativeHead = 5 + kNativeHeaderWords;
+
+/* A room payload's own triangles for this draw (flag 8: last, after the upload's place - a count, then the
+   indices), or none. */
+const u32* RoomDrawIndices(const u32* words, u32 count, u32* n) {
+    if (!(words[0] & 8) || (words[0] & 0x100)) return nullptr;
+    u32 at = kNativeHead;
+    if ((words[0] & 1) && count >= kNativeHead + 2) at += 2 + words[kNativeHead] * 4 + words[kNativeHead + 1];
+    if (count < at + 1 || count < at + 1 + words[at]) return nullptr;
+    *n = words[at];
+    return words + at + 1;
+}
+
+/* The mesh drawn in `state` (OnDraw's), its places moved as OnDraw moves a
+   primitive's (x_offset, y_offset: XYOFFSET less them). */
+/* The characters' payload (flag 0x100): [0] flags, [1-2] the key, [3-4] the tag's PRIM, [5] the header's
+   quadwords H (gs_mesh_chars.vert's: vf00-vf21, rows 11-13, misc - the bridge's XYOFFSET in its x and y -,
+   the matrices' rows), [6] this draw's indices N, the header (4H words), the indices; with 1: the vertices'
+   quadwords Q, the vertices (five quadwords each). With 0x200 too: RenderWare's (gs_mesh_rw.vert, ps2host/
+   rw_native.h: the header's misc its first quadword, the vertices of the program's own size). */
+bool NativeCharacters(Bridge& s, const ps2gpu::GsDrawState& state, u32 x_offset, u32 y_offset) {
+    const NativeDraw& n = *g_native;
+    if (n.count < 7) return false;
+    const u64 key = u64(n.words[1]) | u64(n.words[2]) << 32;
+    const u32 quads = n.words[5], indices = n.words[6];
+    if (n.count < 7 + quads * 4 + indices || quads * 4 > ps2gpu::GsRenderer::kMeshHeaderMost) return false;
+    if (!g_meshes.count(key) || !s.renderer->MeshDrawable(state)) return false;
+    static std::vector<float> header;
+    header.resize(std::size_t(quads) * 4);
+    std::memcpy(header.data(), n.words + 7, header.size() * 4);
+    const bool rw = (n.words[0] & 0x200) != 0;
+    const u32 misc = rw ? ps2host::rw_native::kRwMisc : 25;
+    header[misc * 4 + 0] = float(n.ofx) - 16.0f * float(x_offset);
+    header[misc * 4 + 1] = float(n.ofy) - 16.0f * float(y_offset);
+    ps2gpu::GsRenderer::MeshCall mc;
+    mc.program = rw ? ps2gpu::GsRenderer::kMeshRenderWare : ps2gpu::GsRenderer::kMeshCharacters;
+    mc.header = header.data();
+    mc.header_floats = header.size();
+    mc.indices = n.words + 7 + quads * 4;
+    mc.index_count = indices;
+    ++g_draws;
+    s.renderer->DrawMeshWith(state, key, mc);
+    return true;
+}
+
+/* A native draw declined (drawn some other way): why, and the state it had, for the first few - an item picked
+   up froze the GPU twice right after one (2026-11-11), the item's picture drawn into an image of its own. */
+void NoteDeclined(const char* why, const ps2gpu::GsDrawState& state, const NativeDraw& n) {
+    static int told = 0;
+    if (told++ >= 24) return;
+    std::fprintf(stderr,
+                 "[gpu] native draw declined (%s): %s, target %X/%u psm %02X %ux%u, texture %s%X, sprite %d, alpha test %d "
+                 "(atst %u afail %u), %u words\n",
+                 why, (n.words[0] & 0x100) ? "characters" : "room", unsigned(state.fbp), unsigned(state.fbw),
+                 unsigned(state.psm), unsigned(state.width), unsigned(state.height),
+                 state.texture_target ? "target " : "memory ", unsigned(state.texture_target ? state.tex_fbp : 0),
+                 int(state.sprite), int(state.alpha_test), unsigned(state.atst), unsigned(state.afail), unsigned(n.count));
+    std::fflush(stderr);
+}
+
+bool NativeMesh(Bridge& s, const ps2gpu::GsDrawState& state, u32 x_offset, u32 y_offset, const gs::Context& c) {
+    const NativeDraw& n = *g_native;
+    // (a target sampled as the texture: brought up to date over the whole texture (OnDraw) - but one found inside
+    // another target, its rows lower, the mesh's coordinates would need moving too: the packet's way)
+    if (state.texture_target && n.texture_moved) {
+        NoteDeclined("its texture a target inside another", state, n);
+        return false;
+    }
+    if (n.words[0] & 0x100) {
+        const bool drawn = NativeCharacters(s, state, x_offset, y_offset);
+        if (!drawn) NoteDeclined("the characters' declined", state, n);
+        return drawn;
+    }
+    const u64 key = u64(n.words[1]) | u64(n.words[2]) << 32;
+    if (!g_meshes.count(key)) {
+        NoteDeclined("its mesh not held", state, n);
+        return false;
+    }
+    if (!s.renderer->MeshDrawable(state)) {
+        NoteDeclined("not drawable so (feedback, the shader's blending, two passes or a sprite)", state, n);
+        return false;
+    }
+    float header[ps2gpu::GsRenderer::kMeshHeaderFloats] = {};
+    std::memcpy(header, n.words + 5, 124 * 4);
+    (void)c;
+    header[124] = float(n.ofx) - 16.0f * float(x_offset);
+    header[125] = float(n.ofy) - 16.0f * float(y_offset);
+    header[126] = 1.0f;                 // (the mesh's first two vertices the kept, below)
+    std::memcpy(header + 128, n.words + 5 + 124, 24 * 4);
+    std::memcpy(header + ps2gpu::GsRenderer::kMeshRoomExt, n.words + 5 + 148, 48 * 4);
+    ++g_draws;
+    u32 draw_count = 0;
+    if (const u32* draw = RoomDrawIndices(n.words, n.count, &draw_count)) {
+        ps2gpu::GsRenderer::MeshCall mc;
+        mc.program = ps2gpu::GsRenderer::kMeshRoom;
+        mc.header = header;
+        mc.header_floats = ps2gpu::GsRenderer::kMeshHeaderFloats;
+        mc.indices = draw;
+        mc.index_count = draw_count;
+        if (draw_count) s.renderer->DrawMeshWith(state, key, mc);
+        return true;
+    }
+    s.renderer->DrawMesh(state, key, header);
+    return true;
 }
 
 /* A sprite's Z into its own colour target's memory (OnDraw's z_as_colour),
@@ -1723,6 +1896,29 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     // state (a large struct) is made past the fast path below, which reuses
     // the one before.
     const u32 frame_psm = Bits(c.frame, 24, 6), frame_width = std::min(2048u, std::max(1u, Bits(c.frame, 16, 6)) * 64);
+    // A FRAME no GS draws into (a format of textures', or none): not a
+    // game's but a broken packet's (File #2's lists with another list's
+    // colours written over their tags, 2026-11-13: FRAME 165/58 psm 25 and a
+    // hundred more) - each one an image made and kept, its pages over the
+    // room's textures, written back and loaded again every picture after.
+    // Nothing drawn, nothing made.
+    if (s.primary) {
+        switch (frame_psm) {
+            case gs::PSMCT32: case gs::PSMCT24: case gs::PSMCT16: case gs::PSMCT16S:
+            case gs::PSMZ32: case gs::PSMZ24: case gs::PSMZ16: case gs::PSMZ16S:
+                break;
+            default: {
+                static int told = 0;
+                if (told < 8) {
+                    ++told;
+                    std::fprintf(stderr, "[gpu] a draw into FRAME %X/%u psm %02X (no frame's format): not drawn\n",
+                                 unsigned(Bits(c.frame, 0, 9)), unsigned(Bits(c.frame, 16, 6)), unsigned(frame_psm));
+                    std::fflush(stderr);
+                }
+                return;
+            }
+        }
+    }
     // The rows a page holds twice over in a 16-bit format: a 16-bit view of a
     // 448-row picture is 896 rows (Burnout 3 writes its depth into the
     // picture's alpha through one - at 512 rows, the lower half went unwritten,
@@ -1823,7 +2019,18 @@ void OnDraw(const gs::Gs::DrawCall& call) {
             for (std::size_t i = 0; i < n; ++i) v[i].t += float(fast.t_offset) * v[i].q / float(fast.th);
         // The renderer's last draw this state's (but for gouraud) when
         // nothing has drawn since the one before this.
-        if (fast.last_draw == g_draws) {
+        if (g_native) {
+            // (a texture moved within another target, a Z clamped below 24 bits: not the mesh's - the packet's)
+            static const bool decline_all = std::getenv("PS2HOST_NATIVE_DECLINE") != nullptr;
+            if (decline_all) return;
+            if (fast.t_offset || fast.zmax < 0xFFFFFFu) {
+                NoteDeclined(fast.t_offset ? "its texture moved within another target (fast)" : "its Z clamped below 24 bits (fast)",
+                             st, *g_native);
+                return;
+            }
+            if (!NativeMesh(s, st, 0, fast.y_offset, c)) return;
+            g_native->drawn = true;
+        } else if (fast.last_draw == g_draws) {
             ++g_draws;
             s.renderer->DrawTrianglesAgain(st, v, n);
         } else {
@@ -1962,8 +2169,19 @@ void OnDraw(const gs::Gs::DrawCall& call) {
                 if (s.primary) {
                     Owned& source = s.owned[std::make_tuple(tex_fbp, tex_fbw, psm, false)];
                     Pages sampled;
-                    if (SampledPages(source, c.clamp, tw, th, v, n, &sampled)) Sample(s, source, sampled);
-                    else Use(s, tex_fbp, tex_fbw, psm, false, source.width, source.height, 1);   // sampling grows nothing
+                    if (g_native) {
+                        // (a native draw's coordinates are its mesh's, not the stand-in's: the whole texture, as
+                        // far as the target reaches - brought up to date only where it lacks something)
+                        g_native->texture_moved = t_offset != 0;
+                        if (tw <= std::max(1u, source.fbw) * 64)
+                            Sample(s, source, PagesOf(source, 0, tw, 0, std::max(1u, th)));
+                        else
+                            Use(s, tex_fbp, tex_fbw, psm, false, source.width, source.height, 1);
+                    } else if (SampledPages(source, c.clamp, tw, th, v, n, &sampled)) {
+                        Sample(s, source, sampled);
+                    } else {
+                        Use(s, tex_fbp, tex_fbw, psm, false, source.width, source.height, 1);   // sampling grows nothing
+                    }
                     tex_source = &source;
                 }
                 if (tex_format == 4 && b_clut_rows_cpu_only(s)) {
@@ -1982,9 +2200,20 @@ void OnDraw(const gs::Gs::DrawCall& call) {
             state.ta1 = Bits(call.texa, 32, 8);
             state.aem = Bits(call.texa, 15, 1) != 0;
         }
+        // TEXTURE FILTER trilinear or anisotropic on a 3D draw whose texture has no levels of its own (Outbreak's
+        // every one): levels made from it (GsTextureDecode::auto_levels) and filtered as a modern GPU would - not
+        // for a region mode's (an atlas: its neighbours would bleed in) or a small texture.
+        u32 auto_levels = 1;
+        if (s.primary && !state.texture_target && type != 6 && g_texture_filter.load(std::memory_order_relaxed) >= 3 &&
+            !gs::MipMode(c) && Bits(c.clamp, 0, 2) < 2 && Bits(c.clamp, 2, 2) < 2 && std::min(tw, th) >= 8 &&
+            s.renderer->MakesTextureLevels() && !g_no_auto_levels) {
+            u32 n = 0;
+            while ((2u << n) <= std::min(tw, th)) ++n;
+            auto_levels = std::min(7u, n + 1);
+        }
         if (!state.texture_target) {
             if (s.primary) {
-                state.texture = CachedTexture(s, c, call.texa, tw, th);
+                state.texture = CachedTexture(s, c, call.texa, tw, th, auto_levels);
             } else {
                 // Decoded again when the texture's registers change, local memory
                 // is uploaded into, or a draw since went into the texture's blocks.
@@ -2033,6 +2262,11 @@ void OnDraw(const gs::Gs::DrawCall& call) {
                 if (m && filter >= 3) state.tag |= 2u;
             }
             state.mip = m;
+            if (auto_levels > 1) {
+                // (its made levels: trilinear between them, MODERN's footprint - LCM, K 0: never the GS's LOD)
+                state.mip = 2u | (auto_levels - 1) << 2 | 5u << 5 | kMmag | 1u << 9;
+                state.tag |= 2u;
+            }
         }
         state.wms = Bits(c.clamp, 0, 2);
         state.wmt = Bits(c.clamp, 2, 2);
@@ -2114,10 +2348,33 @@ void OnDraw(const gs::Gs::DrawCall& call) {
         }
     }
 
-    for (std::size_t i = 0; i < n; ++i) v[i].z = std::min(v[i].z, zmax);
-    // Not timed apart: tens of millions of primitives a race, and a timer's
-    // two clock reads each cost as much as recording one.
-    DrawOn(s, state, v, n);
+    if (g_native) {
+        // PS2HOST_NATIVE_DECLINE=1 (a test): every native draw declined here - drawn from the CPU's copy, as one this
+        // state turns away (a zombie's attack: thousands of them, 2026-11-11).
+        static const bool decline_all = std::getenv("PS2HOST_NATIVE_DECLINE") != nullptr;
+        // A target wider than a picture (File #2's 1344-wide view of an item
+        // picked up, a hit taken: FBW 21, over most of local memory): a native
+        // draw's pixels are its whole scissor's as far as memory knows (no
+        // vertices here) - its pages all newer than memory, the textures over
+        // them read from it and later written back with it: the room's
+        // surfaces noise until it loaded again (2026-11-12). Drawn from the
+        // CPU's copy, each triangle's own pixels.
+        const bool wide = state.width > 1024;
+        if (decline_all || t_offset || z_as_colour || zmax < 0xFFFFFFu || wide) {
+            if (!decline_all)
+                NoteDeclined(t_offset ? "its texture moved within another target" : z_as_colour ? "its Z drawn as colour"
+                             : wide ? "its target wider than a picture" : "its Z clamped below 24 bits",
+                             state, *g_native);
+            return;
+        }
+        if (!s.primary || !NativeMesh(s, state, x_offset, y_offset, c)) return;
+        g_native->drawn = true;
+    } else {
+        for (std::size_t i = 0; i < n; ++i) v[i].z = std::min(v[i].z, zmax);
+        // Not timed apart: tens of millions of primitives a race, and a timer's
+        // two clock reads each cost as much as recording one.
+        DrawOn(s, state, v, n);
+    }
     if (s.primary) {
         // FBMSK over every bit the format stores: the colour is not written.
         const u32 stored = state.psm == gs::PSMCT24 ? 0xFFFFFFu : Is16(state.psm) ? 0x80F8F8F8u : 0xFFFFFFFFu;
@@ -2201,6 +2458,406 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     blocks = std::max(blocks, std::max(1u, state.fbw * 64 * e.y1 * PixelBits(state.psm) / 8 / 256));
 }
 
+/* PS2HOST_NATIVE_VERIFY=1: each native draw's triangles made on the CPU as
+   gs_mesh.vert makes them (culled as it culls), set against those its held
+   packet would have drawn (the GS's vertices, in order). */
+struct NativeVerify {
+    std::vector<gs::Vertex> made, held;     // three a triangle
+    std::unordered_map<u64, std::vector<u32>> meshes;   // the payloads' quadwords and indices, by key (kept always:
+                                                        // a draw declined with no packet after it is drawn from them)
+    u64 batches = 0, differ = 0, triangles = 0;
+    bool open = false;
+};
+NativeVerify& TheVerify() {
+    static NativeVerify* v = new NativeVerify;
+    return *v;
+}
+const bool g_native_verify = std::getenv("PS2HOST_NATIVE_VERIFY") != nullptr;
+
+// (the VU's arithmetic: each product and sum rounded - nothing fused)
+#pragma clang fp contract(off)
+void MeshTriangles(const u32* words, u32 count, u32 ofx, u32 ofy, std::vector<gs::Vertex>* made, bool* open);
+const u32* RoomDrawIndices(const u32* words, u32 count, u32* n);
+
+void VerifyMake(const u32* words, u32 count, u32 ofx, u32 ofy) {
+    NativeVerify& nv = TheVerify();
+    nv.held.clear();
+    MeshTriangles(words, count, ofx, ofy, &nv.made, &nv.open);
+}
+
+/* A payload's meshes kept (uploaded, released), and its mesh's triangles made as the microcode's packet has
+   them - its vertices as gs::Vertex, three a triangle, culled as the shader culls (the caller under the VU's
+   rounding: toward zero). *open false: the mesh not known. */
+void MeshTriangles(const u32* words, u32 count, u32 ofx, u32 ofy, std::vector<gs::Vertex>* made_out, bool* open) {
+    NativeVerify& nv = TheVerify();
+    const u64 key = u64(words[1]) | u64(words[2]) << 32;
+    if ((words[0] & 2)) nv.meshes.clear();
+    if ((words[0] & 1) && count >= kNativeHead + 2) {
+        const u32 quads = words[kNativeHead], indices = words[kNativeHead + 1];
+        std::vector<u32> m(words + kNativeHead, words + kNativeHead + 2 + quads * 4 + indices);
+        nv.meshes[key] = std::move(m);
+    }
+    std::vector<gs::Vertex>& made = *made_out;
+    made.clear();
+    *open = false;
+    auto found = nv.meshes.find(key);
+    if (found == nv.meshes.end()) return;
+    *open = true;
+    const std::vector<u32>& m = found->second;
+    const u32 quads = m[0];
+    u32 indices = m[1];
+    const float* q4 = reinterpret_cast<const float*>(m.data() + 2);
+    const u32* index = m.data() + 2 + quads * 4;
+    float h[31][4];
+    std::memcpy(h, words + 5, sizeof h);
+    const float (*k)[4] = h + 24;
+    auto ftoi = [](float y) -> u32 {
+        if (y >= 2147483648.0f) return 0x7FFFFFFFu;
+        if (y < -2147483648.0f) return 0x80000000u;
+        return u32(int32_t(y));
+    };
+    // (each product and sum rounded on its own, as the VU's: through memory, nothing fused)
+    auto M = [](float a, float b) { volatile float r = a * b; return float(r); };
+    auto A = [](float a, float b) { volatile float r = a + b; return float(r); };
+    auto D = [](float a, float b) { volatile float r = a / b; return float(r); };
+    auto dot4 = [&](const float* r0, const float* r1, const float* r2, const float* r3, const float* p, int l) {
+        return A(A(A(M(r0[l], p[0]), M(r1[l], p[1])), M(r2[l], p[2])), r3[l]);
+    };
+    struct Made { gs::Vertex v; float cull[6]; };
+    std::vector<Made> vs(quads / 4);
+    for (u32 i = 0; i < quads / 4; ++i) {
+        const float* p = q4 + i * 16;
+        const float *nrm = p + 4, *col = p + 8, *tx = p + 12;
+        float cp[4], g[4];
+        for (int l = 0; l < 4; ++l) {
+            cp[l] = dot4(h[3], h[4], h[5], h[6], p, l);
+            g[l] = dot4(h[7], h[8], h[9], h[10], p, l);
+        }
+        const float gw = std::fabs(g[3]);
+        const float cull[6] = {gw - g[0], gw + g[0], gw - g[1], gw + g[1], gw - g[2], gw + g[2]};
+        const float q = D(1.0f, cp[3]);
+        const float s = M(A(A(M(h[15][0], tx[0]), M(h[16][0], tx[1])), h[17][0]), q);
+        const float t = M(A(A(M(h[15][1], tx[0]), M(h[16][1], tx[1])), h[17][1]), q);
+        const float lx = k[4][0] - p[0], ly = k[5][0] - p[1], lz = k[6][0] - p[2];
+        const float d2 = A(A(M(lx, lx), M(ly, ly)), M(lz, lz));
+        float rs = float(1.0 / std::sqrt(double(d2)));     // (as Batch::Rsqrt)
+        // PS2HOST_NATIVE_VERIFY=shader: gs_mesh.vert's Rsqrt instead (nearest arithmetic, its exact errors)
+        static const bool shader_way = [] {
+            const char* e = std::getenv("PS2HOST_NATIVE_VERIFY");
+            return e && std::string(e) == "shader";
+        }();
+        if (shader_way) {
+            const unsigned mode = _MM_GET_ROUNDING_MODE();
+            _MM_SET_ROUNDING_MODE(_MM_ROUND_NEAREST);
+            auto bits = [](float f) { u32 b; std::memcpy(&b, &f, 4); return b; };
+            auto of = [](u32 b) { float f; std::memcpy(&f, &b, 4); return f; };
+            auto past = [](float y, float x) {
+                volatile float p = y * y;
+                const float pe = std::fma(y, y, -float(p));
+                const float t = std::fma(float(p), x, -1.0f);
+                return std::fma(pe, x, t) > 0.0f;
+            };
+            volatile float y = 1.0f / std::sqrt(d2);
+            float yy = y;
+            for (int i = 0; i < 2; ++i)
+                if (past(yy, d2)) yy = of(bits(yy) - 1);
+            if (!past(of(bits(yy) + 1), d2)) yy = of(bits(yy) + 1);
+            _MM_SET_ROUNDING_MODE(mode);
+            static u64 differ = 0, all = 0;
+            ++all;
+            if (yy != rs && ++differ <= 5)
+                std::fprintf(stderr, "[gpu] native verify: Rsqrt(%08X) the VU's %08X, the shader's %08X (%llu of %llu)\n", bits(d2),
+                             bits(rs), bits(yy), (unsigned long long)differ, (unsigned long long)all);
+            rs = yy;
+        }
+        const float atten = std::min(k[1][0] * rs, 1.0f);
+        const float lambert = std::max((lx * rs) * nrm[0] + (ly * rs) * nrm[1] + (lz * rs) * nrm[2], 0.0f);
+        int c4[4];
+        for (int l = 0; l < 4; ++l) {
+            float c = col[l];
+            if (l < 3) c = (k[2][l] * lambert + k[3][l] * col[l]) * atten + h[0][l] * col[l];
+            c4[l] = int(std::min(c, 128.0f) * h[1][l]);
+        }
+        const float fog = std::max(std::min((k[0][0] - cp[3]) * k[0][1] * 255.0f, 255.0f), 0.0f);
+        gs::Vertex v;
+        v.x = (float(ftoi(cp[0] * q * 16.0f) & 0xFFFF) - float(ofx)) / 16.0f;
+        v.y = (float(ftoi(cp[1] * q * 16.0f) & 0xFFFF) - float(ofy)) / 16.0f;
+        v.z = (ftoi(cp[2] * q * 16.0f) >> 4) & 0xFFFFFF;
+        v.r = u8(c4[0]), v.g = u8(c4[1]), v.b = u8(c4[2]), v.a = u8(c4[3]);
+        v.s = s, v.t = t, v.q = M(tx[2], q);
+        v.fog = u8((ftoi(fog * 16.0f) >> 4) & 0xFF);
+        vs[i].v = v;
+        std::memcpy(vs[i].cull, cull, sizeof cull);
+    }
+    u32 draw_count = 0;
+    if (const u32* draw = RoomDrawIndices(words, count, &draw_count)) index = draw, indices = draw_count;
+    // the two kept vertices as their packet has them (never culled by themselves)
+    for (u32 i = 0; i < 2 && i < vs.size(); ++i) {
+        const u32* kq = words + 5 + 124 + 12 * i;
+        gs::Vertex v;
+        v.x = (float(kq[8] & 0xFFFF) - float(ofx)) / 16.0f;
+        v.y = (float(kq[9] & 0xFFFF) - float(ofy)) / 16.0f;
+        v.z = (kq[10] >> 4) & 0xFFFFFF;
+        v.r = u8(kq[4]), v.g = u8(kq[5]), v.b = u8(kq[6]), v.a = u8(kq[7]);
+        std::memcpy(&v.s, kq + 0, 4), std::memcpy(&v.t, kq + 1, 4), std::memcpy(&v.q, kq + 2, 4);
+        v.fog = u8((kq[11] >> 4) & 0xFF);
+        vs[i].v = v;
+        for (float& d : vs[i].cull) d = 1.0f;
+    }
+    for (u32 i = 0; i + 2 < indices; i += 3) {
+        bool culled = false;
+        for (int d = 0; d < 6 && !culled; ++d)
+            culled = vs[index[i]].cull[d] < 0 && vs[index[i + 1]].cull[d] < 0 && vs[index[i + 2]].cull[d] < 0;
+        if (culled) continue;
+        for (int j = 0; j < 3; ++j) made.push_back(vs[index[i + j]].v);
+    }
+}
+
+#pragma clang fp contract(on)
+
+void VerifyHeld(const gs::Gs::DrawCall& call) {
+    NativeVerify& nv = TheVerify();
+    if (!nv.open) return;
+    for (u32 i = 0; i < call.count && i < 3; ++i) nv.held.push_back(call.vertices[i]);
+}
+
+void VerifyEnd() {
+    NativeVerify& nv = TheVerify();
+    if (!nv.open) return;
+    nv.open = false;
+    ++nv.batches;
+    nv.triangles += nv.held.size() / 3;
+    auto same = [](const gs::Vertex& a, const gs::Vertex& b) {
+        return a.x == b.x && a.y == b.y && a.z == b.z && a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a &&
+               a.s == b.s && a.t == b.t && a.q == b.q && a.fog == b.fog;
+    };
+    bool ok = nv.made.size() == nv.held.size();
+    size_t at = 0;
+    // (a triangle's vertices in any order: the GS's queue holds a strip's turning round)
+    for (; ok && at < nv.made.size(); ++at) {
+        const size_t tri = at / 3 * 3;
+        bool found = false;
+        for (size_t j = tri; j < tri + 3 && !found; ++j) found = same(nv.made[at], nv.held[j]);
+        if (!found) ok = false;
+    }
+    if (!ok && ++nv.differ <= 8) {
+        std::fprintf(stderr, "[gpu] native verify: batch %llu differs - %zu vertices made, %zu held",
+                     (unsigned long long)nv.batches, nv.made.size(), nv.held.size());
+        if (at > 0 && at <= nv.made.size() && at + 1 <= nv.held.size() + 1) {
+            auto bits = [](float f) { u32 b; std::memcpy(&b, &f, 4); return b; };
+            auto show = [&](const char* what, const gs::Vertex& v) {
+                std::fprintf(stderr, "; %s %08X %08X z %X rgba %02X%02X%02X%02X stq %08X %08X %08X f %u", what, bits(v.x),
+                             bits(v.y), v.z, v.r, v.g, v.b, v.a, bits(v.s), bits(v.t), bits(v.q), v.fog);
+            };
+            show("made", nv.made[at - 1]);
+            const size_t tri = (at - 1) / 3 * 3;
+            for (size_t j = tri; j < tri + 3 && j < nv.held.size(); ++j) show("held", nv.held[j]);
+        }
+        std::fprintf(stderr, "\n");
+    }
+    if (nv.batches % 50000 == 0)
+        std::fprintf(stderr, "[gpu] native verify: %llu batches, %llu triangles, %llu batches different\n",
+                     (unsigned long long)nv.batches, (unsigned long long)nv.triangles, (unsigned long long)nv.differ);
+}
+
+/* A native draw (gs::Gs::Native): its meshes uploaded or released, then drawn
+   through OnDraw as a primitive covering the scissor would be - the state,
+   target and depth buffer made, the pages it may reach brought up to date and
+   marked drawn - its renderer call the mesh's. False: not drawn (the packet's). */
+bool OnNative(const gs::Gs::NativeCall& call) {
+    Bridge& s = *g_bridge;
+    if (!s.primary || call.count < 7) return false;
+    const u32 flags = call.words[0];
+    const u64 key = u64(call.words[1]) | u64(call.words[2]) << 32;
+    if (flags & 2) {
+        // (every mesh of the payload's kind: the room's, or the characters')
+        const bool chars = (flags & 0x100) != 0;
+        for (auto it = g_meshes.begin(); it != g_meshes.end();) {
+            if (((*it >> 63) != 0) == chars) {
+                s.renderer->ReleaseMesh(*it);
+                it = g_meshes.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    if (flags & 0x100) {
+        // The characters': their vertices uploaded (no indices of their own: each draw's).
+        const u32 quads = call.words[5], indices = call.words[6];
+        const u32 at = 7 + quads * 4 + indices;
+        if ((flags & 1) && call.count >= at + 1 && !g_meshes.count(key)) {
+            const u32 vertices = call.words[at];
+            if (call.count >= at + 1 + vertices * 4) {
+                s.renderer->UploadMesh(key, call.words + at + 1, vertices, nullptr, 0);
+                g_meshes.insert(key);
+            }
+        }
+    } else if (call.count < kNativeHead) {
+        return false;
+    }
+    if ((flags & 1) && !(flags & 0x100) && call.count >= kNativeHead + 2) {
+        const u32 quads = call.words[kNativeHead], indices = call.words[kNativeHead + 1];
+        if (call.count >= kNativeHead + 2 + quads * 4 + indices && !g_meshes.count(key)) {
+            const u32* at = call.words + kNativeHead + 2;
+            s.renderer->UploadMesh(key, at, quads, at + quads * 4, indices);
+            g_meshes.insert(key);
+        }
+    }
+    const gs::Context& c = *call.context;
+    // A triangle over the scissor (its bounds clamped to it and to the target).
+    const float x0 = float(Bits(c.scissor, 0, 11)), y0 = float(Bits(c.scissor, 32, 11));
+    const float w = float(Bits(c.scissor, 16, 11)) + 1.0f - x0, h = float(Bits(c.scissor, 48, 11)) + 1.0f - y0;
+    gs::Vertex v[3];
+    v[0].x = x0, v[0].y = y0;
+    v[1].x = x0 + 2.0f * w, v[1].y = y0;
+    v[2].x = x0, v[2].y = y0 + 2.0f * h;
+    static u64 generation = 0;
+    const bool no_packet = (flags & 4) != 0;
+    {
+        // (the CPU's copy of the mesh, for a draw declined with no packet after it, and the check)
+        NativeVerify& nv = TheVerify();
+        if (flags & 2) {
+            const bool chars = (flags & 0x100) != 0;
+            for (auto it = nv.meshes.begin(); it != nv.meshes.end();)
+                it = (((it->first >> 63) != 0) == chars) ? nv.meshes.erase(it) : std::next(it);
+        }
+        if ((flags & 1) && (flags & 0x100)) {
+            const u32 quads = call.words[5], indices = call.words[6], at = 7 + quads * 4 + indices;
+            if (call.count >= at + 1 && call.count >= at + 1 + call.words[at] * 4)
+                nv.meshes[key].assign(call.words + at + 1, call.words + at + 1 + call.words[at] * 4);
+        }
+        if ((flags & 1) && !(flags & 0x100) && call.count >= kNativeHead + 2) {
+            const u32 quads = call.words[kNativeHead], indices = call.words[kNativeHead + 1];
+            if (call.count >= kNativeHead + 2 + quads * 4 + indices)
+                nv.meshes[key].assign(call.words + kNativeHead, call.words + kNativeHead + 2 + quads * 4 + indices);
+        }
+    }
+    if (g_native_verify && !(flags & 0x100)) {
+        // (the VU's rounding: toward zero)
+        const unsigned mode = _MM_GET_ROUNDING_MODE();
+        _MM_SET_ROUNDING_MODE(_MM_ROUND_TOWARD_ZERO);
+        VerifyMake(call.words, call.count, call.ofx, call.ofy);
+        _MM_SET_ROUNDING_MODE(mode);
+    }
+    NativeDraw draw{call.words, call.count, call.ofx, call.ofy, false};
+    // PS2HOST_NATIVE_FALLBACK=1 (a test): every native draw with no packet after it drawn from the CPU's copy alone.
+    static const bool force_fallback = std::getenv("PS2HOST_NATIVE_FALLBACK") != nullptr;
+    if (!(force_fallback && no_packet)) {
+        g_native = &draw;
+        OnDraw(gs::Gs::DrawCall{call.prim, call.context, call.texa, v, 3, call.fogcol, call.pabe, ~0ull - ++generation});
+        g_native = nullptr;
+    }
+    if (no_packet && (flags & 0x200) && !draw.drawn) {
+        // RenderWare's declined: its triangles made on the CPU (rw_native.h, the shader's twin).
+        static std::vector<gs::Vertex> tris;
+        tris.clear();
+        auto found = TheVerify().meshes.find(key);
+        const u32 quads = call.words[5], indices = call.words[6];
+        if (found != TheVerify().meshes.end()) {
+            const float* h = reinterpret_cast<const float*>(call.words + 7);
+            const u32* index = call.words + 7 + quads * 4;
+            const std::vector<u32>& m = found->second;
+            const unsigned mode = _MM_GET_ROUNDING_MODE();
+            _MM_SET_ROUNDING_MODE(_MM_ROUND_TOWARD_ZERO);
+            for (u32 i = 0; i + 2 < indices; i += 3) {
+                bool fits = true;
+                for (int j = 0; j < 3; ++j)
+                    if (std::size_t(ps2host::rw_native::RwVertexOf(h, index[i + j]) + 1) * 12 > m.size()) fits = false;
+                if (!fits || !ps2host::rw_native::RwDrawn(h, m.data(), index[i])) continue;
+                for (int j = 0; j < 3; ++j) {
+                    ps2host::rw_native::GsVertex o;
+                    ps2host::rw_native::RwVertex(h, m.data(), ps2host::rw_native::RwVertexOf(h, index[i + j]), &o);
+                    gs::Vertex v;
+                    v.x = (float(o.xyz[0] & 0xFFFF) - float(call.ofx)) / 16.0f;
+                    v.y = (float(o.xyz[1] & 0xFFFF) - float(call.ofy)) / 16.0f;
+                    v.z = (o.xyz[2] >> 4) & 0xFFFFFF;
+                    v.r = u8(o.rgba[0]), v.g = u8(o.rgba[1]), v.b = u8(o.rgba[2]), v.a = u8(o.rgba[3]);
+                    std::memcpy(&v.s, &o.stq[0], 4), std::memcpy(&v.t, &o.stq[1], 4), std::memcpy(&v.q, &o.stq[2], 4);
+                    v.fog = u8(o.fog);
+                    tris.push_back(v);
+                }
+            }
+            _MM_SET_ROUNDING_MODE(mode);
+        }
+        for (size_t i = 0; i + 2 < tris.size(); i += 3)
+            OnDraw(gs::Gs::DrawCall{call.prim, call.context, call.texa, &tris[i], 3, call.fogcol, call.pabe,
+                                    ~0ull - ++generation});
+        draw.drawn = true;
+    } else if (no_packet && (flags & 0x100) && !draw.drawn) {
+        // The characters' declined: their triangles made on the CPU, from the payload (the vertices' CPU copy).
+        static std::vector<gs::Vertex> tris;
+        tris.clear();
+        auto found = TheVerify().meshes.find(key);
+        const u32 quads = call.words[5], indices = call.words[6];
+        if (found != TheVerify().meshes.end()) {
+            const float* h = reinterpret_cast<const float*>(call.words + 7);
+            const u32* index = call.words + 7 + quads * 4;
+            const std::vector<u32>& m = found->second;
+            const unsigned mode = _MM_GET_ROUNDING_MODE();
+            _MM_SET_ROUNDING_MODE(_MM_ROUND_TOWARD_ZERO);
+            u32 alpha;
+            std::memcpy(&alpha, h + 103, 4);
+            auto vertex = [&](u32 i) {
+                gs::Vertex v;
+                u32 stq[3], rgba[4], xyzf[4];
+                if (i < 2) {
+                    const u32* kq = reinterpret_cast<const u32*>(h + 104 + 12 * i);
+                    std::memcpy(stq, kq, 12), std::memcpy(rgba, kq + 4, 16), std::memcpy(xyzf, kq + 8, 16);
+                } else {
+                    const float* q = reinterpret_cast<const float*>(m.data() + std::size_t(i) * 20);
+                    const u32* w = m.data() + std::size_t(i) * 20;
+                    ps2host::native_chars::Vertex nv;
+                    (void)w;
+                    ps2host::native_chars::MakeVertex(h, q, true, &nv);
+                    std::memcpy(stq, nv.stq, 12);
+                    rgba[0] = nv.rgb[0], rgba[1] = nv.rgb[1], rgba[2] = nv.rgb[2], rgba[3] = alpha;
+                    xyzf[0] = nv.xyz[0], xyzf[1] = nv.xyz[1], xyzf[2] = nv.xyz[2], xyzf[3] = nv.fog4;
+                }
+                v.x = (float(xyzf[0] & 0xFFFF) - float(call.ofx)) / 16.0f;
+                v.y = (float(xyzf[1] & 0xFFFF) - float(call.ofy)) / 16.0f;
+                v.z = (xyzf[2] >> 4) & 0xFFFFFF;
+                v.r = u8(rgba[0]), v.g = u8(rgba[1]), v.b = u8(rgba[2]), v.a = u8(rgba[3]);
+                std::memcpy(&v.s, &stq[0], 4), std::memcpy(&v.t, &stq[1], 4), std::memcpy(&v.q, &stq[2], 4);
+                v.fog = u8((xyzf[3] >> 4) & 0xFF);
+                return v;
+            };
+            for (u32 i = 0; i + 2 < indices; i += 3)
+                for (int j = 0; j < 3; ++j) tris.push_back(vertex(index[i + j]));
+            _MM_SET_ROUNDING_MODE(mode);
+        }
+        for (size_t i = 0; i + 2 < tris.size(); i += 3)
+            OnDraw(gs::Gs::DrawCall{call.prim, call.context, call.texa, &tris[i], 3, call.fogcol, call.pabe,
+                                    ~0ull - ++generation});
+        draw.drawn = true;
+    } else if (!draw.drawn && no_packet) {
+        // Declined, and no packet after it: its triangles from the CPU's copy, each as the packet's would be.
+        static std::vector<gs::Vertex> tris;
+        bool open = false;
+        const unsigned mode = _MM_GET_ROUNDING_MODE();
+        _MM_SET_ROUNDING_MODE(_MM_ROUND_TOWARD_ZERO);
+        MeshTriangles(call.words, call.count, call.ofx, call.ofy, &tris, &open);
+        _MM_SET_ROUNDING_MODE(mode);
+        for (size_t i = 0; i + 2 < tris.size(); i += 3)
+            OnDraw(gs::Gs::DrawCall{call.prim, call.context, call.texa, &tris[i], 3, call.fogcol, call.pabe,
+                                    ~0ull - ++generation});
+        draw.drawn = true;
+        static u64 fallbacks = 0;
+        if (++fallbacks % 10000 == 1)
+            std::fprintf(stderr, "[gpu] native draws: %llu declined with no packet, drawn from the CPU's copy\n",
+                         (unsigned long long)fallbacks);
+    }
+    {
+        // PS2HOST_NATIVE_DRAW_LOG=1: how many were drawn so, every 50,000.
+        static const bool log = std::getenv("PS2HOST_NATIVE_DRAW_LOG") != nullptr;
+        static u64 drawn = 0, declined = 0;
+        ++(draw.drawn ? drawn : declined);
+        if (log && (drawn + declined) % 50000 == 0)
+            std::fprintf(stderr, "[gpu] native draws: %llu drawn, %llu left to their packets; %zu meshes held\n",
+                         (unsigned long long)drawn, (unsigned long long)declined, g_meshes.size());
+    }
+    return draw.drawn;
+}
+
 /* `alpha`: the pixels' own (else opaque). */
 void WriteBmp(const std::string& path, const std::vector<u32>& rgba, u32 stride, u32 w, u32 h, bool alpha) {
     std::FILE* f = std::fopen(path.c_str(), "wb");
@@ -2252,6 +2909,116 @@ u32 WantedScale(const ps2gpu::Display* display) {
 /* A new internal resolution: what the GPU drew goes to its local memory
    first, the renderer drops its targets and depth buffers, and every image
    comes back from memory at the new size as it is next used. */
+/* The GPU's device lost (a hang or fault the driver reset: ps2gpu::DeviceLost) - at a frame's start on the GS
+   thread, the renderer made again on a new device (the window's, ResetDevice: the window kept) and everything
+   the bridge knew to be on the GPU forgotten: the images back from local memory as they are next used (what the
+   GPU had drawn and not written back is lost: a frame or two of what the CPU last had), every texture decoded
+   again, the CLUT and memory sent again, the native meshes uploaded again from their CPU copies. The game goes
+   on: before, it froze, every draw after declined (an item picked up, File #2, 2026-11-11).
+   A device that cannot be made at once is tried again (three times, a while between: a driver restarting takes
+   one), and one lost over and over - five times within a minute - is not made again: a GPU or a driver that
+   cannot hold a device, the game ended with that said rather than resetting it for good.
+   PS2HOST_GPU_LOSE_AT_FRAME=n (a test): the device taken as lost at frame n. */
+bool RecoverLostGpu(Bridge& b, u64 frame) {
+    static const u64 lose_at = std::getenv("PS2HOST_GPU_LOSE_AT_FRAME")
+                                   ? std::strtoull(std::getenv("PS2HOST_GPU_LOSE_AT_FRAME"), nullptr, 10) : 0;
+    static bool lost_once = false;
+    if (lose_at && frame >= lose_at && !lost_once && g_meshes.size() >= 200) {     // (in a scene: its meshes to send again)
+        lost_once = true;
+        ps2gpu::LoseDevice();
+    }
+    if (!ps2gpu::DeviceLost()) return false;
+    const auto began = std::chrono::steady_clock::now();
+    const u32 scale = b.renderer->Scale();
+    std::fprintf(stderr, "[gpu] frame %llu: the GPU's device lost - the renderer made again\n", (unsigned long long)frame);
+    b.renderer.reset();                 // (the threaded renderer's thread joined: nothing of it left on the device)
+    ps2gpu::Display* display = WindowDisplay();
+    std::string error;
+    static std::deque<std::chrono::steady_clock::time_point> losses;
+    losses.push_back(began);
+    while (!losses.empty() && began - losses.front() > std::chrono::seconds(60)) losses.pop_front();
+    const bool over_and_over = losses.size() >= 5;
+    if (over_and_over) error = "lost five times within a minute";
+    for (int attempt = 0; attempt < 3 && !b.renderer && !over_and_over; ++attempt) {
+        if (attempt) {
+            std::fprintf(stderr, "[gpu] the device not made again (%s): tried again\n", error.c_str());
+            std::this_thread::sleep_for(std::chrono::milliseconds(500 << attempt));
+        }
+        ps2gpu::Gpu* device = nullptr;
+        if (display) {
+            if (display->ResetDevice()) device = WindowGpu();
+            else error = "the window's device";
+        } else {
+            b.gpu.reset();
+            ps2gpu::DeviceMadeAgain();
+            b.gpu = ps2gpu::CreateGpu(&error);
+            if (!b.gpu) ps2gpu::LoseDevice();       // (none: lost still)
+            device = b.gpu.get();
+        }
+        if (device) b.renderer = ps2gpu::CreateGsRenderer(*device, &error);
+        if (device && !b.renderer) ps2gpu::LoseDevice();        // (made again with the device, next time round)
+    }
+    if (!b.renderer) {
+        std::fprintf(stderr, "[gpu] the renderer could not be made again (%s): the game cannot draw\n", error.c_str());
+        std::fflush(stderr);
+        throw std::runtime_error("the GPU's device was lost and could not be made again");
+    }
+    const char* threaded = std::getenv("PS2HOST_GPU_THREAD");
+    if (!threaded || std::strcmp(threaded, "0") != 0)
+        b.renderer = ps2gpu::MakeThreadedGsRenderer(std::move(b.renderer));
+    b.renderer->SetScaleRule(g_rule_begin, g_rule_end, g_rule_fbw);
+    b.renderer->SetScale(scale);
+    // Nothing on the GPU now: the images stale (as Rescale's, nothing written back - there is nothing to read),
+    for (auto& [key, o] : b.owned) {
+        o.stale = true;
+        o.stale_beyond = false;
+        o.why = 0;
+        o.by16 = false;
+        o.stale_row0 = 0;
+        o.stale_row1 = ~0u;
+        o.stale_pages.set();
+        o.gpu_newer = false;
+        o.dirty_begin = ~0u;
+        o.dirty_end = 0;
+        o.dirty_pages.reset();
+        o.rect_dirty = false;
+        o.checked = 0;
+    }
+    // every block the CPU's to send, the CLUT's rows too,
+    std::fill(b.blocks.begin(), b.blocks.end(), Bridge::kCpuNewer);
+    b.patch.blocks.clear();
+    b.clut_cpu = 0xFFFF;
+    b.clut_gpu = 0;
+    // no texture decoded,
+    b.textures.clear();
+    b.texture_lru.clear();
+    for (auto& page : b.texture_pages) page.clear();
+    b.texture_bytes = 0;
+    b.texture_budget = 0;
+    b.texture_state = {~0ull, 0, 0, 0};
+    b.drawn.clear();
+    b.depth_seeded.clear();
+    g_held = -1;
+    // and the native meshes again, from the CPU's copies (TheVerify's, kept for a declined draw).
+    g_meshes.clear();
+    std::size_t meshes = 0;
+    for (const auto& [key, m] : TheVerify().meshes) {
+        if (key >> 63) {                // the characters': their vertices, four words a quadword
+            b.renderer->UploadMesh(key, m.data(), m.size() / 4, nullptr, 0);
+        } else {                        // the room's: quadwords, indices, then them
+            if (m.size() < 2 || m.size() < 2 + std::size_t(m[0]) * 4 + m[1]) continue;
+            b.renderer->UploadMesh(key, m.data() + 2, m[0], m.data() + 2 + std::size_t(m[0]) * 4, m[1]);
+        }
+        g_meshes.insert(key);
+        ++meshes;
+    }
+    ++b.newer_epoch;
+    ++g_mutations;
+    std::fprintf(stderr, "[gpu] the renderer made again in %.0f ms (%zu meshes sent again)\n",
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count(), meshes);
+    return true;
+}
+
 void Rescale(Bridge& b, u32 scale) {
     for (auto& [key, o] : b.owned)
         if (o.gpu_newer) WriteBack(b, o);
@@ -2303,7 +3070,21 @@ void RescaleRule(Bridge& b, u32 fbp_begin, u32 fbp_end, u32 max_fbw) {
     ++g_mutations;
 }
 
+bool ShownPicture(std::vector<u32>* pixels, u32* width, u32* height) {
+    u32 fbp = 0, fbw = 0, psm = 0;
+    if (g_bridge && gs::TheGs().Displayed(&fbp, &fbw, &psm)) {
+        auto found = g_bridge->owned.find(std::make_tuple(fbp, fbw, psm, false));
+        if (found != g_bridge->owned.end() && found->second.gpu_newer) WriteBack(*g_bridge, found->second);
+    }
+    return gs::TheGs().Picture(pixels, width, height);
+}
+
 void PresentGpuPicture(ps2gpu::Display& display, u64 due_ns) {
+    std::vector<u32> cover;
+    if (LoadingScreen(&cover)) {                // a port's loading screen in its place
+        display.Present(cover.data(), 640, 448);
+        return;
+    }
     u32 fbp = 0, fbw = 0, psm = 0;
     if (g_bridge && gs::TheGs().Displayed(&fbp, &fbw, &psm)) {
         auto found = g_bridge->owned.find(std::make_tuple(fbp, fbw, psm, false));
@@ -2438,9 +3219,29 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     // game's runs there would share), and it makes every pipeline at once.
     if (!SettingsPath().empty() && !VirtualClock())
         ps2gpu::SetPipelineCacheDir(std::filesystem::path(SettingsPath()).parent_path().u8string());
-    bridge.renderer = ps2gpu::CreateGsRenderer(*device, error);
-    if (!bridge.renderer) return false;
-    WaitForGpuPipelines();              // a first start's, behind a loading screen
+    // Made on a thread of its own, the loading screen up meanwhile (a first
+    // start's, behind which the window answers): its first pipelines took
+    // half a minute on a cold driver, the window "not responding".
+    {
+        std::atomic<bool> preparing{true};
+        std::string made_error;
+        auto make = [&] {
+            bridge.renderer = ps2gpu::CreateGsRenderer(*device, &made_error);
+            preparing = false;
+        };
+        if (device->api() == ps2gpu::Gpu::Api::kD3D11) {
+            make();                     // (Direct3D 11's context: one thread at a time, the display's too)
+            WaitForGpuPipelines();
+        } else {
+            std::thread maker(make);
+            WaitForGpuPipelines(&preparing);
+            maker.join();
+        }
+        if (!bridge.renderer) {
+            if (error) *error = made_error;
+            return false;
+        }
+    }
     // Vulkan's recording on a thread of its own, beside the GS thread's
     // (PS2HOST_GPU_THREAD=0: on the GS thread, as before).
     const char* threaded = std::getenv("PS2HOST_GPU_THREAD");
@@ -2458,6 +3259,30 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     bridge.targets_as_textures = mode == GpuMode::ShadowRtt;
     gs::Gs& g = gs::TheGs();
     g.on_draw = OnDraw;
+    if (bridge.primary) {
+        g.on_native = OnNative;
+        // (a capture's replay.bin: the meshes held now, which its native draws may use without sending)
+        g.on_record_begin = [](std::FILE* out) {
+            for (const auto& [key, words] : TheVerify().meshes) {
+                if (!g_meshes.count(key)) continue;
+                std::fputc('M', out);
+                std::fwrite(&key, 8, 1, out);
+                const u32 count = u32(words.size());
+                std::fwrite(&count, 4, 1, out);
+                std::fwrite(words.data(), 4, count, out);
+            }
+        };
+        if (g_native_verify) {
+            g.on_held = VerifyHeld;
+            g.on_held_end = VerifyEnd;
+        }
+        // Native draws (docs/NATIVE_RENDERER.md): on where the renderer draws meshes - every scripted run of both
+        // Files' pictures as recorded with them; PC SETTINGS' NATIVE RENDERER, PS2HOST_NATIVE_DRAW=0 off.
+        g_meshes_drawn = bridge.renderer->DrawsMeshes();
+        g_enhanced_drawn = bridge.renderer->DrawsEnhancedMeshes();
+        ApplyNativeRendererSetting();
+        ApplyGraphicsEnhancements();
+    }
     g.on_effect = OnEffect;
     if (bridge.primary) {
         g.rasterize = false;
@@ -2504,6 +3329,7 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
         // moved past the displayed buffer (SetPresentAtBlankEnd); the EE goes
         // on meanwhile.
         SetGsFrameHandler([](u64 frame) {
+            if (RecoverLostGpu(*g_bridge, frame)) g_present_waits = false;     // (its picture was the old device's)
             PresentWaiting();               // the last frame's, nothing having moved it on
             if (g_between) MakeBetween();
             GpuShadowFrame(frame, std::string());
@@ -2548,7 +3374,8 @@ void PresentWaiting() {
         // (Its blank, for the GPU's done time: the locked blanks' lead, NoteGpuDone.)
         if (!pace && !VirtualClock()) display->SetPresentTag(FrameEndedNs(g_present_frame));
         const u64 due = pace ? FrameDue(g_present_frame) : 0;
-        if (g_held >= 0) {
+        std::vector<u32> cover;
+        if (g_held >= 0 && !LoadingScreen(&cover)) {
             // Copied as the frame ended (MakeBetween), before the picture
             // between was drawn over it: the shown buffer holds that one now.
             display->ShowHeld(g_held, due);
@@ -2580,8 +3407,15 @@ std::string GpuCaptureScreen(const std::string& dir) {
     const u32 k = s.renderer->Scale();
     if (s.renderer->ReadTargetFull(fbp, fbw, psm, &pixels, &w, &h))
         WriteBmp(dir + "/screen.bmp", pixels, w, std::min(w, 640u * k), std::min(h, 448u * k));
-    if (s.renderer->ReadTarget(fbp, fbw, psm, &pixels, &w, &h))
+    if (s.renderer->ReadTarget(fbp, fbw, psm, &pixels, &w, &h)) {
         WriteBmp(dir + "/screen_1x.bmp", pixels, w, std::min(w, 640u), std::min(h, 448u));
+    } else {
+        // (a picture the GPU holds no target of - a replay's first, drawn before its capture began: in local memory)
+        gs::Gs& g = gs::TheGs();
+        g.Finish();
+        if (g.on_memory) g.on_memory(0, 16384, false);
+        g.WriteBmp(dir + "/screen_1x.bmp");
+    }
     std::snprintf(text, sizeof text, "shown: FBP %X FBW %u PSM %02X; internal resolution %ux", unsigned(fbp),
                   unsigned(fbw), unsigned(psm), unsigned(k));
     return text;
@@ -2604,6 +3438,18 @@ bool GpuShownPicture(std::vector<u32>* pixels, u32* width, u32* height) {
 
 void SavePicture(const std::string& path, const std::vector<u32>& pixels, u32 width, u32 height) {
     WriteBmp(path, pixels, width, width, height);
+}
+
+void GpuReplayMesh(u64 key, const u32* words, u32 count) {
+    if (!g_bridge || !g_bridge->primary || g_meshes.count(key)) return;
+    if (key >> 63) {
+        g_bridge->renderer->UploadMesh(key, words, count / 4, nullptr, 0);
+    } else {
+        if (count < 2 || count < 2 + words[0] * 4 + words[1]) return;
+        g_bridge->renderer->UploadMesh(key, words + 2, words[0], words + 2 + words[0] * 4, words[1]);
+    }
+    g_meshes.insert(key);
+    TheVerify().meshes[key].assign(words, words + count);
 }
 
 void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
@@ -2749,8 +3595,38 @@ bool StartGpuRenderer(std::string* error, GpuMode, bool) {
 }
 void GpuSetScale(u32) {}
 void GpuShadowFrame(gs::u64, const std::string&) {}
+void GpuReplayMesh(gs::u64, const gs::u32*, gs::u32) {}
 std::string GpuShadowSummary() { return ""; }
+bool ShownPicture(std::vector<u32>* pixels, u32* width, u32* height) {
+    return gs::TheGs().Picture(pixels, width, height);
+}
 
 #endif
+
+void ApplyNativeRendererSetting() {
+    const char* native = std::getenv("PS2HOST_NATIVE_DRAW");
+    SetGsNativeDraws(g_meshes_drawn && !(native && std::string(native) == "0") && SettingOn("native_renderer", true));
+}
+
+bool g_enhance_forced = false;           // (PS2HOST_ENHANCE: a test's, on the virtual clock too)
+
+void ApplyGraphicsEnhancements() {
+    u32 bits = ps2gpu::kMeshLitPixels | ps2gpu::kMeshPrecise;
+    const char* test = std::getenv("PS2HOST_ENHANCE");
+    g_enhance_forced = test != nullptr;
+    if (test) bits = u32(std::strtoul(test, nullptr, 0));
+    ps2gpu::SetMeshEnhancements(bits);
+    // MSAA (the setting "msaa": off, 2x, 4x, 8x; PS2HOST_MSAA=<samples> a test's)
+    const std::string msaa = Setting("msaa", "off");
+    u32 samples = msaa == "2x" ? 2 : msaa == "4x" ? 4 : msaa == "8x" ? 8 : 1;
+    if (const char* forced = std::getenv("PS2HOST_MSAA")) samples = u32(std::max(1, std::atoi(forced)));
+    ps2gpu::SetGpuMsaa(samples);
+}
+
+u32 NativeEnhancements() {
+    if (!GsNativeDraws() || !g_enhanced_drawn) return 0u;
+    if (!g_enhance_forced && VirtualClock()) return 0u;      // (a scripted run's recorded pictures: the GS's)
+    return ps2gpu::MeshEnhancements();
+}
 
 }  // namespace ps2host

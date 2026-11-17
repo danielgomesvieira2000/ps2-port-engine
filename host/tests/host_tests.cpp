@@ -787,8 +787,9 @@ void GpuMemorySwizzlesAsTheGs() {
         for (u32 y = 0; y < h && back.size() == w * h; ++y)
             for (u32 x = 0; x < w; ++x) {
                 const u32 raw = reference.Read(base * 32, fbw, x, y, f.psm);
-                // Depth goes through a float (Z / 2^32): exact up to 24 bits.
-                const u32 want = f.depth ? (raw >= 0xFFFFFF80u ? 0xFFFFFFFFu : u32(float(raw)))
+                // Depth goes through a float (gs_depth.glsl): Z / 2^33, exact
+                // to 24 bits, below FF800000; each Z its own from there up.
+                const u32 want = f.depth ? (raw >= 0xFF800000u ? raw : u32(float(raw)))
                                          : sixteen ? from16(raw) : raw;
                 if (back[y * w + x] != want) ++wrong;
             }
@@ -2165,7 +2166,25 @@ void BindingsKeepAndSwap() {
           "bindings: the buttons' names");
 }
 
+// The settings' file read past a UTF-8 byte order mark: its first line's key
+// is the setting's, not the mark's (then the run's settings again: none, and
+// nowhere to write them).
+void SettingsReadPastAByteOrderMark() {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "ps2host_settings_bom.ini";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << "\xEF\xBB\xBF" "disc=C:\\games\\disc.iso\r\nfullscreen=on\r\n";
+    }
+    ps2host::LoadSettings(path.string());
+    Check(ps2host::Setting("disc") == "C:\\games\\disc.iso", "settings: the first key after a byte order mark");
+    Check(ps2host::Setting("fullscreen") == "on", "settings: a line after it, its CR trimmed");
+    ps2host::LoadSettings("");
+    std::error_code e;
+    std::filesystem::remove(path, e);
+}
+
 int main() {
+    SettingsReadPastAByteOrderMark();
     BlanksLockToTheScreen();
     BindingsKeepAndSwap();
     CustomSongsScanAndName();

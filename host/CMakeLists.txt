@@ -49,12 +49,14 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/music.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/presence.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/vu.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/vu_native.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/timers.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/pc_menu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/window.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/settings.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/hud.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/libnet.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/networks.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/logitech.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/bindings.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/prompt_art.cpp
@@ -122,11 +124,15 @@ option(PS2HOST_AVX2 "Build for processors with AVX2 (off: SSE4.1)" ON)
 # A game executable's entry (ps2_add_port's /ENTRY), before the runtime: the
 # processor checked by code built without AVX - a library of its own, apart
 # from ps2rt's flags - and the SSE4 build started instead where it must be.
+# (Linux: an object of the executable's own - its .preinit_array entry,
+# referred to by nothing, would not be taken from a static library.)
 if(MSVC)
     add_library(ps2_cpu_check STATIC ${CMAKE_CURRENT_LIST_DIR}/src/cpu_check.cpp)
-    if(PS2HOST_AVX2)
-        target_compile_definitions(ps2_cpu_check PRIVATE PS2HOST_BUILT_FOR_AVX2=1)
-    endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+    add_library(ps2_cpu_check OBJECT ${CMAKE_CURRENT_LIST_DIR}/src/cpu_check.cpp)
+endif()
+if(TARGET ps2_cpu_check AND PS2HOST_AVX2)
+    target_compile_definitions(ps2_cpu_check PRIVATE PS2HOST_BUILT_FOR_AVX2=1)
 endif()
 
 if(MSVC)
@@ -184,6 +190,7 @@ if(MSVC)
 endif()
 if(WIN32)
     target_link_libraries(ps2host PRIVATE ws2_32)         # the IOP's inet (iop_inet.cpp)
+    target_link_libraries(ps2host PRIVATE iphlpapi)       # this PC's networks (networks.cpp)
 endif()
 if(NOT MSVC)
     # clang or GCC (Android's NDK): translated code throws lifted::Abort; no
@@ -334,7 +341,7 @@ function(ps2_add_port target)
         ${translated}
         ${PORT_SOURCES})
     endif()
-    if(MSVC)
+    if(TARGET ps2_cpu_check)
         target_link_libraries(${target} PRIVATE ps2_cpu_check)
     endif()
     target_link_libraries(${target} PRIVATE ps2host)

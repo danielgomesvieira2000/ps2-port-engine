@@ -63,6 +63,9 @@ public:
     /* Handles the window's events; false once it has been closed. Alt+Enter
        toggles fullscreen. */
     virtual bool Pump() = 0;
+    /* The GPU's device lost (DeviceLost): made again, the window kept - false where it cannot be (or there is
+       none to make: not Vulkan's). The renderer on it must be gone first. */
+    virtual bool ResetDevice() { return false; }
 
     /* How evenly pictures went to the screen since the last call (--frame-times):
        presents, and the time between them - mean, standard deviation and
@@ -110,9 +113,10 @@ public:
 
     /* Fullscreen (borderless, the desktop's resolution) or a window. */
     virtual void SetFullscreen(bool on) { (void)on; }
-    /* Fullscreen at the desktop's own refresh (a high frame rate that
-       follows the screen: 144 Hz kept), not one that 60 divides evenly (120
-       Hz on a 144 Hz screen, the default); taken again now if fullscreen. */
+    /* Fullscreen at the desktop's own mode (borderless: 144 Hz kept), not
+       one that 60 divides evenly (120 Hz on a 144 Hz screen, taken by
+       switching the screen); taken again now if fullscreen. The host keeps
+       it on unless the player asks for exclusive fullscreen. */
     virtual void SetKeepRefresh(bool keep) { (void)keep; }
     virtual bool Fullscreen() const { return false; }
     /* The picture's shape on the screen, width over height: 4:3 as a
@@ -133,8 +137,39 @@ public:
     virtual void SetOverlay(std::vector<std::uint32_t> pixels, std::uint32_t width, std::uint32_t height) {
         (void)pixels, (void)width, (void)height;
     }
+    /* The overlay at the top right (a badge: a game's few words) instead of
+       the top left (a panel); kept until set again. */
+    virtual void SetOverlayRight(bool right) { (void)right; }
+    /* The overlay in the window's middle (the PC settings panel), not its corner. */
+    virtual void SetOverlayCentred(bool centred) { (void)centred; }
+    /* A reticle in the picture's middle (a first-person game's dot), under the
+       overlay: BGRA pixels, rows top-down - those with alpha 0 not drawn (the
+       rest copied, not blended); none when empty. At most 64 x 64. */
+    virtual void SetReticle(std::vector<std::uint32_t> pixels, std::uint32_t width, std::uint32_t height) {
+        (void)pixels, (void)width, (void)height;
+    }
+    virtual std::uint32_t PixelWidth() const { return 0; }
+    /* The mouse for a panel over the game (its own clicks: not the game's
+       TakeMouse) - the pointer in the window's pixels, the buttons gone down
+       and the wheel turned since the last call. */
+    struct PanelMouse {
+        bool over = false;
+        float px = 0.0f, py = 0.0f;
+        std::uint32_t held = 0, pressed = 0;
+        float wheel = 0.0f;
+        bool moved = false;
+    };
+    virtual bool TakePanelMouse(PanelMouse* state) { (void)state; return false; }
     /* The window's title (taken up by the window's own thread, in Pump). */
     virtual void SetTitle(const std::string& title) { (void)title; }
+    /* The window placed (applied at the next Pump): its client area at x, y
+       on the desktop, w x h pixels, framed or borderless - a split screen's
+       half. Out of fullscreen first. */
+    virtual void SetPlacement(int x, int y, int w, int h, bool borderless) { (void)x, (void)y, (void)w, (void)h, (void)borderless; }
+    /* The usable area (the taskbar left out) of the screen the window is on. */
+    virtual bool DesktopArea(int* x, int* y, int* w, int* h) const { (void)x, (void)y, (void)w, (void)h; return false; }
+    /* The window brought to the front, the keyboard's (at the next Pump). */
+    virtual void Raise() {}
     /* F12, or L3 with R3 on a controller, since the last call: a capture asked for. */
     virtual bool TakeCapture() { return false; }
     /* Tab since the last call: the texture pack turned on or off. */
@@ -168,6 +203,7 @@ public:
         std::uint32_t id = 0;
         std::string name;
         std::uint8_t family = 0;
+        std::string path;       // its device's path: the same in every process (a split screen's copies)
     };
     virtual std::vector<ControllerInfo> Controllers() const { return {}; }
     virtual bool PadOf(std::uint32_t id, PadState* state) const { (void)id, (void)state; return false; }
@@ -215,8 +251,13 @@ public:
         std::uint32_t held = 0, pressed = 0;
         float wheel = 0.0f;
         bool moved = false;
+        float dx = 0.0f, dy = 0.0f;     // its moves since the last TakeMouse, in pixels (captured too)
     };
     virtual bool TakeMouse(MouseState* state) { (void)state; return false; }
+    /* The mouse captured: hidden, held in the window, only its moves read
+       (a game's mouse look) - at the next Pump; let go while the window has
+       not the focus. */
+    virtual void SetMouseCaptured(bool on) { (void)on; }
     /* The game's own mouse pointer: RGBA pixels (rows top-down), the point
        that clicks at (hot_x, hot_y); scaled with the window. Shown while
        ShowGameCursor(true) - otherwise the system's (hidden in fullscreen). */
@@ -225,6 +266,8 @@ public:
         (void)rgba, (void)width, (void)height, (void)hot_x, (void)hot_y;
     }
     virtual void ShowGameCursor(bool on) { (void)on; }
+    /* No pointer over the window at all (the game's nor the system's) while set. */
+    virtual void HidePointer(bool hidden) { (void)hidden; }
 
     /* Told each picture PresentImageAt was given: shown (when it was due, when
        it was), or dropped unshown (shown_ns 0) - on the presenting thread. */

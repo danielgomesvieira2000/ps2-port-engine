@@ -2,7 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 // A depth buffer from GS local memory on the GPU, drawn: one triangle over
 // the image (date.vert's), each pixel's Z read from memory as the swizzle
-// reads it and written as the depth (Z / 2^32) - a depth image cannot be a
+// reads it and written as the depth (gs_depth.glsl's) - a depth image cannot be a
 // storage image, and through a linear buffer a 3x depth buffer's copy was
 // most of the GPU's time. Pixels outside the rows asked for are left alone.
 
@@ -20,6 +20,7 @@ layout(push_constant) uniform Params {
 } p;
 
 #include "gs_address.glsl"
+#include "gs_depth.glsl"
 
 void main() {
     const uint k = max(p.scale, 1u);
@@ -31,5 +32,5 @@ void main() {
     if (Is16()) v = (w >> ((a & 2u) * 8u)) & 0xFFFFu;
     else if (p.psm == PSMCT24 || p.psm == PSMZ24) v = w & 0xFFFFFFu;
     else v = w;
-    gl_FragDepth = float(v) * (1.0 / 4294967296.0);
+    gl_FragDepth = DepthOfZ(v);
 }

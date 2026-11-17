@@ -60,9 +60,11 @@ FetchContent_MakeAvailable(glslang)
 endif()
 
 set(PS2GPU_SHADER_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+# (the functions engine/tools/vutrans derived from the microcode, checked in: gs_mesh.vert's GENERATED)
+file(GLOB PS2GPU_GENERATED_GLSL ${CMAKE_CURRENT_LIST_DIR}/shaders/generated/*.glsl)
 file(MAKE_DIRECTORY ${PS2GPU_SHADER_DIR})
 set(PS2GPU_SHADER_HEADERS)
-foreach(shader gs.vert gs.frag date.vert date.frag swizzle.comp decode.comp depth_load.frag patch.comp shuffle.comp fxaa.comp downsample.comp
+foreach(shader gs.vert gs_mesh.vert gs_mesh_chars.vert gs_mesh_rw.vert gs.frag date.vert date.frag swizzle.comp decode.comp mipgen.comp msaa_expand.vert msaa_expand.frag depth_load.frag patch.comp shuffle.comp fxaa.comp downsample.comp
                smaa_edges.comp smaa_weights.comp smaa_blend.comp)
     string(REPLACE "." "_" name ${shader})
     set(out ${PS2GPU_SHADER_DIR}/${name}.h)
@@ -71,9 +73,45 @@ foreach(shader gs.vert gs.frag date.vert date.frag swizzle.comp decode.comp dept
                 -I${CMAKE_CURRENT_LIST_DIR}/third_party/smaa
                 -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader}
         DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
+                ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_common.glsl
+                ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_enhanced.glsl ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_rw.glsl
+                ${PS2GPU_GENERATED_GLSL}
                 ${CMAKE_CURRENT_LIST_DIR}/shaders/smaa_common.glsl ${CMAKE_CURRENT_LIST_DIR}/third_party/smaa/SMAA.glsl
                 ${GLSLANG}
         COMMENT "glslang ${shader}")
+    list(APPEND PS2GPU_SHADER_HEADERS ${out})
+endforeach()
+# The enhanced native draws (gs_mesh_enhanced.glsl): the mesh programs with ENHANCED, the fragment shader's
+# three with MESH_LIT (lit per pixel).
+foreach(variant "gs_mesh_enh_vert gs_mesh.vert -DENHANCED"
+                "gs_mesh_clip_vert gs_mesh.vert -DGUARD_CLIP"
+                "gs_mesh_nofma_vert gs_mesh.vert -DNO_FMA"
+                "gs_mesh_gen_vert gs_mesh.vert -DGENERATED"
+                "gs_mesh_gen_clip_vert gs_mesh.vert -DGENERATED -DGUARD_CLIP"
+                "gs_mesh_gen_nofma_vert gs_mesh.vert -DGENERATED -DNO_FMA"
+                "gs_mesh_chars_gen_vert gs_mesh_chars.vert -DGENERATED"
+                "gs_mesh_chars_gen_nofma_vert gs_mesh_chars.vert -DGENERATED -DNO_FMA"
+                "gs_mesh_chars_nofma_vert gs_mesh_chars.vert -DNO_FMA"
+                "gs_mesh_rw_nofma_vert gs_mesh_rw.vert -DNO_FMA"
+                "gs_mesh_rw_gen_vert gs_mesh_rw.vert -DGENERATED"
+                "gs_mesh_rw_gen_nofma_vert gs_mesh_rw.vert -DGENERATED -DNO_FMA"
+                "gs_mesh_chars_enh_vert gs_mesh_chars.vert -DENHANCED"
+                "gs_frag_lit gs.frag -DMESH_LIT"
+                "gs_frag_single_lit gs.frag -DMESH_LIT -DSINGLE_OUTPUT"
+                "gs_frag_blend_lit gs.frag -DMESH_LIT -DSHADER_BLEND")
+    separate_arguments(parts UNIX_COMMAND "${variant}")
+    list(GET parts 0 name)
+    list(GET parts 1 shader)
+    list(SUBLIST parts 2 -1 defines)
+    set(out ${PS2GPU_SHADER_DIR}/${name}.h)
+    add_custom_command(OUTPUT ${out}
+        COMMAND ${GLSLANG} -V --target-env vulkan1.1 ${defines} --vn spirv_${name}
+                -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader}
+        DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
+                ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_common.glsl
+                ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_enhanced.glsl ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_rw.glsl
+                ${PS2GPU_GENERATED_GLSL} ${GLSLANG}
+        COMMENT "glslang ${shader} (${defines})")
     list(APPEND PS2GPU_SHADER_HEADERS ${out})
 endforeach()
 # The fragment shader without its second output, for devices without
@@ -82,7 +120,7 @@ set(out ${PS2GPU_SHADER_DIR}/gs_frag_single.h)
 add_custom_command(OUTPUT ${out}
     COMMAND ${GLSLANG} -V --target-env vulkan1.1 -DSINGLE_OUTPUT --vn spirv_gs_frag_single
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag
-    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag ${GLSLANG}
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl ${GLSLANG}
     COMMENT "glslang gs.frag (single output)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # The swizzle straight to and from a colour target (a storage image).
@@ -91,6 +129,7 @@ add_custom_command(OUTPUT ${out}
     COMMAND ${GLSLANG} -V --target-env vulkan1.1 -DIMAGE --vn spirv_swizzle_image_comp
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp
     DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
+            ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl
             ${GLSLANG}
     COMMENT "glslang swizzle.comp (a target's image)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
@@ -109,6 +148,7 @@ add_custom_command(OUTPUT ${out}
     COMMAND ${GLSLANG} -V --target-env vulkan1.1 -DDEPTH_IMAGE --vn spirv_swizzle_depth_comp
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp
     DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
+            ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl
             ${GLSLANG}
     COMMENT "glslang swizzle.comp (a depth buffer)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
@@ -117,7 +157,7 @@ set(out ${PS2GPU_SHADER_DIR}/gs_frag_blend.h)
 add_custom_command(OUTPUT ${out}
     COMMAND ${GLSLANG} -V --target-env vulkan1.1 -DSHADER_BLEND --vn spirv_gs_frag_blend
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag
-    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag ${GLSLANG}
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl ${GLSLANG}
     COMMENT "glslang gs.frag (blending in the shader)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # The PC's effects (effects.cpp): effects.comp once for each pass.
@@ -126,7 +166,7 @@ foreach(pass RANGE 0 15)
     add_custom_command(OUTPUT ${out}
         COMMAND ${GLSLANG} -V --target-env vulkan1.1 -DPASS=${pass} --vn spirv_effects_${pass}
                 -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/effects.comp
-        DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/effects.comp ${GLSLANG}
+        DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/effects.comp ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl ${GLSLANG}
         COMMENT "glslang effects.comp (pass ${pass})")
     list(APPEND PS2GPU_SHADER_HEADERS ${out})
 endforeach()
@@ -178,6 +218,9 @@ if(PS2GPU_D3D11)
             COMMAND ps2gpu_spirv_to_hlsl ${spv} ${hlsl} ${PS2GPU_SHADER_DIR}/${name}_hlsl.h ${name}
             COMMAND ${PS2GPU_FXC} /nologo /O3 /T ${profile} /E main /Fh ${out} /Vn dxbc_${name} ${hlsl}
             DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${source} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
+                    ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_depth.glsl ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_common.glsl
+                    ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_enhanced.glsl ${PS2GPU_GENERATED_GLSL}
+                    ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_mesh_rw.glsl
                     ${CMAKE_CURRENT_LIST_DIR}/shaders/smaa_common.glsl ${CMAKE_CURRENT_LIST_DIR}/third_party/smaa/SMAA.glsl
                     ${CMAKE_CURRENT_LIST_DIR}/tools/spirv_to_hlsl.cpp ${GLSLANG} ps2gpu_spirv_to_hlsl
             COMMENT "HLSL ${name} (${source})")
@@ -188,6 +231,21 @@ if(PS2GPU_D3D11)
     ps2gpu_hlsl(d3d_gs_frag_single gs.frag ps_5_0 -DSINGLE_OUTPUT)
     ps2gpu_hlsl(d3d_gs_frag_blend gs.frag ps_5_0 -DSHADER_BLEND)
     ps2gpu_hlsl(d3d_gs_frag_uint gs.frag ps_5_0 -DSINGLE_OUTPUT -DUINT_OUTPUT)
+    # The native meshes (gs_mesh*.vert, gs.frag's MESH_LIT): their rounding without fused multiply-adds (NO_FMA:
+    # Direct3D 11 has none for floats), the room's guard band by clip distances (GUARD_CLIP), the header's dynamic
+    # offset added by spirv_to_hlsl (set 3's binding 1).
+    ps2gpu_hlsl(d3d_gs_mesh_vert gs_mesh.vert vs_5_0 -DGUARD_CLIP -DNO_FMA)
+    ps2gpu_hlsl(d3d_gs_mesh_gen_vert gs_mesh.vert vs_5_0 -DGUARD_CLIP -DNO_FMA -DGENERATED)
+    ps2gpu_hlsl(d3d_gs_mesh_chars_gen_vert gs_mesh_chars.vert vs_5_0 -DNO_FMA -DGENERATED)
+    ps2gpu_hlsl(d3d_gs_mesh_chars_vert gs_mesh_chars.vert vs_5_0 -DNO_FMA)
+    ps2gpu_hlsl(d3d_gs_mesh_rw_vert gs_mesh_rw.vert vs_5_0 -DNO_FMA)
+    ps2gpu_hlsl(d3d_gs_mesh_rw_gen_vert gs_mesh_rw.vert vs_5_0 -DNO_FMA -DGENERATED)
+    ps2gpu_hlsl(d3d_gs_mesh_enh_vert gs_mesh.vert vs_5_0 -DENHANCED -DNO_FMA)
+    ps2gpu_hlsl(d3d_gs_mesh_chars_enh_vert gs_mesh_chars.vert vs_5_0 -DENHANCED -DNO_FMA)
+    ps2gpu_hlsl(d3d_gs_frag_lit gs.frag ps_5_0 -DMESH_LIT)
+    ps2gpu_hlsl(d3d_gs_frag_single_lit gs.frag ps_5_0 -DMESH_LIT -DSINGLE_OUTPUT)
+    ps2gpu_hlsl(d3d_gs_frag_blend_lit gs.frag ps_5_0 -DMESH_LIT -DSHADER_BLEND)
+    ps2gpu_hlsl(d3d_gs_frag_uint_lit gs.frag ps_5_0 -DMESH_LIT -DSINGLE_OUTPUT -DUINT_OUTPUT)
     ps2gpu_hlsl(d3d_date_vert date.vert vs_5_0)
     ps2gpu_hlsl(d3d_date_frag date.frag ps_5_0)
     ps2gpu_hlsl(d3d_depth_load_frag depth_load.frag ps_5_0)
@@ -239,4 +297,6 @@ if(NOT ANDROID)
     target_link_libraries(ps2gpu_smoke PRIVATE ps2gpu)
     add_executable(ps2gpu_tests ${CMAKE_CURRENT_LIST_DIR}/tests/renderer_tests.cpp)
     target_link_libraries(ps2gpu_tests PRIVATE ps2gpu)
+    add_executable(ps2gpu_warm ${CMAKE_CURRENT_LIST_DIR}/tests/pipeline_warm.cpp)
+    target_link_libraries(ps2gpu_warm PRIVATE ps2gpu)
 endif()

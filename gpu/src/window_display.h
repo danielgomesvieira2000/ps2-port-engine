@@ -64,11 +64,46 @@ public:
         overlay_height_ = height;
         ++overlay_generation_;
     }
+    void SetOverlayRight(bool right) override { overlay_right_.store(right); }
+    void SetOverlayCentred(bool centred) override { overlay_centred_.store(centred); }
+    void SetReticle(std::vector<std::uint32_t> pixels, std::uint32_t width, std::uint32_t height) override {
+        std::lock_guard<std::mutex> hold(overlay_lock_);
+        if (width > 64 || height > 64 || pixels.size() < std::size_t(width) * height) pixels.clear();
+        reticle_ = std::move(pixels);
+        reticle_width_ = reticle_.empty() ? 0 : width;
+        reticle_height_ = reticle_.empty() ? 0 : height;
+        ++reticle_generation_;
+    }
+    std::uint32_t PixelWidth() const override {
+        int w = 0, h = 0;
+        if (!window_ || !SDL_GetWindowSizeInPixels(window_, &w, &h)) return 0;
+        return std::uint32_t(w > 0 ? w : 0);
+    }
+    bool TakePanelMouse(PanelMouse* state) override {
+        std::lock_guard<std::mutex> hold(mouse_lock_);
+        *state = panel_mouse_;
+        panel_mouse_.pressed = 0;
+        panel_mouse_.wheel = 0.0f;
+        panel_mouse_.moved = false;
+        return window_ != nullptr;
+    }
     void SetTitle(const std::string& title) override {
         std::lock_guard<std::mutex> hold(title_lock_);
         title_ = title;
         title_changed_ = true;
     }
+    void SetPlacement(int x, int y, int w, int h, bool borderless) override {
+        std::lock_guard<std::mutex> hold(placement_lock_);
+        placement_ = {x, y, w, h, borderless, true};
+    }
+    bool DesktopArea(int* x, int* y, int* w, int* h) const override {
+        std::lock_guard<std::mutex> hold(placement_lock_);
+        if (desktop_[2] <= 0) return false;
+        *x = desktop_[0], *y = desktop_[1], *w = desktop_[2], *h = desktop_[3];
+        return true;
+    }
+    void Raise() override { raise_ = true; }
+    void SetMouseCaptured(bool on) override { capture_mouse_ = on; }
     float WindowAspect() const override {
         int w = 0, h = 0;
         if (!window_ || !SDL_GetWindowSizeInPixels(window_, &w, &h) || w <= 0 || h <= 0) return 0.0f;
@@ -118,6 +153,7 @@ public:
         *state = mouse_;
         mouse_.pressed = 0;
         mouse_.wheel = 0.0f;
+        mouse_.dx = mouse_.dy = 0.0f;
         mouse_.moved = false;
         return true;
     }
@@ -132,6 +168,7 @@ public:
         cursor_size_ = 0;                   // made again at the window's size
     }
     void ShowGameCursor(bool on) override { cursor_wanted_.store(on); }
+    void HidePointer(bool hidden) override { pointer_hidden_.store(hidden); }
     const std::string& error() const { return error_; }
 
 protected:
@@ -150,6 +187,18 @@ protected:
     }
 
     SDL_Window* window_ = nullptr;
+    struct Placement {
+        int x = 0, y = 0, w = 0, h = 0;
+        bool borderless = false, pending = false;
+    };
+    mutable std::mutex placement_lock_;
+    Placement placement_;
+    int desktop_[4] = {0, 0, 0, 0};         // the usable area, Pump's (DesktopArea)
+    unsigned desktop_age_ = 0;
+    std::atomic<bool> raise_{false};
+    std::atomic<bool> capture_mouse_{false};
+    bool mouse_captured_ = false;           // as SDL has it (Pump's)
+    void ApplyPlacement();
     std::string describe_, error_;
     // Set by Pump (the main thread), read where pictures are presented (the
     // GS thread, when it presents): the window closed, or its swapchain to be
@@ -162,6 +211,12 @@ protected:
     std::vector<std::uint32_t> overlay_;
     std::uint32_t overlay_width_ = 0, overlay_height_ = 0;
     std::uint64_t overlay_generation_ = 1;      // a SetOverlay's
+    std::atomic<bool> overlay_right_{false};    // SetOverlayRight's: the top right
+    std::atomic<bool> overlay_centred_{false};  // SetOverlayCentred's: the middle
+    std::vector<std::uint32_t> reticle_;        // SetReticle's (overlay_lock_)
+    std::uint32_t reticle_width_ = 0, reticle_height_ = 0;
+    std::uint64_t reticle_generation_ = 1;
+    PanelMouse panel_mouse_;                    // TakePanelMouse's (mouse_lock_)
     std::shared_ptr<VblankWatch> vblank_watch_;     // RefreshTiming's (null: no such thread)
     std::atomic<std::int32_t> shown_x0_{0}, shown_y0_{0}, shown_w_{1}, shown_h_{1};
 
@@ -205,7 +260,8 @@ private:
     std::uint32_t cursor_size_ = 0;
     SDL_Cursor* cursor_ = nullptr;
     std::atomic<bool> cursor_wanted_{false};
-    int cursor_showing_ = -1;               // what the window shows: -1 not yet set, 0 the system's, 1 the game's
+    std::atomic<bool> pointer_hidden_{false};
+    int cursor_showing_ = -1;               // what the window shows: -1 not yet set, 0 the system's, 1 the game's, 2 none
     bool fullscreen_cursor_stale_ = false;
     void UpdateCursor();
 };

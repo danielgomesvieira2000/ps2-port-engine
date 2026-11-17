@@ -199,6 +199,7 @@ void Vif1RunFrame(std::function<void()> command) {
         while (!w.drained.wait_for(lock, std::chrono::milliseconds(2),
                                    [&] { return w.frames.load() < kFramesBehind; })) {
             lock.unlock();
+            KeepWindowAnswering();
             {
                 Timed iop(Section::Iop);
                 iop::Run(50'000);

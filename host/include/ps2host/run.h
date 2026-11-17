@@ -184,6 +184,9 @@ void SetFrameDumps(const std::string& dir, int every, int limit, u64 from = 0);
 enum class GpuMode { Shadow, ShadowRtt, Primary };
 bool StartGpuRenderer(std::string* error, GpuMode mode, bool show);
 void GpuShadowFrame(u64 frame, const std::string& dump_dir);
+/* A capture's mesh ('M' in replay.bin: --gs-replay), as the native draws had it when the capture began: the room's
+   (key bit 63 clear) its quadword and index counts, quadwords, indices; the characters' their vertices' quadwords. */
+void GpuReplayMesh(u64 key, const u32* words, u32 count);
 /* A capture (F12): the GPU's passes of `frame` dumped into `passes_dir`;
    then the picture shown, at the internal resolution and the PS2's, into
    `dir` (screen.bmp, screen_1x.bmp) - what it was, as text. GpuPrimary:
@@ -224,6 +227,26 @@ void SyncGs();
 void GsQword(int path, u64 low, u64 high);
 void GsWord(int path, u32 word);
 void GsWords(int path, const u32* words, u32 count, u32 from = ~0u);
+/* A native draw's payload (gs::Gs::Native), in turn before the packet it
+   stands for. Only where GsNativeDraws: not with the GS split. */
+void GsNative(const u32* words, u32 count);
+/* The same, written in place: GsNativeBegin's `count` words filled, then GsNativeEnd (nothing else sent between). */
+u32* GsNativeBegin(u32 count);
+void GsNativeEnd(u32 count);
+/* Whether native draws are drawn: the GPU bridge's renderer draws meshes and
+   PS2HOST_NATIVE_DRAW=1 (SetGsNativeDraws, the bridge's). */
+bool GsNativeDraws();
+void SetGsNativeDraws(bool on);
+/* The player's NATIVE RENDERER (PC SETTINGS; the setting native_renderer, on by default): native draws on where
+   the renderer draws meshes, now (PS2HOST_NATIVE_DRAW=0 off whatever it says). */
+void ApplyNativeRendererSetting();
+/* The native draws' enhancements (ps2gpu::SetMeshEnhancements: 1 lit per pixel, 2 precise places): always,
+   with the native renderer - but a scripted run on its virtual clock draws the GS's picture to the pixel (its
+   recorded pictures; PS2HOST_ENHANCE=<bits> a test's, either way). NativeEnhancements: their bits for a draw
+   made now, where the renderer draws them - a game's native programs then send what they need (the kept
+   vertices' places and lighting: the headers' ext, gs_mesh_enhanced.glsl). */
+void ApplyGraphicsEnhancements();
+u32 NativeEnhancements();
 void GsPrivileged(u32 address, u64 value);
 /* A GS register write, as A+D would (the replay's recorded registers). */
 void GsRegister(u32 address, u64 value);
@@ -372,12 +395,26 @@ void PresentFrame();
    thread presents): false once it has been closed. */
 bool PumpWindow();
 /* The GPU's start pipelines made before the game runs, behind a loading
-   screen when that takes a while (a first start on a device). */
-void WaitForGpuPipelines();
+   screen when that takes a while (a first start on a device) - and, while
+   `preparing` is true, whatever another thread is still making (the
+   renderer itself: its first pipelines). The window answers meanwhile. */
+void WaitForGpuPipelines(const std::atomic<bool>* preparing = nullptr);
+/* A wait of the window's thread (the EE's, for the GS thread or VIF1's
+   worker) that may be long: the window told to Windows as answering, every
+   quarter of a second, without taking its events - not "not responding"
+   while a GPU pipeline is made in the middle of a game. Any thread; only
+   the window's does anything. */
+void KeepWindowAnswering();
 /* Fullscreen on or off (saved as the "fullscreen" setting, settings.h, which
    the window opens with); and whether it is. */
 void SetWindowFullscreen(bool on);
 bool WindowFullscreen();
+/* How fullscreen takes the screen (the "fullscreen_mode" setting):
+   "borderless", the default - the screen's own mode, no switch, another
+   screen clicked without losing the picture - or "exclusive": a mode 60
+   divides evenly (120 Hz on a 144 Hz screen: no judder at 60), taken by
+   switching the screen. */
+void SetWindowFullscreenMode(const std::string& mode);
 /* The refresh rate of the screen the window is on, in Hz (0 when not known,
    or no window). */
 float WindowRefreshRate();
@@ -424,6 +461,8 @@ bool WindowGpuBoosted();
    window's own), shown so; and as width over height, for a game to draw it
    so - auto's the window's now. */
 void SetWindowAspect(const std::string& aspect);
+/* The same for this run alone (not written to the settings: a split screen's half). */
+void RunWindowAspect(const std::string& aspect);
 float PictureAspect();
 /* Anti-aliasing (the "antialiasing" setting): "off", the default; "fxaa"
    or "smaa" (SMAA 1x, gpu/third_party/smaa), the picture's edges smoothed
@@ -438,12 +477,47 @@ void SetWindowStatus(const std::string& status);
 /* A panel of text over the picture (a game's tool, its menu): the lines,
    the first a heading, one starting with '>' picked out; none when empty. */
 void SetWindowOverlay(const std::vector<std::string>& lines);
+/* A few words at the top right, in yellow (a game's state the player should
+   see at a glance - Resident Evil Outbreak's LAN skip vote); hidden while a
+   panel (SetWindowOverlay) is up; none when empty. */
+void SetWindowBadge(const std::string& text);
+/* A loading screen in place of the game's picture (a port running the
+   game's own screens unseen behind it): its lines, the first the heading,
+   the second under it; the game's picture again when empty. Or a picture
+   (SetLoadingPicture: the game's own loading screen, as ShownPicture gave
+   it, scaled to 640 x 448; none when empty). The picture shown is
+   LoadingScreen's (640 x 448), false when there is none; the game's sound
+   is silent meanwhile (LoadingScreenShown). */
+void SetLoadingScreen(const std::vector<std::string>& lines);
+void SetLoadingPicture(const std::vector<u32>& pixels, u32 width, u32 height);
+bool LoadingScreen(std::vector<u32>* pixels);
+bool LoadingScreenShown();
+/* The picture the game shows now - its displayed frame buffer, the GPU
+   renderer's written back to the GS's memory first. */
+bool ShownPicture(std::vector<u32>* pixels, u32* width, u32* height);
 /* The PC settings panel (pc_menu.cpp): F1, or L3 + R3 on a controller, over
    any game - resolution, aspect, fullscreen, v-sync, frame pacing, the
    texture pack. UpdatePcMenu reads its keys (PumpWindow calls it); while it
    is open the game gets no input (PcMenuOpen). */
 void UpdatePcMenu();
 bool PcMenuOpen();
+/* The panel's picture (BGRA, width x height) in the window's middle - none:
+   gone, the overlay's lines again; the window's size in pixels; the
+   pointer for it (in the window's pixels, its own clicks, not the game's). */
+struct PanelMouseState {
+    bool over = false;
+    float px = 0.0f, py = 0.0f;
+    u32 held = 0, pressed = 0;
+    float wheel = 0.0f;
+    bool moved = false;
+};
+void SetWindowPanel(std::vector<u32> pixels, u32 width, u32 height);
+/* A reticle in the picture's middle, under any panel (a first-person
+   style's dot): BGRA pixels, alpha 0 not drawn, at most 64 x 64; none when
+   empty. */
+void SetWindowReticle(std::vector<u32> pixels, u32 width, u32 height);
+bool WindowPixelSize(u32* width, u32* height);
+bool TakePanelMouse(PanelMouseState* state);
 /* The PC settings for a game's own menu (a port's PC SETTINGS screen): each
    one's short name and value in capitals (RESOLUTION, 2X) and a line of help;
    a texture pack's only when one is loaded. StepPcSetting changes the n-th to
@@ -465,6 +539,13 @@ struct PortOption {
     void (*set)(int) = nullptr;
 };
 void AddPortOptions(const std::vector<PortOption>& options);
+/* The engine's graphics rows for a port's page (its GRAPHICS): ANTI-ALIASING (OFF, FXAA, SMAA:
+   SetWindowAntiAliasing), MSAA (OFF, 2X, 4X, 8X: the 3D's edges sampled finer - ps2gpu::SetGpuMsaa). */
+std::vector<PortOption> EnhancedGraphicsOptions(const std::string& page);
+/* Their values for a preset: the game's look (all off), or each at its best. */
+void SetEnhancedGraphics(bool on);
+bool EnhancedGraphicsAll();         // (every one at its best)
+bool EnhancedGraphicsNone();        // (every one the game's)
 /* A port's EXIT GAME: the run ends as when the window is closed. */
 void QuitGame();
 /* The platform's (platform.cpp), for a port's settings - the rows that mean
@@ -528,6 +609,7 @@ struct HostDevice {
     u32 id = kKeyboardDevice;
     std::string name;           // "Keyboard", the controller's own name
     ControllerFamily family = ControllerFamily::kOther;
+    std::string path;           // a controller's device path: the same in every process (ids are not)
 };
 std::vector<HostDevice> HostDevices();
 bool HostDevicePad(u32 id, HostPadState* state);
@@ -562,13 +644,29 @@ struct HostMouseState {
     u32 held = 0, pressed = 0;
     float wheel = 0.0f;
     bool moved = false;
+    float dx = 0.0f, dy = 0.0f;     // its moves since the last call, in pixels (captured too: SetMouseCaptured)
 };
 bool TakeHostMouse(HostMouseState* state);
+/* The mouse captured (hidden, held in the window, its moves alone read:
+   HostMouseState::dx, dy) - a game's mouse look; let go whenever the window
+   has not the focus. */
+void SetMouseCaptured(bool on);
+/* The window placed: its client area at x, y on the desktop, w x h pixels,
+   framed or borderless (a split screen's half; out of fullscreen first) -
+   at the window's next pump. WindowDesktopArea: the usable area of the
+   screen it is on (false: not known yet). RaiseWindow: it to the front, the
+   keyboard's. */
+void SetWindowPlacement(int x, int y, int w, int h, bool borderless);
+bool WindowDesktopArea(int* x, int* y, int* w, int* h);
+void RaiseWindow();
 /* The game's own pointer (RGBA pixels, rows top-down, clicking at hot_x,
    hot_y), scaled with the window; shown while ShowHostCursor(true), the
    system's otherwise (hidden in fullscreen). */
 void SetHostCursor(const u32* rgba, u32 width, u32 height, u32 hot_x, u32 hot_y);
 void ShowHostCursor(bool on);
+/* No pointer at all over the window, the game's or the system's, while
+   HideHostPointer(true) (the keys or a controller in use, say). */
+void HideHostPointer(bool hidden);
 /* The window's controller's motors, as a DualShock 2's: the large one 0-255,
    the small one 0-255 (a DualShock 2's is on or off: 0 or 255). */
 void HostRumble(u8 large, u8 small);
@@ -603,6 +701,14 @@ InputDevice LastInputDevice(u64* frame = nullptr);
    each time the pad is read (once a frame, on the EE's thread, at the
    vertical blank): what the mouse means, say. */
 void SetPadHook(u16 (*hook)());
+/* The game given no input while on (a port's own screen over the game - a
+   split screen's controller choice - reading the devices itself), as while
+   the PC settings panel is up. */
+void SetGameInputHeld(bool on);
+/* Buttons the game is not given (bit n: input n, libpad's order), whatever
+   holds them - a port that takes one for itself (a split screen's Select,
+   its pause). 0: none. */
+void SetGameButtonsMasked(u16 mask);
 /* --press: hold `button` (cross, start, up, ...) for 6 frames from `frame` -
    the player's, on port 0; `padN:button` scripted controller N's (from 1), a
    device of its own (HostDevices) a game can give a port (SetPortDevices). */
@@ -697,6 +803,9 @@ void SetGpuDrawTag(u32 tbp, u32 tag);
    by the GS's depth-based level (GsDrawState::tag bit 1). Anisotropic taps
    are SetGpuTextureFilter's (4), the player's choice: they cost. */
 void SetGpuModernTextures(bool on);
+/* ps2gpu::SetGpuEdgeReach: drawn larger, a vertex on a target's top or left edge half a pixel out (on, the default)
+   - off for a game that draws its last picture back over itself (its pictures as recorded before it). */
+void SetGpuEdgeReach(bool on);
 /* The texture filtering a player chose, over the game's own (TEX1) on its
    3D draws - not on sprites (the HUD, text, a picture's copies and effects,
    drawn texel for texel) or a draw that samples a target (render to
@@ -751,6 +860,11 @@ bool AudioActive();
    its virtual frames faster than the device played it - the ring full, the
    sound 0.7 s behind the picture and samples dropped for a minute. */
 void AudioResync();
+/* The master volume, 0 to 100 percent (the PC settings panel's AUDIO): the
+   device's output scaled by it, squared (half way sounds half as loud) - not
+   --audio-wav's recording. Kept as the "master_volume" setting (50 at first). */
+int AudioVolume();
+void SetAudioVolume(int percent);
 
 }  // namespace ps2host
 

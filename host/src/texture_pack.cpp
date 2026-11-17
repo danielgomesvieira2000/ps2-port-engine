@@ -607,6 +607,7 @@ struct Pack {
         u64 id = 0;                     // the renderer's name for its image (UploadReplacement)
     };
     std::unordered_map<Name, File, NameHash> files;
+    std::unordered_map<Name, File, NameHash> materials;     // (a replacement's <name>_n file)
     struct Kept {
         std::shared_ptr<const Image> image;
         std::list<Name>::iterator lru;
@@ -644,8 +645,24 @@ struct Pack {
                 queue.pop_front();
                 file = files[name];
             }
+            File material;
+            {
+                std::lock_guard<std::mutex> hold(lock);
+                auto found = materials.find(name);
+                if (found != materials.end()) material = found->second;
+            }
             std::shared_ptr<Image> loaded = Load(file.path);
             if (loaded) loaded->id = file.id;
+            if (loaded && !material.path.empty()) {
+                // (its surface detail beside it: the same levels' sizes need not be)
+                std::shared_ptr<Image> detail = Load(material.path);
+                if (detail) {
+                    detail->id = material.id;
+                    loaded->material = detail;
+                } else {
+                    std::fprintf(stderr, "[texture pack] could not read %s\n", material.path.string().c_str());
+                }
+            }
             std::shared_ptr<const Image> image = loaded;
             std::lock_guard<std::mutex> hold(lock);
             queued.erase(name);
@@ -656,10 +673,11 @@ struct Pack {
             }
             lru.push_front(name);
             kept[name] = {image, lru.begin()};
-            kept_bytes += image->data.size();
+            kept_bytes += image->data.size() + (image->material ? image->material->data.size() : 0);
             while (kept_bytes > kKeptBytes && lru.size() > 1) {
                 auto old = kept.find(lru.back());
-                kept_bytes -= old->second.image->data.size();
+                kept_bytes -= old->second.image->data.size() +
+                              (old->second.image->material ? old->second.image->material->data.size() : 0);
                 kept.erase(old);
                 lru.pop_back();
             }
@@ -695,6 +713,7 @@ std::size_t Open(const std::string& directory) {
     {
         std::lock_guard<std::mutex> hold(pack.lock);
         pack.files.clear();
+        pack.materials.clear();
         const fs::path root = fs::u8path(directory);
         if (fs::is_directory(root, error)) {
             for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, error), end;
@@ -705,7 +724,14 @@ std::size_t Open(const std::string& directory) {
                 std::transform(ext.begin(), ext.end(), ext.begin(), [](char ch) { return char(std::tolower(ch)); });
                 if (ext != ".dds" && ext != ".png") continue;
                 Name name;
-                if (!ParseName(it->path().stem().string(), &name)) continue;
+                const std::string stem = it->path().stem().string();
+                if (stem.size() > 2 && stem.compare(stem.size() - 2, 2, "_n") == 0) {
+                    // a replacement's surface detail (its own ids, past the replacements')
+                    if (ParseName(stem.substr(0, stem.size() - 2), &name))
+                        pack.materials.emplace(name, Pack::File{it->path(), (u64(1) << 40) + pack.materials.size() + 1});
+                    continue;
+                }
+                if (!ParseName(stem, &name)) continue;
                 pack.files.emplace(name, Pack::File{it->path(), pack.files.size() + 1});    // the first found, as PCSX2
             }
         }

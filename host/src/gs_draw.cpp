@@ -297,8 +297,12 @@ void Gs::Draw() {
     // Timed only when it rasterises: under --gpu the bridge times itself, and
     // a timer per primitive is a measurable share of a race.
     std::optional<Timed> timed;
-    if (rasterize) timed.emplace(Section::GsDraw);
     ++primitives_;
+    if (hold_draws_) {                  // (a native draw drew it: Native)
+        if (on_held) on_held(DrawCall{Prim(), &Ctx(), texa_, queue_, queued_, fogcol_, (pabe_ & 1) != 0, register_writes_});
+        return;
+    }
+    if (rasterize) timed.emplace(Section::GsDraw);
     // The software rasteriser's state; without it (--gpu), made only if the
     // texture is decoded from it - a few thousand of 73 million primitives.
     if (rasterize) Prepare();

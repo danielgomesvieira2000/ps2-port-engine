@@ -806,17 +806,26 @@ void RaiseDmac(u32 channel) {
         return all;
     }();
     const Texts& t = texts[channel & 31];
+    // (each note once noted is not asked of the notes' set again - its lock and string compares, at every raise -
+    // unless every note is wanted)
+    static std::atomic<bool> noted[32][3];
+    auto note = [&](int which, const std::string& key, const std::string& text) {
+        std::atomic<bool>& done = noted[channel & 31][which];
+        if (done.load(std::memory_order_relaxed) && !NotingAll()) return;
+        Note(key, text);
+        done.store(true, std::memory_order_relaxed);
+    };
     if (!(s.dmac_mask & (1u << channel))) {
         // The interrupt is status AND mask: the status stays set (D_STAT),
         // and enabling the channel raises it then (_EnableDmac).
         s.dmac_missed |= 1u << channel;
-        Note(t.masked_key, t.masked);
+        note(0, t.masked_key, t.masked);
         return;
     }
     if (RunHandlers(s.dmac_handlers, channel))
-        Note(t.key, t.delivered);
+        note(1, t.key, t.delivered);
     else
-        Note(t.none_key, t.none);
+        note(2, t.none_key, t.none);
 }
 
 void RaiseIntc(u32 cause) {

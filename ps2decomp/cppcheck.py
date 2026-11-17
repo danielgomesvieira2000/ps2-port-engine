@@ -206,8 +206,12 @@ def syntax_check(source: str, include_dirs) -> None:
 def find_vcvars() -> str:
     if not os.path.exists(VSWHERE):
         raise CompilerUnavailable("vswhere not found; no Visual Studio installed")
+    # The newest install with the C++ tools and its CMake (port.py builds with
+    # that CMake): a newer Visual Studio without them is passed over.
     result = subprocess.run(
-        [VSWHERE, "-latest", "-products", "*", "-property", "installationPath"],
+        [VSWHERE, "-latest", "-products", "*", "-requires",
+         "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+         "Microsoft.VisualStudio.Component.VC.CMake.Project", "-property", "installationPath"],
         capture_output=True, text=True,
     )
     root = result.stdout.strip()

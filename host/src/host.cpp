@@ -28,6 +28,7 @@
 #include "ps2host/iop_vm.h"
 #include "ps2host/vif.h"
 #include "ps2host/vu.h"
+#include "ps2host/vu_native.h"
 #include "ps2host/mc2.h"
 #include "ps2host/memory.h"
 #include "ps2host/profile.h"
@@ -254,6 +255,27 @@ int GsReplay(const std::string& file, const std::string& out) {
                     break;
                 }
             }
+        } else if (kind == 'N') {
+            // (a native draw: a mesh and its header, drawn in its place - gs::Gs::Native)
+            const u32 count = u32_at(at);
+            at += 4;
+            words.resize(count);
+            std::memcpy(words.data(), data.data() + at, std::size_t(count) * 4);
+            at += std::size_t(count) * 4;
+            // (PS2HOST_REPLAY_NO_NATIVE=1: left out - their packets drawn, as before they were recorded)
+            static const bool no_native = std::getenv("PS2HOST_REPLAY_NO_NATIVE") != nullptr;
+            if (no_native) continue;
+            if (threaded) GsNative(words.data(), count);
+            else g.Native(words.data(), count);
+        } else if (kind == 'M') {
+            // (a mesh the native draws held as the capture began)
+            const u64 key = u64_at(at);
+            const u32 count = u32_at(at + 8);
+            at += 12;
+            words.resize(count);
+            std::memcpy(words.data(), data.data() + at, std::size_t(count) * 4);
+            at += std::size_t(count) * 4;
+            if (gpu && !timing) GpuReplayMesh(key, words.data(), count);
         } else if (kind == 'V') {
             if (threaded) SyncGs();
             g.Finish();
@@ -496,6 +518,12 @@ void RegisterOverlays(const OverlayEntry* overlays, std::size_t count) {
     CodeChanged();
 }
 
+bool HasOverlay(const char* name) {
+    for (std::size_t i = 0; i < g_overlay_count; ++i)
+        if (std::strcmp(g_overlays[i].name, name) == 0) return true;
+    return false;
+}
+
 void CodeChanged() {
     if (!g_overlay_count) return;           // the executable's code never moves
     for (CachedCall& line : g_call_cache) line = CachedCall{};
@@ -712,6 +740,8 @@ void Report(const Options& options, const std::string& outcome) {
                 static_cast<unsigned long long>(gs::TheGs().pixels_drawn()));
     std::printf("%s\n", gs::TheGs().Summary().c_str());
     std::printf("%s\n", ProfileSummary().c_str());
+    VuProfileReport();
+    VuNativeReport();
     const std::string samples = SampleReport(std::getenv("PS2HOST_SAMPLE_TOP") ? std::atoi(std::getenv("PS2HOST_SAMPLE_TOP")) : 30);
     if (!samples.empty()) std::printf("%s", samples.c_str());
     if (!GpuShadowSummary().empty()) std::printf("%s\n", GpuShadowSummary().c_str());

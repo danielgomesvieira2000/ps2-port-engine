@@ -82,6 +82,9 @@ public:
     /* Runs from instruction address `pc` (bytes) to the end of the program;
        returns the instruction pairs executed. Stops after `limit` regardless. */
     u64 Run(u32 pc, u64 limit = u64(1) << 24);
+    u64 RunTimed(u32 pc, u64 limit);   // (Run's work; Run adds PS2HOST_VU_PROFILE's timing)
+    /* The microcode's run alone (RunTimed takes a native program first: vu_native.h). */
+    u64 RunEmulated(u32 pc, u64 limit);
 
     u64 pairs() const { return pairs_; }
     /* Of those, the pairs run compiled ahead of time (vu_core.h). */
@@ -160,6 +163,9 @@ private:
     // count when it was last found in memory: unchanged since, it still is
     // (2.3 million entries a race compared 4.4 GB of code otherwise).
     u64 micro_generation_ = 1;
+    int native_cache_ = -1;             // vu_native.cpp: the native program for this instruction memory
+    u64 native_generation_ = 0;         // ...found at this micro_generation_
+    friend struct VuNativeAccess;
     std::unordered_map<const void*, u64> held_at_;
     // The compiled program found at each pair address and its block table,
     // while instruction memory is as it was then (micro_generation_): a run
@@ -171,6 +177,13 @@ private:
         bool fast = false;
     };
     std::vector<Entered> entered_;
+    // The compiled program run last (and its blocks): where the interpreter
+    // took over in the middle of it, the run goes back to it at the next
+    // block that knows nothing on entry (RunCompiled).
+    const void* last_program_ = nullptr;
+    const void* last_table_ = nullptr;
+    u64 last_generation_ = 0;
+    bool last_fast_ = false;
 
     // Compiled code: the vector registers that may hold fields the model's
     // Clean would change (bit r for VF r) - loaded so, or not known; the FMAC
@@ -227,6 +240,11 @@ private:
 Vu& Vu1();
 /* VU0, which VIF0 loads and the EE starts (vcallms) or VIF0 does. */
 Vu& Vu0();
+
+/* PS2HOST_VU_PROFILE's table (VU1's time by microprogram), written at the run's end. */
+void VuProfileReport();
+/* The kind of thing VU1 draws now (vif.cpp: the words of the last UNPACK to VU address 0 - a thing's header), for PS2HOST_VU_PROFILE. */
+extern unsigned g_vu_thing_kind;
 
 }  // namespace ps2host
 

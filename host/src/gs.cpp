@@ -171,6 +171,7 @@ void Gs::BeginRecord(std::FILE* out) {
     privileged(0x0090, dispfb_[1]);
     privileged(0x00A0, display_[1]);
     privileged(0x00E0, bgcolor_);
+    if (on_record_begin) on_record_begin(out);
     record_ = out;
 }
 
@@ -186,7 +187,42 @@ void Gs::EndRecord() {
 }
 
 void Gs::Words(int path, const u32* words, u32 count, u32 from) {
+    if (hold_next_ && path == 1) {
+        // (the packet a native draw stood for: through as ever, drawing nothing)
+        hold_next_ = false;
+        hold_draws_ = true;
+        GifDecode<Gs>::Words(gif, *this, path, words, count, from);
+        hold_draws_ = false;
+        if (on_held_end) on_held_end();
+        return;
+    }
     GifDecode<Gs>::Words(gif, *this, path, words, count, from);
+}
+
+void Gs::Native(const u32* words, u32 count) {
+    if (record_) {
+        std::fputc('N', record_);
+        std::fwrite(&count, 4, 1, record_);
+        std::fwrite(words, 4, count, record_);
+    }
+    hold_next_ = false;
+    if (!on_native || count < 5) return;
+    const u64 tag_prim = u64(words[3]) | u64(words[4]) << 32;
+    // (flag 4: no packet follows - the PRIM its tag would set, set here, as the tag's PRE would)
+    const bool no_packet = (words[0] & 4) != 0;
+    if (no_packet && tag_prim != ~0ull) WriteRegister(0x00, tag_prim);
+    u64 prim = Prim();
+    if (tag_prim != ~0ull) prim = (prmodecont_ & 1) ? tag_prim : ((tag_prim & 7) | (prmode_ & ~7ull));
+    Finish();                           // (the renderer reads local memory as of now)
+    // XYOFFSET as GifDecode's Register takes it for a vertex (gs_decode.h).
+    const u64 xyoffset = gif.xyoffset[(prim >> 9) & 1];
+    static const bool half_offset = std::getenv("PS2HOST_HALF_OFFSET") != nullptr;
+    const bool field_mode = Bits(gif.smode2, 0, 1) && Bits(gif.smode2, 1, 1);
+    const u32 ofx = Bits(xyoffset, 0, 16);
+    const u32 ofy = field_mode && !half_offset ? Bits(xyoffset, 32, 16) & ~15u : Bits(xyoffset, 32, 16);
+    if (on_native(NativeCall{prim, &ctx_[(prim >> 9) & 1], texa_, fogcol_, (pabe_ & 1) != 0, words, count, ofx, ofy}) &&
+        !no_packet)
+        hold_next_ = true;
 }
 
 void Gs::Qword(int path, u64 low, u64 high) { GifDecode<Gs>::Qword(gif, *this, path, low, high); }

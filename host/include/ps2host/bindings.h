@@ -77,6 +77,21 @@ void SetGameKey(int input, int vk);
 /* Whether the port maps the keyboard itself (its own controls). */
 bool PortMapsKeyboard();
 
+/* A port's bindings, rebound in the PC settings panel: a CONTROLS tab of
+   one context's rows - each input named (`rows`: the input, what it does
+   there) and the key or button on it; Enter (or a click), then the key or
+   button; the tab's last row, DEFAULTS, every one as it was. `changed`:
+   after any change (the port reloads its table). */
+struct PanelPage {
+    std::string title;              // the tab's: "PLAY (RE4)"
+    std::string context;            // the settings' context: "play_re4"
+    Device device = Device::kKeyboard;
+    Table defaults{};
+    std::vector<std::pair<int, std::string>> rows;
+    void (*changed)() = nullptr;
+};
+void AddPanelPage(const PanelPage& page);
+
 }  // namespace bindings
 }  // namespace ps2host
 

@@ -74,6 +74,12 @@ public:
     void SetAntiAliasing(AntiAliasing mode) override { anti_aliasing_.store(int(mode)); }
     /* The overlay into the swapchain image (TRANSFER_DST) being made. */
     void DrawOverlay(VkImage target);
+    /* The reticle into it, before the overlay (DrawReticle). */
+    void DrawReticle(VkImage target);
+    VkBuffer reticle_buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory reticle_memory_ = VK_NULL_HANDLE;
+    void* reticle_mapped_ = nullptr;
+    std::uint64_t reticle_slot_generation_[4] = {};
     static constexpr VkDeviceSize kOverlayBytes = VkDeviceSize(1280) * 720 * 4;
     VkBuffer overlay_buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory overlay_memory_ = VK_NULL_HANDLE;
@@ -167,6 +173,7 @@ private:
     VkPresentModeKHR mode_ = VK_PRESENT_MODE_FIFO_KHR;
     std::atomic<bool> vsync_{false};        // FIFO when set (SetVsync)
     std::atomic<bool> vrr_{false};          // IMMEDIATE before MAILBOX when set (SetVrr)
+    std::atomic<bool> mode_changed_{false}; // the next swapchain another mode's: the old one gone first
     // SetGpuBoost: VK_NV_low_latency2 enabled on the device (the driver has
     // it), the boost wanted, and its call (the loader's, by name).
     bool low_latency_ = false;
@@ -272,6 +279,12 @@ private:
     std::uint64_t presents_ = 0;
     double interval_sum_ = 0, interval_squares_ = 0, interval_longest_ = 0;
     std::unique_ptr<VulkanGpu> shared_;
+    // Init's choice, for MakeDevice again (ResetDevice).
+    VkPath path_ = kVk13;
+    bool baked_ = false;
+    bool MakeDevice();
+public:
+    bool ResetDevice() override;
 };
 
 Gpu* VulkanDisplay::SharedGpu() {
@@ -287,6 +300,7 @@ Gpu* VulkanDisplay::SharedGpu() {
 
 bool VulkanDisplay::Check(VkResult result, const char* what) {
     if (result == VK_SUCCESS) return true;
+    NoteResult(result);
     char text[160];
     std::snprintf(text, sizeof text, "%s failed (VkResult %d)", what, int(result));
     error_ = text;
@@ -388,7 +402,15 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
                   VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
                   VK_API_VERSION_PATCH(p.apiVersion), p.driverVersion, VkPathName(path, baked));
     describe_ = text;
+    path_ = path;
+    baked_ = baked;
+    return MakeDevice();
+}
 
+/* The device, its queue, the presents' command buffers and the swapchain (Init's; ResetDevice's again). */
+bool VulkanDisplay::MakeDevice() {
+    const VkPath path = path_;
+    const bool baked = baked_;
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = family_;
@@ -535,6 +557,12 @@ bool VulkanDisplay::CreateSwapchain() {
     sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     sci.presentMode = mode_;
     sci.clipped = VK_TRUE;
+    // Another present mode (V-sync, VRR changed by the player): the old swapchain gone before the new one is
+    // made, not handed to it - V-sync turned off in fullscreen left the screen black with every picture
+    // presented (NVIDIA, a 144 Hz screen of its own, 2026-11-13: FIFO's swapchain alive while MAILBOX's was
+    // made on the same window). PS2HOST_SWAPCHAIN_HAND_ON=1: handed on as before.
+    static const bool hand_on = std::getenv("PS2HOST_SWAPCHAIN_HAND_ON") != nullptr;
+    if (mode_changed_.exchange(false) && swapchain_ && !hand_on) DestroySwapchain();
     sci.oldSwapchain = swapchain_;
     VkSwapchainLatencyCreateInfoNV latency{VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV};
     latency.latencyModeEnable = VK_TRUE;
@@ -559,7 +587,7 @@ void VulkanDisplay::DestroySwapchain() {
     if (!device_) return;
     {
         std::lock_guard<std::mutex> hold(g_queue_lock);
-        vkDeviceWaitIdle(device_);
+        WaitIdle(device_);
     }
     for (VkSemaphore s : rendered_) vkDestroySemaphore(device_, s, nullptr);
     rendered_.clear();
@@ -594,7 +622,7 @@ bool VulkanDisplay::EnsurePicture(std::uint32_t width, std::uint32_t height) {
     if (width == picture_width_ && height == picture_height_ && picture_) return true;
     {
         std::lock_guard<std::mutex> hold(g_queue_lock);
-        vkDeviceWaitIdle(device_);
+        WaitIdle(device_);
     }
     DestroyPicture();
     const VkDeviceSize bytes = VkDeviceSize(width) * height * 4;
@@ -663,6 +691,22 @@ bool VulkanDisplay::BeginPresent(std::uint32_t* index, bool* ok) {
         const double ms = std::chrono::duration<double, std::milli>(stamp() - from).count();
         if (ms > 100) std::fprintf(stderr, "[present] %s: %.0f ms%s\n", what, ms, bounded_ ? " (bounded)" : "");
     };
+    // The device lost: nothing shown (and nothing waited for - a hung GPU answers no wait) until it is made again
+    // (ResetDevice); not a failure of the display's.
+    if (Lost()) return false;
+    // Pictures not shown one after another (no slot, no image of the swapchain's within the wait): said in the
+    // log at the thirtieth - a screen left black or still with the game going on says why there.
+    static int missed = 0;
+    auto miss = [&](const char* why, VkResult result) {
+        if (++missed == 30) {
+            std::fprintf(stderr, "[display] 30 pictures not shown one after another: %s (result %d, %s, %ux%u)\n", why,
+                         int(result), mode_ == VK_PRESENT_MODE_FIFO_KHR ? "FIFO"
+                                      : mode_ == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : "IMMEDIATE",
+                         extent_.width, extent_.height);
+            std::fflush(stderr);
+        }
+        return false;
+    };
     auto t0 = stamp();
     if (stale_ && !CreateSwapchain()) {
         *ok = false;
@@ -675,13 +719,16 @@ bool VulkanDisplay::BeginPresent(std::uint32_t* index, bool* ok) {
     // a compositor's or a driver's hiccup held the GS thread - the whole
     // game - for 300 ms to seconds (two cores, the integrated GPU; caught
     // by PS2HOST_STALL_WATCH in vkAcquireNextImageKHR's wait).
-    const std::uint64_t limit = bounded_ ? 25'000'000ull : UINT64_MAX;
+    // (Unbounded: no longer than a hung GPU is waited for - kGpuHangNanoseconds, the device counted lost then.)
+    const std::uint64_t limit = bounded_ ? 25'000'000ull : kGpuHangNanoseconds;
     const int next = (slot_ + 1) % kInFlight;
     over("swapchain made", t0);
     t0 = stamp();
-    const bool slot_free = vkWaitForFences(device_, 1, &fences_[next], VK_TRUE, limit) != VK_TIMEOUT;
+    const VkResult slot_wait = bounded_ ? vkWaitForFences(device_, 1, &fences_[next], VK_TRUE, limit)
+                                        : WaitForFence(device_, fences_[next], "a present's slot");
+    NoteResult(slot_wait);
     over("the slot's last submission", t0);
-    if (!slot_free) return false;
+    if (slot_wait != VK_SUCCESS) return miss("the slot's last present not done", slot_wait);
     t0 = stamp();
     VkFence acquire_fence = acquire_fences_[next];
     vkResetFences(device_, 1, &acquire_fence);
@@ -689,7 +736,7 @@ bool VulkanDisplay::BeginPresent(std::uint32_t* index, bool* ok) {
     over("vkAcquireNextImageKHR", t0);
     if (r == VK_TIMEOUT || r == VK_NOT_READY) {
         ++skipped_;
-        return false;               // (nothing acquired: the semaphore and the fence untouched)
+        return miss("no image of the swapchain's", r);      // (nothing acquired: the semaphore and the fence untouched)
     }
     slot_ = next;
     cmd_ = cmds_[slot_];
@@ -697,20 +744,22 @@ bool VulkanDisplay::BeginPresent(std::uint32_t* index, bool* ok) {
     fence_ = fences_[slot_];
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         stale_ = true;
-        return false;
+        return miss("the swapchain out of date", r);
     }
     if (r != VK_SUBOPTIMAL_KHR && !Check(r, "vkAcquireNextImageKHR")) {
         *ok = false;
         return false;
     }
     t0 = stamp();
-    vkWaitForFences(device_, 1, &acquire_fence, VK_TRUE, UINT64_MAX);
+    if (WaitForFence(device_, acquire_fence, "the acquired image") != VK_SUCCESS) return false;
     over("the acquired image's fence", t0);
     vkResetFences(device_, 1, &fence_);
     vkResetCommandBuffer(cmd_, 0);
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd_, &begin);
+    if (missed >= 30) std::fprintf(stderr, "[display] pictures shown again (%d not)\n", missed);
+    missed = 0;
     return true;
 }
 
@@ -740,6 +789,11 @@ void VulkanDisplay::DrawOverlay(VkImage target) {
     x = std::uint32_t(std::max(0, shown_x0_.load())) + 16;
     y = extent_.height / 9;
 #endif
+    if (overlay_right_.load() && extent_.width > overlay_width_ + 32) x = extent_.width - overlay_width_ - 16;
+    if (overlay_centred_.load() && extent_.width > overlay_width_ && extent_.height > overlay_height_) {
+        x = (extent_.width - overlay_width_) / 2;
+        y = (extent_.height - overlay_height_) / 2;
+    }
     if (x + 16 >= extent_.width) x = 16;
     if (y + 16 >= extent_.height) y = 16;
     const std::uint32_t w = std::min(overlay_width_, extent_.width > x ? extent_.width - x : 0u);
@@ -763,6 +817,69 @@ void VulkanDisplay::DrawOverlay(VkImage target) {
     copy.imageOffset = {std::int32_t(x), std::int32_t(y), 0};
     copy.imageExtent = {w, h, 1};
     vkCmdCopyBufferToImage(cmd_, overlay_buffer_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+}
+
+void VulkanDisplay::DrawReticle(VkImage target) {
+    constexpr VkDeviceSize kReticleBytes = 64 * 64 * 4;
+    static_assert(kInFlight <= 4, "reticle_slot_generation_");
+    std::lock_guard<std::mutex> hold(overlay_lock_);
+    if (reticle_.empty() || !reticle_width_ || !reticle_height_) return;
+    if (extent_.width < reticle_width_ || extent_.height < reticle_height_) return;
+    if (!reticle_buffer_) {
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = kReticleBytes * kInFlight;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        if (vkCreateBuffer(device_, &bci, nullptr, &reticle_buffer_) != VK_SUCCESS) return;
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(device_, reticle_buffer_, &req);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (vkAllocateMemory(device_, &mai, nullptr, &reticle_memory_) != VK_SUCCESS) {
+            vkDestroyBuffer(device_, reticle_buffer_, nullptr);
+            reticle_buffer_ = VK_NULL_HANDLE;
+            return;
+        }
+        vkBindBufferMemory(device_, reticle_buffer_, reticle_memory_, 0);
+        vkMapMemory(device_, reticle_memory_, 0, kReticleBytes * kInFlight, 0, &reticle_mapped_);
+        for (std::uint64_t& g : reticle_slot_generation_) g = 0;
+    }
+    const VkDeviceSize offset = kReticleBytes * VkDeviceSize(slot_);
+    if (reticle_slot_generation_[slot_] != reticle_generation_) {
+        std::memcpy(static_cast<char*>(reticle_mapped_) + offset, reticle_.data(),
+                    std::size_t(reticle_width_) * reticle_height_ * 4);
+        reticle_slot_generation_[slot_] = reticle_generation_;
+    }
+    // Its pixels' runs, row by row (alpha 0 left as the picture has it).
+    static thread_local std::vector<VkBufferImageCopy> copies(64 * 32);   // (each row's runs; reused, not on the stack)
+    std::uint32_t n = 0;
+    const std::int32_t x0 = std::int32_t((extent_.width - reticle_width_) / 2);
+    const std::int32_t y0 = std::int32_t((extent_.height - reticle_height_) / 2);
+    for (std::uint32_t y = 0; y < reticle_height_; ++y)
+        for (std::uint32_t x = 0; x < reticle_width_;) {
+            if (!(reticle_[y * reticle_width_ + x] >> 24)) {
+                ++x;
+                continue;
+            }
+            std::uint32_t end = x;
+            while (end < reticle_width_ && (reticle_[y * reticle_width_ + end] >> 24)) ++end;
+            if (n < copies.size()) {
+                VkBufferImageCopy& c = copies[n++];
+                c = {};
+                c.bufferOffset = offset + VkDeviceSize(y * reticle_width_ + x) * 4;
+                c.bufferRowLength = reticle_width_;
+                c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                c.imageOffset = {x0 + std::int32_t(x), y0 + std::int32_t(y), 0};
+                c.imageExtent = {end - x, 1, 1};
+            }
+            x = end;
+        }
+    if (!n) return;
+    Barrier(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT);
+    vkCmdCopyBufferToImage(cmd_, reticle_buffer_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, n, copies.data());
 }
 
 void VulkanDisplay::DestroyPostImages() {
@@ -851,7 +968,7 @@ bool VulkanDisplay::EnsurePost(std::uint32_t width, std::uint32_t height, std::u
     // Earlier presents may still read the old images.
     {
         std::lock_guard<std::mutex> hold(g_queue_lock);
-        vkDeviceWaitIdle(device_);
+        WaitIdle(device_);
     }
     DestroyPostImages();
     struct Made { VkImage* image; VkDeviceMemory* memory; VkImageView* view; VkImageUsageFlags usage;
@@ -1082,7 +1199,7 @@ bool VulkanDisplay::EnsureSmaa(std::uint32_t width, std::uint32_t height) {
     // Earlier presents may still read the old images.
     {
         std::lock_guard<std::mutex> hold(g_queue_lock);
-        vkDeviceWaitIdle(device_);
+        WaitIdle(device_);
     }
     for (int which : {int(kSmaaEdges), int(kSmaaWeights)}) {
         if (smaa_view_[which]) vkDestroyImageView(device_, smaa_view_[which], nullptr);
@@ -1233,6 +1350,7 @@ bool VulkanDisplay::FinishPresent(std::uint32_t index, VkImage source, std::uint
     blit.dstOffsets[1] = {x0 + dw, y0 + dh, 1};
     vkCmdBlitImage(cmd_, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    DrawReticle(target);
     DrawOverlay(target);
     Barrier(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -1253,7 +1371,10 @@ bool VulkanDisplay::Present(const std::uint32_t* pixels, std::uint32_t width, st
     // One staging buffer and picture for all: what an earlier present still
     // copies from goes first.
     for (int i = 0; i < kInFlight; ++i)
-        if (i != slot_) vkWaitForFences(device_, 1, &fences_[i], VK_TRUE, UINT64_MAX);
+        if (i != slot_ && WaitForFence(device_, fences_[i], "an earlier present") != VK_SUCCESS) {
+            vkEndCommandBuffer(cmd_);
+            return Lost();              // (the device lost: made again by its owner, not the display's failure)
+        }
     std::memcpy(mapped_, pixels, std::size_t(width) * height * 4);
     Barrier(cmd_, picture_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -1299,7 +1420,7 @@ bool VulkanDisplay::EnsurePaced(std::uint32_t width, std::uint32_t height) {
     }
     {
         std::lock_guard<std::mutex> hold(g_queue_lock);
-        vkDeviceWaitIdle(device_);
+        WaitIdle(device_);
     }
     DestroyPaced();
     if (!copy_pool_) {
@@ -1360,7 +1481,8 @@ int VulkanDisplay::CopyPaced(std::uint64_t image, int layout, std::uint32_t widt
                              std::uint64_t due_ns, bool held) {
     if (!width || !height || !image) return closed_ ? -2 : -1;
     if (closed_) return -2;
-    if (!EnsurePaced(width, height)) return -2;
+    if (Lost()) return -1;              // (nothing copied on a lost device: made again first, ResetDevice)
+    if (!EnsurePaced(width, height)) return Lost() ? -1 : -2;
     // A picture neither waiting to be shown nor being shown - or, with all
     // of them waiting, the oldest waiting (its turn is lost: the shown
     // picture keeps no more than two frames behind). What the GPU still
@@ -1378,7 +1500,8 @@ int VulkanDisplay::CopyPaced(std::uint64_t image, int layout, std::uint32_t widt
         }
     }
     PacedPicture& p = paced_[slot];
-    vkWaitForFences(device_, 1, &p.copied, VK_TRUE, UINT64_MAX);    // its command buffer, from last time
+    // Its command buffer, from last time (never done on a lost device: left as it is, nothing copied).
+    if (WaitForFence(device_, p.copied, "a paced picture's copy") != VK_SUCCESS) return -1;
     vkResetFences(device_, 1, &p.copied);
     vkResetCommandBuffer(p.copy, 0);
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1411,7 +1534,7 @@ int VulkanDisplay::CopyPaced(std::uint64_t image, int layout, std::uint32_t widt
     submit.pCommandBuffers = &p.copy;
     {
         std::lock_guard<std::mutex> hold(g_queue_lock);
-        if (!Check(vkQueueSubmit(queue_, 1, &submit, p.copied), "vkQueueSubmit (paced)")) return -2;
+        if (!Check(vkQueueSubmit(queue_, 1, &submit, p.copied), "vkQueueSubmit (paced)")) return Lost() ? -1 : -2;
     }
     p.width = width;
     p.height = height;
@@ -1534,15 +1657,44 @@ void VulkanDisplay::PresentLoop() {
             while (Clock::now() < due) std::this_thread::yield();
         }
         {
-            std::lock_guard<std::mutex> hold(paced_lock_);
+            std::unique_lock<std::mutex> hold(paced_lock_);
             if (stop_) {
                 if (began) vkEndCommandBuffer(cmd_);
                 return;
             }
             // The oldest waiting now (a newer one may have taken its turn
-            // meanwhile): into the image already taken.
-            if (ready_.empty()) {
+            // meanwhile: CopyPaced takes the oldest's slot, then queues its
+            // own; a resize empties the queue, then queues anew) - waited for
+            // a little: the image is taken, and it must be shown. Left so (its
+            // command buffer ended, nothing submitted), its slot's fence was
+            // reset and never signalled: the third picture on waited for it
+            // the whole hang limit, 15 s, and the device counted lost.
+            if (ready_.empty() && began)
+                paced_wake_.wait_for(hold, std::chrono::milliseconds(250), [&] { return stop_ || !ready_.empty(); });
+            if (stop_) {
                 if (began) vkEndCommandBuffer(cmd_);
+                return;
+            }
+            if (ready_.empty()) {
+                hold.unlock();
+                if (began) {
+                    // (none came: the image shown black - submitted, its fence signalled, the image given back)
+                    static int told = 0;
+                    if (told < 5) {
+                        ++told;
+                        std::fprintf(stderr, "[display] a picture's turn with none to show: the screen black once\n");
+                    }
+                    const VkImage target = images_[index];
+                    Barrier(cmd_, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    const VkClearColorValue black{};
+                    const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                    vkCmdClearColorImage(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+                    Barrier(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+                    Submit(index);
+                }
                 continue;
             }
             slot = ready_.front();
@@ -1680,6 +1832,7 @@ Display::Pacing VulkanDisplay::TakePacing() {
 void VulkanDisplay::SetVsync(bool on) {
     if (vsync_ == on) return;
     vsync_ = on;
+    mode_changed_ = true;
     stale_ = true;                              // the swapchain again, with the other mode
 }
 
@@ -1712,7 +1865,7 @@ void VulkanDisplay::SetGpuBoost(bool on) {
 void VulkanDisplay::SetVrr(bool on) {
     if (vrr_ == on) return;
     vrr_ = on;
-    if (!vsync_) stale_ = true;                 // (vertical sync's FIFO either way)
+    if (!vsync_) mode_changed_ = true, stale_ = true;     // (vertical sync's FIFO either way)
 }
 
 void VulkanDisplay::SetGpuDoneObserver(GpuDoneObserver observer) {
@@ -1740,7 +1893,9 @@ void VulkanDisplay::WatchDone() {
         }
         const std::uint64_t done = std::uint64_t(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-        vkResetFences(device_, 1, &next.first);
+        // (A fence whose wait failed - the device lost - may be the GPU's still: not reset, gone with the device.)
+        if (r == VK_SUCCESS) vkResetFences(device_, 1, &next.first);
+        else NoteResult(r);
         {
             std::lock_guard<std::mutex> hold(w.lock);
             w.waiting.erase(w.waiting.begin());
@@ -1763,6 +1918,94 @@ void VulkanDisplay::StopDoneWatch() {
     done_watch_.reset();
 }
 
+/* The device lost (g_device_lost): everything made on it let go - the shared GPU (the renderer's, gone first),
+   the presents' thread and their images, the effects' passes, the swapchain - and made again on a new device of
+   the same GPU, the window and its surface kept. */
+bool VulkanDisplay::ResetDevice() {
+    {
+        std::lock_guard<std::mutex> hold(paced_lock_);
+        stop_ = true;
+    }
+    paced_wake_.notify_all();
+    if (present_thread_.joinable()) present_thread_.join();
+    std::lock_guard<std::mutex> presenting(present_lock_);
+    shared_.reset();
+    GpuDoneObserver done = done_watch_ ? done_watch_->observer : GpuDoneObserver{};
+    StopDoneWatch();
+    if (device_) {
+        std::lock_guard<std::mutex> hold(g_queue_lock);
+        WaitIdle(device_);                      // (not asked of a lost device: a hung GPU's may never return)
+    }
+    DestroyPaced();
+    if (copy_pool_) vkDestroyCommandPool(device_, copy_pool_, nullptr);
+    copy_pool_ = VK_NULL_HANDLE;
+    DestroyPicture();
+    DestroyPostImages();
+    DestroySmaa();
+    smaa_tables_sent_ = smaa_failed_ = false;
+    smaa_width_ = smaa_height_ = 0;
+    smaa_for_in_ = VK_NULL_HANDLE;
+    for (VkDescriptorSet& set : smaa_sets_) set = VK_NULL_HANDLE;
+    if (fxaa_pipeline_) vkDestroyPipeline(device_, fxaa_pipeline_, nullptr);
+    if (downsample_pipeline_) vkDestroyPipeline(device_, downsample_pipeline_, nullptr);
+    if (post_layout_) vkDestroyPipelineLayout(device_, post_layout_, nullptr);
+    if (post_descriptors_) vkDestroyDescriptorPool(device_, post_descriptors_, nullptr);
+    if (post_set_layout_) vkDestroyDescriptorSetLayout(device_, post_set_layout_, nullptr);
+    if (post_sampler_) vkDestroySampler(device_, post_sampler_, nullptr);
+    fxaa_pipeline_ = downsample_pipeline_ = VK_NULL_HANDLE;
+    post_layout_ = VK_NULL_HANDLE;
+    post_descriptors_ = VK_NULL_HANDLE;
+    post_set_layout_ = VK_NULL_HANDLE;
+    post_sampler_ = VK_NULL_HANDLE;
+    post_set_ = VK_NULL_HANDLE;
+    post_failed_ = false;
+    if (overlay_buffer_) vkDestroyBuffer(device_, overlay_buffer_, nullptr);
+    if (overlay_memory_) vkFreeMemory(device_, overlay_memory_, nullptr);
+    overlay_buffer_ = VK_NULL_HANDLE;
+    overlay_memory_ = VK_NULL_HANDLE;
+    overlay_mapped_ = nullptr;
+    for (std::uint64_t& g : overlay_slot_generation_) g = 0;
+    if (reticle_buffer_) vkDestroyBuffer(device_, reticle_buffer_, nullptr);
+    if (reticle_memory_) vkFreeMemory(device_, reticle_memory_, nullptr);
+    reticle_buffer_ = VK_NULL_HANDLE;
+    reticle_memory_ = VK_NULL_HANDLE;
+    reticle_mapped_ = nullptr;
+    DestroySwapchain();
+    if (device_) {
+        for (int i = 0; i < kInFlight; ++i) {
+            if (fences_[i]) vkDestroyFence(device_, fences_[i], nullptr);
+            if (acquire_fences_[i]) vkDestroyFence(device_, acquire_fences_[i], nullptr);
+            if (acquireds_[i]) vkDestroySemaphore(device_, acquireds_[i], nullptr);
+            fences_[i] = acquire_fences_[i] = VK_NULL_HANDLE;
+            acquireds_[i] = VK_NULL_HANDLE;
+            cmds_[i] = VK_NULL_HANDLE;
+        }
+        if (pool_) vkDestroyCommandPool(device_, pool_, nullptr);
+        pool_ = VK_NULL_HANDLE;
+        vkDestroyDevice(device_, nullptr);
+    }
+    device_ = VK_NULL_HANDLE;
+    queue_ = VK_NULL_HANDLE;
+    slot_ = 0;
+    {
+        std::lock_guard<std::mutex> hold(paced_lock_);
+        stop_ = false;
+        ready_.clear();
+        taken_ = held_ = -1;
+    }
+    g_device_lost = false;
+    if (!MakeDevice()) {
+        // (None to draw with: lost still, for whoever asks - nothing recorded for or waited on what is not there.)
+        g_device_lost = true;
+        std::fprintf(stderr, "[display] the device could not be made again: %s\n", error_.c_str());
+        return false;
+    }
+    if (done) SetGpuDoneObserver(std::move(done));
+    ApplyBoost();
+    std::fprintf(stderr, "[display] the device made again (%s)\n", describe_.c_str());
+    return true;
+}
+
 VulkanDisplay::~VulkanDisplay() {
     {
         std::lock_guard<std::mutex> hold(paced_lock_);
@@ -1771,7 +2014,7 @@ VulkanDisplay::~VulkanDisplay() {
     paced_wake_.notify_all();
     if (present_thread_.joinable()) present_thread_.join();
     shared_.reset();
-    if (device_) vkDeviceWaitIdle(device_);
+    if (device_) WaitIdle(device_);
     StopDoneWatch();
     DestroyPaced();
     if (copy_pool_) vkDestroyCommandPool(device_, copy_pool_, nullptr);
@@ -1786,6 +2029,8 @@ VulkanDisplay::~VulkanDisplay() {
     if (post_sampler_) vkDestroySampler(device_, post_sampler_, nullptr);
     if (overlay_buffer_) vkDestroyBuffer(device_, overlay_buffer_, nullptr);
     if (overlay_memory_) vkFreeMemory(device_, overlay_memory_, nullptr);
+    if (reticle_buffer_) vkDestroyBuffer(device_, reticle_buffer_, nullptr);
+    if (reticle_memory_) vkFreeMemory(device_, reticle_memory_, nullptr);
     DestroySwapchain();
     if (device_) {
         for (int i = 0; i < kInFlight; ++i) {

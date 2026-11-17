@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <unordered_map>
 #include <xmmintrin.h>
 #include <unordered_set>
@@ -25,6 +26,7 @@
 
 #include "ps2host/memory.h"
 #include "ps2host/profile.h"
+#include "ps2host/run.h"
 #include "ps2host/vu_core.h"
 #include "ps2rt/generated.h"
 #include "ps2rt/vu_math.h"
@@ -182,6 +184,81 @@ bool Holds(const Vu::Span& micro, const Vu::u32* code) {
         code += 2 + words;
     }
     return true;
+}
+
+// ---------------------------------------------------------------- the time by microprogram (PS2HOST_VU_PROFILE)
+//
+// PS2HOST_VU_PROFILE=1: each VU1 run's time and pairs, by the microcode it
+// starts in - a hash of the 32 pairs from its start (what a native program
+// would be known by: docs/NATIVE_RENDERER.md), and its start - written at the
+// run's end, the costliest first. PS2HOST_VU_PROFILE_FROM=<frame>: from then
+// on only (gameplay, not the boot's).
+
+struct ProgramTime {
+    std::uint64_t ns = 0, runs = 0, pairs = 0, interpreted = 0;
+    std::uint32_t pc = 0, kind = 0;
+    std::uint64_t code = 0;
+};
+thread_local std::uint64_t t_interpreted = 0;     // (RunTimed's last run: its pairs the interpreter ran)
+
+struct ProgramTimes {
+    std::unordered_map<std::uint64_t, ProgramTime> by;
+    std::mutex lock;
+    void Report() {
+        std::lock_guard<std::mutex> hold(lock);
+        if (by.empty()) return;
+        std::vector<std::pair<std::uint64_t, ProgramTime>> all(by.begin(), by.end());
+        std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+        std::uint64_t total = 0, runs = 0;
+        for (const auto& [k, t] : all) total += t.ns, runs += t.runs;
+        std::fprintf(stderr, "[vu profile] VU1: %.1f ms in %llu runs, %zu microprograms (by their code at the start)\n",
+                     double(total) / 1e6, (unsigned long long)runs, all.size());
+        for (size_t i = 0; i < all.size() && i < 40; ++i) {
+            const auto& [k, t] = all[i];
+            std::fprintf(stderr, "[vu profile]  %016llX at 0x%04X, things of %3u words: %5.1f%% %9.1f ms, %8llu runs, %11llu pairs (%llu a run), %.0f%% interpreted\n",
+                         (unsigned long long)t.code, unsigned(t.pc), unsigned(t.kind), 100.0 * double(t.ns) / double(std::max<std::uint64_t>(total, 1)),
+                         double(t.ns) / 1e6, (unsigned long long)t.runs, (unsigned long long)t.pairs,
+                         (unsigned long long)(t.pairs / std::max<std::uint64_t>(t.runs, 1)),
+                         100.0 * double(t.interpreted) / double(std::max<std::uint64_t>(t.pairs, 1)));
+        }
+    }
+};
+
+ProgramTimes* VuProfile() {
+    static ProgramTimes* times = [] {
+        const char* e = std::getenv("PS2HOST_VU_PROFILE");
+        return e && *e && *e != '0' ? new ProgramTimes : nullptr;
+    }();
+    return times;
+}
+
+}  // namespace
+
+unsigned g_vu_thing_kind = 0;
+
+void VuProfileReport() {
+    if (ProgramTimes* t = VuProfile()) t->Report();
+}
+
+namespace {
+
+unsigned long long VuProfileFrom() {
+    static const unsigned long long from = [] {
+        const char* e = std::getenv("PS2HOST_VU_PROFILE_FROM");
+        return e ? std::strtoull(e, nullptr, 10) : 0ull;
+    }();
+    return from;
+}
+
+std::uint64_t CodeHash(const Vu::Span& micro, Vu::u32 pc) {
+    std::uint64_t h = 1469598103934665603ull;
+    const Vu::u32 mask = Vu::u32(micro.size() - 1);
+    for (Vu::u32 i = 0; i < 32 * 8; i += 4) {
+        Vu::u32 w;
+        std::memcpy(&w, micro.data() + ((pc + i) & mask), 4);
+        h = (h ^ w) * 1099511628211ull;
+    }
+    return h;
 }
 
 // ---------------------------------------------------------------- recording (--vu-record)
@@ -1935,6 +2012,44 @@ int Vu::Speculate(const std::string& path, const std::string& spec) {
 }
 
 Vu::u64 Vu::Run(u32 pc, u64 limit) {
+    ProgramTimes* profile = data_mask_ == 0x3FF ? VuProfile() : nullptr;
+    if (profile && FrameNumber() < VuProfileFrom()) profile = nullptr;
+    if (!profile) return RunTimed(pc, limit);
+    const auto began = std::chrono::steady_clock::now();
+    const unsigned kind = g_vu_thing_kind;
+    const std::uint64_t code = CodeHash(micro, pc & u32(micro.size() - 1) & ~7u);
+    const std::uint64_t key = code ^ (std::uint64_t(kind) * 0x9E3779B97F4A7C15ull);
+    const u64 pairs = RunTimed(pc, limit);
+    const std::uint64_t ns = std::uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
+    std::lock_guard<std::mutex> hold(profile->lock);
+    ProgramTime& t = profile->by[key];
+    t.ns += ns;
+    ++t.runs;
+    t.pairs += pairs;
+    t.interpreted += t_interpreted;
+    t.pc = pc & u32(micro.size() - 1) & ~7u;
+    t.kind = kind;
+    t.code = code;
+    return pairs;
+}
+
+bool VuNativeRun(Vu& vu, Vu::u32 pc, Vu::u64 limit, Vu::u64* pairs, Vu::u64 generation, int* cache,
+                 Vu::u64* cache_generation);     // vu_native.cpp
+
+Vu::u64 Vu::RunTimed(u32 pc, u64 limit) {
+    if (data_mask_ == 0x3FF) {
+        Timed timed(Section::Vu1);
+        VuRounding rounding;                // (a native program's arithmetic as the VU's)
+        u64 pairs = 0;
+        if (VuNativeRun(*this, pc & u32(micro.size() - 1) & ~7u, limit, &pairs, micro_generation_, &native_cache_,
+                        &native_generation_))
+            return pairs;
+    }
+    return RunEmulated(pc, limit);
+}
+
+Vu::u64 Vu::RunEmulated(u32 pc, u64 limit) {
     Timed timed(data_mask_ == 0x3FF ? Section::Vu1 : Section::Vu0);
     VuRounding rounding;
     const int unit = data_mask_ == 0x3FF ? 1 : 0;
@@ -1966,6 +2081,7 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     RunCompiled(state, limit);
     const u64 compiled = state.count;
     if (!state.done) Interpret(state, limit);
+    t_interpreted = state.count - compiled;
     LandAll();
     resume = state.pc;
     pairs_ += state.count;
@@ -1984,6 +2100,15 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     return state.count;
 }
 
+/* Whether `program`'s block at `pc` knows fields clean from the ways into it
+   (compiled for them: entered another way, not exact). */
+bool KnowsAt(const VuCompiled* program, Vu::u32 pc) {
+    if (!program->knows) return false;
+    const Vu::u32* end = program->starts + program->block_count;
+    const Vu::u32* at = std::lower_bound(program->starts, end, pc);
+    return at != end && *at == pc && program->knows[at - program->starts];
+}
+
 bool Vu::RunCompiled(VuRunState& state, u64 limit) {
     if (!use_compiled || Compiled().empty()) return false;
     const int unit = data_mask_ == 0x3FF ? 1 : 0;
@@ -2000,9 +2125,25 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
         } else {
             const auto found = Compiled().find(std::uint64_t(unit) << 32 | state.pc);
             if (found == Compiled().end()) {
-                if (g_record && ran) RecordProgram(micro, unit, state.pc);
-                break;
+                // No program starts here: the one run last goes on, if a block
+                // of it starts here that knows nothing on entry (the
+                // interpreter took over in the middle of it - a jump to a
+                // register's address into a block that knows fields clean -
+                // and the run comes back at its next jump: 99% of a run of
+                // File #2's 72-word things was interpreted).
+                const VuCompiled* last = static_cast<const VuCompiled*>(last_program_);
+                const std::vector<VuBlock>* last_table = static_cast<const std::vector<VuBlock>*>(last_table_);
+                if (last && last_generation_ == micro_generation_ && last_fast_ == fast && state.pc < micro.size() &&
+                    (*last_table)[state.pc / 8] && !KnowsAt(last, state.pc)) {
+                    program = last;
+                    blocks = last_table;
+                    if (entered) *entered = Entered{program, blocks, micro_generation_, fast};
+                } else {
+                    if (g_record && ran) RecordProgram(micro, unit, state.pc);
+                    break;
+                }
             }
+            if (!program)
             for (const VuCompiled* candidate : found->second) {
                 u64& held_at = held_at_[candidate];
                 if (held_at == micro_generation_) { program = candidate; break; }
@@ -2021,6 +2162,10 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
             if (entered) *entered = Entered{program, blocks, micro_generation_, fast};
         }
         ++compiled_entries_;
+        last_program_ = program;
+        last_table_ = blocks;
+        last_generation_ = micro_generation_;
+        last_fast_ = fast;
         const std::vector<VuBlock>& table = *blocks;
         const u64 before = state.count;
         const u32 started = state.pc;
@@ -2170,6 +2315,7 @@ void Vu::Interpret(VuRunState& state, u64 limit) {
             state.count = count;
             state.delayed = delayed;
             state.stopping = stopping;
+            state.interpret = false;        // (compiled code may go on here: RunCompiled says where)
             if (RunCompiled(state, limit)) {
                 if (state.done) return;
                 pc = state.pc;

@@ -70,7 +70,7 @@ constexpr u32 kMaxRun = kRing / 8;              // the longest run of words one 
 // register the GS keeps (kApply), a vertex (kVertex, the path bits 1 if it
 // may draw), IMAGE data (kImage, quadwords), a line of the trace (kTrace).
 enum : u32 { kQword = 1, kWord = 2, kWords = 3, kPrivileged = 4, kWrap = 5, kFrame = 6, kRegister = 7, kApply = 8,
-             kVertex = 9, kImage = 10, kTrace = 11 };
+             kVertex = 9, kImage = 10, kTrace = 11, kNative = 12 };
 constexpr u32 kVertexWords = sizeof(gs::Vertex) / 4;
 static_assert(sizeof(gs::Vertex) % 4 == 0, "a vertex is whole words");
 
@@ -208,6 +208,8 @@ struct Feed {
                 waiting.store(true);
                 room.wait_for(lock, std::chrono::milliseconds(1), [&] { return done() || has_failed.load(); });
                 waiting.store(false);
+                lock.unlock();
+                KeepWindowAnswering();      // (a GPU pipeline made meanwhile: seconds on a cold driver)
             }
         }
     }
@@ -351,6 +353,7 @@ u32 Whole(const u32* e, u32 at) {
         case kQword: g.Qword(path, Value(e + 1), Value(e + 3)); return 5;
         case kWord: g.Word(path, e[1]); return 2;
         case kWords: g.Words(path, e + 2, count, e[1]); return 2 + count;
+        case kNative: g.Native(e + 1, count); return 1 + count;
         case kPrivileged: g.SetPrivileged(e[1], Value(e + 2)); return 4;
         case kRegister: g.WriteRegister(e[1], Value(e + 2)); return 4;
         case kFrame: FrameEnd(e); return 3;
@@ -582,6 +585,42 @@ void GsWords(int path, const u32* words, u32 count, u32 from) {
         count -= run;
         if (from != gs::Gs::kNoSource) from += 4 * run;
     }
+}
+
+std::atomic<bool> g_native_draws{false};
+
+void SetGsNativeDraws(bool on) { g_native_draws.store(on && !GsSplit(), std::memory_order_relaxed); }
+bool GsNativeDraws() { return g_native_draws.load(std::memory_order_relaxed); }
+
+void GsNative(const u32* words, u32 count) {
+    if (!g_feed) return gs::TheGs().Native(words, count);
+    Producing producing;
+    if (count + 1 > kMaxRun) return;        // (no payload is this large: kMaxRun is 512K words)
+    u32* e = g_feed->Reserve(1 + count);
+    e[0] = Header(kNative, 1, count);
+    std::memcpy(e + 1, words, std::size_t(count) * 4);
+    g_feed->Publish(1 + count);
+}
+
+thread_local std::vector<u32> t_native_local;     // (GsNativeBegin's, with no GS thread)
+
+u32* GsNativeBegin(u32 count) {
+    if (!g_feed || count + 1 > kMaxRun) {
+        t_native_local.resize(count);
+        return t_native_local.data();
+    }
+    Producing producing;
+    u32* e = g_feed->Reserve(1 + count);
+    e[0] = Header(kNative, 1, count);
+    return e + 1;
+}
+
+void GsNativeEnd(u32 count) {
+    if (!g_feed || count + 1 > kMaxRun) {
+        if (!g_feed) gs::TheGs().Native(t_native_local.data(), count);
+        return;
+    }
+    g_feed->Publish(1 + count);
 }
 
 void SetGsFrameHandler(std::function<void(u64)> handler) { g_frame_handler = std::move(handler); }

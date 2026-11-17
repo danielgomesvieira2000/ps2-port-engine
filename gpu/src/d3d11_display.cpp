@@ -112,6 +112,8 @@ private:
     bool Show(ID3D11ShaderResourceView* picture, std::uint32_t width, std::uint32_t height,
               std::uint32_t texture_width, std::uint32_t texture_height);
     void DrawOverlay(std::uint32_t target_width, std::uint32_t target_height);
+    /* The reticle (SetReticle's) in the target's middle, blended by its alpha (0: the picture), under the overlay. */
+    void DrawReticle(std::uint32_t target_width, std::uint32_t target_height);
     void CountPresent();
     /* ANTI-ALIASING: the picture's used part copied into post_in_, then
        FXAA or SMAA into post_out_ (its size), or supersampling's average
@@ -160,6 +162,11 @@ private:
     ID3D11ShaderResourceView* overlay_view_ = nullptr;
     std::uint32_t overlay_texture_width_ = 0, overlay_texture_height_ = 0;
     std::uint64_t overlay_uploaded_ = 0;
+    ID3D11Texture2D* reticle_texture_ = nullptr;
+    ID3D11ShaderResourceView* reticle_view_ = nullptr;
+    std::uint32_t reticle_texture_width_ = 0, reticle_texture_height_ = 0;
+    std::uint64_t reticle_uploaded_ = 0;
+    ID3D11BlendState* alpha_blend_ = nullptr;
     std::mutex present_lock_;
     /* PresentImageAt's pictures: copies of the renderer's images (it may draw
        over them next), shown by a thread of the display's at their time - the
@@ -386,6 +393,7 @@ bool D3D11Display::Show(ID3D11ShaderResourceView* picture, std::uint32_t width, 
     c->PSSetShaderResources(0, 1, &picture);
     c->PSSetSamplers(0, 1, &linear_);
     c->Draw(3, 0);
+    DrawReticle(back_width_, back_height_);
     DrawOverlay(back_width_, back_height_);
     // (What it bound unbound: the GS renderer draws on this context too.)
     ID3D11ShaderResourceView* none = nullptr;
@@ -398,6 +406,59 @@ bool D3D11Display::Show(ID3D11ShaderResourceView* picture, std::uint32_t width, 
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) return Fail(hr, "Present (the device was lost)");
     CountPresent();
     return !closed_;
+}
+
+void D3D11Display::DrawReticle(std::uint32_t target_width, std::uint32_t target_height) {
+    std::lock_guard<std::mutex> hold(overlay_lock_);
+    if (reticle_.empty() || !reticle_width_ || !reticle_height_) return;
+    if (target_width < reticle_width_ || target_height < reticle_height_) return;
+    if (reticle_uploaded_ != reticle_generation_) {
+        if (!reticle_texture_ || reticle_texture_width_ != reticle_width_ || reticle_texture_height_ != reticle_height_) {
+            Release(reticle_view_);
+            Release(reticle_texture_);
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = reticle_width_;
+            td.Height = reticle_height_;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            if (FAILED(gpu_.device->CreateTexture2D(&td, nullptr, &reticle_texture_)) ||
+                FAILED(gpu_.device->CreateShaderResourceView(reticle_texture_, nullptr, &reticle_view_))) {
+                Release(reticle_texture_);
+                return;
+            }
+            reticle_texture_width_ = reticle_width_;
+            reticle_texture_height_ = reticle_height_;
+        }
+        gpu_.context->UpdateSubresource(reticle_texture_, 0, nullptr, reticle_.data(), reticle_width_ * 4, 0);
+        reticle_uploaded_ = reticle_generation_;
+    }
+    if (!alpha_blend_) {
+        D3D11_BLEND_DESC bd{};
+        bd.RenderTarget[0].BlendEnable = TRUE;
+        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(gpu_.device->CreateBlendState(&bd, &alpha_blend_))) return;
+    }
+    const std::uint32_t x = (target_width - reticle_width_) / 2, y = (target_height - reticle_height_) / 2;
+    const D3D11_VIEWPORT vp{float(x), float(y), float(reticle_width_), float(reticle_height_), 0.0f, 1.0f};
+    const D3D11_RECT scissor{LONG(x), LONG(y), LONG(x + reticle_width_), LONG(y + reticle_height_)};
+    ID3D11DeviceContext* c = gpu_.context;
+    c->OMSetBlendState(alpha_blend_, nullptr, 0xFFFFFFFFu);
+    c->RSSetViewports(1, &vp);
+    c->RSSetScissorRects(1, &scissor);
+    c->PSSetShaderResources(0, 1, &reticle_view_);
+    c->PSSetSamplers(0, 1, &point_);
+    c->Draw(3, 0);
+    c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
 }
 
 void D3D11Display::DrawOverlay(std::uint32_t target_width, std::uint32_t target_height) {
@@ -428,6 +489,11 @@ void D3D11Display::DrawOverlay(std::uint32_t target_width, std::uint32_t target_
         overlay_uploaded_ = overlay_generation_;
     }
     std::uint32_t x = 16, y = 16;
+    if (overlay_right_.load() && target_width > overlay_width_ + 32) x = target_width - overlay_width_ - 16;
+    if (overlay_centred_.load() && target_width > overlay_width_ && target_height > overlay_height_) {
+        x = (target_width - overlay_width_) / 2;
+        y = (target_height - overlay_height_) / 2;
+    }
     if (x + 16 >= target_width) x = 16;
     if (y + 16 >= target_height) y = 16;
     const D3D11_VIEWPORT vp{float(x), float(y), float(overlay_width_), float(overlay_height_), 0.0f, 1.0f};
@@ -783,6 +849,9 @@ D3D11Display::~D3D11Display() {
     }
     Release(overlay_view_);
     Release(overlay_texture_);
+    Release(reticle_view_);
+    Release(reticle_texture_);
+    Release(alpha_blend_);
     ReleasePostImage(post_in_);
     ReleasePostImage(post_out_);
     ReleasePostImage(smaa_edges_);

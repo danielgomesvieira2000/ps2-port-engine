@@ -217,6 +217,41 @@ void SdlWindowDisplay::SetFullscreen(bool on) {
     stale_ = true;
 }
 
+/* Pump's: a placement asked for (SetPlacement), and the desktop's usable
+   area now and then (DesktopArea). */
+void SdlWindowDisplay::ApplyPlacement() {
+    if (!window_) return;
+    Placement p;
+    {
+        std::lock_guard<std::mutex> hold(placement_lock_);
+        p = placement_;
+        placement_.pending = false;
+    }
+    if (p.pending) {
+        if (Fullscreen()) SDL_SetWindowFullscreen(window_, false);
+        SDL_SetWindowBordered(window_, !p.borderless);
+        if (p.w > 0 && p.h > 0) SDL_SetWindowSize(window_, p.w, p.h);
+        SDL_SetWindowPosition(window_, p.x, p.y);
+        stale_ = true;
+        std::fprintf(stderr, "[window] placed at %d,%d, %dx%d%s\n", p.x, p.y, p.w, p.h, p.borderless ? ", borderless" : "");
+    }
+    if (raise_.exchange(false)) SDL_RaiseWindow(window_);
+    // The mouse captured while asked and the window has the focus (let go
+    // the moment it has not: another window's mouse is the player's).
+    const bool capture = capture_mouse_ && (SDL_GetWindowFlags(window_) & SDL_WINDOW_INPUT_FOCUS) != 0;
+    if (capture != mouse_captured_) {
+        mouse_captured_ = capture;
+        SDL_SetWindowRelativeMouseMode(window_, capture);
+    }
+    if (desktop_age_++ % 120 == 0) {
+        SDL_Rect r{};
+        if (SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(window_), &r)) {
+            std::lock_guard<std::mutex> hold(placement_lock_);
+            desktop_[0] = r.x, desktop_[1] = r.y, desktop_[2] = r.w, desktop_[3] = r.h;
+        }
+    }
+}
+
 bool SdlWindowDisplay::Fullscreen() const {
     return window_ && (SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN) != 0;
 }
@@ -268,6 +303,7 @@ bool SdlWindowDisplay::Pump() {
             }
         }
     }
+    ApplyPlacement();
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
@@ -288,7 +324,14 @@ bool SdlWindowDisplay::Pump() {
                 SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_RIGHT_STICK))
                 capture_ = true;
         }
-        if (e.type == SDL_EVENT_MOUSE_MOTION) MouseAt(e.motion.x, e.motion.y);
+        if (e.type == SDL_EVENT_MOUSE_MOTION) {
+            {
+                std::lock_guard<std::mutex> hold(mouse_lock_);
+                mouse_.dx += e.motion.xrel;
+                mouse_.dy += e.motion.yrel;
+            }
+            if (!mouse_captured_) MouseAt(e.motion.x, e.motion.y);
+        }
         if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_UP) {
             MouseAt(e.button.x, e.button.y);
             const int bit = e.button.button == SDL_BUTTON_LEFT ? 0 : e.button.button == SDL_BUTTON_MIDDLE ? 1
@@ -297,18 +340,24 @@ bool SdlWindowDisplay::Pump() {
             if (bit >= 0 && e.button.down) {
                 mouse_.held |= 1u << bit;
                 mouse_.pressed |= 1u << bit;
+                panel_mouse_.held |= 1u << bit;
+                panel_mouse_.pressed |= 1u << bit;
             } else if (bit >= 0) {
                 mouse_.held &= ~(1u << bit);
+                panel_mouse_.held &= ~(1u << bit);
             }
         }
         if (e.type == SDL_EVENT_MOUSE_WHEEL) {
             std::lock_guard<std::mutex> hold(mouse_lock_);
             mouse_.wheel += e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
+            panel_mouse_.wheel += e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
         }
         if (e.type == SDL_EVENT_WINDOW_MOUSE_LEAVE) {
             std::lock_guard<std::mutex> hold(mouse_lock_);
             mouse_.over = false;
             mouse_.held = 0;
+            panel_mouse_.over = false;
+            panel_mouse_.held = 0;
         }
         if (e.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
             std::lock_guard<std::mutex> hold(mouse_lock_);
@@ -347,6 +396,10 @@ void SdlWindowDisplay::MouseAt(float x, float y) {
     const float density = window_ ? SDL_GetWindowPixelDensity(window_) : 1.0f;
     const float px = x * (density > 0.0f ? density : 1.0f), py = y * (density > 0.0f ? density : 1.0f);
     std::lock_guard<std::mutex> hold(mouse_lock_);
+    if (px != panel_mouse_.px || py != panel_mouse_.py || !panel_mouse_.over) panel_mouse_.moved = true;
+    panel_mouse_.over = true;
+    panel_mouse_.px = px;
+    panel_mouse_.py = py;
     if (px != mouse_px_ || py != mouse_py_ || !mouse_.over) mouse_.moved = true;
     mouse_px_ = px;
     mouse_py_ = py;
@@ -356,8 +409,8 @@ void SdlWindowDisplay::MouseAt(float x, float y) {
 }
 
 /* The window's pointer: the game's, at a size that goes with the picture's
-   (its art's height a twentieth of the picture's), while the game wants it;
-   otherwise the system's - hidden in fullscreen. */
+   (its art's height a 22nd of the picture's: 49 pixels at 1080), while the game wants it; otherwise the system's - hidden
+   in fullscreen; none while HidePointer(true). */
 void SdlWindowDisplay::UpdateCursor() {
     if (!window_) return;
 #ifdef __ANDROID__
@@ -366,34 +419,39 @@ void SdlWindowDisplay::UpdateCursor() {
     return;
 #endif
     const bool want = cursor_wanted_.load();
-    std::uint32_t size = std::uint32_t(float(shown_h_.load()) / 20.0f + 0.5f);
+    // (`size`: the pointer's height.)
+    std::uint32_t size = std::uint32_t(float(shown_h_.load()) / 22.0f + 0.5f);
     size = std::clamp<std::uint32_t>(size, 20, 128);
     if (want) {
         std::lock_guard<std::mutex> hold(mouse_lock_);
         if (!cursor_art_.empty() && (!cursor_ || cursor_size_ != size)) {
-            // The art resampled to `size` (bilinear, by premultiplied colour).
-            const std::uint32_t w = size, h = std::uint32_t(float(size) * float(cursor_height_) /
-                                                            float(cursor_width_) + 0.5f);
+            // The art resampled to `size` high (bilinear, by premultiplied
+            // colour; smaller than the art, n x n samples a pixel averaged).
+            const std::uint32_t h = size, w = std::max<std::uint32_t>(1, std::uint32_t(float(size) * float(cursor_width_) /
+                                                                                       float(cursor_height_) + 0.5f));
+            const int n = std::clamp(int(std::ceil(float(cursor_height_) / float(h))), 1, 8);
             SDL_Surface* surface = SDL_CreateSurface(int(w), int(h), SDL_PIXELFORMAT_RGBA32);
             if (surface) {
                 for (std::uint32_t y = 0; y < h; ++y) {
                     auto* row = reinterpret_cast<std::uint8_t*>(surface->pixels) + std::size_t(y) * surface->pitch;
                     for (std::uint32_t x = 0; x < w; ++x) {
-                        const float sx = (float(x) + 0.5f) * float(cursor_width_) / float(w) - 0.5f;
-                        const float sy = (float(y) + 0.5f) * float(cursor_height_) / float(h) - 0.5f;
-                        const int x0 = int(std::floor(sx)), y0 = int(std::floor(sy));
-                        const float fx = sx - float(x0), fy = sy - float(y0);
                         float sum[4] = {};
-                        for (int k = 0; k < 4; ++k) {
-                            const int ix = std::clamp(x0 + (k & 1), 0, int(cursor_width_) - 1);
-                            const int iy = std::clamp(y0 + (k >> 1), 0, int(cursor_height_) - 1);
-                            const float weight = ((k & 1) ? fx : 1.0f - fx) * ((k >> 1) ? fy : 1.0f - fy);
-                            const std::uint32_t p = cursor_art_[std::size_t(iy) * cursor_width_ + ix];
-                            const float a = float(p >> 24) / 255.0f;
-                            sum[0] += weight * float(p & 0xFF) * a;
-                            sum[1] += weight * float((p >> 8) & 0xFF) * a;
-                            sum[2] += weight * float((p >> 16) & 0xFF) * a;
-                            sum[3] += weight * a;
+                        for (int j = 0; j < n * n; ++j) {
+                            const float sx = (float(x) + (float(j % n) + 0.5f) / float(n)) * float(cursor_width_) / float(w) - 0.5f;
+                            const float sy = (float(y) + (float(j / n) + 0.5f) / float(n)) * float(cursor_height_) / float(h) - 0.5f;
+                            const int x0 = int(std::floor(sx)), y0 = int(std::floor(sy));
+                            const float fx = sx - float(x0), fy = sy - float(y0);
+                            for (int k = 0; k < 4; ++k) {
+                                const int ix = std::clamp(x0 + (k & 1), 0, int(cursor_width_) - 1);
+                                const int iy = std::clamp(y0 + (k >> 1), 0, int(cursor_height_) - 1);
+                                const float weight = ((k & 1) ? fx : 1.0f - fx) * ((k >> 1) ? fy : 1.0f - fy) / float(n * n);
+                                const std::uint32_t p = cursor_art_[std::size_t(iy) * cursor_width_ + ix];
+                                const float a = float(p >> 24) / 255.0f;
+                                sum[0] += weight * float(p & 0xFF) * a;
+                                sum[1] += weight * float((p >> 8) & 0xFF) * a;
+                                sum[2] += weight * float((p >> 16) & 0xFF) * a;
+                                sum[3] += weight * a;
+                            }
                         }
                         const float a = sum[3];
                         row[4 * x + 0] = std::uint8_t(a > 0.0f ? std::min(255.0f, sum[0] / a + 0.5f) : 0.0f);
@@ -417,11 +475,13 @@ void SdlWindowDisplay::UpdateCursor() {
             }
         }
     }
-    const int showing = want && cursor_ ? 1 : 0;
+    const int showing = pointer_hidden_.load() ? 2 : want && cursor_ ? 1 : 0;
     if (showing == cursor_showing_ && !(showing == 0 && fullscreen_cursor_stale_)) return;
     cursor_showing_ = showing;
     fullscreen_cursor_stale_ = false;
-    if (showing) {
+    if (showing == 2) {
+        SDL_HideCursor();
+    } else if (showing) {
         SDL_SetCursor(cursor_);
         SDL_ShowCursor();
     } else {
@@ -555,7 +615,8 @@ std::vector<Display::ControllerInfo> SdlWindowDisplay::Controllers() const {
         std::lock_guard<std::mutex> hold(pads_lock_);
         for (const Gamepad& g : pads_) {
             const char* name = SDL_GetGamepadName(g.pad);
-            list.push_back({g.id, name ? name : "Controller", FamilyOf(g.pad)});
+            const char* path = SDL_GetGamepadPath(g.pad);
+            list.push_back({g.id, name ? name : "Controller", FamilyOf(g.pad), path ? path : ""});
         }
     }
     std::lock_guard<std::mutex> hold(g_touch_lock);

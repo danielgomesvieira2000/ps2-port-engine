@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // The PC's effects on a game's picture (GsRenderer::RunEffect, effects.cpp):
 // each pass of each effect, chosen by PASS at build time. Every pass sees
 // the same bindings - the target (the game's picture, RGBA8, its alpha the
@@ -7,7 +8,7 @@
 // that image's size, and the effect's parameters as the game's port sent
 // them (gs_renderer.h's GsEffect).
 //
-// Depth: the depth buffer holds the GS's Z / 2^32; the port gives the
+// Depth: the depth buffer holds the GS's Z (as gs_depth.glsl maps it); the port gives the
 // camera's mapping, Z = a / w + b (RenderWare's zScale and zShift), so the
 // view-space distance is a / (Z - b). The view window's half extents (at
 // distance 1) place a pixel in view space.
@@ -70,7 +71,7 @@ layout(push_constant) uniform Params {
 #define PASS_SSR_APPLY 14
 #define PASS_AO_DEPTH 15
 
-const float kTwoTo32 = 4294967296.0;
+#include "gs_depth.glsl"
 
 // ---------------------------------------------------------------- depth and place
 
@@ -78,7 +79,7 @@ ivec2 TargetSize() { return textureSize(target_tex, 0); }
 
 // View-space distance of a depth sample (0: the sky - nothing drawn, Z 0).
 float ViewZ(float d) {
-    const float z = d * kTwoTo32;
+    const float z = ZOfDepthF(d);
     return z > PC(1) + 0.5 ? PC(0) / (z - PC(1)) : 1e9;
 }
 
@@ -152,7 +153,8 @@ void main() {
     // `radius` world units around the pixel, each occluding as much as it
     // lies above the pixel's surface and near it. The surface's normal from
     // the depth around it (the nearer side of each pair: no normal across an
-    // edge). p4 radius, p5 strength, p6 the distance it fades out by.
+    // edge). p4 radius, p5 strength, p6 the distance it fades out by; p18 1
+    // GTAO instead (below), p19 its strength.
     if (any(greaterThanEqual(at, pc.size.xy))) return;
     const float div = float(max(pc.size.w, 2));
     const vec2 pixel = vec2(pc.rect.xy) + (vec2(at) + 0.5) * div;   // the target pixel it stands for
@@ -178,22 +180,73 @@ void main() {
         imageStore(dst, at, vec4(1.0, z, 0.0, 0.0));
         return;
     }
-    const int kSamples = 12;
     const float spin = StillNoise(vec2(at)) * 6.2831853;
-    float sum = 0.0;
-    for (int i = 0; i < kSamples; ++i) {
-        const float alpha = (float(i) + 0.5) / float(kSamples);
-        const float angle = alpha * 7.0 * 6.2831853 + spin;      // seven turns of the spiral
-        const vec2 offset = vec2(cos(angle), sin(angle)) * alpha * min(screen_radius, 160.0);
-        const vec3 v = AoPos(pixel + offset, div) - c;
-        const float vv = dot(v, v);
-        const float vn = dot(v, n);
-        const float r2 = radius * radius;
-        const float f = max(r2 - vv, 0.0);
-        sum += f * f * f * max((vn - 0.002 * z) / (vv + 0.01 * r2), 0.0);
+    float ao;
+    if (PC(18) > 0.5) {
+        // p18 1: GTAO (Jimenez et al., "Practical real-time strategies for
+        // accurate indirect occlusion") - in three slices through the view
+        // direction (turned by the still noise), the highest horizon each
+        // way within `radius` (each point's direction from the pixel as the
+        // cosine of its angle from the view, faded out towards the radius),
+        // and the arc of sky between them integrated against the normal as
+        // the slice sees it: the share of the sky the pixel sees, cosine
+        // weighted - shade in corners and under things as it falls, not a
+        // count of points nearby. p19: its strength (an exponent).
+        const vec3 v = normalize(-c);
+        const float reach = min(screen_radius, 160.0);
+        const float jitter = StillNoise(vec2(at) + vec2(7.0, 3.0));
+        const int kSlices = 3, kSteps = 6;
+        float seen = 0.0;
+        for (int sl = 0; sl < kSlices; ++sl) {
+            const float phi = (float(sl) + spin / 6.2831853) * 3.14159265 / float(kSlices);
+            const vec2 d2 = vec2(cos(phi), sin(phi));
+            vec3 dir = ViewPos(pixel + d2 * div, z) - c;         // the screen's way, in view space
+            dir = normalize(dir - dot(dir, v) * v);
+            const vec3 axis = normalize(cross(dir, v));
+            const vec3 pn = n - axis * dot(n, axis);             // the normal in the slice's plane
+            const float pl = length(pn);
+            if (pl < 1e-4) {
+                seen += 1.0;
+                continue;
+            }
+            const float gamma = sign(dot(pn, dir)) * acos(clamp(dot(pn, v) / pl, -1.0, 1.0));
+            float horizon[2];
+            for (int side = 0; side < 2; ++side) {
+                const float way = side == 0 ? 1.0 : -1.0;
+                float best = -1.0;
+                for (int k = 0; k < kSteps; ++k) {
+                    const float t = (float(k) + jitter) / float(kSteps);
+                    const vec3 dv = AoPos(pixel + d2 * (way * t * reach), div) - c;
+                    const float len = length(dv);
+                    if (len < 1e-4) continue;
+                    const float fade = clamp(1.0 - len * len / (radius * radius), 0.0, 1.0);
+                    best = max(best, mix(-1.0, dot(dv / len, v) - 0.08, fade));   // (less a bias: the half-resolution depth's steps on a plane)
+                }
+                horizon[side] = acos(clamp(best, -1.0, 1.0));
+            }
+            const float h1 = gamma + min(horizon[0] - gamma, 1.5707963);     // along dir
+            const float h0 = gamma + max(-horizon[1] - gamma, -1.5707963);   // against it
+            seen += pl * 0.25 * ((-cos(2.0 * h0 - gamma) + cos(gamma) + 2.0 * h0 * sin(gamma)) +
+                                 (-cos(2.0 * h1 - gamma) + cos(gamma) + 2.0 * h1 * sin(gamma)));
+        }
+        ao = pow(clamp(seen / float(kSlices), 0.0, 1.0), max(PC(19), 0.1));
+    } else {
+        const int kSamples = 12;
+        float sum = 0.0;
+        for (int i = 0; i < kSamples; ++i) {
+            const float alpha = (float(i) + 0.5) / float(kSamples);
+            const float angle = alpha * 7.0 * 6.2831853 + spin;      // seven turns of the spiral
+            const vec2 offset = vec2(cos(angle), sin(angle)) * alpha * min(screen_radius, 160.0);
+            const vec3 v = AoPos(pixel + offset, div) - c;
+            const float vv = dot(v, v);
+            const float vn = dot(v, n);
+            const float r2 = radius * radius;
+            const float f = max(r2 - vv, 0.0);
+            sum += f * f * f * max((vn - 0.002 * z) / (vv + 0.01 * r2), 0.0);
+        }
+        const float r6 = radius * radius * radius * radius * radius * radius;
+        ao = max(0.0, 1.0 - sum * PC(5) * 5.0 / (r6 * float(kSamples)));
     }
-    const float r6 = radius * radius * radius * radius * radius * radius;
-    float ao = max(0.0, 1.0 - sum * PC(5) * 5.0 / (r6 * float(kSamples)));
     // A second, wider scale (p17 metres, p16 its strength; 0 none): the broad
     // shade at a wall's foot, under an awning, between parked cars - what the
     // close disc is too small to see. Fewer samples: it is soft by nature.
@@ -498,13 +551,36 @@ void main() {
     // warmth (p16: red up and blue down, a share).
     // p17: sharpening (contrast-adaptive, AMD's CAS) first, 0-1 - then the
     // result goes to dst (the effect copies it back): the neighbours read
-    // must be the picture's own.
+    // must be the picture's own. p18: debanding before it all (the
+    // threshold, in 255ths; p19 its radius, the target's pixels) - the same
+    // way to dst.
     const ivec2 q = pc.rect.xy + at;
     if (any(greaterThanEqual(q, pc.rect.zw))) return;
     const vec4 c = LoadTarget(q);
     const float white = PC(9) > 0.0 ? 1.0 / PC(9) : 1.0;       // p9: the picture's white (its 1.0)
     vec3 col = c.rgb * white;
     const bool sharpen = PC(17) > 0.0;
+    const bool scratch = sharpen || PC(18) > 0.0;
+    if (PC(18) > 0.0) {
+        // Where four pixels at a spot of their own around this one (a turn
+        // and a distance from the still noise) are all within the threshold
+        // of it - a smooth gradient the 8 bits stepped, a dark wall in the
+        // fog - their average with it: the step's edge spread out (and
+        // dithered below). Where any is past it (an edge, a texture's
+        // detail) the pixel as it was.
+        const float turn = StillNoise(vec2(q)) * 6.2831853;
+        const float reach = max(PC(19), 1.0) * (0.5 + 0.5 * StillNoise(vec2(q) + vec2(17.0, 5.0)));
+        vec3 sum = col;
+        bool even = true;
+        for (int k = 0; k < 4; ++k) {
+            const float a = turn + float(k) * 1.5707963;
+            const ivec2 o = ivec2(round(vec2(cos(a), sin(a)) * reach));
+            const vec3 n = texelFetch(target_tex, clamp(q + o, pc.rect.xy, pc.rect.zw - 1), 0).rgb * white;
+            even = even && all(lessThan(abs(n - col), vec3(PC(18) / 255.0)));
+            sum += n;
+        }
+        if (even) col = sum * 0.2;
+    }
     if (sharpen) {
         #define T(dx, dy) min(texelFetch(target_tex, clamp(q + ivec2(dx, dy), pc.rect.xy, pc.rect.zw - 1), 0).rgb * white, vec3(1.0))
         const vec3 n = T(0, -1), w = T(-1, 0), e = T(1, 0), s = T(0, 1);
@@ -541,7 +617,7 @@ void main() {
     // Dithered by under half a step of the 8 bits it is stored in (the same
     // each frame): no bands in the sky's and the glow's gradients.
     const vec3 stored = clamp(col / white + (StillNoise(vec2(q)) - 0.5) / 255.0, 0.0, 1.0);
-    if (sharpen) imageStore(dst, at, vec4(stored, c.a));
+    if (scratch) imageStore(dst, at, vec4(stored, c.a));
     else StoreTarget(q, vec4(stored, c.a));
 #elif PASS == PASS_SSR
     // Screen-space reflections on the cars' paint (dst: the reflected

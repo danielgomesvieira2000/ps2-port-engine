@@ -6,7 +6,13 @@
  *   - a resource at (set, binding) is register set * 7 + binding of its kind
  *     (t for textures and read-only buffers, s for their samplers, u for
  *     storage images and buffers): Direct3D 11 has no sets;
- *   - the push constants are constant buffer b0.
+ *   - the push constants are constant buffer b0;
+ *   - set 3's binding 1 (the native meshes' header: a STORAGE_BUFFER_DYNAMIC
+ *     in Vulkan) read at the draw's dynamic offset: every Load of it has
+ *     _ps2gpu_dynamic added, the first uint of constant buffer b12 - the D3D11
+ *     layer's table of offsets bound there at the offset that holds the
+ *     draw's (CmdBindDescriptorSets) - Direct3D 11 binds no view at an offset
+ *     that changes each draw, and a constant buffer bound at one is no map.
  *
  *   spirv_to_hlsl in.spv out.hlsl [out.h name]
  *
@@ -21,6 +27,8 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <regex>
+#include <string>
 #include <vector>
 
 int main(int argc, char** argv) {
@@ -68,7 +76,22 @@ int main(int argc, char** argv) {
         push.binding = spirv_cross::ResourceBindingPushConstantBinding;
         push.cbv.register_binding = 0;
         compiler.add_hlsl_resource_binding(push);
-        const std::string hlsl = compiler.compile();
+        std::string hlsl = compiler.compile();
+        // The dynamic buffer (set 3, binding 1): its Loads at the draw's offset.
+        std::string dynamic;
+        for (const spirv_cross::Resource& r : resources.storage_buffers)
+            if (compiler.get_decoration(r.id, spv::DecorationDescriptorSet) == 3 &&
+                compiler.get_decoration(r.id, spv::DecorationBinding) == 1)
+                dynamic = compiler.get_name(r.id);
+        if (!dynamic.empty()) {
+            const std::regex load("\\b" + dynamic + "\\.Load([234]?)\\(");
+            const std::string with = hlsl;
+            hlsl = std::regex_replace(with, load, dynamic + ".Load$1(_ps2gpu_dynamic + ");
+            // (its offset: b12's first uint, before the shader's own code)
+            const std::size_t at = hlsl.find("ByteAddressBuffer");
+            hlsl.insert(at == std::string::npos ? 0 : at,
+                        "cbuffer PS2GPU_Dynamic : register(b12)\n{\n    uint _ps2gpu_dynamic : packoffset(c0.x);\n};\n\n");
+        }
         std::ofstream out(argv[2], std::ios::binary);
         out << hlsl;
         if (!out) return 1;

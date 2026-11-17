@@ -250,7 +250,17 @@ def package_linux(game, target, title, version, release, build, cmake, root):
         fail("no build at %s: build it (python engine/tools/linux.py --game %s build)" % (exe, game))
     if os.path.exists(os.path.join(build, "port", "icon.ico")):
         fail("build/port/icon.ico is the disc-made logo (the publisher's artwork): delete it, build again")
+    # The build for processors without AVX2 (linux.py build --sse4), which the
+    # main one starts on such a processor - as the Windows package has it.
+    exe_sse4 = exe + "-sse4"
+    if not os.path.exists(exe_sse4):
+        fail("no build at %s: build it (python engine/tools/linux.py --game %s build --sse4)" % (exe_sse4, game))
+    if os.path.getmtime(exe_sse4) < os.path.getmtime(exe) - 3600:
+        fail("%s is older than %s: build it again (linux.py build --sse4)" % (exe_sse4, target))
     needed = check_linux(exe, {os.path.expanduser("~"), root})
+    for library in check_linux(exe_sse4, {os.path.expanduser("~"), root}):
+        if library not in needed:
+            needed.append(library)
     text = notices(title, os.path.join(cmake, "_deps"), os.path.join(cmake, "ps2host", "third_party"))
     with open(os.path.join(game, "port", "release", "README.txt"), encoding="utf-8") as f:
         readme = f.read().replace("{version}", version)
@@ -268,8 +278,9 @@ def package_linux(game, target, title, version, release, build, cmake, root):
         tar.addfile(info, io.BytesIO(data))
 
     with tarfile.open(out, "w:gz", compresslevel=9) as tar:
-        with open(exe, "rb") as f:
-            add_bytes(tar, "%s/%s" % (name, target), f.read(), 0o755)
+        for path, inside in ((exe, target), (exe_sse4, target + "-sse4")):
+            with open(path, "rb") as f:
+                add_bytes(tar, "%s/%s" % (name, inside), f.read(), 0o755)
         add_bytes(tar, "%s/README.txt" % name, readme.encode("utf-8"))
         add_bytes(tar, "%s/THIRD-PARTY-NOTICES.txt" % name, text.replace("\r\n", "\n").encode("utf-8"))
         for inside, source in (release.get("extras") or {}).items():

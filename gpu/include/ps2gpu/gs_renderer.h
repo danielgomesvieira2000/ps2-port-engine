@@ -34,6 +34,26 @@ namespace ps2gpu {
    host's profiler (PS2HOST_PROFILE). On the waiting thread. */
 using GpuWaitObserver = void (*)(const char* why, std::uint64_t from_ns, std::uint64_t to_ns);
 void SetGpuWaitObserver(GpuWaitObserver observer);
+/* The native mesh draws' enhancements (PC SETTINGS' GRAPHICS; gs_mesh_enhanced.glsl), bits: kMeshLitPixels the
+   microprograms' lights per pixel, kMeshPrecise their places not rounded to the GS's sixteenths. 0, the
+   default: the GS's picture to the pixel. Any thread: what a game's native program reads as it makes a draw
+   (ps2host::NativeEnhancements), and writes into its header for the renderer - the draw made and drawn alike. */
+constexpr std::uint32_t kMeshLitPixels = 1, kMeshPrecise = 2;
+/* ANTI-ALIASING's MSAA: the samples a pixel of a game's frame buffers is drawn with (1: none, the default; 2, 4,
+   8 - at most the device's). Each large target drawn in 3D gets a multisampled copy its passes draw into and
+   resolve from (gs_renderer.cpp's twins); draws reading their own target, DATE's, draw single-sampled. Any
+   thread; the renderer takes it at its next frame. */
+void SetGpuMsaa(std::uint32_t samples);
+std::uint32_t GpuMsaa();
+/* Drawn larger (an internal resolution): a vertex on the target's top or left edge reaches half a pixel out
+   (gs.vert's edge), so the larger picture's first row and column are drawn by what starts at 0 - a whole-screen
+   overlay (Outbreak's fades) - on by default. It stretches a primitive touching the edge by that half pixel,
+   its texture with it: a game that draws its last picture back over itself each frame (Burnout 3's blur and
+   glow) sees that grow; such a game turns it off (its pictures as at its own recordings). Any thread. */
+void SetGpuEdgeReach(bool on);
+bool GpuEdgeReach();
+void SetMeshEnhancements(std::uint32_t bits);
+std::uint32_t MeshEnhancements();
 /* Called on the renderer's own thread (a threaded renderer's) as it starts:
    the host's profiler sampling it (--sample-renderer). */
 void SetRendererThreadStart(void (*start)());
@@ -166,6 +186,10 @@ struct GsTextureDecode {
        its left edge - the image tw wide, as tall as all of them. */
     std::uint32_t levels = 1;
     std::uint32_t level_tbp[7] = {}, level_tbw[7] = {};
+    /* A texture with no levels of its own (levels 1): this many made from
+       level 0 (2-7; mipgen.comp - each the four texels above it averaged), in
+       the same layout, where the renderer can (MakesTextureLevels). */
+    std::uint32_t auto_levels = 1;
     /* The CLUT as the GS model holds it, or null: the CLUT the GPU holds
        (ClutFromMemory, ClutRows) at this point of what is recorded. */
     const std::uint32_t* clut = nullptr;
@@ -264,6 +288,10 @@ public:
        TW x TH (the draw's tw, th), sampled in its own texels at the same
        places. Until the key is uploaded or decoded again. */
     virtual void UseReplacement(std::uint64_t key, std::uint64_t id) { (void)key, (void)id; }
+    /* Replacement `id`'s surface detail: replacement `material` (uploaded as any is - its RGB a normal in the
+       texture's space, its alpha the shine: texture_pack.h), lighting a native mesh's pixels (gs.frag's
+       LitShade) where the replacement is drawn. 0: none. */
+    virtual void UseMaterial(std::uint64_t id, std::uint64_t material) { (void)id, (void)material; }
     /* Whether block-compressed replacements can be uploaded as they are. */
     virtual bool BlockCompression() const { return false; }
     /* A depth buffer's contents, one Z per pixel, rows top-down: what local
@@ -293,6 +321,59 @@ public:
     virtual void DrawTriangleRun(const GsDrawState& state, const GsVertex* vertices, std::size_t per,
                                  std::size_t prims) {
         for (std::size_t i = 0; i < prims; ++i) DrawTriangles(state, vertices + i * per, per);
+    }
+    /* Native microprograms' meshes (docs/NATIVE_RENDERER.md, the GPU's way):
+       the game's own vertices kept on the GPU and drawn through a vertex
+       program (gs_mesh.vert: Outbreak's room) with, each draw, the header the
+       microprogram would have been given. Whether this renderer draws them: */
+    virtual bool DrawsMeshes() const { return false; }
+    /* Whether a decode's auto_levels are made (GsTextureDecode). */
+    virtual bool MakesTextureLevels() const { return false; }
+    /* How many bytes of textures the bridge's cache may keep on the GPU (TextureFromMemory's images): a share
+       of the device's own memory - past it, the least recently drawn go. */
+    virtual std::uint64_t TextureBudget() const { return std::uint64_t(512) << 20; }
+    /* ...and their enhanced draws (gs_mesh_enhanced.glsl: the device's clip distances) - a header whose ext asks
+       for them (its y, the enhancements the game made it for) drawn so. */
+    virtual bool DrawsEnhancedMeshes() const { return false; }
+    /* Whether a mesh in `state` draws as its triangles one by one would: not
+       where each must see the one before it (a draw sampling its own target,
+       blending in the shader, an alpha test's two passes) - a mesh is one batch. */
+    virtual bool MeshDrawable(const GsDrawState& state) const { (void)state; return false; }
+    /* A mesh under `key` (again: replaced): `quads` its vertices, 16 bytes a
+       quadword, four a vertex (gs_mesh.vert's); `indices` its triangles,
+       three each, into them. */
+    virtual void UploadMesh(std::uint64_t key, const void* quads, std::size_t quad_count,
+                            const std::uint32_t* indices, std::size_t index_count) {
+        (void)key, (void)quads, (void)quad_count, (void)indices, (void)index_count;
+    }
+    virtual void ReleaseMesh(std::uint64_t key) { (void)key; }
+    /* The mesh's triangles drawn in `state`, in turn with DrawTriangles';
+       `header` kMeshHeaderFloats floats (gs_mesh.vert's Header: VU1 data
+       rows 0-23, vf11-vf17, XYOFFSET). */
+    static constexpr std::size_t kMeshHeaderFloats = 200;      // (rows 0-23, vf11-vf17, XYOFFSET, the kept vertices, ext)
+    /* The headers' ext (gs_mesh_enhanced.glsl), twelve quadwords: the room's at kMeshHeaderFloats - 48, the
+       characters' at kMeshCharactersExt (their matrices' rows after it). */
+    static constexpr std::size_t kMeshRoomExt = 152, kMeshCharactersExt = 128;
+    virtual void DrawMesh(const GsDrawState& state, std::uint64_t key, const float* header) {
+        DrawMeshWith(state, key, MeshCall{kMeshRoom, header, kMeshHeaderFloats, nullptr, 0});
+    }
+    /* A mesh drawn by a program of its own - kMeshRoom gs_mesh.vert (a vertex
+       four quadwords), kMeshCharacters gs_mesh_chars.vert (five) - its header
+       `header_floats` floats (at most kMeshHeaderMost), its triangles this
+       draw's `indices` (index_count; none: the mesh's own). */
+    /* kMeshRenderWare gs_mesh_rw.vert: RenderWare's VU1 programs (Burnout 3's; gs_mesh_rw.glsl), its vertex
+       a stride of the header's choosing. */
+    enum MeshProgram : std::uint32_t { kMeshRoom = 0, kMeshCharacters = 1, kMeshRenderWare = 2 };
+    static constexpr std::size_t kMeshHeaderMost = 4 * (44 + 1024);
+    struct MeshCall {
+        std::uint32_t program = kMeshRoom;
+        const float* header = nullptr;
+        std::size_t header_floats = 0;
+        const std::uint32_t* indices = nullptr;
+        std::size_t index_count = 0;
+    };
+    virtual void DrawMeshWith(const GsDrawState& state, std::uint64_t key, const MeshCall& call) {
+        (void)state, (void)key, (void)call;
     }
     /* Runs what has been drawn. */
     virtual void Flush() = 0;
@@ -408,6 +489,11 @@ void SetPipelineHints(const std::uint32_t* keys, std::size_t count);
 /* The start's pipelines (the last runs', the hints) being made: true while
    some are still to come, with how many are made of how many. */
 bool PipelineWarmProgress(std::size_t* made, std::size_t* total);
+/* The GPU's device lost (a submission, present or wait said VK_ERROR_DEVICE_LOST): the renderer on it draws
+   nothing more, and the display's ResetDevice makes it again. LoseDevice: as if (a test's). */
+bool DeviceLost();
+void LoseDevice();
+void DeviceMadeAgain();          // (a device of the renderer's own, without a display: made again by its owner)
 /* `inner` on a thread of its own (threaded_renderer.cpp): what only hands
    work over is queued and made there in order; what answers or reads waits
    for the queue to empty first. One caller thread. */
