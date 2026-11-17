@@ -11,9 +11,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#ifdef __APPLE__
+#include <os/os_sync_wait_on_address.h>
+#else
 #include <linux/futex.h>
-#include <sys/mman.h>
 #include <sys/syscall.h>
+#endif
+#include <sys/mman.h>
 #include <unistd.h>
 
 namespace {
@@ -38,13 +42,25 @@ extern "C" void ps2_call_on_stack(void* sp, void (*fn)(void*), void* arg);
 extern "C" void ps2_fiber_switch(void** save, void* load);
 extern "C" void ps2_fiber_start();
 
+// Assembler differences: Mach-O (Apple) prefixes a C symbol with an underscore
+// and has no .type or .size; ELF has both.
+#if defined(__APPLE__)
+#define PS2_SYM(n) "_" #n
+#define PS2_FN_TYPE(n, kind) ""
+#define PS2_FN_SIZE(n) ""
+#else
+#define PS2_SYM(n) #n
+#define PS2_FN_TYPE(n, kind) ".type " #n ", " kind "\n"
+#define PS2_FN_SIZE(n) ".size " #n ", .-" #n "\n"
+#endif
+
 #if defined(__aarch64__)
 __asm__(
     ".text\n"
-    ".globl ps2_fiber_switch\n"
-    ".type ps2_fiber_switch, %function\n"
+    ".globl " PS2_SYM(ps2_fiber_switch) "\n"
+    PS2_FN_TYPE(ps2_fiber_switch, "%function")
     ".p2align 4\n"
-    "ps2_fiber_switch:\n"
+    PS2_SYM(ps2_fiber_switch) ":\n"
     "    sub sp, sp, #160\n"
     "    stp x19, x20, [sp, #0]\n"
     "    stp x21, x22, [sp, #16]\n"
@@ -71,19 +87,19 @@ __asm__(
     "    ldp d14, d15, [sp, #144]\n"
     "    add sp, sp, #160\n"
     "    ret\n"
-    ".size ps2_fiber_switch, .-ps2_fiber_switch\n"
-    ".globl ps2_fiber_start\n"
-    ".type ps2_fiber_start, %function\n"
+    PS2_FN_SIZE(ps2_fiber_switch)
+    ".globl " PS2_SYM(ps2_fiber_start) "\n"
+    PS2_FN_TYPE(ps2_fiber_start, "%function")
     ".p2align 4\n"
-    "ps2_fiber_start:\n"            // x19 the start routine, x20 its parameter
+    PS2_SYM(ps2_fiber_start) ":\n"            // x19 the start routine, x20 its parameter
     "    mov x0, x20\n"
     "    blr x19\n"
     "    brk #0\n"                  // (a fiber's routine never returns)
-    ".size ps2_fiber_start, .-ps2_fiber_start\n"
-    ".globl ps2_call_on_stack\n"
-    ".type ps2_call_on_stack, %function\n"
+    PS2_FN_SIZE(ps2_fiber_start)
+    ".globl " PS2_SYM(ps2_call_on_stack) "\n"
+    PS2_FN_TYPE(ps2_call_on_stack, "%function")
     ".p2align 4\n"
-    "ps2_call_on_stack:\n"          // x0 the stack, x1 the routine, x2 its parameter
+    PS2_SYM(ps2_call_on_stack) ":\n"          // x0 the stack, x1 the routine, x2 its parameter
     "    stp x29, x30, [sp, #-16]!\n"
     "    mov x29, sp\n"             // (kept by the call)
     "    mov sp, x0\n"
@@ -92,15 +108,15 @@ __asm__(
     "    mov sp, x29\n"
     "    ldp x29, x30, [sp], #16\n"
     "    ret\n"
-    ".size ps2_call_on_stack, .-ps2_call_on_stack\n");
+    PS2_FN_SIZE(ps2_call_on_stack));
 constexpr std::size_t kFrame = 160;
 #elif defined(__x86_64__)
 __asm__(
     ".text\n"
-    ".globl ps2_fiber_switch\n"
-    ".type ps2_fiber_switch, @function\n"
+    ".globl " PS2_SYM(ps2_fiber_switch) "\n"
+    PS2_FN_TYPE(ps2_fiber_switch, "@function")
     ".p2align 4\n"
-    "ps2_fiber_switch:\n"
+    PS2_SYM(ps2_fiber_switch) ":\n"
     "    pushq %rbp\n"
     "    pushq %rbx\n"
     "    pushq %r12\n"
@@ -116,19 +132,19 @@ __asm__(
     "    popq %rbx\n"
     "    popq %rbp\n"
     "    ret\n"
-    ".size ps2_fiber_switch, .-ps2_fiber_switch\n"
-    ".globl ps2_fiber_start\n"
-    ".type ps2_fiber_start, @function\n"
+    PS2_FN_SIZE(ps2_fiber_switch)
+    ".globl " PS2_SYM(ps2_fiber_start) "\n"
+    PS2_FN_TYPE(ps2_fiber_start, "@function")
     ".p2align 4\n"
-    "ps2_fiber_start:\n"            // r12 the start routine, r13 its parameter
+    PS2_SYM(ps2_fiber_start) ":\n"            // r12 the start routine, r13 its parameter
     "    movq %r13, %rdi\n"
     "    callq *%r12\n"
     "    ud2\n"
-    ".size ps2_fiber_start, .-ps2_fiber_start\n"
-    ".globl ps2_call_on_stack\n"
-    ".type ps2_call_on_stack, @function\n"
+    PS2_FN_SIZE(ps2_fiber_start)
+    ".globl " PS2_SYM(ps2_call_on_stack) "\n"
+    PS2_FN_TYPE(ps2_call_on_stack, "@function")
     ".p2align 4\n"
-    "ps2_call_on_stack:\n"          // rdi the stack, rsi the routine, rdx its parameter
+    PS2_SYM(ps2_call_on_stack) ":\n"          // rdi the stack, rsi the routine, rdx its parameter
     "    pushq %rbp\n"
     "    movq %rsp, %rbp\n"         // (kept by the call)
     "    movq %rdi, %rsp\n"
@@ -137,7 +153,7 @@ __asm__(
     "    movq %rbp, %rsp\n"
     "    popq %rbp\n"
     "    ret\n"
-    ".size ps2_call_on_stack, .-ps2_call_on_stack\n");
+    PS2_FN_SIZE(ps2_call_on_stack));
 #else
 #error "fiber.cpp: no context switch for this processor"
 #endif
@@ -207,14 +223,24 @@ void DeleteFiber(void* fiber) {
 }
 
 bool WaitOnAddress(volatile void* address, void* compare, std::size_t, unsigned ms) {
+#ifdef __APPLE__
+    os_sync_wait_on_address_with_timeout(const_cast<void*>(address), std::uint64_t(*static_cast<unsigned*>(compare)),
+                                         sizeof(int), OS_SYNC_WAIT_ON_ADDRESS_NONE, OS_CLOCK_MACH_ABSOLUTE_TIME,
+                                         std::uint64_t(ms) * 1000000ull);
+#else
     timespec timeout{time_t(ms / 1000), long(ms % 1000) * 1000000L};
     syscall(SYS_futex, const_cast<void*>(address), FUTEX_WAIT_PRIVATE, *static_cast<int*>(compare), &timeout,
             nullptr, 0);
+#endif
     return true;
 }
 
 void WakeByAddressAll(void* address) {
+#ifdef __APPLE__
+    os_sync_wake_by_address_all(address, sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+#else
     syscall(SYS_futex, address, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+#endif
 }
 
 #endif

@@ -109,8 +109,12 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     game = game_config.load(args.game)
-    executable = args.exe or game.path(os.path.join(game.build, "port", "cmake", os.path.basename(
-        os.path.normpath(game.directory)) + ".exe"))
+    target = os.path.basename(os.path.normpath(game.directory))
+    executable = args.exe or game.path(os.path.join(game.build, "port", "cmake", target + ".exe"))
+    if not args.exe and not os.path.exists(executable):     # a Mac's (tools/macos.py build)
+        executable = game.path(os.path.join(game.build, "macos", target, target))
+        import macos
+        os.environ.update(macos.run_env())
     elf = game.path(os.path.join(game.extracted, game.executable))
     disc = game.path(game.iso) if game.iso else ""
     jobs = [("replay " + os.path.basename(f), lambda f=f: replay(executable, elf, f, args.repeat)) for f in args.replay]

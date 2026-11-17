@@ -243,7 +243,7 @@ class TestLift(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         try:
-            cppcheck.find_vcvars()
+            (cppcheck.find_vcvars() if os.name == "nt" else cppcheck.find_compiler())
         except cppcheck.CompilerUnavailable as exc:
             raise unittest.SkipTest(str(exc))
         cls.programs = programs()
@@ -359,7 +359,7 @@ class TestStructured(TestLift):
     @classmethod
     def setUpClass(cls):
         try:
-            cppcheck.find_vcvars()
+            (cppcheck.find_vcvars() if os.name == "nt" else cppcheck.find_compiler())
         except cppcheck.CompilerUnavailable as exc:
             raise unittest.SkipTest(str(exc))
         from ps2decomp import structure

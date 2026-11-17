@@ -1723,7 +1723,7 @@ def _functions_at_errors(source: str, errors: str) -> set:
     with open(source, encoding="utf-8") as handle:
         text = handle.read().splitlines()
     starts = [(number + 1, int(match.group(1), 16)) for number, line in enumerate(text)
-              for match in [re.match(r"^(?:s32|void) func_([0-9A-F]{8})\(.*\) \{$", line)]
+              for match in [re.match(r"^(?:s32|u32|u64|void) func_([0-9A-F]{8})\(.*\) \{$", line)]
               if match]
     found = set()
     for line in lines:
@@ -1755,7 +1755,7 @@ def check_compiled(verified, machine, out_dir: str, database: dict, work: str,
     # rather than aborting the whole check: one rendering gap must not cost every
     # other function its verdict.
     source = os.path.join(out_dir, "accessors.cpp")
-    for _attempt_number in range(24):
+    for _attempt_number in range(200):
         try:
             stage = time.time()
             dll, _functions = cppcheck.build(source, runtime,
