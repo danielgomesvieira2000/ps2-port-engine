@@ -48,7 +48,13 @@ void LoadSettings(const std::string& path) {
     g_file.clear();
     std::ifstream in(path);
     std::string line;
+    bool first = true;
     while (std::getline(in, line)) {
+        // A UTF-8 byte order mark before the first line (a file saved so by
+        // an editor, or PowerShell's Set-Content -Encoding utf8): not its
+        // key's - the first setting was lost to it.
+        if (first && line.compare(0, 3, "\xEF\xBB\xBF") == 0) line.erase(0, 3);
+        first = false;
         const auto equals = line.find('=');
         if (line.empty() || line[0] == '#' || equals == std::string::npos) continue;
         const std::string key = Trim(line.substr(0, equals));

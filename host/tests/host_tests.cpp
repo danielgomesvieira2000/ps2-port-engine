@@ -2166,7 +2166,25 @@ void BindingsKeepAndSwap() {
           "bindings: the buttons' names");
 }
 
+// The settings' file read past a UTF-8 byte order mark: its first line's key
+// is the setting's, not the mark's (then the run's settings again: none, and
+// nowhere to write them).
+void SettingsReadPastAByteOrderMark() {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "ps2host_settings_bom.ini";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << "\xEF\xBB\xBF" "disc=C:\\games\\disc.iso\r\nfullscreen=on\r\n";
+    }
+    ps2host::LoadSettings(path.string());
+    Check(ps2host::Setting("disc") == "C:\\games\\disc.iso", "settings: the first key after a byte order mark");
+    Check(ps2host::Setting("fullscreen") == "on", "settings: a line after it, its CR trimmed");
+    ps2host::LoadSettings("");
+    std::error_code e;
+    std::filesystem::remove(path, e);
+}
+
 int main() {
+    SettingsReadPastAByteOrderMark();
     BlanksLockToTheScreen();
     BindingsKeepAndSwap();
     CustomSongsScanAndName();
