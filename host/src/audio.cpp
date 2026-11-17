@@ -66,6 +66,7 @@
 
 #include "ps2host/music.h"
 #include "ps2host/run.h"
+#include "ps2host/settings.h"
 #include "ps2host/timeline.h"
 
 #ifdef _WIN32
@@ -111,6 +112,7 @@ struct Device {
     unsigned target_frames = kRate * 45 / 1000;    // (grown after running dry: kTargetStepMs)
     bool mute = false;
     bool log = false;
+    std::atomic<float> gain{1.0f};      // the master volume's (SetAudioVolume)
     std::atomic<bool> open{false}, stop{false};
     std::atomic<bool> resync{false};    // AudioResync: the backlog dropped at the next Render
     std::atomic<int> opened{0};         // the audio thread's answer: 1 a device, -1 none
@@ -307,6 +309,8 @@ void Device::Render(float* out, unsigned frames) {
         buffering = true;
     }
     if (mute) std::fill(out, out + 2 * frames, 0.0f);
+    if (const float g = gain.load(std::memory_order_relaxed); g != 1.0f)
+        for (unsigned i = 0; i < 2 * frames; ++i) out[i] *= g;
     if (log) {
         const int ms = int(available * 1000 / kRate);
         AtomicMin(stats.fewest_ms, ms);
@@ -524,6 +528,7 @@ bool OpenAudio() {
     Device& d = D();
     d.mute = std::getenv("PS2HOST_AUDIO_MUTE") != nullptr;
     d.log = std::getenv("PS2HOST_AUDIO_LOG") != nullptr;
+    SetAudioVolume(AudioVolume());
     if (const char* ms = std::getenv("PS2HOST_AUDIO_LATENCY_MS"))
         d.target_frames = unsigned(kRate * std::clamp(std::atoi(ms), 20, 250) / 1000);
     const bool wave_only = std::getenv("PS2HOST_AUDIO_WAVEOUT") != nullptr;
@@ -557,6 +562,15 @@ bool OpenWavDump(const std::string& path) {
 }
 
 void AudioResync() { D().resync = true; }
+
+int AudioVolume() { return std::clamp(std::atoi(Setting("master_volume", "50").c_str()), 0, 100); }
+
+void SetAudioVolume(int percent) {
+    percent = std::clamp(percent, 0, 100);
+    if (percent != AudioVolume()) SetSetting("master_volume", std::to_string(percent));
+    const float level = float(percent) / 100.0f;
+    D().gain.store(level * level, std::memory_order_relaxed);
+}
 
 bool AudioActive() {
     Device& d = D();

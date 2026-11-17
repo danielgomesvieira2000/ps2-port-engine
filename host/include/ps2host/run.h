@@ -860,6 +860,11 @@ bool AudioActive();
    its virtual frames faster than the device played it - the ring full, the
    sound 0.7 s behind the picture and samples dropped for a minute. */
 void AudioResync();
+/* The master volume, 0 to 100 percent (the PC settings panel's AUDIO): the
+   device's output scaled by it, squared (half way sounds half as loud) - not
+   --audio-wav's recording. Kept as the "master_volume" setting (50 at first). */
+int AudioVolume();
+void SetAudioVolume(int percent);
 
 }  // namespace ps2host
 

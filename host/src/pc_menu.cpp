@@ -6,7 +6,8 @@
  * settings the host itself applies, changed while the game runs and saved
  * with the PC settings (settings.h). While it is open the game gets no input.
  *
- * Its tabs: DISPLAY (the engine's settings), each of a port's pages
+ * Its tabs: DISPLAY (the engine's settings), AUDIO (the master volume, a
+ * slider: Left / Right step it, a click or a drag on it sets it), each of a port's pages
  * (AddPortOptions), each of its binding pages (bindings::AddPanelPage: a
  * context's keys or buttons, rebound - Enter, then the key; DEFAULTS), and,
  * for a port without controls of its own (no SetKeyboardMapper), KEYBOARD
@@ -60,6 +61,7 @@ int g_binding = -1;                      // the row a key (or button) is awaited
 bool g_binding_armed = false;            // ...every key let go since it began
 u64 g_binding_until = 0;                 // ...the panel's tick it gives up at
 u64 g_tick = 0;
+bool g_sliding = false;                  // a slider's bar dragged (the mouse's button held since it was pressed on it)
 
 /* The KEYBOARD tab's rows, in the order a player thinks of them. */
 constexpr int kKeyRows[] = {bindings::kUp,     bindings::kDown, bindings::kLeft,   bindings::kRight,
@@ -188,13 +190,13 @@ std::vector<int> Rows() {
 // ------------------------------------------------------------------ tabs and rows
 
 struct Tab {
-    enum Kind { kDisplay, kPort, kBindings, kKeyboard } kind;
+    enum Kind { kDisplay, kAudio, kPort, kBindings, kKeyboard } kind;
     int index;                          // the port's page, or its binding page
     std::string title;
 };
 
 std::vector<Tab> Tabs() {
-    std::vector<Tab> tabs = {{Tab::kDisplay, 0, "DISPLAY"}};
+    std::vector<Tab> tabs = {{Tab::kDisplay, 0, "DISPLAY"}, {Tab::kAudio, 0, "AUDIO"}};
     const std::vector<std::string> pages = Pages();
     for (int i = 0; i < int(pages.size()); ++i) tabs.push_back({Tab::kPort, i, pages[std::size_t(i)]});
     for (int i = 0; i < int(PanelPages().size()); ++i)
@@ -209,17 +211,21 @@ Tab CurrentTab() {
     return tabs[std::size_t(g_tab)];
 }
 
-/* A row shown: the engine's setting, a port's option, a binding, a KEYBOARD key, DEFAULTS. */
+/* A row shown: the engine's setting, the master volume, a port's option, a binding, a KEYBOARD key, DEFAULTS. */
 struct Row {
-    enum Kind { kChoice, kOption, kBinding, kKey, kDefaults } kind;
+    enum Kind { kChoice, kVolume, kOption, kBinding, kKey, kDefaults } kind;
     int index;                          // the choice, the option, the binding page's row, the input
 };
+
+constexpr int kVolumeStep = 5;          // percent, a press of Left or Right
 
 std::vector<Row> Shown() {
     std::vector<Row> rows;
     const Tab tab = CurrentTab();
     if (tab.kind == Tab::kDisplay) {
         for (int i : Rows()) rows.push_back({Row::kChoice, i});
+    } else if (tab.kind == Tab::kAudio) {
+        rows.push_back({Row::kVolume, 0});
     } else if (tab.kind == Tab::kPort) {
         const std::string page = Pages()[std::size_t(tab.index)];
         const auto& options = PortOptions();
@@ -273,6 +279,7 @@ std::string BindingName(const bindings::PanelPage& page, int physical) {
 struct RowText {
     std::string label, value, help;
     bool steps = false;                 // Left / Right change it (a value with arrows)
+    int slider = -1;                    // a slider's percent (drawn as a bar, the value beside it), or -1
 };
 
 RowText TextOf(const Row& row) {
@@ -285,6 +292,12 @@ RowText TextOf(const Row& row) {
             if (c.values[i] == now) t.value = c.shown[i];
         t.label = c.label;
         t.help = c.help ? c.help : "";
+        t.steps = true;
+    } else if (row.kind == Row::kVolume) {
+        t.label = "Master volume";
+        t.slider = AudioVolume();
+        t.value = std::to_string(t.slider) + "%";
+        t.help = "The game's sound, from silent to full. Left / Right, or click or drag the bar.";
         t.steps = true;
     } else if (row.kind == Row::kOption) {
         const PortOption& o = PortOptions()[std::size_t(row.index)];
@@ -342,6 +355,16 @@ Layout MakeLayout() {
     l.visible = std::max(1, (l.h - l.rows_y - l.help_h) / l.row_h);
     l.pill_w = int(300 * l.s);
     return l;
+}
+
+/* A slider's bar in its row's pill: between the "<" and the value (then ">"). */
+struct Track {
+    int x0, x1;
+};
+
+Track SliderTrack(const Layout& l) {
+    const int px = l.w - l.pad - l.pill_w;
+    return {px + int(44 * l.s), px + l.pill_w - int(100 * l.s)};
 }
 
 void KeepRowShown(const Layout& l, int rows) {
@@ -460,8 +483,20 @@ bool DrawPanel(const Layout& l, std::vector<u32>* pixels) {
             Text(dc, value_font, on ? kAccent : kFaint, ">", px + l.pill_w - S(36), py, S(28), ph,
                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
-        Text(dc, value_font, waiting ? kWait : kText, t.value, px + S(36), py, l.pill_w - S(72), ph,
-             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (t.slider >= 0) {
+            // the bar, filled to the value, a knob at its end; the value beside it
+            const Track track = SliderTrack(l);
+            const int bar_h = S(6), bar_y = py + (ph - bar_h) / 2, knob = S(16);
+            const int fill = (track.x1 - track.x0) * t.slider / 100;
+            Fill(dc, track.x0, bar_y, track.x1 - track.x0, bar_h, kBack, bar_h);
+            Fill(dc, track.x0, bar_y, fill, bar_h, on ? kAccent : kDim, bar_h);
+            Fill(dc, track.x0 + fill - knob / 2, py + (ph - knob) / 2, knob, knob, on ? kText : kDim, knob);
+            Text(dc, value_font, kText, t.value, track.x1 + S(8), py, px + l.pill_w - S(36) - track.x1 - S(8), ph,
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            Text(dc, value_font, waiting ? kWait : kText, t.value, px + S(36), py, l.pill_w - S(72), ph,
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
     }
     // a scroll bar, when not all show
     if (int(rows.size()) > l.visible) {
@@ -542,6 +577,7 @@ void Draw(bool force = false) {
 void Close() {
     g_open = false;
     g_binding = -1;
+    g_sliding = false;
 #ifdef _WIN32
     SetWindowPanel({}, 0, 0);
 #else
@@ -574,6 +610,12 @@ void Change(int step) {
         bindings::Save(page.device, page.context, page.defaults);
         if (page.changed) page.changed();
         std::fprintf(stderr, "[pc menu] %s: the defaults again\n", page.title.c_str());
+        return;
+    }
+    if (row.kind == Row::kVolume) {
+        // (a slider stops at its ends, not round to the other)
+        SetAudioVolume(AudioVolume() + step * kVolumeStep);
+        std::fprintf(stderr, "[pc menu] AUDIO: master volume %d%%\n", AudioVolume());
         return;
     }
     if (row.kind == Row::kOption) {
@@ -713,6 +755,21 @@ void PanelMouse() {
         return;
     }
     if (g_binding >= 0) return;
+    // a slider's bar: set where it is pointed at, and on while the button is held (off the bar too)
+    const Track track = SliderTrack(l);
+    auto slide = [&] {
+        const int percent = int(std::lround(100.0f * (x - float(track.x0)) / float(track.x1 - track.x0)));
+        if (std::clamp(percent, 0, 100) == AudioVolume()) return;
+        SetAudioVolume(percent);
+        std::fprintf(stderr, "[pc menu] AUDIO: master volume %d%%\n", AudioVolume());
+    };
+    if (g_sliding) {
+        g_sliding = (m.held & 1) != 0;
+        if (g_sliding) {
+            slide();
+            return;
+        }
+    }
     const std::vector<Row> rows = Shown();
     if (m.wheel != 0.0f) {
         g_scroll = std::clamp(g_scroll - int(m.wheel), 0, std::max(0, int(rows.size()) - l.visible));
@@ -733,6 +790,12 @@ void PanelMouse() {
     if (m.pressed & 1) {
         g_row = r;
         const RowText t = TextOf(rows[std::size_t(r)]);
+        const float knob = 8.0f * l.s;
+        if (t.slider >= 0 && x >= float(track.x0) - knob && x <= float(track.x1) + knob) {
+            g_sliding = true;
+            slide();
+            return;
+        }
         const float pill_x = float(l.w - l.pad - l.pill_w);
         // the value's arrows: back on the left one, on elsewhere
         Change(t.steps && x >= pill_x && x < pill_x + 44.0f * l.s ? -1 : +1);
