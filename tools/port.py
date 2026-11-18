@@ -524,7 +524,8 @@ def main(argv=None) -> int:
         # A new game: there is no game directory yet for --game to name.
         import init_game
         return init_game.main(argv[1:])
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False,
+                                     usage="%(prog)s --game GAME [action] [options] [-- options for the port itself]")
     game_config.add_argument(parser)
     parser.add_argument("action", nargs="?", default="all", choices=("all", "build", "run", "pgo"))
     parser.add_argument("--sse4", action="store_true",
@@ -533,11 +534,15 @@ def main(argv=None) -> int:
                         help="build: without the profile `pgo` made (build/port/pgo.profdata)")
     parser.add_argument("--rounds", type=int, default=60,
                         help="build-and-run rounds to translate code found at run time")
-    parser.add_argument("extra", nargs=argparse.REMAINDER,
-                        help="options for the port itself, after --")
-    args = parser.parse_args(argv)
+    # The port's own options follow "--"; port.py's own (--sse4, --no-pgo ...)
+    # are read before or after the action. (They were an argparse.REMAINDER,
+    # which took all after the action: `build --sse4` built the main build.)
+    split = argv.index("--") if "--" in argv else len(argv)
+    args, unknown = parser.parse_known_args(argv[:split])
+    if unknown and args.action not in ("all", "run"):
+        parser.error("unrecognized arguments: %s" % " ".join(unknown))
     game = game_config.from_args(args)
-    extra = [a for a in args.extra if a != "--"]
+    extra = unknown + argv[split + 1:]
     if args.action == "run":
         target = os.path.basename(os.path.normpath(game.directory))
         executable = game.path(os.path.join(game.build, "port", "cmake", target + ".exe"))
