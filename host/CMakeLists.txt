@@ -30,6 +30,8 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/iop.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/sdk.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/hang_report.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/crash_report.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/updater.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/custom_songs.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/disc.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/cdvd.cpp
@@ -191,6 +193,7 @@ endif()
 if(WIN32)
     target_link_libraries(ps2host PRIVATE ws2_32)         # the IOP's inet (iop_inet.cpp)
     target_link_libraries(ps2host PRIVATE iphlpapi)       # this PC's networks (networks.cpp)
+    target_link_libraries(ps2host PRIVATE winhttp bcrypt) # the update check (updater.cpp)
 endif()
 if(NOT MSVC)
     # clang or GCC (Android's NDK): translated code throws lifted::Abort; no
@@ -336,6 +339,21 @@ function(ps2_add_port target)
         if(no_version)
             set(game_version "0.0.0")
         endif()
+        # The update check's (updater.cpp): the GitHub repository ("release":
+        # {"github": "owner/repository"}) and the zip's name, as package.py
+        # makes it ("release": {"name"}, else the title's letters and digits
+        # and "-PC").
+        string(JSON game_github ERROR_VARIABLE no_github GET ${game_json} release github)
+        if(no_github)
+            set(game_github "")
+        endif()
+        string(JSON game_release ERROR_VARIABLE no_release_name GET ${game_json} release name)
+        if(no_release_name OR game_release STREQUAL "")
+            string(REGEX REPLACE "[^A-Za-z0-9]" "" game_release "${game_title}")
+            set(game_release "${game_release}-PC")
+        endif()
+        target_compile_definitions(${target} PRIVATE PS2HOST_GAME_GITHUB="${game_github}"
+                                                     PS2HOST_GAME_RELEASE="${game_release}")
         target_compile_definitions(${target} PRIVATE PS2HOST_GAME_NAME="${game_name}"
                                                      PS2HOST_GAME_TITLE="${game_title}"
                                                      PS2HOST_GAME_VERSION="${game_version}"

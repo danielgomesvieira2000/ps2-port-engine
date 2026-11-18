@@ -7,6 +7,7 @@
 #define PS2HOST_RUN_H
 
 #include <atomic>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <functional>
@@ -405,6 +406,13 @@ void WaitForGpuPipelines(const std::atomic<bool>* preparing = nullptr);
    while a GPU pipeline is made in the middle of a game. Any thread; only
    the window's does anything. */
 void KeepWindowAnswering();
+/* When the window's thread last answered (read its events, or said it
+   waits: KeepWindowAnswering), steady_clock nanoseconds; 0 before it has a
+   window. And that thread (Windows' id; 0 none). For the freeze watch
+   (crash_report.h). PS2HOST_TEST_HANG=AFTER:FOR (a test's): the window's
+   thread stops answering FOR seconds once, AFTER seconds into the run. */
+std::int64_t WindowAnsweredNs();
+unsigned long WindowThreadId();
 /* Fullscreen on or off (saved as the "fullscreen" setting, settings.h, which
    the window opens with); and whether it is. */
 void SetWindowFullscreen(bool on);

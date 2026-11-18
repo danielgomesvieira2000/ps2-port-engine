@@ -35,10 +35,12 @@
 #include <SDL3/SDL.h>           // (a player's messages: SDL's message box)
 #endif
 
+#include "ps2host/crash_report.h"
 #include "ps2host/disc.h"
 #include "ps2host/host.h"
 #include "ps2host/run.h"
 #include "ps2host/settings.h"
+#include "ps2host/updater.h"
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
@@ -78,6 +80,7 @@ bool HasAvx2() {
 }
 
 std::string g_log;     // the log a run started without arguments writes
+std::filesystem::path g_here;      // ...beside the game, with the player's files
 
 #ifdef PS2HOST_GAME_EXECUTABLE
 /* Whether `path` is an image of the game's disc: the executable it boots is
@@ -304,6 +307,7 @@ std::vector<std::string> PlayArguments(const char* self) {
     // once, shared (fopen's would lock the file to one stream), and given to
     // both: their lines in the order they were written.
     g_log = std::filesystem::path(exe).stem().string() + ".log";     // (on Linux: the program's name, .log)
+    g_here = here;
     LogTo((here / g_log).string());
     std::fprintf(stderr, "[port] disc %s\n", disc.c_str());
     return {self, "--disc", disc, "--memcard", (here / "memcard").string(), "--window", "--gpu",
@@ -363,6 +367,11 @@ extern "C" JNIEXPORT void JNICALL Java_org_ps2port_PortActivity_nativeTouchShown
 
 int main(int argc, char** argv) {
     AttachTerminal();
+#ifdef PS2HOST_GAME_GITHUB
+    const ps2host::ReportGame report{PS2HOST_GAME_TITLE, PS2HOST_GAME_VERSION, PS2HOST_GAME_TARGET, PS2HOST_GAME_GITHUB};
+    // A crashed run's report (ps2host/crash_report.h: this program started again by the crash).
+    if (ps2host::IsCrashReportHelper(argc, argv)) return ps2host::CrashReportHelper(argc, argv, report);
+#endif
 #ifndef _WIN32
     // A send to a peer that went away (a LAN player leaving) an error, not
     // the end of the process.
@@ -390,6 +399,15 @@ int main(int argc, char** argv) {
     if (argc == 1) {
         play = PlayArguments(argv[0]);
         if (play.empty()) return 0;
+#if defined(_WIN32) && defined(PS2HOST_GAME_GITHUB)
+        // A player's run: its crashes reported, and a newer release offered
+        // (ps2host/crash_report.h, ps2host/updater.h) - installed, it starts
+        // in this one's place.
+        ps2host::ArmCrashReports(g_here, g_log, report);
+        if (ps2host::CheckForUpdate(g_here, {PS2HOST_GAME_TITLE, PS2HOST_GAME_VERSION, PS2HOST_GAME_TARGET,
+                                             PS2HOST_GAME_GITHUB, PS2HOST_GAME_RELEASE}))
+            return 0;
+#endif
         for (std::string& arg : play) play_argv.push_back(arg.data());
         play_argv.push_back(nullptr);
         argc = int(play.size());
@@ -413,7 +431,7 @@ int main(int argc, char** argv) {
         std::fflush(nullptr);
         const std::string text = "The game stopped because of an error. What happened is in " +
                                  g_log + ", beside the game.";
-        Tell(text, true);
+        if (!ps2host::ReportStop(code)) Tell(text, true);       // (a player's run: a crash report)
     }
     // What must be finished is (the report written, the settings and the
     // memory card saved as they changed, the WAV's header here); the rest -

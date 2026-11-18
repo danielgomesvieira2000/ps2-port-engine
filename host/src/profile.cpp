@@ -588,6 +588,8 @@ std::string SampleReport(int top) {
 
 namespace {
 
+wchar_t g_crash_command[4096] = L"";    // (made before: nothing allocated in a crash)
+
 LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     if (reported.exchange(true)) return EXCEPTION_CONTINUE_SEARCH;
@@ -639,6 +641,17 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
                      lined ? "  " : "", lined ? line.FileName : "", lined ? line.LineNumber : 0ul);
     }
     std::fflush(stderr);
+    if (g_crash_command[0]) {
+        static wchar_t line[4096];
+        std::memcpy(line, g_crash_command, sizeof line);
+        STARTUPINFOW startup{};
+        startup.cb = sizeof startup;
+        PROCESS_INFORMATION started{};
+        if (CreateProcessW(nullptr, line, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &started)) {
+            CloseHandle(started.hThread);
+            CloseHandle(started.hProcess);
+        }
+    }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -723,9 +736,68 @@ void StartStallWatch() {
 
 void InstallCrashReport() { SetUnhandledExceptionFilter(CrashFilter); }
 
+unsigned long RendererThreadId() { return g_renderer_tid.load(); }
+
+std::string ThreadStack(unsigned long thread_id) {
+    if (!thread_id || thread_id == GetCurrentThreadId()) return "";
+    static std::mutex lock;             // (DbgHelp's calls: one thread at a time)
+    std::lock_guard<std::mutex> hold(lock);
+    HANDLE process = GetCurrentProcess();
+    static const bool symbols = [process] {
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+        char exe_dir[MAX_PATH] = "";
+        GetModuleFileNameA(nullptr, exe_dir, MAX_PATH);
+        if (char* slash = std::strrchr(exe_dir, '\\')) *slash = 0;
+        return SymInitialize(process, exe_dir, TRUE) != FALSE;
+    }();
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, thread_id);
+    if (!h) return "";
+    constexpr int kDeep = 40;
+    std::uint64_t frames[kDeep] = {};
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_FULL;
+    if (SuspendThread(h) != DWORD(-1)) {
+        if (GetThreadContext(h, &ctx)) WalkStack(ctx, frames, kDeep);
+        ResumeThread(h);
+    }
+    CloseHandle(h);
+    std::string line;
+    for (int n = 0; n < kDeep && frames[n]; ++n) {
+        alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256];
+        SYMBOL_INFO* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        DWORD64 displacement = 0;
+        char text[300];
+        if (symbols && SymFromAddr(process, frames[n], &displacement, symbol)) {
+            std::snprintf(text, sizeof text, "%s%s", n ? " <- " : "", symbol->Name);
+        } else {
+            // (no symbols - a player's build: the module and the offset, for its .pdb later)
+            const DWORD64 base = symbols ? SymGetModuleBase64(process, frames[n]) : 0;
+            char module[MAX_PATH] = "?";
+            if (base) {
+                GetModuleFileNameA(reinterpret_cast<HMODULE>(base), module, MAX_PATH);
+                if (const char* slash = std::strrchr(module, '\\')) std::memmove(module, slash + 1, std::strlen(slash));
+            }
+            if (base)
+                std::snprintf(text, sizeof text, "%s%s+0x%llX", n ? " <- " : "", module, (unsigned long long)(frames[n] - base));
+            else
+                std::snprintf(text, sizeof text, "%s0x%llX", n ? " <- " : "", (unsigned long long)frames[n]);
+        }
+        line += text;
+    }
+    return line;
+}
+void SetCrashCommand(const wchar_t* command) {
+    wcsncpy_s(g_crash_command, command ? command : L"", _TRUNCATE);
+}
+
 #else
 
 void InstallCrashReport() {}
+void SetCrashCommand(const wchar_t*) {}
+std::string ThreadStack(unsigned long) { return ""; }
+unsigned long RendererThreadId() { return 0; }
 void StartStallWatch() {}
 void StallWorkBegan() {}
 void StallWorkEnded() {}

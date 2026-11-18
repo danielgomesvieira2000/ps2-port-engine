@@ -29,7 +29,10 @@ What is the game's own comes from its game.json:
                the title's letters and digits, then "-PC"),
                "extras": {path in the zip: file in the game's directory}
                - more text files for the player (a texture pack folder's
-               README, say), written with Windows line ends}.
+               README, say), written with Windows line ends,
+               "github": "owner/repository" - where the game's update
+               check (engine/host/src/updater.cpp) finds its releases,
+               and its crash reports' GitHub issues}.
 The player README is the game's port/release/README.txt.
 """
 

@@ -96,6 +96,143 @@ void WatchVblanks(std::shared_ptr<VblankWatch> watch, HWND window) {
     }
     if (output) output->Release();
 }
+
+/* The window moved and resized by the port, not by Windows' own loop.
+   Dragging the title bar or a border runs a loop of Windows' (DefWindowProc's
+   WM_NCLBUTTONDOWN: SC_MOVE / SC_SIZE) until the button is let go - and the
+   thread in it is the game's, which reads the window's messages once a
+   frame (Pump): the game stopped while the window moved. So the press is
+   taken here, before SDL dispatches it (SDL_SetWindowsMessageHook): the
+   pointer captured, the window moved or sized to it at each move the
+   frames' Pump reads, let go on the button's release - the game playing on.
+   What Windows' loop also did: a maximized window dragged by its title
+   comes back to its size under the pointer; let go at the top of the screen
+   it is maximized, at its left or right edge it takes that half; Escape
+   puts it back where it was. */
+struct WindowDrag {
+    HWND window = nullptr;      // the game's
+    WPARAM edge = 0;            // HTCAPTION or a border's hit-test code; 0: none under way
+    POINT from{};               // the pointer as it began (the screen's)
+    RECT rect{};                // the window then
+};
+WindowDrag g_drag;
+
+constexpr int kSmallestW = 320, kSmallestH = 240;
+
+const wchar_t* EdgeCursor(WPARAM edge) {
+    switch (edge) {
+        case HTLEFT: case HTRIGHT: return MAKEINTRESOURCEW(32644);              // IDC_SIZEWE
+        case HTTOP: case HTBOTTOM: return MAKEINTRESOURCEW(32645);              // IDC_SIZENS
+        case HTTOPLEFT: case HTBOTTOMRIGHT: return MAKEINTRESOURCEW(32642);     // IDC_SIZENWSE
+        case HTTOPRIGHT: case HTBOTTOMLEFT: return MAKEINTRESOURCEW(32643);     // IDC_SIZENESW
+        default: return MAKEINTRESOURCEW(32512);                                // IDC_ARROW
+    }
+}
+
+void DragTo(const POINT& at) {
+    const int dx = at.x - g_drag.from.x, dy = at.y - g_drag.from.y;
+    RECT n = g_drag.rect;
+    if (g_drag.edge == HTCAPTION) {
+        SetWindowPos(g_drag.window, nullptr, n.left + dx, n.top + dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        return;
+    }
+    const WPARAM e = g_drag.edge;
+    if (e == HTLEFT || e == HTTOPLEFT || e == HTBOTTOMLEFT) n.left = std::min(n.left + dx, n.right - kSmallestW);
+    if (e == HTRIGHT || e == HTTOPRIGHT || e == HTBOTTOMRIGHT) n.right = std::max(n.right + dx, n.left + kSmallestW);
+    if (e == HTTOP || e == HTTOPLEFT || e == HTTOPRIGHT) n.top = std::min(n.top + dy, n.bottom - kSmallestH);
+    if (e == HTBOTTOM || e == HTBOTTOMLEFT || e == HTBOTTOMRIGHT) n.bottom = std::max(n.bottom + dy, n.top + kSmallestH);
+    SetWindowPos(g_drag.window, nullptr, n.left, n.top, n.right - n.left, n.bottom - n.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    SetCursor(LoadCursorW(nullptr, EdgeCursor(e)));
+}
+
+/* A move let go at the screen's top (maximized) or its left or right edge (that half). */
+void Snap(const POINT& at) {
+    MONITORINFO m{};
+    m.cbSize = sizeof m;
+    if (!GetMonitorInfoW(MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST), &m)) return;
+    const RECT& w = m.rcWork;
+    constexpr int kNear = 2;
+    if (at.y <= m.rcMonitor.top + kNear) {
+        ShowWindow(g_drag.window, SW_MAXIMIZE);
+    } else if (at.x <= m.rcMonitor.left + kNear || at.x >= m.rcMonitor.right - 1 - kNear) {
+        const int half = (w.right - w.left) / 2;
+        const int left = at.x <= m.rcMonitor.left + kNear ? w.left : w.left + half;
+        SetWindowPos(g_drag.window, nullptr, left, w.top, half, w.bottom - w.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+void EndDrag() {
+    g_drag.edge = 0;
+    if (GetCapture() == g_drag.window) ReleaseCapture();
+}
+
+bool SDLCALL WindowMessages(void*, MSG* m) {
+    if (!g_drag.window || m->hwnd != g_drag.window) return true;
+    // The pointer taken from the window meanwhile (another window's, Alt+Tab): the drag over.
+    if (g_drag.edge && GetCapture() != g_drag.window) g_drag.edge = 0;
+    switch (m->message) {
+        case WM_NCLBUTTONDOWN: {
+            const WPARAM hit = m->wParam;
+            if (hit != HTCAPTION && !(hit >= HTLEFT && hit <= HTBOTTOMRIGHT)) return true;   // (its buttons: Windows')
+            if (IsZoomed(m->hwnd) && hit != HTCAPTION) return true;
+            POINT at;
+            GetCursorPos(&at);
+            if (IsZoomed(m->hwnd)) {
+                // Maximized: its own size again, under the pointer as far across as it was.
+                RECT big{};
+                GetWindowRect(m->hwnd, &big);
+                const double across = big.right > big.left ? double(at.x - big.left) / double(big.right - big.left) : 0.5;
+                ShowWindow(m->hwnd, SW_RESTORE);
+                RECT small{};
+                GetWindowRect(m->hwnd, &small);
+                const int w = small.right - small.left, h = small.bottom - small.top;
+                const int left = at.x - int(across * double(w)), top = at.y - (at.y - big.top);
+                SetWindowPos(m->hwnd, nullptr, left, top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            g_drag.edge = hit;
+            g_drag.from = at;
+            GetWindowRect(m->hwnd, &g_drag.rect);
+            SetForegroundWindow(m->hwnd);
+            SetCapture(m->hwnd);
+            if (hit != HTCAPTION) SetCursor(LoadCursorW(nullptr, EdgeCursor(hit)));
+            return false;
+        }
+        case WM_MOUSEMOVE:
+        case WM_NCMOUSEMOVE:
+            if (!g_drag.edge) return true;
+            {
+                POINT at;
+                GetCursorPos(&at);
+                DragTo(at);
+            }
+            return false;
+        case WM_LBUTTONUP:
+        case WM_NCLBUTTONUP:
+            if (!g_drag.edge) return true;
+            {
+                POINT at;
+                GetCursorPos(&at);
+                DragTo(at);
+                if (g_drag.edge == HTCAPTION) Snap(at);
+            }
+            EndDrag();
+            return false;
+        case WM_KEYDOWN:
+            if (!g_drag.edge || m->wParam != VK_ESCAPE) return true;
+            SetWindowPos(g_drag.window, nullptr, g_drag.rect.left, g_drag.rect.top, g_drag.rect.right - g_drag.rect.left,
+                         g_drag.rect.bottom - g_drag.rect.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            EndDrag();
+            return false;
+        case WM_LBUTTONDOWN:
+        case WM_RBUTTONDOWN:
+        case WM_RBUTTONUP:
+        case WM_MBUTTONDOWN:
+        case WM_MBUTTONUP:
+            return !g_drag.edge;            // (the game sees no click while the window moves)
+        default:
+            return true;
+    }
+}
 #endif
 
 }  // namespace
@@ -154,6 +291,9 @@ bool SdlWindowDisplay::OpenWindow(const char* title, int width, int height, SDL_
             SDL_GetPointerProperty(SDL_GetWindowProperties(window_), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr))) {
         vblank_watch_ = std::make_shared<VblankWatch>();
         std::thread(WatchVblanks, vblank_watch_, hwnd).detach();
+        // Moved and resized with the game running on (WindowMessages).
+        g_drag.window = hwnd;
+        SDL_SetWindowsMessageHook(WindowMessages, nullptr);
     }
 #endif
     return true;

@@ -69,6 +69,7 @@ bool g_closed = false;
 std::unique_ptr<ps2gpu::Display> g_display;
 std::thread::id g_window_thread;                    // the one that opened it, and pumps it
 std::atomic<std::int64_t> g_answered_ns{0};         // when it last looked at its events
+std::atomic<unsigned long> g_window_tid{0};         // (its thread, Windows' id: the freeze watch's)
 bool g_pipelines_behind = false;    // the first start went on before its pipelines were all made
 
 // The keys the controller reads, as Win32 virtual keys, by position.
@@ -353,6 +354,7 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
     if (g_display) {
         g_window_thread = std::this_thread::get_id();
 #ifdef _WIN32
+        g_window_tid = GetCurrentThreadId();
         // No ghost window ("not responding", its title greyed) for a moment
         // the game waits on the GPU: a game's own stall is not a hang.
         DisableProcessWindowsGhosting();
@@ -695,9 +697,43 @@ void KeepWindowAnswering() {
 #endif
 }
 
+std::int64_t WindowAnsweredNs() {
+#ifdef PS2HOST_VULKAN
+    return g_display ? g_answered_ns.load(std::memory_order_relaxed) : 0;
+#else
+    return 0;
+#endif
+}
+
+unsigned long WindowThreadId() {
+#ifdef PS2HOST_VULKAN
+    return g_window_tid.load(std::memory_order_relaxed);
+#else
+    return 0;
+#endif
+}
+
+namespace {
+/* PS2HOST_TEST_HANG=AFTER:FOR (run.h): the window's thread asleep FOR
+   seconds, once, AFTER seconds after its first pump. */
+void TestHang() {
+    static const char* v = std::getenv("PS2HOST_TEST_HANG");
+    if (!v) return;
+    static const double after = std::atof(v), length = std::strchr(v, ':') ? std::atof(std::strchr(v, ':') + 1) : 0.0;
+    static const auto began = std::chrono::steady_clock::now();
+    static bool done = false;
+    if (done || std::chrono::steady_clock::now() - began < std::chrono::duration<double>(after)) return;
+    done = true;
+    std::fprintf(stderr, "[test] the window's thread stops answering for %.0f s\n", length);
+    std::this_thread::sleep_for(std::chrono::duration<double>(length));
+    std::fprintf(stderr, "[test] the window's thread answers again\n");
+}
+}  // namespace
+
 bool PumpWindow() {
 #ifdef PS2HOST_VULKAN
     if (g_display) {
+        TestHang();
         g_answered_ns.store(NowNs(), std::memory_order_relaxed);
         if (!PumpDisplay()) g_closed = true;
         KeepFullscreenSetting();
